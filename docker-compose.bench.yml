@@ -1,0 +1,107 @@
+# MeshGuard WireGuard Benchmark
+#
+# Compares userspace WG (Zig) vs kernel WG throughput using iperf3.
+#
+# Usage:
+#   zig build -Doptimize=ReleaseSafe
+#   docker compose -f docker-compose.bench.yml up --build -d
+#   # Wait ~10s for handshakes
+#   docker compose -f docker-compose.bench.yml exec zig-client iperf3 -c <zig-server-mesh-ip> -t 10
+#   docker compose -f docker-compose.bench.yml exec kernel-client iperf3 -c <kernel-server-mesh-ip> -t 10
+
+services:
+  # ── Userspace WG pair (Zig implementation) ──
+  zig-server:
+    build: .
+    container_name: mg-bench-zig-server
+    hostname: zig-server
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      - net.ipv4.ip_forward=1
+    volumes:
+      - bench-keys:/shared/keys
+    networks:
+      bench:
+        ipv4_address: 172.32.0.10
+    environment:
+      - MESHGUARD_CONFIG_DIR=/etc/meshguard
+      - SEED_DELAY=1
+      - BENCH_ROLE=server
+
+  zig-client:
+    build: .
+    container_name: mg-bench-zig-client
+    hostname: zig-client
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      - net.ipv4.ip_forward=1
+    volumes:
+      - bench-keys:/shared/keys
+    depends_on:
+      - zig-server
+    networks:
+      bench:
+        ipv4_address: 172.32.0.11
+    environment:
+      - MESHGUARD_CONFIG_DIR=/etc/meshguard
+      - SEED_PEERS=172.32.0.10:51821
+      - SEED_DELAY=3
+      - BENCH_ROLE=client
+
+  # ── Kernel WG pair (standard wg-quick) ──
+  kernel-server:
+    build: .
+    container_name: mg-bench-kernel-server
+    hostname: kernel-server
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      - net.ipv4.ip_forward=1
+    volumes:
+      - bench-keys:/shared/keys
+    networks:
+      bench:
+        ipv4_address: 172.32.0.20
+    environment:
+      - MESHGUARD_CONFIG_DIR=/etc/meshguard
+      - SEED_DELAY=1
+      - BENCH_MODE=kernel
+      - BENCH_ROLE=server
+
+  kernel-client:
+    build: .
+    container_name: mg-bench-kernel-client
+    hostname: kernel-client
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      - net.ipv4.ip_forward=1
+    volumes:
+      - bench-keys:/shared/keys
+    depends_on:
+      - kernel-server
+    networks:
+      bench:
+        ipv4_address: 172.32.0.21
+    environment:
+      - MESHGUARD_CONFIG_DIR=/etc/meshguard
+      - SEED_PEERS=172.32.0.20:51821
+      - SEED_DELAY=3
+      - BENCH_MODE=kernel
+      - BENCH_ROLE=client
+
+volumes:
+  bench-keys:
+
+networks:
+  bench:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.32.0.0/24

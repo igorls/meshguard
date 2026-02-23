@@ -1,0 +1,81 @@
+# MeshGuard — 3-node mesh simulation (userspace WG mode)
+#
+# Usage:
+#   zig build -Doptimize=ReleaseSafe
+#   docker compose up --build
+#   docker compose exec node-b ping -c3 <node-a-mesh-ip>
+#   docker compose down
+
+services:
+  node-a:
+    build: .
+    container_name: mg-node-a
+    hostname: node-a
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      - net.ipv4.ip_forward=1
+    volumes:
+      - shared-keys:/shared/keys
+    networks:
+      mesh:
+        ipv4_address: 172.31.0.10
+    environment:
+      - MESHGUARD_CONFIG_DIR=/etc/meshguard
+      - SEED_DELAY=1
+
+  node-b:
+    build: .
+    container_name: mg-node-b
+    hostname: node-b
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      - net.ipv4.ip_forward=1
+    volumes:
+      - shared-keys:/shared/keys
+    depends_on:
+      - node-a
+    networks:
+      mesh:
+        ipv4_address: 172.31.0.11
+    environment:
+      - MESHGUARD_CONFIG_DIR=/etc/meshguard
+      - SEED_PEERS=172.31.0.10:51821
+      - SEED_DELAY=3
+
+  node-c:
+    build: .
+    container_name: mg-node-c
+    hostname: node-c
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      - net.ipv4.ip_forward=1
+    volumes:
+      - shared-keys:/shared/keys
+    depends_on:
+      - node-a
+    networks:
+      mesh:
+        ipv4_address: 172.31.0.12
+    environment:
+      - MESHGUARD_CONFIG_DIR=/etc/meshguard
+      - SEED_PEERS=172.31.0.10:51821
+      - SEED_DELAY=4
+
+volumes:
+  shared-keys:
+
+networks:
+  mesh:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24

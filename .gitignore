@@ -1,0 +1,33 @@
+# Zig
+.zig-cache/
+zig-out/
+
+# Docs (VitePress / Bun)
+docs/node_modules/
+docs/.vitepress/dist/
+docs/.vitepress/cache/
+
+# Build artifacts
+*.o
+*.obj
+*.lib
+*.a
+*.so
+*.dylib
+*.dll
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# IDE / Editor
+.vscode/
+.idea/
+.zed/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,16 @@
+.{
+    .name = .meshguard,
+    .version = "0.1.0",
+    .fingerprint = 0x83397fd2015885da,
+    .minimum_zig_version = "0.15.0",
+
+    .dependencies = .{},
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+        "LICENSE",
+    },
+}
