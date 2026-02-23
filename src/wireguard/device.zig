@@ -53,6 +53,8 @@ pub const WgPeer = struct {
     identity_key: [32]u8,
     /// X25519 WG static public key
     wg_pubkey: [32]u8,
+    /// Mesh IP address (10.99.x.y)
+    mesh_ip: [4]u8 = .{0} ** 4,
     /// Noise handshake state
     handshake: noise.Handshake,
     /// Active tunnel (after successful handshake)
@@ -186,6 +188,12 @@ const StaticKeyTable = struct {
     }
 };
 
+/// Extract the host ID (u16) from a mesh IP address.
+/// Mesh prefix is 10.99.0.0/16, so octets [2] and [3] form the host key.
+fn meshIpHostId(ip: [4]u8) u16 {
+    return (@as(u16, ip[2]) << 8) | @as(u16, ip[3]);
+}
+
 /// Userspace WireGuard device.
 pub const WgDevice = struct {
     /// Our X25519 keypair
@@ -203,6 +211,11 @@ pub const WgDevice = struct {
     /// Static pubkey → peer slot mapping (for O(1) handshake initiation routing)
     /// Replaces O(N) iteration in handleInitiation
     static_map: StaticKeyTable = .{},
+
+    /// Mesh IP → peer slot mapping (O(1) routing for data plane).
+    /// Mesh prefix is 10.99.0.0/16, so the last 2 octets form a u16 host ID.
+    /// Uses u8 with 0xFF sentinel (MAX_PEERS=64 fits in u8). 65536 bytes = 64KB.
+    ip_to_slot: [65536]u8 = .{0xFF} ** 65536,
 
     /// Next sender index to assign (random-ish via wrapping increment)
     next_index: u32 = 0,
@@ -231,11 +244,26 @@ pub const WgDevice = struct {
     /// Add or update a peer by their WG public key.
     /// Returns the peer slot index.
     pub fn addPeer(self: *WgDevice, identity_key: [32]u8, wg_pubkey: [32]u8, addr: [4]u8, port: u16) !usize {
+        return self.addPeerWithMeshIp(identity_key, wg_pubkey, addr, port, .{ 0, 0, 0, 0 });
+    }
+
+    /// Add or update a peer with mesh IP for O(1) data-plane routing.
+    pub fn addPeerWithMeshIp(self: *WgDevice, identity_key: [32]u8, wg_pubkey: [32]u8, addr: [4]u8, port: u16, mesh_ip: [4]u8) !usize {
         // Check if peer already exists
         if (self.static_map.get(wg_pubkey)) |existing| {
             if (self.peers[existing]) |*peer| {
                 peer.endpoint_addr = addr;
                 peer.endpoint_port = port;
+                // Update mesh IP routing if provided
+                if (mesh_ip[0] != 0 or mesh_ip[1] != 0) {
+                    // Clear old mapping if mesh_ip changed
+                    if (peer.mesh_ip[0] != 0 or peer.mesh_ip[1] != 0) {
+                        const old_host = meshIpHostId(peer.mesh_ip);
+                        self.ip_to_slot[old_host] = 0xFF;
+                    }
+                    peer.mesh_ip = mesh_ip;
+                    self.ip_to_slot[meshIpHostId(mesh_ip)] = @intCast(existing);
+                }
                 return existing;
             }
         }
@@ -252,6 +280,7 @@ pub const WgDevice = struct {
                 slot.* = .{
                     .identity_key = identity_key,
                     .wg_pubkey = wg_pubkey,
+                    .mesh_ip = mesh_ip,
                     .handshake = handshake,
                     .endpoint_addr = addr,
                     .endpoint_port = port,
@@ -259,6 +288,10 @@ pub const WgDevice = struct {
                 };
                 self.peer_count += 1;
                 self.static_map.put(wg_pubkey, i);
+                // Register mesh IP routing
+                if (mesh_ip[0] != 0 or mesh_ip[1] != 0) {
+                    self.ip_to_slot[meshIpHostId(mesh_ip)] = @intCast(i);
+                }
                 return i;
             }
         }
@@ -270,6 +303,10 @@ pub const WgDevice = struct {
         if (self.static_map.get(wg_pubkey)) |slot| {
             if (self.peers[slot]) |peer| {
                 self.index_map.remove(peer.sender_index);
+                // Clear mesh IP routing
+                if (peer.mesh_ip[0] != 0 or peer.mesh_ip[1] != 0) {
+                    self.ip_to_slot[meshIpHostId(peer.mesh_ip)] = 0xFF;
+                }
                 self.static_map.remove(wg_pubkey);
                 self.peers[slot] = null;
                 self.peer_count -|= 1;
@@ -395,6 +432,14 @@ pub const WgDevice = struct {
     /// Find a peer slot by WG public key (O(1) via static_map).
     pub fn findByWgPubkey(self: *const WgDevice, wg_pubkey: [32]u8) ?usize {
         return self.static_map.get(wg_pubkey);
+    }
+
+    /// O(1) mesh IP routing lookup for data plane.
+    /// Extracts host ID from destination IP and does flat-array lookup.
+    pub fn lookupByMeshIp(self: *const WgDevice, dst_ip: [4]u8) ?usize {
+        const slot = self.ip_to_slot[meshIpHostId(dst_ip)];
+        if (slot == 0xFF) return null;
+        return @as(usize, slot);
     }
 };
 

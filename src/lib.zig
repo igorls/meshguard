@@ -39,6 +39,7 @@ pub const protocol = struct {
 
 pub const net = struct {
     pub const Udp = @import("net/udp.zig");
+    pub const BatchUdp = @import("net/batch_udp.zig");
     pub const Io = @import("net/io.zig");
     pub const Tun = @import("net/tun.zig");
 };

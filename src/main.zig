@@ -614,7 +614,7 @@ fn wgOnPeerJoin(ctx: *anyopaque, peer: *const lib.discovery.Membership.Peer) voi
             const peer_addr = if (peer.gossip_endpoint) |ep| ep.addr else if (peer.public_endpoint) |pub_ep| pub_ep.addr else [4]u8{ 0, 0, 0, 0 };
             const peer_port = if (peer.gossip_endpoint) |ep| ep.port else if (peer.public_endpoint) |pub_ep| pub_ep.port else @as(u16, 0);
 
-            const slot = dev.addPeer(peer.pubkey, wg_key, peer_addr, peer_port) catch {
+            const slot = dev.addPeerWithMeshIp(peer.pubkey, wg_key, peer_addr, peer_port, peer.mesh_ip) catch {
                 writeFormatted(handler.stdout, "  warning: failed to add userspace WG peer {s}\n", .{ip_str}) catch {};
                 return;
             };
@@ -695,6 +695,7 @@ fn wgOnPeerPunched(ctx: *anyopaque, peer: *const lib.discovery.Membership.Peer, 
 
 /// Userspace multiplexed event loop.
 /// Polls both the UDP socket (for WG/SWIM/STUN) and the TUN device (for outgoing IP).
+/// Uses recvmmsg/sendmmsg for batch UDP I/O to minimize syscall overhead.
 fn userspaceEventLoop(
     swim: *lib.discovery.Swim.SwimProtocol,
     wg_dev: *lib.wireguard.Device.WgDevice,
@@ -703,14 +704,20 @@ fn userspaceEventLoop(
     stdout: std.fs.File,
 ) !void {
     const Device = lib.wireguard.Device;
+    const BatchUdp = lib.net.BatchUdp;
 
     // Set TUN to non-blocking for poll
     var tun_mut = tun_dev;
     try tun_mut.setNonBlocking();
 
-    var recv_buf: [1500]u8 = undefined;
+    // Batch I/O state — pre-allocated for zero-alloc hot path
+    var rx = BatchUdp.BatchReceiver{};
+    rx.setupPointers(); // Must be called after struct is at final stack location
+    var tx = BatchUdp.BatchSender{};
+
     var tun_buf: [1500]u8 = undefined;
-    var encrypt_buf: [1600]u8 = undefined; // MTU + WG overhead
+    // Encrypt buffers: one per batch slot so sendmmsg can reference them simultaneously
+    var encrypt_bufs: [BatchUdp.BATCH_SIZE][1600]u8 = undefined;
 
     while (swim.running.load(.acquire)) {
         // Poll both fds with 50ms timeout
@@ -720,86 +727,78 @@ fn userspaceEventLoop(
         };
         _ = posix.poll(&fds, 50) catch continue;
 
-        // ── Handle incoming UDP packets ──
+        // ── Batch-receive incoming UDP packets ──
         if (fds[0].revents & posix.POLL.IN != 0) {
-            while (true) {
-                const result = udp_sock.recvFrom(&recv_buf) catch break;
-                if (result == null) break;
-                const recv = result.?;
+            const count = rx.recvBatch(udp_sock.fd);
+            for (0..count) |i| {
+                const pkt = rx.getPacket(i);
+                const sender = rx.getSender(i);
 
-                switch (Device.PacketType.classify(recv.data)) {
+                switch (Device.PacketType.classify(pkt)) {
                     .wg_handshake_init => {
-                        // Someone is initiating a handshake with us
-                        if (recv.data.len >= @sizeOf(lib.wireguard.Noise.HandshakeInitiation)) {
-                            const msg: *const lib.wireguard.Noise.HandshakeInitiation = @ptrCast(@alignCast(recv.data.ptr));
+                        if (pkt.len >= @sizeOf(lib.wireguard.Noise.HandshakeInitiation)) {
+                            const msg: *const lib.wireguard.Noise.HandshakeInitiation = @ptrCast(@alignCast(pkt.ptr));
                             if (wg_dev.handleInitiation(msg)) |hs_result| {
-                                // Send response back
                                 const resp_bytes = std.mem.asBytes(&hs_result.response);
-                                _ = udp_sock.sendTo(resp_bytes, recv.sender_addr, recv.sender_port) catch 0;
+                                _ = udp_sock.sendTo(resp_bytes, sender.addr, sender.port) catch 0;
                                 writeFormatted(stdout, "  WG handshake: responded to initiation\n", .{}) catch {};
                             } else |_| {}
                         }
                     },
                     .wg_handshake_resp => {
-                        // Response to our handshake initiation
-                        if (recv.data.len >= @sizeOf(lib.wireguard.Noise.HandshakeResponse)) {
-                            const msg: *const lib.wireguard.Noise.HandshakeResponse = @ptrCast(@alignCast(recv.data.ptr));
+                        if (pkt.len >= @sizeOf(lib.wireguard.Noise.HandshakeResponse)) {
+                            const msg: *const lib.wireguard.Noise.HandshakeResponse = @ptrCast(@alignCast(pkt.ptr));
                             if (wg_dev.handleResponse(msg)) |slot| {
-                                // Update peer endpoint from where the response came from
                                 if (wg_dev.peers[slot]) |*p| {
-                                    p.endpoint_addr = recv.sender_addr;
-                                    p.endpoint_port = recv.sender_port;
+                                    p.endpoint_addr = sender.addr;
+                                    p.endpoint_port = sender.port;
                                 }
                                 writeFormatted(stdout, "  WG handshake: completed with peer\n", .{}) catch {};
                             } else |_| {}
                         }
                     },
                     .wg_transport => {
-                        // Encrypted data packet — decrypt and write to TUN
                         var decrypt_buf: [1500]u8 = undefined;
-                        if (wg_dev.decryptTransport(recv.data, &decrypt_buf)) |result2| {
-                            tun_mut.write(decrypt_buf[0..result2.len]) catch {};
+                        if (wg_dev.decryptTransport(pkt, &decrypt_buf)) |result| {
+                            tun_mut.write(decrypt_buf[0..result.len]) catch {};
                         } else |_| {}
                     },
-                    .wg_cookie => {
-                        // Cookie reply — ignore for now
-                    },
-                    .stun => {
-                        // STUN response — feed to SWIM (it handles STUN internally)
-                        swim.feedPacket(recv.data, recv.sender_addr, recv.sender_port);
-                    },
-                    .swim => {
-                        // SWIM gossip — feed to SWIM protocol
-                        swim.feedPacket(recv.data, recv.sender_addr, recv.sender_port);
-                    },
+                    .wg_cookie => {},
+                    .stun => swim.feedPacket(pkt, sender.addr, sender.port),
+                    .swim => swim.feedPacket(pkt, sender.addr, sender.port),
                     .unknown => {},
                 }
             }
         }
 
-        // ── Handle outgoing IP packets from TUN ──
+        // ── Batch-send outgoing IP packets TUN → encrypt → UDP ──
         if (fds[1].revents & posix.POLL.IN != 0) {
-            while (true) {
+            tx.reset();
+            var send_idx: usize = 0;
+
+            while (send_idx < BatchUdp.BATCH_SIZE) {
                 const n = tun_mut.read(&tun_buf) catch break;
                 if (n == 0) break;
 
                 const ip_packet = tun_buf[0..n];
-
-                // Extract destination IP from IP header (bytes 16-19 in IPv4)
                 if (n < 20) continue;
                 const dst_ip: [4]u8 = ip_packet[16..20].*;
 
-                // Look up destination peer by mesh IP and encrypt
-                const target_slot = findPeerByMeshIp(wg_dev, swim, dst_ip);
+                const target_slot = wg_dev.lookupByMeshIp(dst_ip);
                 if (target_slot) |slot| {
-                    if (wg_dev.encryptForPeer(slot, ip_packet, &encrypt_buf)) |enc_len| {
-                        const peer = &(wg_dev.peers[slot].?);
-                        if (peer.endpoint_addr[0] != 0) {
-                            _ = udp_sock.sendTo(encrypt_buf[0..enc_len], peer.endpoint_addr, peer.endpoint_port) catch 0;
+                    if (wg_dev.encryptForPeer(slot, ip_packet, &encrypt_bufs[send_idx])) |enc_len| {
+                        if (wg_dev.peers[slot]) |peer| {
+                            if (peer.endpoint_addr[0] != 0) {
+                                tx.queue(encrypt_bufs[send_idx][0..enc_len], peer.endpoint_addr, peer.endpoint_port);
+                                send_idx += 1;
+                            }
                         }
                     } else |_| {}
                 }
             }
+
+            // Flush all queued encrypted packets in one sendmmsg call
+            _ = tx.flush(udp_sock.fd);
         }
 
         // ── Run SWIM timers (gossip probes, expiry, hole punch) ──
