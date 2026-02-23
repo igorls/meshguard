@@ -4,7 +4,13 @@ All meshguard gossip traffic uses a **binary wire protocol** on a single UDP por
 
 ## Message Format
 
-Every message starts with a **1-byte type tag**:
+Packets are classified by their **first 4 bytes** (little-endian u32):
+
+- **WireGuard**: Types 1, 2, 3, 4 (followed by 3 zero bytes).
+- **STUN**: RFC 5389 magic cookie (`0x2112A442`) at bytes 4-7.
+- **SWIM**: Anything else (typically starts with `0x01`-`0x34`).
+
+SWIM messages use a **1-byte type tag**:
 
 ```
 [1B type][payload...]
@@ -12,24 +18,17 @@ Every message starts with a **1-byte type tag**:
 
 ## Message Types
 
-| Tag    | Name              | Category  | Direction       |
-| ------ | ----------------- | --------- | --------------- |
-| `0x01` | Ping              | SWIM      | A → B           |
-| `0x02` | PingReq           | SWIM      | A → C (probe B) |
-| `0x03` | Ack               | SWIM      | B → A           |
-| `0x10` | HandshakeInit     | Handshake | A → B           |
-| `0x11` | HandshakeResp     | Handshake | B → A           |
-| `0x12` | HandshakeComplete | Handshake | A → B           |
-| `0x20` | MemberJoin        | Gossip    | Piggybacked     |
-| `0x21` | MemberLeave       | Gossip    | Piggybacked     |
-| `0x22` | MemberSuspect     | Gossip    | Piggybacked     |
-| `0x23` | MemberAlive       | Gossip    | Piggybacked     |
-| `0x24` | MemberDead        | Gossip    | Piggybacked     |
-| `0x30` | RelayRequest      | NAT       | A → Relay       |
-| `0x31` | RelayData         | NAT       | Relay-forwarded |
-| `0x32` | EndpointUpdate    | NAT       | Broadcast       |
-| `0x33` | HolepunchRequest  | NAT       | A → Rendezvous  |
-| `0x34` | HolepunchResponse | NAT       | B → Rendezvous  |
+| Tag    | Name                | Category  | Direction       |
+| ------ | ------------------- | --------- | --------------- |
+| `0x01` | Ping                | SWIM      | A → B           |
+| `0x02` | PingReq             | SWIM      | A → C (probe B) |
+| `0x03` | Ack                 | SWIM      | B → A           |
+| `0x01` | HandshakeInitiation | WireGuard | A → B           |
+| `0x02` | HandshakeResponse   | WireGuard | B → A           |
+| `0x03` | CookieReply         | WireGuard | B → A           |
+| `0x04` | TransportData       | WireGuard | A ↔ B           |
+| `0x33` | HolepunchRequest    | NAT       | A → Rendezvous  |
+| `0x34` | HolepunchResponse   | NAT       | B → Rendezvous  |
 
 ## Ping
 
@@ -71,36 +70,34 @@ Piggybacked on Ping and Ack messages:
 
 Fixed size: **89 bytes** per entry. Up to 8 entries per message.
 
-## HandshakeInit
+## HandshakeInitiation (Type 1)
+
+Standard Noise_IKpsk2 initiation message.
 
 ```
-[0x10]
-[32B sender_pubkey]
-[32B nonce]
-[64B signature]          # sign(nonce, sender_privkey)
-[32B wg_pubkey]          # X25519 WireGuard public key
-[4B mesh_ip]
-[2B wg_port (LE)]
-[2B gossip_port (LE)]
+[4B type (1)][4B sender_index]
+[32B unencrypted_ephemeral]
+[48B encrypted_static + auth]
+[28B encrypted_timestamp + auth]
+[16B mac1]
+[16B mac2]
 ```
 
-Total: **169 bytes**.
+Total: **148 bytes**.
 
-## HandshakeResp
+## HandshakeResponse (Type 2)
+
+Standard Noise_IKpsk2 response message.
 
 ```
-[0x11]
-[32B sender_pubkey]
-[32B nonce]              # Responder's nonce
-[32B init_nonce]         # Echo of initiator's nonce
-[64B signature]          # sign(init_nonce || nonce, responder_privkey)
-[32B wg_pubkey]
-[4B mesh_ip]
-[2B wg_port (LE)]
-[2B gossip_port (LE)]
+[4B type (2)][4B sender_index][4B receiver_index]
+[32B unencrypted_ephemeral]
+[16B encrypted_nothing + auth]
+[16B mac1]
+[16B mac2]
 ```
 
-Total: **201 bytes**.
+Total: **92 bytes**.
 
 ## HolepunchRequest
 
