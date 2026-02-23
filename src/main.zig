@@ -536,6 +536,14 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
 
         try writeFormatted(stdout, "  TUN device: {s} (fd={d}, mtu=1420)\n", .{ tun_dev.getName(), tun_dev.fd });
 
+        // Enable GSO/GRO offloads for large packet coalescing
+        tun_dev.enableOffload();
+        if (tun_dev.vnet_hdr) {
+            try stdout.writeAll("  GSO/GRO offloads: enabled (IFF_VNET_HDR)\n");
+        } else {
+            try stdout.writeAll("  GSO/GRO offloads: disabled (fallback to single-packet)\n");
+        }
+
         // Run multiplexed event loop
         userspaceEventLoop(&swim, &wg_device, &gossip_socket, tun_dev, stdout) catch |err| {
             try writeFormatted(stderr, "error: event loop failed: {s}\n", .{@errorName(err)});
@@ -698,20 +706,29 @@ const MAX_WORKERS: usize = 8;
 
 /// Data-plane worker: reads TUN, encrypts, sends UDP via shared fd.
 /// Each worker has its own TUN fd (multi-queue). UDP send is thread-safe on DGRAM sockets.
+/// When IFF_VNET_HDR is active, strips the 10-byte virtio_net_hdr and handles GSO super-packets.
 fn dataPlaneWorker(
     running: *const std.atomic.Value(bool),
     wg_dev: *lib.wireguard.Device.WgDevice,
     tun_fd: posix.fd_t,
     udp_fd: posix.fd_t,
+    vnet_hdr: bool,
 ) void {
     const BatchUdp = lib.net.BatchUdp;
+    const Offload = lib.net.Offload;
 
     var tx = BatchUdp.BatchSender{};
-    var tun_buf: [1500]u8 = undefined;
+    // Large read buffer for GSO super-packets (10 vnet_hdr + up to 65535)
+    var tun_buf: [Offload.VNET_HDR_LEN + 65535]u8 = undefined;
     var encrypt_bufs: [BatchUdp.BATCH_SIZE][1600]u8 = undefined;
+    // Segment buffers for GSO split
+    var seg_bufs: [BatchUdp.BATCH_SIZE][1500]u8 = undefined;
+    var seg_slices: [BatchUdp.BATCH_SIZE][]u8 = undefined;
+    for (0..BatchUdp.BATCH_SIZE) |i| {
+        seg_slices[i] = &seg_bufs[i];
+    }
 
     while (running.load(.acquire)) {
-        // Poll TUN fd only — workers handle send path (TUN→encrypt→UDP)
         var fds = [_]posix.pollfd{
             .{ .fd = tun_fd, .events = posix.POLL.IN, .revents = 0 },
         };
@@ -725,25 +742,66 @@ fn dataPlaneWorker(
                 const n = posix.read(tun_fd, &tun_buf) catch break;
                 if (n == 0) break;
 
-                if (n < 20) continue;
-                const ip_packet = tun_buf[0..n];
-                const dst_ip: [4]u8 = ip_packet[16..20].*;
+                if (vnet_hdr) {
+                    // Strip 10-byte virtio_net_hdr
+                    if (n <= Offload.VNET_HDR_LEN) continue;
+                    const vhdr: *const Offload.VirtioNetHdr = @ptrCast(@alignCast(&tun_buf));
+                    const ip_data = tun_buf[Offload.VNET_HDR_LEN..n];
 
-                const target_slot = wg_dev.lookupByMeshIp(dst_ip);
-                if (target_slot) |slot| {
-                    if (wg_dev.encryptForPeer(slot, ip_packet, &encrypt_bufs[send_idx])) |enc_len| {
-                        if (wg_dev.peers[slot]) |peer| {
-                            if (peer.endpoint_addr[0] != 0) {
-                                tx.queue(encrypt_bufs[send_idx][0..enc_len], peer.endpoint_addr, peer.endpoint_port);
-                                send_idx += 1;
-                            }
+                    // Complete partial checksum if kernel used checksum offload
+                    Offload.completeChecksum(vhdr.*, ip_data);
+
+                    if (vhdr.gso_type != Offload.GSO_NONE) {
+                        // GSO super-packet — split into segments, encrypt each
+                        var seg_sizes: [BatchUdp.BATCH_SIZE]usize = undefined;
+                        const seg_count = Offload.gsoSplit(
+                            vhdr.*,
+                            ip_data,
+                            &seg_slices,
+                            &seg_sizes,
+                            BatchUdp.BATCH_SIZE - send_idx,
+                        );
+                        for (0..seg_count) |s| {
+                            if (send_idx >= BatchUdp.BATCH_SIZE) break;
+                            encryptAndQueue(wg_dev, seg_bufs[s][0..seg_sizes[s]], &encrypt_bufs[send_idx], &tx, &send_idx);
                         }
-                    } else |_| {}
+                    } else {
+                        // Non-GSO: standard single packet
+                        if (ip_data.len < 20) continue;
+                        encryptAndQueue(wg_dev, ip_data, &encrypt_bufs[send_idx], &tx, &send_idx);
+                    }
+                } else {
+                    // No vnet_hdr — legacy single-packet mode
+                    if (n < 20) continue;
+                    const ip_packet = tun_buf[0..n];
+                    encryptAndQueue(wg_dev, ip_packet, &encrypt_bufs[send_idx], &tx, &send_idx);
                 }
             }
 
             _ = tx.flush(udp_fd);
         }
+    }
+}
+
+/// Encrypt an IP packet and queue it for batch sending.
+fn encryptAndQueue(
+    wg_dev: *lib.wireguard.Device.WgDevice,
+    ip_packet: []const u8,
+    encrypt_buf: *[1600]u8,
+    tx: *lib.net.BatchUdp.BatchSender,
+    send_idx: *usize,
+) void {
+    const dst_ip: [4]u8 = ip_packet[16..20].*;
+    const target_slot = wg_dev.lookupByMeshIp(dst_ip);
+    if (target_slot) |slot| {
+        if (wg_dev.encryptForPeer(slot, ip_packet, encrypt_buf)) |enc_len| {
+            if (wg_dev.peers[slot]) |peer| {
+                if (peer.endpoint_addr[0] != 0) {
+                    tx.queue(encrypt_buf[0..enc_len], peer.endpoint_addr, peer.endpoint_port);
+                    send_idx.* += 1;
+                }
+            }
+        } else |_| {}
     }
 }
 
@@ -804,6 +862,7 @@ fn userspaceEventLoop(
             wg_dev,
             tun_fds[w],
             udp_sock.fd,
+            tun_dev.vnet_hdr,
         }) catch {
             writeFormatted(stdout, "  warning: failed to spawn worker {d}\n", .{w}) catch {};
             continue;
@@ -854,7 +913,18 @@ fn userspaceEventLoop(
                     .wg_transport => {
                         var decrypt_buf: [1500]u8 = undefined;
                         if (wg_dev.decryptTransport(pkt, &decrypt_buf)) |result| {
-                            _ = posix.write(tun_dev.fd, decrypt_buf[0..result.len]) catch {};
+                            if (tun_dev.vnet_hdr) {
+                                // Prepend empty vnet_hdr (GSO_NONE) for IFF_VNET_HDR TUN
+                                const Offload = lib.net.Offload;
+                                var vhdr_bytes = std.mem.zeroes([Offload.VNET_HDR_LEN]u8);
+                                var iov = [_]posix.iovec_const{
+                                    .{ .base = &vhdr_bytes, .len = Offload.VNET_HDR_LEN },
+                                    .{ .base = decrypt_buf[0..result.len].ptr, .len = result.len },
+                                };
+                                _ = posix.writev(tun_dev.fd, &iov) catch {};
+                            } else {
+                                _ = posix.write(tun_dev.fd, decrypt_buf[0..result.len]) catch {};
+                            }
                         } else |_| {}
                     },
                     .wg_cookie => {},
