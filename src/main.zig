@@ -302,7 +302,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     const stdout = getStdOut();
     const stderr = getStdErr();
 
-    // Parse --seed, --announce, --kernel, --dns, and --mdns arguments
+    // Parse --seed, --announce, --kernel, --dns, --mdns, and --encrypt-workers arguments
     const messages = @import("protocol/messages.zig");
     var seed_buf: [16]messages.Endpoint = undefined;
     var seed_count: usize = 0;
@@ -310,6 +310,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     var use_kernel_wg: bool = false;
     var dns_domain: []const u8 = "";
     var use_mdns: bool = false;
+    var encrypt_workers: usize = 0; // 0 = auto (CPU count)
     // Collect raw seed strings for hostname resolution
     var seed_strs: [16][]const u8 = undefined;
     var seed_str_count: usize = 0;
@@ -337,6 +338,9 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
                 dns_domain = extra_args[i];
             } else if (std.mem.eql(u8, extra_args[i], "--mdns")) {
                 use_mdns = true;
+            } else if (std.mem.eql(u8, extra_args[i], "--encrypt-workers") and i + 1 < extra_args.len) {
+                i += 1;
+                encrypt_workers = std.fmt.parseInt(usize, extra_args[i], 10) catch 0;
             }
         }
     }
@@ -582,7 +586,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
         }
 
         // Run multiplexed event loop
-        userspaceEventLoop(&swim, &wg_device, &gossip_socket, tun_dev, stdout) catch |err| {
+        userspaceEventLoop(&swim, &wg_device, &gossip_socket, tun_dev, stdout, encrypt_workers) catch |err| {
             try writeFormatted(stderr, "error: event loop failed: {s}\n", .{@errorName(err)});
         };
     }
@@ -739,12 +743,239 @@ fn wgOnPeerPunched(ctx: *anyopaque, peer: *const lib.discovery.Membership.Peer, 
     }
 }
 
-/// Maximum data-plane worker threads.
+/// Maximum data-plane worker threads (TUN readers + encrypt workers combined).
 const MAX_WORKERS: usize = 8;
+const MAX_ENCRYPT_WORKERS: usize = 16;
 
-/// Data-plane worker: reads TUN, encrypts, sends UDP via shared fd.
-/// Each worker has its own TUN fd (multi-queue). UDP send is thread-safe on DGRAM sockets.
-/// When IFF_VNET_HDR is active, strips the 10-byte virtio_net_hdr and handles GSO super-packets.
+// ── Parallel encryption pipeline ──────────────────────────────────────
+
+/// Work item passed from TUN reader to encrypt worker.
+const EncryptWorkItem = struct {
+    /// IP packet data (copied from TUN read buffer)
+    data: [1500]u8 = undefined,
+    len: u16 = 0,
+    /// Peer info for routing the encrypted packet
+    peer_slot: u16 = 0,
+    endpoint_addr: [4]u8 = .{ 0, 0, 0, 0 },
+    endpoint_port: u16 = 0,
+};
+
+/// Bounded MPMC (multi-producer multi-consumer) queue for encrypt work items.
+/// Uses mutex + condition variable for simplicity — encryption is the bottleneck, not queueing.
+const EncryptQueue = struct {
+    const QUEUE_SIZE = 512; // must be power of 2
+
+    items: [QUEUE_SIZE]EncryptWorkItem = undefined,
+    head: usize = 0, // next write position
+    tail: usize = 0, // next read position
+    count: usize = 0,
+    mutex: std.Thread.Mutex = .{},
+    not_empty: std.Thread.Condition = .{},
+    not_full: std.Thread.Condition = .{},
+    closed: bool = false,
+
+    /// Push a work item (blocks if full).
+    fn push(self: *EncryptQueue, item: EncryptWorkItem) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        while (self.count >= QUEUE_SIZE and !self.closed) {
+            self.not_full.wait(&self.mutex);
+        }
+        if (self.closed) return false;
+
+        self.items[self.head] = item;
+        self.head = (self.head + 1) % QUEUE_SIZE;
+        self.count += 1;
+        self.not_empty.signal();
+        return true;
+    }
+
+    /// Try to push without blocking. Returns false if full.
+    fn tryPush(self: *EncryptQueue, item: EncryptWorkItem) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.count >= QUEUE_SIZE or self.closed) return false;
+
+        self.items[self.head] = item;
+        self.head = (self.head + 1) % QUEUE_SIZE;
+        self.count += 1;
+        self.not_empty.signal();
+        return true;
+    }
+
+    /// Pop a work item (blocks if empty). Returns null if closed.
+    fn pop(self: *EncryptQueue) ?EncryptWorkItem {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        while (self.count == 0 and !self.closed) {
+            self.not_empty.wait(&self.mutex);
+        }
+        if (self.count == 0) return null;
+
+        const item = self.items[self.tail];
+        self.tail = (self.tail + 1) % QUEUE_SIZE;
+        self.count -= 1;
+        self.not_full.signal();
+        return item;
+    }
+
+    /// Close the queue, waking all waiters.
+    fn close(self: *EncryptQueue) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.closed = true;
+        self.not_empty.broadcast();
+        self.not_full.broadcast();
+    }
+};
+
+/// TUN reader thread: reads from TUN, resolves peer, pushes to encrypt queue.
+/// Does NOT encrypt — leaves that to the encrypt workers.
+fn tunReaderWorker(
+    running: *const std.atomic.Value(bool),
+    wg_dev: *lib.wireguard.Device.WgDevice,
+    tun_fd: posix.fd_t,
+    vnet_hdr: bool,
+    queue: *EncryptQueue,
+) void {
+    const Offload = lib.net.Offload;
+
+    var tun_buf: [Offload.VNET_HDR_LEN + 65535]u8 = undefined;
+    // Segment buffers for GSO split
+    var seg_bufs: [64][1500]u8 = undefined;
+    var seg_slices: [64][]u8 = undefined;
+    for (0..64) |i| {
+        seg_slices[i] = &seg_bufs[i];
+    }
+
+    while (running.load(.acquire)) {
+        var fds = [_]posix.pollfd{
+            .{ .fd = tun_fd, .events = posix.POLL.IN, .revents = 0 },
+        };
+        _ = posix.poll(&fds, 50) catch continue;
+
+        if (fds[0].revents & posix.POLL.IN != 0) {
+            // Drain available packets
+            while (true) {
+                const n = posix.read(tun_fd, &tun_buf) catch break;
+                if (n == 0) break;
+
+                if (vnet_hdr) {
+                    if (n <= Offload.VNET_HDR_LEN) continue;
+                    const vhdr: *const Offload.VirtioNetHdr = @ptrCast(@alignCast(&tun_buf));
+                    const ip_data = tun_buf[Offload.VNET_HDR_LEN..n];
+
+                    if (vhdr.gso_type != Offload.GSO_NONE) {
+                        // GSO super-packet — split and push each segment
+                        var seg_sizes: [64]usize = undefined;
+                        const seg_count = Offload.gsoSplit(
+                            vhdr.*,
+                            ip_data,
+                            &seg_slices,
+                            &seg_sizes,
+                            64,
+                        );
+                        for (0..seg_count) |s| {
+                            pushToQueue(wg_dev, seg_bufs[s][0..seg_sizes[s]], queue);
+                        }
+                    } else {
+                        if (ip_data.len < 20) continue;
+                        const mutable_data = tun_buf[Offload.VNET_HDR_LEN..n];
+                        Offload.completeChecksum(vhdr.*, mutable_data);
+                        pushToQueue(wg_dev, mutable_data, queue);
+                    }
+                } else {
+                    if (n < 20) continue;
+                    pushToQueue(wg_dev, tun_buf[0..n], queue);
+                }
+            }
+        }
+    }
+}
+
+/// Resolve peer and push work item to encrypt queue.
+fn pushToQueue(
+    wg_dev: *lib.wireguard.Device.WgDevice,
+    ip_packet: []const u8,
+    queue: *EncryptQueue,
+) void {
+    if (ip_packet.len < 20 or ip_packet.len > 1500) return;
+    const dst_ip: [4]u8 = ip_packet[16..20].*;
+    const target_slot = wg_dev.lookupByMeshIp(dst_ip) orelse return;
+    const peer = wg_dev.peers[target_slot] orelse return;
+    if (peer.endpoint_addr[0] == 0) return;
+
+    var item = EncryptWorkItem{
+        .len = @intCast(ip_packet.len),
+        .peer_slot = @intCast(target_slot),
+        .endpoint_addr = peer.endpoint_addr,
+        .endpoint_port = peer.endpoint_port,
+    };
+    @memcpy(item.data[0..ip_packet.len], ip_packet);
+    _ = queue.tryPush(item); // drop if full (backpressure)
+}
+
+/// Encrypt worker: pops from queue, encrypts, sends via UDP.
+fn encryptWorker(
+    running: *const std.atomic.Value(bool),
+    wg_dev: *lib.wireguard.Device.WgDevice,
+    udp_fd: posix.fd_t,
+    queue: *EncryptQueue,
+) void {
+    const BatchUdp = lib.net.BatchUdp;
+    var tx = BatchUdp.BatchSender{};
+    var encrypt_buf: [1600]u8 = undefined;
+
+    while (running.load(.acquire)) {
+        tx.reset();
+        var batch_count: usize = 0;
+
+        // Pop first item (blocking)
+        if (queue.pop()) |first_item| {
+            encryptAndSendItem(wg_dev, &first_item, &encrypt_buf, &tx);
+            batch_count += 1;
+
+            // Drain more items without blocking to fill batch
+            while (batch_count < BatchUdp.BATCH_SIZE) {
+                const maybe_item = blk: {
+                    queue.mutex.lock();
+                    defer queue.mutex.unlock();
+                    if (queue.count == 0) break :blk null;
+                    const item = queue.items[queue.tail];
+                    queue.tail = (queue.tail + 1) % EncryptQueue.QUEUE_SIZE;
+                    queue.count -= 1;
+                    queue.not_full.signal();
+                    break :blk item;
+                };
+                if (maybe_item) |item| {
+                    encryptAndSendItem(wg_dev, &item, &encrypt_buf, &tx);
+                    batch_count += 1;
+                } else break;
+            }
+
+            _ = tx.flush(udp_fd);
+        } else break; // queue closed
+    }
+}
+
+/// Encrypt a single work item and queue it for batch sending.
+fn encryptAndSendItem(
+    wg_dev: *lib.wireguard.Device.WgDevice,
+    item: *const EncryptWorkItem,
+    encrypt_buf: *[1600]u8,
+    tx: *lib.net.BatchUdp.BatchSender,
+) void {
+    const plaintext = item.data[0..item.len];
+    if (wg_dev.encryptForPeer(item.peer_slot, plaintext, encrypt_buf)) |enc_len| {
+        tx.queue(encrypt_buf[0..enc_len], item.endpoint_addr, item.endpoint_port);
+    } else |_| {}
+}
+
+/// Legacy data-plane worker: reads TUN, encrypts, sends UDP (serial).
+/// Used only when encrypt_workers == 0 (legacy mode).
 fn dataPlaneWorker(
     running: *const std.atomic.Value(bool),
     wg_dev: *lib.wireguard.Device.WgDevice,
@@ -756,10 +987,8 @@ fn dataPlaneWorker(
     const Offload = lib.net.Offload;
 
     var tx = BatchUdp.BatchSender{};
-    // Large read buffer for GSO super-packets (10 vnet_hdr + up to 65535)
     var tun_buf: [Offload.VNET_HDR_LEN + 65535]u8 = undefined;
     var encrypt_bufs: [BatchUdp.BATCH_SIZE][1600]u8 = undefined;
-    // Segment buffers for GSO split
     var seg_bufs: [BatchUdp.BATCH_SIZE][1500]u8 = undefined;
     var seg_slices: [BatchUdp.BATCH_SIZE][]u8 = undefined;
     for (0..BatchUdp.BATCH_SIZE) |i| {
@@ -781,14 +1010,11 @@ fn dataPlaneWorker(
                 if (n == 0) break;
 
                 if (vnet_hdr) {
-                    // Strip 10-byte virtio_net_hdr
                     if (n <= Offload.VNET_HDR_LEN) continue;
                     const vhdr: *const Offload.VirtioNetHdr = @ptrCast(@alignCast(&tun_buf));
                     const ip_data = tun_buf[Offload.VNET_HDR_LEN..n];
 
                     if (vhdr.gso_type != Offload.GSO_NONE) {
-                        // GSO super-packet — split into segments, encrypt each.
-                        // gsoSplit() handles all checksums internally per-segment.
                         var seg_sizes: [BatchUdp.BATCH_SIZE]usize = undefined;
                         const seg_count = Offload.gsoSplit(
                             vhdr.*,
@@ -802,15 +1028,12 @@ fn dataPlaneWorker(
                             encryptAndQueue(wg_dev, seg_bufs[s][0..seg_sizes[s]], &encrypt_bufs[send_idx], &tx, &send_idx);
                         }
                     } else {
-                        // Non-GSO: complete partial checksum if kernel used offload
                         if (ip_data.len < 20) continue;
-                        // ip_data is a mutable slice of tun_buf, safe to call completeChecksum
                         const mutable_data = tun_buf[Offload.VNET_HDR_LEN..n];
                         Offload.completeChecksum(vhdr.*, mutable_data);
                         encryptAndQueue(wg_dev, mutable_data, &encrypt_bufs[send_idx], &tx, &send_idx);
                     }
                 } else {
-                    // No vnet_hdr — legacy single-packet mode
                     if (n < 20) continue;
                     const ip_packet = tun_buf[0..n];
                     encryptAndQueue(wg_dev, ip_packet, &encrypt_bufs[send_idx], &tx, &send_idx);
@@ -970,32 +1193,46 @@ fn writeCoalescedToTun(
 
 /// Userspace multiplexed event loop with multi-threaded data plane.
 ///
-/// Architecture:
-/// - N data-plane workers: each reads from its own TUN fd (multi-queue),
-///   encrypts, and sends via the shared UDP fd. Workers handle TUN→UDP.
+/// Architecture (parallel mode, encrypt_workers > 0):
+/// - N TUN reader threads: read from TUN queues, split GSO, push to EncryptQueue.
+/// - M encrypt workers: pop from queue, encrypt, sendmmsg via shared UDP fd.
 /// - Control-plane (this function): receives all UDP, dispatches handshakes
 ///   to WG device, SWIM gossip, and decrypts transport → TUN. Handles UDP→TUN.
+///
+/// Architecture (legacy mode, encrypt_workers == 0):
+/// - N data-plane workers: each reads TUN, encrypts, sends UDP (serial).
 fn userspaceEventLoop(
     swim: *lib.discovery.Swim.SwimProtocol,
     wg_dev: *lib.wireguard.Device.WgDevice,
     udp_sock: *lib.net.Udp.UdpSocket,
     tun_dev: lib.net.Tun.TunDevice,
     stdout: std.fs.File,
+    encrypt_workers_arg: usize,
 ) !void {
     const Device = lib.wireguard.Device;
     const BatchUdp = lib.net.BatchUdp;
 
-    // Determine worker count: min(cpus, MAX_WORKERS), at least 1
+    // Determine TUN reader count: min(cpus, MAX_WORKERS), at least 1
     const cpu_count = std.Thread.getCpuCount() catch 1;
-    const n_workers = @min(cpu_count, MAX_WORKERS);
+    const n_tun_readers = @min(cpu_count, MAX_WORKERS);
 
-    writeFormatted(stdout, "  data-plane workers: {d} (on {d} CPUs)\n", .{ n_workers, cpu_count }) catch {};
+    // Determine encrypt worker count
+    const n_encrypt = if (encrypt_workers_arg > 0)
+        @min(encrypt_workers_arg, MAX_ENCRYPT_WORKERS)
+    else
+        0; // 0 = legacy serial mode
+
+    if (n_encrypt > 0) {
+        writeFormatted(stdout, "  pipeline: {d} TUN readers + {d} encrypt workers (on {d} CPUs)\n", .{ n_tun_readers, n_encrypt, cpu_count }) catch {};
+    } else {
+        writeFormatted(stdout, "  data-plane workers: {d} (on {d} CPUs, serial mode)\n", .{ n_tun_readers, cpu_count }) catch {};
+    }
 
     // Open additional TUN queue fds for workers
     var tun_fds: [MAX_WORKERS]posix.fd_t = undefined;
     var opened_workers: usize = 0;
 
-    for (0..n_workers) |w| {
+    for (0..n_tun_readers) |w| {
         if (w == 0) {
             tun_fds[0] = tun_dev.fd;
         } else {
@@ -1016,23 +1253,59 @@ fn userspaceEventLoop(
         _ = posix.fcntl(tun_fds[w], posix.F.SETFL, flags | @as(usize, 0x800)) catch {};
     }
 
-    // Spawn worker threads — all share the same UDP fd for sending
-    var threads: [MAX_WORKERS]std.Thread = undefined;
+    // Total thread pool
+    const MAX_TOTAL_THREADS = MAX_WORKERS + MAX_ENCRYPT_WORKERS;
+    var threads: [MAX_TOTAL_THREADS]std.Thread = undefined;
     var spawned: usize = 0;
-    for (0..opened_workers) |w| {
-        threads[w] = std.Thread.spawn(.{}, dataPlaneWorker, .{
-            &swim.running,
-            wg_dev,
-            tun_fds[w],
-            udp_sock.fd,
-            tun_dev.vnet_hdr,
-        }) catch {
-            writeFormatted(stdout, "  warning: failed to spawn worker {d}\n", .{w}) catch {};
-            continue;
-        };
-        spawned += 1;
+
+    // Shared encrypt queue (only used in parallel mode)
+    var encrypt_queue = EncryptQueue{};
+
+    if (n_encrypt > 0) {
+        // Parallel pipeline: TUN readers + encrypt workers
+        for (0..opened_workers) |w| {
+            threads[spawned] = std.Thread.spawn(.{}, tunReaderWorker, .{
+                &swim.running,
+                wg_dev,
+                tun_fds[w],
+                tun_dev.vnet_hdr,
+                &encrypt_queue,
+            }) catch {
+                writeFormatted(stdout, "  warning: failed to spawn TUN reader {d}\n", .{w}) catch {};
+                continue;
+            };
+            spawned += 1;
+        }
+
+        for (0..n_encrypt) |e| {
+            threads[spawned] = std.Thread.spawn(.{}, encryptWorker, .{
+                &swim.running,
+                wg_dev,
+                udp_sock.fd,
+                &encrypt_queue,
+            }) catch {
+                writeFormatted(stdout, "  warning: failed to spawn encrypt worker {d}\n", .{e}) catch {};
+                continue;
+            };
+            spawned += 1;
+        }
+    } else {
+        // Legacy serial mode: each worker does TUN read + encrypt + send
+        for (0..opened_workers) |w| {
+            threads[spawned] = std.Thread.spawn(.{}, dataPlaneWorker, .{
+                &swim.running,
+                wg_dev,
+                tun_fds[w],
+                udp_sock.fd,
+                tun_dev.vnet_hdr,
+            }) catch {
+                writeFormatted(stdout, "  warning: failed to spawn worker {d}\n", .{w}) catch {};
+                continue;
+            };
+            spawned += 1;
+        }
     }
-    writeFormatted(stdout, "  spawned {d} data-plane workers\n", .{spawned}) catch {};
+    writeFormatted(stdout, "  spawned {d} data-plane threads\n", .{spawned}) catch {};
 
     // ── Control-plane loop: SWIM + handshakes + decrypt on original gossip socket ──
     var rx = BatchUdp.BatchReceiver{};
@@ -1112,7 +1385,8 @@ fn userspaceEventLoop(
         swim.tickTimersOnly();
     }
 
-    // Wait for worker threads to finish
+    // Signal encrypt workers to stop, then wait for all threads
+    encrypt_queue.close();
     for (0..spawned) |w| {
         threads[w].join();
     }
@@ -1185,15 +1459,109 @@ fn cmdDown(allocator: std.mem.Allocator) !void {
 
 fn cmdStatus(allocator: std.mem.Allocator) !void {
     _ = allocator;
-    // TODO: Phase 2 — query running daemon for mesh status
-    // For now, check if mg0 exists
     const stdout = getStdOut();
     const stderr = getStdErr();
 
+    const Netlink = lib.wireguard.Netlink;
+
+    // Check if interface exists
     const ifindex = lib.wireguard.RtNetlink.getInterfaceIndex("mg0") catch {
         try stderr.writeAll("meshguard is not running (no mg0 interface).\n");
         std.process.exit(1);
     };
 
-    try writeFormatted(stdout, "meshguard is running.\n  interface: mg0 (index {d})\n", .{ifindex});
+    // Resolve WireGuard generic netlink family
+    const family_id = Netlink.resolveWireguardFamily() catch {
+        try writeFormatted(stdout, "meshguard is running.\n  interface: mg0 (index {d})\n  (could not query WireGuard device — kernel module not loaded?)\n", .{ifindex});
+        return;
+    };
+
+    // Query device info
+    const dev = Netlink.getDevice(family_id, "mg0") catch {
+        try writeFormatted(stdout, "meshguard is running.\n  interface: mg0 (index {d})\n  (could not query device status)\n", .{ifindex});
+        return;
+    };
+
+    // Format public key as hex prefix
+    try writeFormatted(stdout, "meshguard is running.\n", .{});
+    try writeFormatted(stdout, "  interface: mg0 (index {d})\n", .{ifindex});
+    try writeFormatted(stdout, "  public key: {x:0>2}{x:0>2}{x:0>2}{x:0>2}...{x:0>2}{x:0>2}\n", .{
+        dev.public_key[0],  dev.public_key[1],  dev.public_key[2], dev.public_key[3],
+        dev.public_key[30], dev.public_key[31],
+    });
+    try writeFormatted(stdout, "  listening port: {d}\n", .{dev.listen_port});
+    try writeFormatted(stdout, "  peers: {d}\n", .{dev.peer_count});
+
+    if (dev.peer_count == 0) return;
+
+    try stdout.writeAll("\n");
+
+    // Display each peer
+    const now = std.time.timestamp();
+    for (dev.peers[0..dev.peer_count]) |peer| {
+        // Peer pubkey (hex prefix)
+        try writeFormatted(stdout, "  peer: {x:0>2}{x:0>2}{x:0>2}{x:0>2}...\n", .{
+            peer.public_key[0], peer.public_key[1], peer.public_key[2], peer.public_key[3],
+        });
+
+        // Mesh IP (from allowed IPs)
+        if (peer.allowed_ip[0] != 0) {
+            try writeFormatted(stdout, "    mesh ip: {d}.{d}.{d}.{d}/{d}\n", .{
+                peer.allowed_ip[0], peer.allowed_ip[1], peer.allowed_ip[2], peer.allowed_ip[3],
+                peer.allowed_cidr,
+            });
+        }
+
+        // Endpoint
+        if (peer.endpoint_addr[0] != 0 or peer.endpoint_port != 0) {
+            try writeFormatted(stdout, "    endpoint: {d}.{d}.{d}.{d}:{d}\n", .{
+                peer.endpoint_addr[0], peer.endpoint_addr[1],
+                peer.endpoint_addr[2], peer.endpoint_addr[3],
+                peer.endpoint_port,
+            });
+        }
+
+        // Last handshake
+        if (peer.last_handshake_sec > 0) {
+            const ago = now - peer.last_handshake_sec;
+            if (ago < 60) {
+                try writeFormatted(stdout, "    last handshake: {d}s ago\n", .{ago});
+            } else if (ago < 3600) {
+                try writeFormatted(stdout, "    last handshake: {d}m {d}s ago\n", .{ @divFloor(ago, 60), @mod(ago, 60) });
+            } else {
+                try writeFormatted(stdout, "    last handshake: {d}h {d}m ago\n", .{ @divFloor(ago, 3600), @divFloor(@mod(ago, 3600), 60) });
+            }
+        } else {
+            try stdout.writeAll("    last handshake: never\n");
+        }
+
+        // Transfer stats
+        const rx = formatBytes(peer.rx_bytes);
+        const tx = formatBytes(peer.tx_bytes);
+        try writeFormatted(stdout, "    transfer: ↓ {d}.{d:0>1} {s}  ↑ {d}.{d:0>1} {s}\n", .{
+            rx.whole, rx.frac, rx.unit, tx.whole, tx.frac, tx.unit,
+        });
+    }
+}
+
+const FormattedBytes = struct {
+    whole: u64,
+    frac: u64, // single decimal digit
+    unit: []const u8,
+};
+
+fn formatBytes(bytes: u64) FormattedBytes {
+    if (bytes < 1024) {
+        return .{ .whole = bytes, .frac = 0, .unit = "B" };
+    } else if (bytes < 1024 * 1024) {
+        return .{ .whole = bytes / 1024, .frac = (bytes % 1024) * 10 / 1024, .unit = "KiB" };
+    } else if (bytes < 1024 * 1024 * 1024) {
+        const mib = bytes / (1024 * 1024);
+        const rem = bytes % (1024 * 1024);
+        return .{ .whole = mib, .frac = rem * 10 / (1024 * 1024), .unit = "MiB" };
+    } else {
+        const gib = bytes / (1024 * 1024 * 1024);
+        const rem = bytes % (1024 * 1024 * 1024);
+        return .{ .whole = gib, .frac = rem * 10 / (1024 * 1024 * 1024), .unit = "GiB" };
+    }
 }
