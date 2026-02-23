@@ -19,8 +19,11 @@ const usage =
     \\  status      Show mesh status
     \\  keygen      Generate a new identity keypair (--force to overwrite)
     \\  trust       Authorize a peer's public key (--name <label>)
+    \\  trust --org Trust an organization's public key
     \\  revoke      Revoke a peer's public key
     \\  export      Print this node's public key
+    \\  org-keygen  Generate a new org keypair
+    \\  org-sign    Sign a node's key with org key (--name <label>)
     \\  version     Print version
     \\
     \\OPTIONS:
@@ -110,6 +113,20 @@ pub fn main() !void {
         return;
     }
 
+    if (std.mem.eql(u8, command, "org-keygen")) {
+        try cmdOrgKeygen(allocator);
+        return;
+    }
+
+    if (std.mem.eql(u8, command, "org-sign")) {
+        if (args.len < 3) {
+            try getStdErr().writeAll("error: 'org-sign' requires a node public key or .pub file\n");
+            std.process.exit(1);
+        }
+        try cmdOrgSign(allocator, args[2], args[3..]);
+        return;
+    }
+
     try getStdErr().writeAll("error: unknown command\n\n");
     try getStdErr().writeAll(usage);
     std.process.exit(1);
@@ -194,11 +211,14 @@ fn cmdTrust(allocator: std.mem.Allocator, key_or_path: []const u8, extra_args: [
     const config_dir = try Config.ensureConfigDir(allocator);
     defer allocator.free(config_dir);
 
-    // Parse --name <label> from extra args
+    // Check for --org flag first
+    var is_org = false;
     var peer_name: ?[]const u8 = null;
     var i: usize = 0;
     while (i < extra_args.len) : (i += 1) {
-        if (std.mem.eql(u8, extra_args[i], "--name")) {
+        if (std.mem.eql(u8, extra_args[i], "--org")) {
+            is_org = true;
+        } else if (std.mem.eql(u8, extra_args[i], "--name")) {
             if (i + 1 < extra_args.len) {
                 peer_name = extra_args[i + 1];
                 i += 1;
@@ -207,6 +227,10 @@ fn cmdTrust(allocator: std.mem.Allocator, key_or_path: []const u8, extra_args: [
                 std.process.exit(1);
             }
         }
+    }
+
+    if (is_org) {
+        return cmdTrustOrg(allocator, config_dir, key_or_path, peer_name);
     }
 
     // Step 1: Validate the key
@@ -284,6 +308,136 @@ fn cmdTrust(allocator: std.mem.Allocator, key_or_path: []const u8, extra_args: [
     // Step 4: New key, new name — just add it
     try lib.identity.Trust.addAuthorizedKey(allocator, config_dir, key_b64, name);
     try writeFormatted(stdout, "Peer '{s}' trusted.\n", .{name});
+}
+
+/// Trust an org public key — auto-accept nodes signed by this org.
+fn cmdTrustOrg(allocator: std.mem.Allocator, config_dir: []const u8, key_or_path: []const u8, name_override: ?[]const u8) !void {
+    const stdout = getStdOut();
+    const stderr = getStdErr();
+    const Org = lib.identity.Org;
+
+    // Validate the key
+    var key_b64_buf: [44]u8 = undefined;
+    var pk_bytes: [32]u8 = undefined;
+    if (lib.identity.Trust.validateKey(key_or_path, &key_b64_buf, &pk_bytes)) |err_msg| {
+        try writeFormatted(stderr, "error: {s}\n", .{err_msg});
+        std.process.exit(1);
+    }
+
+    const key_b64: []const u8 = blk: {
+        for (key_b64_buf, 0..) |c, idx| {
+            if (c == 0) break :blk key_b64_buf[0..idx];
+        }
+        break :blk &key_b64_buf;
+    };
+
+    // Derive deterministic domain for the name
+    const domain = Org.deriveOrgDomain(pk_bytes);
+    const name = name_override orelse &domain;
+
+    try lib.identity.Trust.addTrustedOrg(allocator, config_dir, key_b64, name);
+    try writeFormatted(stdout, "Org '{s}' trusted (domain: {s}.mesh).\n", .{ name, domain });
+    try writeFormatted(stdout, "Nodes signed by this org will be auto-accepted.\n", .{});
+}
+
+/// Generate an org Ed25519 keypair.
+fn cmdOrgKeygen(allocator: std.mem.Allocator) !void {
+    const config_dir = try Config.ensureConfigDir(allocator);
+    defer allocator.free(config_dir);
+
+    const stdout = getStdOut();
+    const stderr = getStdErr();
+    const Org = lib.identity.Org;
+
+    // Check if org key already exists
+    const org_key_path = try std.fs.path.join(allocator, &.{ config_dir, "org", "org.key" });
+    defer allocator.free(org_key_path);
+
+    if (std.fs.accessAbsolute(org_key_path, .{})) |_| {
+        try stderr.writeAll("error: org keypair already exists. Use --force to overwrite.\n");
+        std.process.exit(1);
+    } else |_| {}
+
+    const kp = Org.generateOrgKeyPair();
+    try Org.saveOrgKeyPair(allocator, config_dir, kp);
+
+    var pk_buf: [44]u8 = undefined;
+    const pk_b64 = std.base64.standard.Encoder.encode(&pk_buf, &kp.public_key.toBytes());
+    const domain = Org.deriveOrgDomain(kp.public_key.toBytes());
+
+    try writeFormatted(stdout, "Org keypair generated.\n", .{});
+    try writeFormatted(stdout, "  public key: {s}\n", .{pk_b64});
+    try writeFormatted(stdout, "  domain:     {s}.mesh\n", .{domain});
+    try writeFormatted(stdout, "\nShare the public key with peers who should trust your org.\n", .{});
+    try writeFormatted(stdout, "Sign nodes with: meshguard org-sign <node.pub> --name <label>\n", .{});
+}
+
+/// Sign a node's public key with the org private key, producing a NodeCertificate.
+fn cmdOrgSign(allocator: std.mem.Allocator, node_key_path: []const u8, extra_args: []const []const u8) !void {
+    const config_dir = try Config.ensureConfigDir(allocator);
+    defer allocator.free(config_dir);
+
+    const stdout = getStdOut();
+    const stderr = getStdErr();
+    const Org = lib.identity.Org;
+
+    // Parse --name and --expires from extra args
+    var node_name: []const u8 = "node";
+    var expires_at: i64 = 0; // default: never
+    var j: usize = 0;
+    while (j < extra_args.len) : (j += 1) {
+        if (std.mem.eql(u8, extra_args[j], "--name")) {
+            if (j + 1 < extra_args.len) {
+                node_name = extra_args[j + 1];
+                j += 1;
+            }
+        } else if (std.mem.eql(u8, extra_args[j], "--expires")) {
+            if (j + 1 < extra_args.len) {
+                expires_at = std.fmt.parseInt(i64, extra_args[j + 1], 10) catch 0;
+                j += 1;
+            }
+        }
+    }
+
+    // Load org keypair
+    const org_kp = Org.loadOrgKeyPair(allocator, config_dir) catch {
+        try stderr.writeAll("error: no org keypair found. Run 'meshguard org-keygen' first.\n");
+        std.process.exit(1);
+    };
+
+    // Validate node key
+    var key_b64_buf: [44]u8 = undefined;
+    var node_pk_bytes: [32]u8 = undefined;
+    if (lib.identity.Trust.validateKey(node_key_path, &key_b64_buf, &node_pk_bytes)) |err_msg| {
+        try writeFormatted(stderr, "error: {s}\n", .{err_msg});
+        std.process.exit(1);
+    }
+
+    // Issue certificate
+    const cert = Org.issueCertificate(org_kp, node_pk_bytes, node_name, expires_at) catch {
+        try stderr.writeAll("error: failed to sign certificate\n");
+        std.process.exit(1);
+    };
+
+    // Save certificate
+    const cert_filename = try std.fmt.allocPrint(allocator, "{s}.cert", .{node_name});
+    defer allocator.free(cert_filename);
+
+    const cert_path = try std.fs.path.join(allocator, &.{ config_dir, cert_filename });
+    defer allocator.free(cert_path);
+
+    try Org.saveCertificate(allocator, cert_path, &cert);
+
+    const domain = Org.deriveOrgDomain(org_kp.public_key.toBytes());
+    try writeFormatted(stdout, "Certificate signed for '{s}'.\n", .{node_name});
+    try writeFormatted(stdout, "  mesh domain: {s}.{s}.mesh\n", .{ node_name, domain });
+    try writeFormatted(stdout, "  saved to:    {s}\n", .{cert_path});
+    if (expires_at == 0) {
+        try stdout.writeAll("  expires:     never\n");
+    } else {
+        try writeFormatted(stdout, "  expires:     {d}\n", .{expires_at});
+    }
+    try writeFormatted(stdout, "\nCopy this file to the node as: ~/.config/meshguard/node.cert\n", .{});
 }
 
 fn cmdRevoke(allocator: std.mem.Allocator, key_or_name: []const u8) !void {
@@ -747,104 +901,32 @@ fn wgOnPeerPunched(ctx: *anyopaque, peer: *const lib.discovery.Membership.Peer, 
 const MAX_WORKERS: usize = 8;
 const MAX_ENCRYPT_WORKERS: usize = 16;
 
-// ── Parallel encryption pipeline ──────────────────────────────────────
+// ── Zero-copy parallel encryption pipeline ──────────────────────────────
 
-/// Work item passed from TUN reader to encrypt worker.
-const EncryptWorkItem = struct {
-    /// IP packet data (copied from TUN read buffer)
-    data: [1500]u8 = undefined,
-    len: u16 = 0,
-    /// Peer info for routing the encrypted packet
-    peer_slot: u16 = 0,
-    endpoint_addr: [4]u8 = .{ 0, 0, 0, 0 },
-    endpoint_port: u16 = 0,
-};
-
-/// Bounded MPMC (multi-producer multi-consumer) queue for encrypt work items.
-/// Uses mutex + condition variable for simplicity — encryption is the bottleneck, not queueing.
-const EncryptQueue = struct {
-    const QUEUE_SIZE = 512; // must be power of 2
-
-    items: [QUEUE_SIZE]EncryptWorkItem = undefined,
-    head: usize = 0, // next write position
-    tail: usize = 0, // next read position
-    count: usize = 0,
-    mutex: std.Thread.Mutex = .{},
-    not_empty: std.Thread.Condition = .{},
-    not_full: std.Thread.Condition = .{},
-    closed: bool = false,
-
-    /// Push a work item (blocks if full).
-    fn push(self: *EncryptQueue, item: EncryptWorkItem) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        while (self.count >= QUEUE_SIZE and !self.closed) {
-            self.not_full.wait(&self.mutex);
-        }
-        if (self.closed) return false;
-
-        self.items[self.head] = item;
-        self.head = (self.head + 1) % QUEUE_SIZE;
-        self.count += 1;
-        self.not_empty.signal();
-        return true;
-    }
-
-    /// Try to push without blocking. Returns false if full.
-    fn tryPush(self: *EncryptQueue, item: EncryptWorkItem) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        if (self.count >= QUEUE_SIZE or self.closed) return false;
-
-        self.items[self.head] = item;
-        self.head = (self.head + 1) % QUEUE_SIZE;
-        self.count += 1;
-        self.not_empty.signal();
-        return true;
-    }
-
-    /// Pop a work item (blocks if empty). Returns null if closed.
-    fn pop(self: *EncryptQueue) ?EncryptWorkItem {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        while (self.count == 0 and !self.closed) {
-            self.not_empty.wait(&self.mutex);
-        }
-        if (self.count == 0) return null;
-
-        const item = self.items[self.tail];
-        self.tail = (self.tail + 1) % QUEUE_SIZE;
-        self.count -= 1;
-        self.not_full.signal();
-        return item;
-    }
-
-    /// Close the queue, waking all waiters.
-    fn close(self: *EncryptQueue) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.closed = true;
-        self.not_empty.broadcast();
-        self.not_full.broadcast();
-    }
-};
-
-/// TUN reader thread: reads from TUN, resolves peer, pushes to encrypt queue.
-/// Does NOT encrypt — leaves that to the encrypt workers.
-fn tunReaderWorker(
+/// Stage 1: TUN reader pipeline — reads from TUN, builds PacketBatches per-peer,
+/// assigns nonces in bulk, pushes batch indices to CryptoQueue + PeerTxRing.
+/// Does NOT encrypt — leaves that to the crypto workers.
+fn tunReaderPipeline(
     running: *const std.atomic.Value(bool),
     wg_dev: *lib.wireguard.Device.WgDevice,
     tun_fd: posix.fd_t,
     vnet_hdr: bool,
-    queue: *EncryptQueue,
+    pool: *lib.net.Pipeline.DataPlanePool,
+    crypto_q: *lib.net.Pipeline.CryptoQueue,
 ) void {
     const Offload = lib.net.Offload;
+    const MAX_PEERS = lib.wireguard.Device.MAX_PEERS;
 
     var tun_buf: [Offload.VNET_HDR_LEN + 65535]u8 = undefined;
-    // Segment buffers for GSO split
+    // Per-peer batch building: thread-local staging
+    var local_batches: [MAX_PEERS]?u16 = .{null} ** MAX_PEERS;
+
+    // Thread-local buffer cache to avoid per-packet mutex contention
+    const BUF_CACHE_SIZE: usize = 128;
+    var buf_cache: [BUF_CACHE_SIZE]u16 = undefined;
+    var buf_cache_count: usize = 0;
+
+    // GSO segment buffers
     var seg_bufs: [64][1500]u8 = undefined;
     var seg_slices: [64][]u8 = undefined;
     for (0..64) |i| {
@@ -857,121 +939,243 @@ fn tunReaderWorker(
         };
         _ = posix.poll(&fds, 50) catch continue;
 
-        if (fds[0].revents & posix.POLL.IN != 0) {
-            // Drain available packets
-            while (true) {
-                const n = posix.read(tun_fd, &tun_buf) catch break;
-                if (n == 0) break;
+        if (fds[0].revents & posix.POLL.IN == 0) continue;
 
-                if (vnet_hdr) {
-                    if (n <= Offload.VNET_HDR_LEN) continue;
-                    const vhdr: *const Offload.VirtioNetHdr = @ptrCast(@alignCast(&tun_buf));
-                    const ip_data = tun_buf[Offload.VNET_HDR_LEN..n];
+        // Track which peers have partial batches to flush
+        var touched_peers: [MAX_PEERS]bool = .{false} ** MAX_PEERS;
 
-                    if (vhdr.gso_type != Offload.GSO_NONE) {
-                        // GSO super-packet — split and push each segment
-                        var seg_sizes: [64]usize = undefined;
-                        const seg_count = Offload.gsoSplit(
-                            vhdr.*,
-                            ip_data,
-                            &seg_slices,
-                            &seg_sizes,
-                            64,
-                        );
-                        for (0..seg_count) |s| {
-                            pushToQueue(wg_dev, seg_bufs[s][0..seg_sizes[s]], queue);
-                        }
-                    } else {
-                        if (ip_data.len < 20) continue;
-                        const mutable_data = tun_buf[Offload.VNET_HDR_LEN..n];
-                        Offload.completeChecksum(vhdr.*, mutable_data);
-                        pushToQueue(wg_dev, mutable_data, queue);
+        // Drain available packets
+        while (true) {
+            const n = posix.read(tun_fd, &tun_buf) catch break;
+            if (n == 0) break;
+
+            if (vnet_hdr) {
+                if (n <= Offload.VNET_HDR_LEN) continue;
+                const vhdr: *const Offload.VirtioNetHdr = @ptrCast(@alignCast(&tun_buf));
+                const ip_data = tun_buf[Offload.VNET_HDR_LEN..n];
+
+                if (vhdr.gso_type != Offload.GSO_NONE) {
+                    // GSO super-packet — split and stage each segment
+                    var seg_sizes: [64]usize = undefined;
+                    const seg_count = Offload.gsoSplit(
+                        vhdr.*,
+                        ip_data,
+                        &seg_slices,
+                        &seg_sizes,
+                        64,
+                    );
+                    for (0..seg_count) |s| {
+                        stageSegment(wg_dev, pool, crypto_q, seg_bufs[s][0..seg_sizes[s]], &local_batches, &touched_peers, &buf_cache, &buf_cache_count);
                     }
                 } else {
-                    if (n < 20) continue;
-                    pushToQueue(wg_dev, tun_buf[0..n], queue);
+                    if (ip_data.len < 20) continue;
+                    const mutable_data = tun_buf[Offload.VNET_HDR_LEN..n];
+                    Offload.completeChecksum(vhdr.*, mutable_data);
+                    stageSegment(wg_dev, pool, crypto_q, mutable_data, &local_batches, &touched_peers, &buf_cache, &buf_cache_count);
+                }
+            } else {
+                if (n < 20) continue;
+                stageSegment(wg_dev, pool, crypto_q, tun_buf[0..n], &local_batches, &touched_peers, &buf_cache, &buf_cache_count);
+            }
+        }
+
+        // Flush partial batches for all touched peers (bound latency)
+        for (0..MAX_PEERS) |slot| {
+            if (touched_peers[slot]) {
+                if (local_batches[slot]) |batch_idx| {
+                    dispatchBatch(wg_dev, pool, crypto_q, @intCast(slot), batch_idx);
+                    local_batches[slot] = null;
                 }
             }
         }
     }
 }
 
-/// Resolve peer and push work item to encrypt queue.
-fn pushToQueue(
+/// Stage a single IP segment into the per-peer batch.
+fn stageSegment(
     wg_dev: *lib.wireguard.Device.WgDevice,
+    pool: *lib.net.Pipeline.DataPlanePool,
+    crypto_q: *lib.net.Pipeline.CryptoQueue,
     ip_packet: []const u8,
-    queue: *EncryptQueue,
+    local_batches: *[lib.wireguard.Device.MAX_PEERS]?u16,
+    touched_peers: *[lib.wireguard.Device.MAX_PEERS]bool,
+    buf_cache: *[128]u16,
+    buf_cache_count: *usize,
 ) void {
+    const Pipeline = lib.net.Pipeline;
     if (ip_packet.len < 20 or ip_packet.len > 1500) return;
+
     const dst_ip: [4]u8 = ip_packet[16..20].*;
-    const target_slot = wg_dev.lookupByMeshIp(dst_ip) orelse return;
-    const peer = wg_dev.peers[target_slot] orelse return;
+    const peer_slot = wg_dev.lookupByMeshIp(dst_ip) orelse return;
+    const peer = wg_dev.peers[peer_slot] orelse return;
     if (peer.endpoint_addr[0] == 0) return;
 
-    var item = EncryptWorkItem{
-        .len = @intCast(ip_packet.len),
-        .peer_slot = @intCast(target_slot),
-        .endpoint_addr = peer.endpoint_addr,
-        .endpoint_port = peer.endpoint_port,
-    };
-    @memcpy(item.data[0..ip_packet.len], ip_packet);
-    _ = queue.tryPush(item); // drop if full (backpressure)
-}
+    // Allocate or reuse batch for this peer
+    if (local_batches[peer_slot] == null) {
+        local_batches[peer_slot] = pool.allocBatch() orelse return; // drop if OOM
+    }
 
-/// Encrypt worker: pops from queue, encrypts, sends via UDP.
-fn encryptWorker(
-    running: *const std.atomic.Value(bool),
-    wg_dev: *lib.wireguard.Device.WgDevice,
-    udp_fd: posix.fd_t,
-    queue: *EncryptQueue,
-) void {
-    const BatchUdp = lib.net.BatchUdp;
-    var tx = BatchUdp.BatchSender{};
-    var encrypt_buf: [1600]u8 = undefined;
+    const batch_idx = local_batches[peer_slot].?;
+    var batch = &pool.batches[batch_idx];
 
-    while (running.load(.acquire)) {
-        tx.reset();
-        var batch_count: usize = 0;
+    // Thread-local buffer cache: refill in bulk when empty
+    if (buf_cache_count.* == 0) {
+        buf_cache_count.* = pool.allocBufferBatch(buf_cache);
+        if (buf_cache_count.* == 0) return; // pool exhausted, drop
+    }
 
-        // Pop first item (blocking)
-        if (queue.pop()) |first_item| {
-            encryptAndSendItem(wg_dev, &first_item, &encrypt_buf, &tx);
-            batch_count += 1;
+    // Pop from local cache (zero contention)
+    buf_cache_count.* -= 1;
+    const buf_idx = buf_cache[buf_cache_count.*];
+    var pkt = &pool.buffers[buf_idx];
 
-            // Drain more items without blocking to fill batch
-            while (batch_count < BatchUdp.BATCH_SIZE) {
-                const maybe_item = blk: {
-                    queue.mutex.lock();
-                    defer queue.mutex.unlock();
-                    if (queue.count == 0) break :blk null;
-                    const item = queue.items[queue.tail];
-                    queue.tail = (queue.tail + 1) % EncryptQueue.QUEUE_SIZE;
-                    queue.count -= 1;
-                    queue.not_full.signal();
-                    break :blk item;
-                };
-                if (maybe_item) |item| {
-                    encryptAndSendItem(wg_dev, &item, &encrypt_buf, &tx);
-                    batch_count += 1;
-                } else break;
-            }
+    // ZERO-COPY: write IP payload at offset 16, leaving room for WG transport header
+    @memcpy(pkt.data[Pipeline.WG_HEADER_LEN..][0..ip_packet.len], ip_packet);
+    pkt.len = @intCast(ip_packet.len);
+    pkt.endpoint_addr = peer.endpoint_addr;
+    pkt.endpoint_port = peer.endpoint_port;
 
-            _ = tx.flush(udp_fd);
-        } else break; // queue closed
+    // Add to batch
+    batch.buf_indices[batch.count] = buf_idx;
+    batch.lengths[batch.count] = @intCast(ip_packet.len);
+    batch.count += 1;
+    touched_peers[peer_slot] = true;
+
+    // If batch is full, dispatch immediately
+    if (batch.count >= Pipeline.BATCH_SIZE) {
+        dispatchBatch(wg_dev, pool, crypto_q, @intCast(peer_slot), batch_idx);
+        local_batches[peer_slot] = null;
     }
 }
 
-/// Encrypt a single work item and queue it for batch sending.
-fn encryptAndSendItem(
+/// Dispatch a complete batch: assign nonces, push to CryptoQueue + PeerTxRing.
+fn dispatchBatch(
     wg_dev: *lib.wireguard.Device.WgDevice,
-    item: *const EncryptWorkItem,
-    encrypt_buf: *[1600]u8,
-    tx: *lib.net.BatchUdp.BatchSender,
+    pool: *lib.net.Pipeline.DataPlanePool,
+    crypto_q: *lib.net.Pipeline.CryptoQueue,
+    peer_slot: u16,
+    batch_idx: u16,
 ) void {
-    const plaintext = item.data[0..item.len];
-    if (wg_dev.encryptForPeer(item.peer_slot, plaintext, encrypt_buf)) |enc_len| {
-        tx.queue(encrypt_buf[0..enc_len], item.endpoint_addr, item.endpoint_port);
-    } else |_| {}
+    const Pipeline = lib.net.Pipeline;
+    var peer = &(wg_dev.peers[peer_slot] orelse return);
+    var batch = &pool.batches[batch_idx];
+    batch.peer_slot = peer_slot;
+
+    const tun = &(peer.active_tunnel orelse {
+        // No active tunnel — return resources
+        var i: usize = 0;
+        while (i < batch.count) : (i += 1) {
+            pool.freeBuffers(&.{batch.buf_indices[i]});
+        }
+        pool.freeBatch(batch_idx);
+        return;
+    });
+
+    // 1. Lock per-peer push_lock briefly for nonce assignment + ring insertion
+    peer.tx_ring.push_lock.lock();
+
+    // Bulk nonce assignment: fetchAdd(count) claims a contiguous block
+    const start_nonce = tun.send_counter.fetchAdd(batch.count, .monotonic);
+    for (0..batch.count) |i| {
+        batch.nonces[i] = start_nonce + i;
+    }
+
+    // Push batch index into per-peer TxRing (maintains nonce ordering)
+    peer.tx_ring.push(batch_idx);
+
+    peer.tx_ring.push_lock.unlock();
+
+    // 2. Mark batch as Encrypting and dispatch to crypto workers
+    batch.state.store(@intFromEnum(Pipeline.BatchState.Encrypting), .release);
+    crypto_q.push(batch_idx);
+}
+
+/// Stage 2 + Opportunistic Stage 3: Crypto worker + Tx flusher.
+/// Pops batches from CryptoQueue, encrypts all packets in-place (zero-copy via pool indices),
+/// marks batch Ready, then tries to acquire peer's send_lock to flush Ready batches in order.
+fn cryptoWorkerPipeline(
+    running: *const std.atomic.Value(bool),
+    wg_dev: *lib.wireguard.Device.WgDevice,
+    udp_fd: posix.fd_t,
+    pool: *lib.net.Pipeline.DataPlanePool,
+    crypto_q: *lib.net.Pipeline.CryptoQueue,
+) void {
+    const Pipeline = lib.net.Pipeline;
+
+    while (running.load(.acquire)) {
+        const batch_idx = crypto_q.pop() orelse break; // null = closed
+        var batch = &pool.batches[batch_idx];
+        var peer = &(wg_dev.peers[batch.peer_slot] orelse continue);
+        var tun = &(peer.active_tunnel orelse continue);
+
+        // STAGE 2: Encrypt all packets in-place (100% cache-local, no locks)
+        for (0..batch.count) |i| {
+            var pkt = &pool.buffers[batch.buf_indices[i]];
+            if (tun.encryptPreassigned(&pkt.data, batch.lengths[i], batch.nonces[i])) |enc_len| {
+                pkt.len = @intCast(enc_len);
+            } else {
+                pkt.len = 0; // mark as failed
+            }
+        }
+
+        // Mark batch as Ready for sequential sending
+        batch.state.store(@intFromEnum(Pipeline.BatchState.Ready), .release);
+
+        // STAGE 3: Opportunistic Tx flush
+        // If another crypto worker is already sending for this peer, tryLock fails
+        // and we safely go back to encrypting. They will drain our Ready batch.
+        if (!peer.tx_ring.send_lock.tryLock()) continue;
+        defer peer.tx_ring.send_lock.unlock();
+
+        flushPeerTxRing(peer, pool, udp_fd);
+    }
+}
+
+/// Drain all Ready batches from a peer's TxRing in strict nonce order.
+/// Called while holding peer.tx_ring.send_lock.
+/// Uses UDP GSO (sendmsg with UDP_SEGMENT cmsg) to send all encrypted packets
+/// for this peer in a single syscall — ~45x fewer syscalls than sendmmsg.
+fn flushPeerTxRing(
+    peer: *lib.wireguard.Device.WgPeer,
+    pool: *lib.net.Pipeline.DataPlanePool,
+    udp_fd: posix.fd_t,
+) void {
+    const Pipeline = lib.net.Pipeline;
+    const BatchUdp = lib.net.BatchUdp;
+    var gso_tx = BatchUdp.GSOSender{};
+
+    while (!peer.tx_ring.isEmpty()) {
+        const head_idx = peer.tx_ring.peekHead();
+        var head_batch = &pool.batches[head_idx];
+
+        // Strict ROB: if next sequential batch isn't Ready, stop!
+        if (head_batch.state.load(.acquire) != @intFromEnum(Pipeline.BatchState.Ready)) break;
+
+        // Pack encrypted packets into GSO buffer for single sendmsg
+        for (0..head_batch.count) |i| {
+            const pkt = &pool.buffers[head_batch.buf_indices[i]];
+            if (pkt.len > 0) {
+                if (!gso_tx.append(pkt.data[0..pkt.len])) {
+                    // GSO buffer full — flush and start a new one
+                    _ = gso_tx.sendGSO(udp_fd, peer.endpoint_addr, peer.endpoint_port);
+                    gso_tx.reset();
+                    _ = gso_tx.append(pkt.data[0..pkt.len]);
+                }
+            }
+        }
+
+        // Bulk-free all buffer indices from this batch (single lock acquisition)
+        pool.freeBuffers(head_batch.buf_indices[0..head_batch.count]);
+        head_batch.state.store(@intFromEnum(Pipeline.BatchState.Empty), .release);
+        pool.freeBatch(head_idx);
+
+        peer.tx_ring.advanceHead();
+    }
+
+    // Flush remaining GSO buffer
+    if (gso_tx.used > 0) {
+        _ = gso_tx.sendGSO(udp_fd, peer.endpoint_addr, peer.endpoint_port);
+    }
 }
 
 /// Legacy data-plane worker: reads TUN, encrypts, sends UDP (serial).
@@ -1191,13 +1395,67 @@ fn writeCoalescedToTun(
     }
 }
 
+/// Process a single incoming UDP packet: classify and dispatch to the appropriate handler.
+/// Shared by both GRO (single coalesced buffer) and legacy batch (recvmmsg) receive paths.
+fn processIncomingPacket(
+    pkt: []const u8,
+    sender_addr: [4]u8,
+    sender_port: u16,
+    wg_dev: *lib.wireguard.Device.WgDevice,
+    swim: *lib.discovery.Swim.SwimProtocol,
+    udp_sock: *lib.net.Udp.UdpSocket,
+    stdout: std.fs.File,
+    decrypt_storage: *[64][1500]u8,
+    decrypt_lens: *[64]usize,
+    n_decrypted: *usize,
+) void {
+    const Device = lib.wireguard.Device;
+
+    switch (Device.PacketType.classify(pkt)) {
+        .wg_handshake_init => {
+            if (pkt.len >= @sizeOf(lib.wireguard.Noise.HandshakeInitiation)) {
+                const msg: *const lib.wireguard.Noise.HandshakeInitiation = @ptrCast(@alignCast(pkt.ptr));
+                if (wg_dev.handleInitiation(msg)) |hs_result| {
+                    const resp_bytes = std.mem.asBytes(&hs_result.response);
+                    _ = udp_sock.sendTo(resp_bytes, sender_addr, sender_port) catch 0;
+                    writeFormatted(stdout, "  WG handshake: responded to initiation\n", .{}) catch {};
+                } else |_| {}
+            }
+        },
+        .wg_handshake_resp => {
+            if (pkt.len >= @sizeOf(lib.wireguard.Noise.HandshakeResponse)) {
+                const msg: *const lib.wireguard.Noise.HandshakeResponse = @ptrCast(@alignCast(pkt.ptr));
+                if (wg_dev.handleResponse(msg)) |slot| {
+                    if (wg_dev.peers[slot]) |*p| {
+                        p.endpoint_addr = sender_addr;
+                        p.endpoint_port = sender_port;
+                    }
+                    writeFormatted(stdout, "  WG handshake: completed with peer\n", .{}) catch {};
+                } else |_| {}
+            }
+        },
+        .wg_transport => {
+            if (n_decrypted.* < 64) {
+                if (wg_dev.decryptTransport(pkt, &decrypt_storage[n_decrypted.*])) |result| {
+                    decrypt_lens[n_decrypted.*] = result.len;
+                    n_decrypted.* += 1;
+                } else |_| {}
+            }
+        },
+        .wg_cookie => {},
+        .stun => swim.feedPacket(pkt, sender_addr, sender_port),
+        .swim => swim.feedPacket(pkt, sender_addr, sender_port),
+        .unknown => {},
+    }
+}
+
 /// Userspace multiplexed event loop with multi-threaded data plane.
 ///
 /// Architecture (parallel mode, encrypt_workers > 0):
 /// - N TUN reader threads: read from TUN queues, split GSO, push to EncryptQueue.
-/// - M encrypt workers: pop from queue, encrypt, sendmmsg via shared UDP fd.
-/// - Control-plane (this function): receives all UDP, dispatches handshakes
-///   to WG device, SWIM gossip, and decrypts transport → TUN. Handles UDP→TUN.
+/// - M encrypt workers: pop from queue, encrypt via UDP GSO (single sendmsg per peer).
+/// - Control-plane (this function): receives all UDP (GRO coalesced or batch),
+///   dispatches handshakes, SWIM gossip, and decrypts transport → TUN.
 ///
 /// Architecture (legacy mode, encrypt_workers == 0):
 /// - N data-plane workers: each reads TUN, encrypts, sends UDP (serial).
@@ -1209,7 +1467,6 @@ fn userspaceEventLoop(
     stdout: std.fs.File,
     encrypt_workers_arg: usize,
 ) !void {
-    const Device = lib.wireguard.Device;
     const BatchUdp = lib.net.BatchUdp;
 
     // Determine TUN reader count: min(cpus, MAX_WORKERS), at least 1
@@ -1224,6 +1481,11 @@ fn userspaceEventLoop(
 
     if (n_encrypt > 0) {
         writeFormatted(stdout, "  pipeline: {d} TUN readers + {d} encrypt workers (on {d} CPUs)\n", .{ n_tun_readers, n_encrypt, cpu_count }) catch {};
+
+        // Enable UDP GRO+GSO on the socket for coalesced I/O
+        udp_sock.enableGRO();
+        udp_sock.enableGSO();
+        writeFormatted(stdout, "  UDP offloads: GRO + GSO enabled\n", .{}) catch {};
     } else {
         writeFormatted(stdout, "  data-plane workers: {d} (on {d} CPUs, serial mode)\n", .{ n_tun_readers, cpu_count }) catch {};
     }
@@ -1258,18 +1520,35 @@ fn userspaceEventLoop(
     var threads: [MAX_TOTAL_THREADS]std.Thread = undefined;
     var spawned: usize = 0;
 
-    // Shared encrypt queue (only used in parallel mode)
-    var encrypt_queue = EncryptQueue{};
+    // Zero-copy pipeline state (heap allocated — DataPlanePool is ~33MB)
+    const Pipeline = lib.net.Pipeline;
+    var data_pool: *Pipeline.DataPlanePool = undefined;
+    var crypto_queue: *Pipeline.CryptoQueue = undefined;
 
     if (n_encrypt > 0) {
+        const page_alloc = std.heap.page_allocator;
+        data_pool = page_alloc.create(Pipeline.DataPlanePool) catch {
+            writeFormatted(stdout, "  error: failed to allocate data plane pool\n", .{}) catch {};
+            return error.OutOfMemory;
+        };
+        data_pool.* = .{};
+        data_pool.init();
+
+        crypto_queue = page_alloc.create(Pipeline.CryptoQueue) catch {
+            writeFormatted(stdout, "  error: failed to allocate crypto queue\n", .{}) catch {};
+            return error.OutOfMemory;
+        };
+        crypto_queue.* = Pipeline.CryptoQueue{};
+
         // Parallel pipeline: TUN readers + encrypt workers
         for (0..opened_workers) |w| {
-            threads[spawned] = std.Thread.spawn(.{}, tunReaderWorker, .{
+            threads[spawned] = std.Thread.spawn(.{}, tunReaderPipeline, .{
                 &swim.running,
                 wg_dev,
                 tun_fds[w],
                 tun_dev.vnet_hdr,
-                &encrypt_queue,
+                data_pool,
+                crypto_queue,
             }) catch {
                 writeFormatted(stdout, "  warning: failed to spawn TUN reader {d}\n", .{w}) catch {};
                 continue;
@@ -1278,11 +1557,12 @@ fn userspaceEventLoop(
         }
 
         for (0..n_encrypt) |e| {
-            threads[spawned] = std.Thread.spawn(.{}, encryptWorker, .{
+            threads[spawned] = std.Thread.spawn(.{}, cryptoWorkerPipeline, .{
                 &swim.running,
                 wg_dev,
                 udp_sock.fd,
-                &encrypt_queue,
+                data_pool,
+                crypto_queue,
             }) catch {
                 writeFormatted(stdout, "  warning: failed to spawn encrypt worker {d}\n", .{e}) catch {};
                 continue;
@@ -1308,8 +1588,11 @@ fn userspaceEventLoop(
     writeFormatted(stdout, "  spawned {d} data-plane threads\n", .{spawned}) catch {};
 
     // ── Control-plane loop: SWIM + handshakes + decrypt on original gossip socket ──
-    var rx = BatchUdp.BatchReceiver{};
-    rx.setupPointers();
+    // Use GRO receiver when pipeline is active (UDP GRO enabled), else batch receiver
+    var gro_rx = BatchUdp.GROReceiver{};
+    var batch_rx = BatchUdp.BatchReceiver{};
+    batch_rx.setupPointers();
+    const use_gro = n_encrypt > 0;
 
     while (swim.running.load(.acquire)) {
         var fds = [_]posix.pollfd{
@@ -1318,8 +1601,6 @@ fn userspaceEventLoop(
         _ = posix.poll(&fds, 50) catch continue;
 
         if (fds[0].revents & posix.POLL.IN != 0) {
-            const count = rx.recvBatch(udp_sock.fd);
-
             // ── Two-pass decrypt→coalesce→write ──
             // Pass 1: decrypt all transport packets, handle non-transport inline
             const MAX_DECRYPTED = 64;
@@ -1327,45 +1608,53 @@ fn userspaceEventLoop(
             var decrypt_lens: [MAX_DECRYPTED]usize = undefined;
             var n_decrypted: usize = 0;
 
-            for (0..count) |i| {
-                const pkt = rx.getPacket(i);
-                const sender = rx.getSender(i);
+            if (use_gro) {
+                // GRO path: single recvmsg returns coalesced buffer
+                const total = gro_rx.recvGRO(udp_sock.fd);
+                if (total > 0) {
+                    const sender = gro_rx.getSender();
+                    const seg_size: usize = if (gro_rx.segment_size > 0)
+                        @as(usize, gro_rx.segment_size)
+                    else
+                        total;
 
-                switch (Device.PacketType.classify(pkt)) {
-                    .wg_handshake_init => {
-                        if (pkt.len >= @sizeOf(lib.wireguard.Noise.HandshakeInitiation)) {
-                            const msg: *const lib.wireguard.Noise.HandshakeInitiation = @ptrCast(@alignCast(pkt.ptr));
-                            if (wg_dev.handleInitiation(msg)) |hs_result| {
-                                const resp_bytes = std.mem.asBytes(&hs_result.response);
-                                _ = udp_sock.sendTo(resp_bytes, sender.addr, sender.port) catch 0;
-                                writeFormatted(stdout, "  WG handshake: responded to initiation\n", .{}) catch {};
-                            } else |_| {}
-                        }
-                    },
-                    .wg_handshake_resp => {
-                        if (pkt.len >= @sizeOf(lib.wireguard.Noise.HandshakeResponse)) {
-                            const msg: *const lib.wireguard.Noise.HandshakeResponse = @ptrCast(@alignCast(pkt.ptr));
-                            if (wg_dev.handleResponse(msg)) |slot| {
-                                if (wg_dev.peers[slot]) |*p| {
-                                    p.endpoint_addr = sender.addr;
-                                    p.endpoint_port = sender.port;
-                                }
-                                writeFormatted(stdout, "  WG handshake: completed with peer\n", .{}) catch {};
-                            } else |_| {}
-                        }
-                    },
-                    .wg_transport => {
-                        if (n_decrypted < MAX_DECRYPTED) {
-                            if (wg_dev.decryptTransport(pkt, &decrypt_storage[n_decrypted])) |result| {
-                                decrypt_lens[n_decrypted] = result.len;
-                                n_decrypted += 1;
-                            } else |_| {}
-                        }
-                    },
-                    .wg_cookie => {},
-                    .stun => swim.feedPacket(pkt, sender.addr, sender.port),
-                    .swim => swim.feedPacket(pkt, sender.addr, sender.port),
-                    .unknown => {},
+                    var offset: usize = 0;
+                    while (offset < total) {
+                        const pkt_len = @min(seg_size, total - offset);
+                        const pkt = gro_rx.buf[offset..][0..pkt_len];
+                        processIncomingPacket(
+                            pkt,
+                            sender.addr,
+                            sender.port,
+                            wg_dev,
+                            swim,
+                            udp_sock,
+                            stdout,
+                            &decrypt_storage,
+                            &decrypt_lens,
+                            &n_decrypted,
+                        );
+                        offset += pkt_len;
+                    }
+                }
+            } else {
+                // Legacy batch path: recvmmsg returns individual packets
+                const count = batch_rx.recvBatch(udp_sock.fd);
+                for (0..count) |i| {
+                    const pkt = batch_rx.getPacket(i);
+                    const sender = batch_rx.getSender(i);
+                    processIncomingPacket(
+                        pkt,
+                        sender.addr,
+                        sender.port,
+                        wg_dev,
+                        swim,
+                        udp_sock,
+                        stdout,
+                        &decrypt_storage,
+                        &decrypt_lens,
+                        &n_decrypted,
+                    );
                 }
             }
 
@@ -1386,7 +1675,7 @@ fn userspaceEventLoop(
     }
 
     // Signal encrypt workers to stop, then wait for all threads
-    encrypt_queue.close();
+    crypto_queue.close();
     for (0..spawned) |w| {
         threads[w].join();
     }

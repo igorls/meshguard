@@ -3,13 +3,23 @@
 //! Manages the authorized_keys/ directory — the set of Ed25519 public keys
 //! that this node is willing to peer with. Adding/removing keys to this
 //! directory controls mesh membership.
+//!
+//! Also manages trusted_orgs/ — org public keys whose signed certificates
+//! allow automatic peering with all member nodes.
 
 const std = @import("std");
 const Keys = @import("keys.zig");
+const Org = @import("org.zig");
 
 pub const AuthorizedPeer = struct {
     name: []const u8,
     public_key: Keys.PublicKey,
+};
+
+/// A trusted organization whose signed certs are auto-accepted.
+pub const TrustedOrg = struct {
+    name: []const u8,
+    public_key: [32]u8,
 };
 
 /// Result of adding an authorized key.
@@ -223,7 +233,9 @@ pub fn loadAuthorizedKeys(allocator: std.mem.Allocator, config_dir: []const u8) 
 }
 
 /// Check if a public key is in the authorized set.
+/// Also checks org certificates: if the node has a valid cert from a trusted org, it's authorized.
 pub fn isAuthorized(allocator: std.mem.Allocator, config_dir: []const u8, public_key: Keys.PublicKey) !bool {
+    // Path 1: individual key trust
     const peers = try loadAuthorizedKeys(allocator, config_dir);
     defer {
         for (peers) |peer| {
@@ -238,6 +250,123 @@ pub fn isAuthorized(allocator: std.mem.Allocator, config_dir: []const u8, public
         }
     }
     return false;
+}
+
+/// Check if a node with an org certificate is authorized.
+/// Validates: cert signature, cert expiry, and org key in trusted_orgs/.
+pub fn isAuthorizedByCert(allocator: std.mem.Allocator, config_dir: []const u8, cert: *const Org.NodeCertificate) !bool {
+    // 1. Verify cert signature
+    if (!Org.verifyCertificate(cert)) return false;
+
+    // 2. Check expiry
+    if (!cert.isValid()) return false;
+
+    // 3. Check if the org is trusted
+    return try isOrgTrusted(allocator, config_dir, cert.org_pubkey);
+}
+
+// ─── Org Trust Management ───
+
+/// Check if an org public key is in trusted_orgs/.
+pub fn isOrgTrusted(allocator: std.mem.Allocator, config_dir: []const u8, org_pubkey: [32]u8) !bool {
+    const orgs = try loadTrustedOrgs(allocator, config_dir);
+    defer {
+        for (orgs) |org| {
+            allocator.free(org.name);
+        }
+        allocator.free(orgs);
+    }
+
+    for (orgs) |org| {
+        if (std.mem.eql(u8, &org.public_key, &org_pubkey)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Load all trusted orgs from trusted_orgs/ directory.
+pub fn loadTrustedOrgs(allocator: std.mem.Allocator, config_dir: []const u8) ![]TrustedOrg {
+    const org_dir = try std.fs.path.join(allocator, &.{ config_dir, "trusted_orgs" });
+    defer allocator.free(org_dir);
+
+    var temp: [64]TrustedOrg = undefined;
+    var count: usize = 0;
+
+    const dir = std.fs.openDirAbsolute(org_dir, .{ .iterate = true }) catch |err| {
+        if (err == error.FileNotFound) return try allocator.alloc(TrustedOrg, 0);
+        return err;
+    };
+
+    var iter = dir.iterate();
+    while (try iter.next()) |entry| {
+        if (!std.mem.endsWith(u8, entry.name, ".org")) continue;
+        if (count >= 64) break;
+
+        const file_path = try std.fs.path.join(allocator, &.{ org_dir, entry.name });
+        defer allocator.free(file_path);
+
+        const file = std.fs.openFileAbsolute(file_path, .{}) catch continue;
+        defer file.close();
+
+        var buf: [256]u8 = undefined;
+        const read = file.readAll(&buf) catch continue;
+        const key_b64 = std.mem.trimRight(u8, buf[0..read], "\n\r ");
+
+        var pk_bytes: [32]u8 = undefined;
+        std.base64.standard.Decoder.decode(&pk_bytes, key_b64) catch continue;
+
+        const name = try allocator.dupe(u8, std.fs.path.stem(entry.name));
+        temp[count] = .{ .name = name, .public_key = pk_bytes };
+        count += 1;
+    }
+
+    const result = try allocator.alloc(TrustedOrg, count);
+    @memcpy(result, temp[0..count]);
+    return result;
+}
+
+/// Add a trusted org to the trusted_orgs/ directory.
+pub fn addTrustedOrg(allocator: std.mem.Allocator, config_dir: []const u8, key_b64: []const u8, name: []const u8) !void {
+    const org_dir = try std.fs.path.join(allocator, &.{ config_dir, "trusted_orgs" });
+    defer allocator.free(org_dir);
+    std.fs.makeDirAbsolute(org_dir) catch |err| {
+        if (err != error.PathAlreadyExists) return err;
+    };
+
+    const dest_name = try std.fmt.allocPrint(allocator, "{s}.org", .{name});
+    defer allocator.free(dest_name);
+
+    const dest_path = try std.fs.path.join(allocator, &.{ org_dir, dest_name });
+    defer allocator.free(dest_path);
+
+    const file = try std.fs.createFileAbsolute(dest_path, .{});
+    defer file.close();
+    try file.writeAll(key_b64);
+    try file.writeAll("\n");
+}
+
+/// Remove a trusted org from the trusted_orgs/ directory.
+pub fn removeTrustedOrg(allocator: std.mem.Allocator, config_dir: []const u8, name: []const u8) !void {
+    const org_dir = try std.fs.path.join(allocator, &.{ config_dir, "trusted_orgs" });
+    defer allocator.free(org_dir);
+
+    const del_name = try std.fmt.allocPrint(allocator, "{s}.org", .{name});
+    defer allocator.free(del_name);
+
+    const del_path = try std.fs.path.join(allocator, &.{ org_dir, del_name });
+    defer allocator.free(del_path);
+
+    try std.fs.deleteFileAbsolute(del_path);
+}
+
+/// Load this node's org certificate from config_dir/node.cert.
+/// Returns null if no cert is present.
+pub fn loadNodeCert(allocator: std.mem.Allocator, config_dir: []const u8) !?Org.NodeCertificate {
+    const cert_path = try std.fs.path.join(allocator, &.{ config_dir, "node.cert" });
+    defer allocator.free(cert_path);
+
+    return Org.loadCertificate(allocator, cert_path) catch return null;
 }
 
 // ─── Internal helpers ───

@@ -113,7 +113,8 @@ pub fn verify(message: []const u8, signature_bytes: [64]u8, public_key: PublicKe
 /// Derive a deterministic mesh IP from a public key.
 /// The mesh IP is 10.99.X.Y where X and Y come from a hash of the public key.
 pub fn deriveMeshIp(public_key: PublicKey) [4]u8 {
-    const hash = std.crypto.hash.Blake3.hash(&public_key.toBytes(), .{});
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(&public_key.toBytes(), &hash, .{});
     return .{ 10, 99, hash[0], hash[1] };
 }
 

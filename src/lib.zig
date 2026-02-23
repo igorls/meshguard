@@ -6,6 +6,7 @@
 pub const identity = struct {
     pub const Keys = @import("identity/keys.zig");
     pub const Trust = @import("identity/trust.zig");
+    pub const Org = @import("identity/org.zig");
 };
 
 pub const discovery = struct {
@@ -44,6 +45,7 @@ pub const net = struct {
     pub const Io = @import("net/io.zig");
     pub const Tun = @import("net/tun.zig");
     pub const Dns = @import("net/dns.zig");
+    pub const Pipeline = @import("net/pipeline.zig");
 };
 
 pub const config = @import("config.zig");

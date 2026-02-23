@@ -31,6 +31,11 @@ pub const MessageType = enum(u8) {
     holepunch_request = 0x33,
     holepunch_response = 0x34,
 
+    // ─── Org trust ───
+    org_cert_present = 0x40,
+    org_alias_announce = 0x41,
+    org_cert_revoke = 0x42,
+
     _,
 };
 
@@ -67,6 +72,10 @@ pub const HandshakeInit = struct {
     mesh_ip: [4]u8, // sender's deterministic mesh IP
     wg_port: u16, // sender's WireGuard listen port
     gossip_port: u16, // sender's gossip listen port
+    /// Org certificate (186 bytes), zeroes if none
+    org_cert: [186]u8 = std.mem.zeroes([186]u8),
+    /// Whether org_cert contains a valid certificate
+    has_org_cert: bool = false,
 };
 
 /// Handshake response: sent back if the initiator is authorized.
@@ -79,6 +88,10 @@ pub const HandshakeResp = struct {
     mesh_ip: [4]u8,
     wg_port: u16,
     gossip_port: u16,
+    /// Org certificate (186 bytes), zeroes if none
+    org_cert: [186]u8 = std.mem.zeroes([186]u8),
+    /// Whether org_cert contains a valid certificate
+    has_org_cert: bool = false,
 };
 
 /// A single gossip entry piggybacked on SWIM messages.
@@ -155,6 +168,26 @@ pub const HolepunchResponse = struct {
     sender_pubkey: [32]u8,
     public_endpoint: Endpoint,
     token_echo: [16]u8, // echo of request's token
+};
+
+// ─── Org trust messages ───
+
+/// Org alias announcement — propagated via gossip.
+/// Allows orgs to claim human-readable *.name.mesh domains.
+pub const OrgAliasAnnounce = struct {
+    org_pubkey: [32]u8,
+    alias: [32]u8, // e.g. "eosrio", null-padded
+    lamport: u64, // conflict resolution (earliest wins)
+    signature: [64]u8, // sign(alias ‖ lamport, org_privkey)
+};
+
+/// Org certificate revocation — broadcast to invalidate a node cert.
+pub const OrgCertRevoke = struct {
+    org_pubkey: [32]u8,
+    node_pubkey: [32]u8,
+    reason: u8, // 0=unspecified, 1=key_compromised, 2=admin_removed
+    lamport: u64,
+    signature: [64]u8, // sign(node_pubkey ‖ reason ‖ lamport, org_privkey)
 };
 
 test "message type values" {

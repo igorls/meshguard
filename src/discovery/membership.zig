@@ -49,6 +49,13 @@ pub const Peer = struct {
     nat_type: messages.NatType = .unknown,
     /// Whether this peer can act as a relay
     is_relay_capable: bool = false,
+    // ── Org trust fields ──
+    /// Org public key (if peer authenticated via org cert)
+    org_pubkey: ?[32]u8 = null,
+    /// Node name from certificate (e.g. "node-1")
+    org_node_name: [32]u8 = std.mem.zeroes([32]u8),
+    /// Certificate expiry (0 = never, null = no cert)
+    cert_expires_at: ?i64 = null,
 };
 
 pub const MembershipTable = struct {
