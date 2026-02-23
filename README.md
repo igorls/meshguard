@@ -126,8 +126,8 @@ Trust is **bidirectional** — both peers must have each other's key in `authori
 
 - Binary codec: type-tag-delimited, fixed-size fields, little-endian
 - SWIM: Ping (`0x01`), Ack (`0x03`), PingReq (`0x02`)
-- Handshake: Init (`0x10`), Resp (`0x11`) — signed Ed25519 + WG key exchange
-- NAT: HolepunchRequest (`0x33`), HolepunchResponse (`0x34`), EndpointUpdate (`0x32`)
+- Handshake: Standard WireGuard Noise_IKpsk2 (Type 1, Type 2)
+- NAT: HolepunchRequest (`0x33`), HolepunchResponse (`0x34`)
 
 ## Benchmarking
 
