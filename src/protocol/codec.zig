@@ -137,6 +137,61 @@ pub fn encodeHolepunchResponse(buf: []u8, resp: messages.HolepunchResponse) !usi
     return pos;
 }
 
+// ─── Org Trust Encoding ───
+
+/// Encode an OrgAliasAnnounce message.
+/// Wire: [0x41][32B org_pubkey][32B alias][8B lamport][64B signature]
+pub fn encodeOrgAliasAnnounce(buf: []u8, msg: messages.OrgAliasAnnounce) !usize {
+    const required = 1 + 32 + 32 + 8 + 64;
+    if (buf.len < required) return error.BufferTooShort;
+    var pos: usize = 0;
+
+    buf[pos] = @intFromEnum(messages.MessageType.org_alias_announce);
+    pos += 1;
+
+    @memcpy(buf[pos..][0..32], &msg.org_pubkey);
+    pos += 32;
+
+    @memcpy(buf[pos..][0..32], &msg.alias);
+    pos += 32;
+
+    std.mem.writeInt(u64, buf[pos..][0..8], msg.lamport, .little);
+    pos += 8;
+
+    @memcpy(buf[pos..][0..64], &msg.signature);
+    pos += 64;
+
+    return pos;
+}
+
+/// Encode an OrgCertRevoke message.
+/// Wire: [0x42][32B org_pubkey][32B node_pubkey][1B reason][8B lamport][64B signature]
+pub fn encodeOrgCertRevoke(buf: []u8, msg: messages.OrgCertRevoke) !usize {
+    const required = 1 + 32 + 32 + 1 + 8 + 64;
+    if (buf.len < required) return error.BufferTooShort;
+    var pos: usize = 0;
+
+    buf[pos] = @intFromEnum(messages.MessageType.org_cert_revoke);
+    pos += 1;
+
+    @memcpy(buf[pos..][0..32], &msg.org_pubkey);
+    pos += 32;
+
+    @memcpy(buf[pos..][0..32], &msg.node_pubkey);
+    pos += 32;
+
+    buf[pos] = msg.reason;
+    pos += 1;
+
+    std.mem.writeInt(u64, buf[pos..][0..8], msg.lamport, .little);
+    pos += 8;
+
+    @memcpy(buf[pos..][0..64], &msg.signature);
+    pos += 64;
+
+    return pos;
+}
+
 fn encodeGossipEntry(buf: []u8, entry: messages.GossipEntry) usize {
     var pos: usize = 0;
 
@@ -213,6 +268,8 @@ pub const DecodedMessage = union(enum) {
     ping_req: messages.PingReq,
     holepunch_request: messages.HolepunchRequest,
     holepunch_response: messages.HolepunchResponse,
+    org_alias_announce: messages.OrgAliasAnnounce,
+    org_cert_revoke: messages.OrgCertRevoke,
 };
 
 /// Decoded Ping with owned gossip slice.
@@ -253,6 +310,8 @@ pub fn decode(data: []const u8) DecodeError!DecodedMessage {
         .ping_req => .{ .ping_req = try decodePingReq(data[1..]) },
         .holepunch_request => .{ .holepunch_request = try decodeHolepunchRequest(data[1..]) },
         .holepunch_response => .{ .holepunch_response = try decodeHolepunchResponse(data[1..]) },
+        .org_alias_announce => .{ .org_alias_announce = try decodeOrgAliasAnnounce(data[1..]) },
+        .org_cert_revoke => .{ .org_cert_revoke = try decodeOrgCertRevoke(data[1..]) },
         else => error.InvalidMessageType,
     };
 }
@@ -389,6 +448,31 @@ fn decodeGossipEntry(data: []const u8) DecodeError!messages.GossipEntry {
     return entry;
 }
 
+fn decodeOrgAliasAnnounce(data: []const u8) DecodeError!messages.OrgAliasAnnounce {
+    if (data.len < 32 + 32 + 8 + 64) return error.BufferTooShort;
+
+    var result: messages.OrgAliasAnnounce = undefined;
+    @memcpy(&result.org_pubkey, data[0..32]);
+    @memcpy(&result.alias, data[32..64]);
+    result.lamport = std.mem.readInt(u64, data[64..72], .little);
+    @memcpy(&result.signature, data[72..136]);
+
+    return result;
+}
+
+fn decodeOrgCertRevoke(data: []const u8) DecodeError!messages.OrgCertRevoke {
+    if (data.len < 32 + 32 + 1 + 8 + 64) return error.BufferTooShort;
+
+    var result: messages.OrgCertRevoke = undefined;
+    @memcpy(&result.org_pubkey, data[0..32]);
+    @memcpy(&result.node_pubkey, data[32..64]);
+    result.reason = data[64];
+    result.lamport = std.mem.readInt(u64, data[65..73], .little);
+    @memcpy(&result.signature, data[73..137]);
+
+    return result;
+}
+
 // ─── Tests ───
 
 test "ping roundtrip" {
@@ -486,6 +570,60 @@ test "ping_req roundtrip" {
             try std.testing.expectEqualSlices(u8, &sender, &r.sender_pubkey);
             try std.testing.expectEqualSlices(u8, &target, &r.target_pubkey);
             try std.testing.expectEqual(r.seq, 55);
+        },
+        else => return error.InvalidMessageType,
+    }
+}
+
+test "org alias announce roundtrip" {
+    const org_pk = [_]u8{0xAA} ** 32;
+    const alias_name = "eosrio\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+    const sig = [_]u8{0x55} ** 64;
+
+    const msg = messages.OrgAliasAnnounce{
+        .org_pubkey = org_pk,
+        .alias = alias_name.*,
+        .lamport = 100,
+        .signature = sig,
+    };
+
+    var buf: [256]u8 = undefined;
+    const written = try encodeOrgAliasAnnounce(&buf, msg);
+
+    const decoded = try decode(buf[0..written]);
+    switch (decoded) {
+        .org_alias_announce => |a| {
+            try std.testing.expectEqualSlices(u8, &org_pk, &a.org_pubkey);
+            try std.testing.expectEqual(a.lamport, 100);
+            try std.testing.expectEqualSlices(u8, a.alias[0..6], "eosrio");
+        },
+        else => return error.InvalidMessageType,
+    }
+}
+
+test "org cert revoke roundtrip" {
+    const org_pk = [_]u8{0xBB} ** 32;
+    const node_pk = [_]u8{0xCC} ** 32;
+    const sig = [_]u8{0xDD} ** 64;
+
+    const msg = messages.OrgCertRevoke{
+        .org_pubkey = org_pk,
+        .node_pubkey = node_pk,
+        .reason = 1, // key_compromised
+        .lamport = 42,
+        .signature = sig,
+    };
+
+    var buf: [256]u8 = undefined;
+    const written = try encodeOrgCertRevoke(&buf, msg);
+
+    const decoded = try decode(buf[0..written]);
+    switch (decoded) {
+        .org_cert_revoke => |r| {
+            try std.testing.expectEqualSlices(u8, &org_pk, &r.org_pubkey);
+            try std.testing.expectEqualSlices(u8, &node_pk, &r.node_pubkey);
+            try std.testing.expectEqual(r.reason, 1);
+            try std.testing.expectEqual(r.lamport, 42);
         },
         else => return error.InvalidMessageType,
     }

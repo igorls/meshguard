@@ -13,6 +13,7 @@ const messages = @import("../protocol/messages.zig");
 const codec = @import("../protocol/codec.zig");
 const Udp = @import("../net/udp.zig");
 const Holepuncher = @import("../nat/holepunch.zig").Holepuncher;
+const log = std.log.scoped(.swim);
 
 pub const SwimConfig = struct {
     gossip_port: u16 = 51821,
@@ -89,6 +90,23 @@ pub const SwimProtocol = struct {
     authorized_count: usize = 0,
     enforce_trust: bool = false,
 
+    // Org trust: trusted org pubkeys
+    trusted_orgs: [16][32]u8 = std.mem.zeroes([16][32]u8),
+    trusted_org_count: usize = 0,
+
+    // Org alias registry: org_pubkey → alias (in-memory, populated via gossip)
+    alias_org_pubkeys: [16][32]u8 = std.mem.zeroes([16][32]u8),
+    alias_names: [16][32]u8 = std.mem.zeroes([16][32]u8),
+    alias_lamports: [16]u64 = std.mem.zeroes([16]u64),
+    alias_count: usize = 0,
+
+    // Revoked node pubkeys (propagated via gossip)
+    revoked_nodes: [64][32]u8 = std.mem.zeroes([64][32]u8),
+    revoked_count: usize = 0,
+
+    // Node's own org certificate (if any, loaded at init)
+    our_org_cert: ?[186]u8 = null,
+
     pub fn init(
         membership: *Membership.MembershipTable,
         socket: Udp.UdpSocket,
@@ -139,11 +157,36 @@ pub const SwimProtocol = struct {
         if (std.mem.eql(u8, &pubkey, &self.our_pubkey)) return true;
         // Allow zero pubkey (initial seed hello pings)
         if (std.mem.eql(u8, &pubkey, &([_]u8{0} ** 32))) return true;
-        // Check authorized set
+        // Check authorized set (individual keys)
         for (self.authorized_keys[0..self.authorized_count]) |key| {
             if (std.mem.eql(u8, &key, &pubkey)) return true;
         }
+        // Check if revoked
+        for (self.revoked_nodes[0..self.revoked_count]) |revoked| {
+            if (std.mem.eql(u8, &revoked, &pubkey)) return false;
+        }
         return false;
+    }
+
+    /// Check if a peer is authorized via org cert (checking peer's org cert against trusted orgs).
+    pub fn isOrgAuthorizedPeer(self: *const SwimProtocol, org_pubkey: [32]u8) bool {
+        for (self.trusted_orgs[0..self.trusted_org_count]) |trusted| {
+            if (std.mem.eql(u8, &trusted, &org_pubkey)) return true;
+        }
+        return false;
+    }
+
+    /// Add a trusted org pubkey.
+    pub fn addTrustedOrg(self: *SwimProtocol, org_pubkey: [32]u8) void {
+        if (self.trusted_org_count < self.trusted_orgs.len) {
+            self.trusted_orgs[self.trusted_org_count] = org_pubkey;
+            self.trusted_org_count += 1;
+        }
+    }
+
+    /// Set this node's org certificate.
+    pub fn setOrgCert(self: *SwimProtocol, cert_wire: [186]u8) void {
+        self.our_org_cert = cert_wire;
     }
 
     /// Run the SWIM event loop (blocking). Call stop() to exit.
@@ -331,6 +374,8 @@ pub const SwimProtocol = struct {
             .ping_req => |r| r.sender_pubkey,
             .holepunch_request => |req| req.sender_pubkey,
             .holepunch_response => |resp| resp.sender_pubkey,
+            .org_alias_announce => |ann| ann.org_pubkey,
+            .org_cert_revoke => |rev| rev.org_pubkey,
         };
         if (!self.isAuthorizedPeer(sender_pubkey)) return;
 
@@ -340,6 +385,81 @@ pub const SwimProtocol = struct {
             .ping_req => |r| self.handlePingReq(r, sender_addr, sender_port),
             .holepunch_request => |req| self.handleHolepunchRequest(req, sender_addr, sender_port),
             .holepunch_response => |resp| self.handleHolepunchResponse(resp),
+            .org_alias_announce => |ann| self.handleOrgAlias(ann),
+            .org_cert_revoke => |rev| self.handleOrgRevoke(rev),
+        }
+    }
+
+    /// Handle an OrgAliasAnnounce: register or update org alias, with Lamport conflict resolution.
+    fn handleOrgAlias(self: *SwimProtocol, ann: messages.OrgAliasAnnounce) void {
+        const alias_name = std.mem.trimRight(u8, &ann.alias, "\x00");
+
+        // Check for existing alias with same name from a different org (conflict)
+        for (0..self.alias_count) |i| {
+            const existing_name = std.mem.trimRight(u8, &self.alias_names[i], "\x00");
+            if (std.mem.eql(u8, existing_name, alias_name)) {
+                if (std.mem.eql(u8, &self.alias_org_pubkeys[i], &ann.org_pubkey)) {
+                    // Same org, update lamport if newer
+                    if (ann.lamport > self.alias_lamports[i]) {
+                        self.alias_lamports[i] = ann.lamport;
+                    }
+                    return;
+                }
+                // Different org, same alias name — conflict!
+                if (ann.lamport < self.alias_lamports[i]) {
+                    // Incoming claim is earlier — overwrite
+                    log.warn("org alias conflict: '{s}' reassigned (earlier Lamport timestamp wins)", .{alias_name});
+                    self.alias_org_pubkeys[i] = ann.org_pubkey;
+                    self.alias_lamports[i] = ann.lamport;
+                } else {
+                    log.warn("org alias conflict: '{s}' claim rejected (later Lamport timestamp)", .{alias_name});
+                }
+                return;
+            }
+        }
+
+        // Check for existing entry for this org (different alias name)
+        for (0..self.alias_count) |i| {
+            if (std.mem.eql(u8, &self.alias_org_pubkeys[i], &ann.org_pubkey)) {
+                // Update alias name for this org
+                self.alias_names[i] = ann.alias;
+                self.alias_lamports[i] = ann.lamport;
+                return;
+            }
+        }
+
+        // New entry
+        if (self.alias_count < self.alias_org_pubkeys.len) {
+            self.alias_org_pubkeys[self.alias_count] = ann.org_pubkey;
+            self.alias_names[self.alias_count] = ann.alias;
+            self.alias_lamports[self.alias_count] = ann.lamport;
+            self.alias_count += 1;
+            log.info("org alias registered: '{s}'", .{alias_name});
+        }
+    }
+
+    /// Handle an OrgCertRevoke: add the revoked node pubkey to the set.
+    fn handleOrgRevoke(self: *SwimProtocol, rev: messages.OrgCertRevoke) void {
+        // Check if already revoked
+        for (self.revoked_nodes[0..self.revoked_count]) |revoked| {
+            if (std.mem.eql(u8, &revoked, &rev.node_pubkey)) return;
+        }
+
+        // Add to revocation set
+        if (self.revoked_count < self.revoked_nodes.len) {
+            self.revoked_nodes[self.revoked_count] = rev.node_pubkey;
+            self.revoked_count += 1;
+            log.warn("node revoked by org (reason={d})", .{rev.reason});
+
+            // If the revoked node is currently a peer, mark as dead
+            if (self.membership.peers.getPtr(rev.node_pubkey)) |peer| {
+                if (peer.state == .alive or peer.state == .suspected) {
+                    self.membership.markDead(rev.node_pubkey);
+                    if (self.handler) |h| {
+                        h.onPeerDead(h.ctx, rev.node_pubkey);
+                    }
+                }
+            }
         }
     }
 
