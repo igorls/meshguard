@@ -66,10 +66,11 @@ pub const Tunnel = struct {
         std.mem.writeInt(u32, out[4..8], self.keys.receiving_index, .little); // Peer's receiver index
         std.mem.writeInt(u64, out[8..16], self.send_counter, .little); // Counter/nonce
 
-        // Build 12-byte nonce: 8-byte LE counter + 4 zero bytes
-        // WG spec: "padded with zeroes at the most significant 32 bits"
+        // Build 12-byte nonce: 4 zero bytes || 8-byte LE counter
+        // WG spec: "counter is prepended with four bytes of zeros"
+        // Kernel: put_unaligned_le64(nonce, iv + 4)
         var nonce: [12]u8 = .{0} ** 12;
-        std.mem.writeInt(u64, nonce[0..8], self.send_counter, .little);
+        std.mem.writeInt(u64, nonce[4..12], self.send_counter, .little);
 
         // Copy plaintext + zero padding into output buffer temporarily
         const ct_start = TRANSPORT_HEADER_LEN;
@@ -113,9 +114,9 @@ pub const Tunnel = struct {
         const elapsed = std.time.nanoTimestamp() - self.keys.birthdate_ns;
         if (elapsed >= REJECT_AFTER_TIME_NS) return error.KeyExpired;
 
-        // Build nonce: 8-byte LE counter + 4 zero bytes
+        // Build nonce: 4 zero bytes || 8-byte LE counter
         var nonce: [12]u8 = .{0} ** 12;
-        std.mem.writeInt(u64, nonce[0..8], counter, .little);
+        std.mem.writeInt(u64, nonce[4..12], counter, .little);
 
         const ciphertext = packet[TRANSPORT_HEADER_LEN..];
         const plaintext_len = ciphertext.len - AUTHTAG_LEN;

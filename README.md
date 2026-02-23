@@ -1,5 +1,8 @@
 # meshguard
 
+[![CI](https://github.com/igorls/meshguard/actions/workflows/ci.yml/badge.svg)](https://github.com/igorls/meshguard/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 **Decentralized, serverless, WireGuard®-compatible mesh VPN daemon.**
 
 Zero central authority. Trust-agnostic. Single static binary.
@@ -197,7 +200,9 @@ Core functionality is implemented and under active benchmarking:
 
 ## Documentation
 
-Full documentation is available under `docs/` (VitePress):
+Full documentation: **[igorls.github.io/meshguard](https://igorls.github.io/meshguard/)**
+
+To run locally:
 
 ```bash
 cd docs && bun install && bun run docs:dev

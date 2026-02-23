@@ -196,10 +196,7 @@ pub fn main() !void {
                         var decrypt_buf: [1500]u8 = undefined;
                         if (wg_dev.decryptTransport(recv.data, &decrypt_buf)) |r| {
                             tun.write(decrypt_buf[0..r.len]) catch {};
-                            try writeFormatted(stdout, "  >> transport: decrypted {d}B, wrote to TUN\n", .{r.len});
-                        } else |e| {
-                            try writeFormatted(stdout, "  >> transport: decrypt failed: {s}\n", .{@errorName(e)});
-                        }
+                        } else |_| {}
                     },
                     else => {},
                 }
@@ -209,23 +206,15 @@ pub fn main() !void {
         // TUN outgoing
         if (fds[1].revents & posix.POLL.IN != 0) {
             while (true) {
-                const n = tun.read(&tun_buf) catch |e| {
-                    try writeFormatted(stdout, "  TUN read error: {s}\n", .{@errorName(e)});
-                    break;
-                };
+                const n = tun.read(&tun_buf) catch break;
                 if (n == 0) break;
-
-                try writeFormatted(stdout, "  TUN: read {d}B, encrypting for slot {d}\n", .{ n, slot });
 
                 // Route to the single peer (slot 0)
                 if (wg_dev.encryptForPeer(slot, tun_buf[0..n], &encrypt_buf)) |enc_len| {
                     if (wg_dev.peers[slot]) |peer| {
-                        const sent = udp.sendTo(encrypt_buf[0..enc_len], peer.endpoint_addr, peer.endpoint_port) catch 0;
-                        try writeFormatted(stdout, "  TUN: encrypted {d}B -> sent {d}B to peer\n", .{ enc_len, sent });
+                        _ = udp.sendTo(encrypt_buf[0..enc_len], peer.endpoint_addr, peer.endpoint_port) catch 0;
                     }
-                } else |e| {
-                    try writeFormatted(stdout, "  TUN: encrypt failed: {s}\n", .{@errorName(e)});
-                }
+                } else |_| {}
             }
         }
     }

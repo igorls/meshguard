@@ -399,9 +399,8 @@ pub const Handshake = struct {
         return .{
             // Initiator sends with key1, receives with key2
             // Responder sends with key2, receives with key1
-            // NOTE: Testing swap — kernel might expect inverted order
-            .sending_key = if (is_initiator) keys.key else keys.ck,
-            .receiving_key = if (is_initiator) keys.ck else keys.key,
+            .sending_key = if (is_initiator) keys.ck else keys.key,
+            .receiving_key = if (is_initiator) keys.key else keys.ck,
             .sending_index = self.sender_index,
             .receiving_index = self.remote_index,
             .is_initiator = is_initiator,
