@@ -29,6 +29,9 @@ SWIM messages use a **1-byte type tag**:
 | `0x04` | TransportData       | WireGuard | A ↔ B           |
 | `0x33` | HolepunchRequest    | NAT       | A → Rendezvous  |
 | `0x34` | HolepunchResponse   | NAT       | B → Rendezvous  |
+| `0x40` | OrgCertPresent      | Org Trust | A → B           |
+| `0x41` | OrgAliasAnnounce    | Org Trust | Gossip          |
+| `0x42` | OrgCertRevoke       | Org Trust | Gossip          |
 
 ## Ping
 
@@ -114,6 +117,26 @@ Total: **87 bytes**.
 ```
 
 Total: **55 bytes**.
+
+## OrgAliasAnnounce
+
+Propagated via gossip to claim a human-readable `*.name.mesh` domain for an org.
+
+```
+[0x41][32B org_pubkey][32B alias (null-padded)][8B lamport (LE)][64B signature]
+```
+
+Total: **137 bytes**. Conflicts resolved by Lamport timestamp (earliest wins).
+
+## OrgCertRevoke
+
+Broadcast to invalidate a node certificate.
+
+```
+[0x42][32B org_pubkey][32B node_pubkey][1B reason][8B lamport (LE)][64B signature]
+```
+
+Total: **138 bytes**. Reason codes: `0`=unspecified, `1`=key_compromised, `2`=admin_removed.
 
 ## Endpoint Encoding
 

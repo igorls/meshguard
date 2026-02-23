@@ -66,15 +66,31 @@ The `10.99.0.0/16` prefix and derivation algorithm are defined in `wireguard/ip.
 
 meshguard uses **two separate key systems**, each serving a different purpose:
 
-| Key Type      | Algorithm | Purpose                        | Stored Where           |
-| ------------- | --------- | ------------------------------ | ---------------------- |
-| **Identity**  | Ed25519   | Authentication, trust, mesh IP | `~/.config/meshguard/` |
-| **WireGuard** | X25519    | Tunnel encryption (Noise IK)   | Ephemeral (in memory)  |
+| Key Type      | Algorithm | Purpose                        | Stored Where               |
+| ------------- | --------- | ------------------------------ | -------------------------- |
+| **Identity**  | Ed25519   | Authentication, trust, mesh IP | `~/.config/meshguard/`     |
+| **WireGuard** | X25519    | Tunnel encryption (Noise IK)   | Ephemeral (in memory)      |
+| **Org**       | Ed25519   | Fleet trust, cert signing      | `~/.config/meshguard/org/` |
 
-The X25519 WireGuard keypair is derived or generated at runtime. The Ed25519 identity key is the long-lived anchor of the node's identity.
+The X25519 WireGuard keypair is derived or generated at runtime. The Ed25519 identity key is the long-lived anchor of the node's identity. Org keys are only held by organization admins.
 
 When two nodes discover each other:
 
 1. They authenticate using Ed25519 signatures in the meshguard handshake
-2. They exchange X25519 public keys for WireGuard tunnel setup
-3. The Noise IK handshake establishes transport keys
+2. If individual trust fails, org certificate is verified (signature, expiry, org trust)
+3. They exchange X25519 public keys for WireGuard tunnel setup
+4. The Noise IK handshake establishes transport keys
+
+## Org Trust & Certificates
+
+Organizations sign `NodeCertificate` structures (186 bytes) that bind a node's Ed25519 public key to an org identity. See the [Trust Model](/guide/trust-model) guide for full details.
+
+## Deterministic Mesh DNS
+
+In addition to mesh IPs (`10.99.X.Y`), each organization gets a **deterministic mesh domain**:
+
+```
+Blake3(org_pubkey)[0..3].hex() → *.a1b2c3.mesh
+```
+
+Nodes with org certificates resolve as `node-name.org-domain.mesh` (e.g. `db-1.a1b2c3.mesh`). Orgs can also claim aliases (e.g. `*.eosrio.mesh`) via SWIM gossip, with Lamport-based conflict resolution.

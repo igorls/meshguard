@@ -50,7 +50,9 @@ Building a secure mesh network between N nodes (blockchain validators, edge serv
 | **SWIM gossip protocol**     | O(log N) convergence, built-in failure detection, no coordinator                                                    |
 | **Dual WireGuard modes**     | Kernel module (fastest) or full userspace (portable, zero dependencies)                                             |
 | **Trust-agnostic**           | `authorized_keys/` directory — you decide how keys get there                                                        |
+| **Org trust (hierarchical)** | Trust one org key → auto-accept all nodes signed by that org                                                        |
 | **Deterministic mesh IPs**   | Blake3(pubkey) → `10.99.X.Y`. No DHCP, no conflicts, no coordination                                                |
+| **Deterministic mesh DNS**   | Blake3(org_pubkey) → `*.a1b2c3.mesh`. Per-org deterministic subdomains                                              |
 
 ## Quick Start
 
@@ -80,17 +82,56 @@ meshguard status
 meshguard down
 ```
 
+### Org Trust (Fleet Mode)
+
+```bash
+# Org admin: generate org keypair
+meshguard org-keygen
+# → prints public key + deterministic domain (a1b2c3.mesh)
+
+# Sign a node's identity with the org key
+meshguard org-sign /path/to/node.pub --name node-1
+# → node-1.cert (186 bytes)
+
+# Remote peer: trust the org (one-time)
+meshguard trust <org-pubkey> --org --name eosrio
+
+# Node: install cert and start
+cp node-1.cert ~/.config/meshguard/node.cert
+meshguard up --seed 1.2.3.4:51821
+# → auto-accepted by any peer trusting the org
+```
+
 ## Trust Model
 
-meshguard is **intentionally unopinionated** about key distribution. It reads public keys from `~/.config/meshguard/authorized_keys/`. How they get there is your choice:
+meshguard supports **two trust models** that can be used independently or together:
+
+### Individual Trust
+
+meshguard reads public keys from `~/.config/meshguard/authorized_keys/`. How they get there is your choice:
 
 - **Manual**: `scp` keys between nodes
 - **Config management**: Ansible/Salt push keys to all nodes
 - **Blockchain**: Query on-chain validator registry, write `.pub` files
-- **Shared storage**: All nodes poll S3/IPFS for the latest keyset
 - **Git**: Keep keys in a repo, `git pull` on a cron job
 
-Trust is **bidirectional** — both peers must have each other's key in `authorized_keys/` for a tunnel to form.
+### Org Trust (Hierarchical)
+
+For fleets, trust one org public key instead of N individual keys:
+
+```
+~/.config/meshguard/
+├── identity.key / identity.pub    # Node identity
+├── node.cert                      # Org-signed certificate (186 bytes)
+├── authorized_keys/               # Individual peer trust
+│   └── validator-1.pub
+└── trusted_orgs/                  # Org trust (auto-accept members)
+    └── eosrio.org
+```
+
+Each org gets a **deterministic mesh domain**: `Blake3(org_pubkey)[0..3].hex()` → `*.a1b2c3.mesh`. Orgs can also claim human-readable aliases via gossip (e.g. `*.eosrio.mesh`).
+
+Trust is **bidirectional** — both peers must have each other's key (or mutual org trust) for a tunnel to form.
 
 ## Architecture
 
@@ -99,6 +140,8 @@ Trust is **bidirectional** — both peers must have each other's key in `authori
 - Ed25519 keypair per node (`identity.key` / `identity.pub`)
 - Mesh IP deterministically derived: `Blake3(pubkey) → 10.99.X.Y`
 - Authorized keys directory gates mesh membership
+- **Org certificates**: 186-byte Ed25519-signed `NodeCertificate` for fleet trust
+- **Mesh DNS**: deterministic `*.a1b2c3.mesh` domains per org, gossip-propagated aliases
 
 ### Discovery (SWIM)
 
@@ -128,6 +171,7 @@ Trust is **bidirectional** — both peers must have each other's key in `authori
 - SWIM: Ping (`0x01`), Ack (`0x03`), PingReq (`0x02`)
 - Handshake: Standard WireGuard Noise_IKpsk2 (Type 1, Type 2)
 - NAT: HolepunchRequest (`0x33`), HolepunchResponse (`0x34`)
+- Org: OrgAliasAnnounce (`0x41`), OrgCertRevoke (`0x42`)
 
 ## Benchmarking
 
@@ -188,6 +232,10 @@ Core functionality is implemented and under active benchmarking:
 - [x] Relay selection for symmetric NAT
 - [x] Daemon event loop (kernel + userspace modes)
 - [x] Docker + LXC benchmarking infrastructure
+- [x] Org trust — hierarchical PKI with org certificates
+- [x] Deterministic mesh DNS domains (Blake3 → `*.a1b2c3.mesh`)
+- [x] Org alias system via SWIM gossip
+- [x] Org certificate revocation via gossip
 - [ ] `recvmmsg`/`sendmmsg` batched I/O
 - [ ] GRO/GSO via `IFF_VNET_HDR` for TUN
 - [ ] Multi-queue TUN (`IFF_MULTI_QUEUE`)
