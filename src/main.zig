@@ -805,6 +805,130 @@ fn encryptAndQueue(
     }
 }
 
+/// Write decrypted packets to TUN, coalescing consecutive same-flow TCP
+/// segments into GSO super-packets to reduce TUN write syscalls.
+///
+/// For a batch of N packets where many are same-flow TCP, this can reduce
+/// syscalls from N to ~1, since the kernel segments the super-packet for us.
+fn writeCoalescedToTun(
+    tun_dev: *const lib.net.Tun.TunDevice,
+    storage: *const [64][1500]u8,
+    lens: *const [64]usize,
+    n: usize,
+) void {
+    const Offload = lib.net.Offload;
+
+    var i: usize = 0;
+    while (i < n) {
+        const pkt_a = storage[i][0..lens[i]];
+
+        // Try to coalesce consecutive packets
+        if (pkt_a.len >= 40) {
+            var coalesce_end = i;
+            var total_payload: usize = 0;
+            var first_seg_payload: usize = 0;
+
+            // Check how many consecutive packets can coalesce with pkt_a
+            var j: usize = i + 1;
+            while (j < n) : (j += 1) {
+                const prev = storage[coalesce_end][0..lens[coalesce_end]];
+                const curr = storage[j][0..lens[j]];
+                const payload_b = Offload.canCoalesceTCP(prev, curr);
+                if (payload_b == 0) break;
+                if (coalesce_end == i) {
+                    // Record first segment's payload size for gso_size
+                    const ip_version = pkt_a[0] >> 4;
+                    var iph_len: usize = undefined;
+                    if (ip_version == 4) {
+                        iph_len = @as(usize, pkt_a[0] & 0x0F) * 4;
+                    } else {
+                        iph_len = 40;
+                    }
+                    const tcph_len = @as(usize, pkt_a[iph_len + 12] >> 4) * 4;
+                    first_seg_payload = pkt_a.len - iph_len - tcph_len;
+                    total_payload = first_seg_payload;
+                }
+                total_payload += payload_b;
+                coalesce_end = j;
+            }
+
+            if (coalesce_end > i and first_seg_payload > 0) {
+                // Coalesce: build super-packet = headers of pkt_a + all payloads
+                const ip_version = pkt_a[0] >> 4;
+                var iph_len: usize = undefined;
+                if (ip_version == 4) {
+                    iph_len = @as(usize, pkt_a[0] & 0x0F) * 4;
+                } else {
+                    iph_len = 40;
+                }
+                const tcph_len = @as(usize, pkt_a[iph_len + 12] >> 4) * 4;
+                const headers_len = iph_len + tcph_len;
+                const total_len = headers_len + total_payload;
+
+                if (total_len <= 65535) {
+                    // Build the super-packet in a stack buffer
+                    var super_pkt: [65535]u8 = undefined;
+                    @memcpy(super_pkt[0..headers_len], pkt_a[0..headers_len]);
+
+                    // Copy payloads from all segments
+                    var off: usize = headers_len;
+                    var k: usize = i;
+                    while (k <= coalesce_end) : (k += 1) {
+                        const seg = storage[k][0..lens[k]];
+                        const seg_payload = seg[headers_len..];
+                        @memcpy(super_pkt[off..][0..seg_payload.len], seg_payload);
+                        off += seg_payload.len;
+                    }
+
+                    // Fix IP total length and last segment's TCP flags (PSH)
+                    if (ip_version == 4) {
+                        std.mem.writeInt(u16, super_pkt[2..4], @intCast(total_len), .big);
+                        // Recalculate IP checksum
+                        super_pkt[10] = 0;
+                        super_pkt[11] = 0;
+                        var csum: u32 = 0;
+                        var ci: usize = 0;
+                        while (ci < iph_len) : (ci += 2) {
+                            csum += @as(u32, super_pkt[ci]) << 8 | @as(u32, super_pkt[ci + 1]);
+                        }
+                        while (csum > 0xFFFF) csum = (csum & 0xFFFF) + (csum >> 16);
+                        const ip_csum = ~@as(u16, @intCast(csum & 0xFFFF));
+                        super_pkt[10] = @intCast(ip_csum >> 8);
+                        super_pkt[11] = @intCast(ip_csum & 0xFF);
+                    } else {
+                        std.mem.writeInt(u16, super_pkt[4..6], @intCast(total_len - 40), .big);
+                    }
+
+                    // Build GSO header
+                    const protocol: u8 = if (ip_version == 4) pkt_a[9] else pkt_a[6];
+                    const vhdr = Offload.makeGSOHeader(
+                        protocol,
+                        ip_version == 6,
+                        @intCast(iph_len),
+                        @intCast(tcph_len),
+                        @intCast(first_seg_payload),
+                    );
+
+                    // Write super-packet with GSO header to TUN
+                    tun_dev.writeGSO(vhdr, super_pkt[0..total_len]) catch {};
+
+                    i = coalesce_end + 1;
+                    continue;
+                }
+            }
+        }
+
+        // Not coalesceable — write individually with GSO_NONE
+        var vhdr_bytes = std.mem.zeroes([Offload.VNET_HDR_LEN]u8);
+        var iov = [_]posix.iovec_const{
+            .{ .base = &vhdr_bytes, .len = Offload.VNET_HDR_LEN },
+            .{ .base = pkt_a.ptr, .len = pkt_a.len },
+        };
+        _ = posix.writev(tun_dev.fd, &iov) catch {};
+        i += 1;
+    }
+}
+
 /// Userspace multiplexed event loop with multi-threaded data plane.
 ///
 /// Architecture:
@@ -883,6 +1007,14 @@ fn userspaceEventLoop(
 
         if (fds[0].revents & posix.POLL.IN != 0) {
             const count = rx.recvBatch(udp_sock.fd);
+
+            // ── Two-pass decrypt→coalesce→write ──
+            // Pass 1: decrypt all transport packets, handle non-transport inline
+            const MAX_DECRYPTED = 64;
+            var decrypt_storage: [MAX_DECRYPTED][1500]u8 = undefined;
+            var decrypt_lens: [MAX_DECRYPTED]usize = undefined;
+            var n_decrypted: usize = 0;
+
             for (0..count) |i| {
                 const pkt = rx.getPacket(i);
                 const sender = rx.getSender(i);
@@ -911,26 +1043,29 @@ fn userspaceEventLoop(
                         }
                     },
                     .wg_transport => {
-                        var decrypt_buf: [1500]u8 = undefined;
-                        if (wg_dev.decryptTransport(pkt, &decrypt_buf)) |result| {
-                            if (tun_dev.vnet_hdr) {
-                                // Prepend empty vnet_hdr (GSO_NONE) for IFF_VNET_HDR TUN
-                                const Offload = lib.net.Offload;
-                                var vhdr_bytes = std.mem.zeroes([Offload.VNET_HDR_LEN]u8);
-                                var iov = [_]posix.iovec_const{
-                                    .{ .base = &vhdr_bytes, .len = Offload.VNET_HDR_LEN },
-                                    .{ .base = decrypt_buf[0..result.len].ptr, .len = result.len },
-                                };
-                                _ = posix.writev(tun_dev.fd, &iov) catch {};
-                            } else {
-                                _ = posix.write(tun_dev.fd, decrypt_buf[0..result.len]) catch {};
-                            }
-                        } else |_| {}
+                        if (n_decrypted < MAX_DECRYPTED) {
+                            if (wg_dev.decryptTransport(pkt, &decrypt_storage[n_decrypted])) |result| {
+                                decrypt_lens[n_decrypted] = result.len;
+                                n_decrypted += 1;
+                            } else |_| {}
+                        }
                     },
                     .wg_cookie => {},
                     .stun => swim.feedPacket(pkt, sender.addr, sender.port),
                     .swim => swim.feedPacket(pkt, sender.addr, sender.port),
                     .unknown => {},
+                }
+            }
+
+            // Pass 2: coalesce same-flow TCP segments and write to TUN
+            if (n_decrypted > 0) {
+                if (tun_dev.vnet_hdr) {
+                    writeCoalescedToTun(&tun_dev, &decrypt_storage, &decrypt_lens, n_decrypted);
+                } else {
+                    // No vnet_hdr — write each packet individually
+                    for (0..n_decrypted) |d| {
+                        _ = posix.write(tun_dev.fd, decrypt_storage[d][0..decrypt_lens[d]]) catch {};
+                    }
                 }
             }
         }

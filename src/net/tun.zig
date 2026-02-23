@@ -147,7 +147,7 @@ pub const TunDevice = struct {
 
     /// Write an IP packet with a GSO virtio_net_hdr to the TUN device.
     /// The kernel will segment the large packet for us.
-    pub fn writeGSO(self: *TunDevice, vhdr: Offload.VirtioNetHdr, data: []const u8) !void {
+    pub fn writeGSO(self: *const TunDevice, vhdr: Offload.VirtioNetHdr, data: []const u8) !void {
         var hdr_bytes: [Offload.VNET_HDR_LEN]u8 = undefined;
         @memcpy(&hdr_bytes, std.mem.asBytes(&vhdr));
         var iov = [_]posix.iovec_const{
