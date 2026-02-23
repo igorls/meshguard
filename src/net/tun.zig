@@ -80,15 +80,23 @@ pub const TunDevice = struct {
 
     /// Enable GSO/GRO offloads on a vnet_hdr-capable TUN device.
     /// Call after open() + IP config. Gracefully falls back on failure.
+    ///
+    /// TSO4/TSO6: kernel delivers 64KB super-packets from TUN reads. We split
+    /// them in gsoSplit(). Benefits require parallel encryption (not yet impl).
+    /// Without parallel encrypt, TSO causes pipeline stalls (45 serial encrypts
+    /// vs 1 encrypt per 1.4KB read without TSO).
     pub fn enableOffload(self: *TunDevice) void {
         const linux = std.os.linux;
-        // Enable only TUN_F_CSUM — no TSO/USO to avoid read-side GSO super-packets.
-        // With just TUN_F_CSUM, reads deliver individual packets (gso_type=NONE),
-        // but writes can still use GSO by setting virtio_net_hdr.gso_type.
-        const offloads: u32 = TUN_F_CSUM;
-        const rc = linux.ioctl(@intCast(self.fd), TUNSETOFFLOAD, offloads);
+        // Enable CSUM + TSO4 + TSO6 to match wireguard-go's tunTCPOffloads.
+        const offloads: u32 = TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6;
+        var rc = linux.ioctl(@intCast(self.fd), TUNSETOFFLOAD, offloads);
+        if (rc == 0) {
+            self.vnet_hdr = true;
+            return;
+        }
+        // Fallback: CSUM only (older kernels without TSO support)
+        rc = linux.ioctl(@intCast(self.fd), TUNSETOFFLOAD, TUN_F_CSUM);
         if (rc != 0) return;
-
         self.vnet_hdr = true;
     }
 

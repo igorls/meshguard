@@ -136,11 +136,12 @@ pub fn completeChecksum(hdr: VirtioNetHdr, pkt: []u8) void {
 }
 
 /// Split a GSO super-packet into individual MTU-sized segments.
-/// The input `pkt` is the raw IP packet (no vnet_hdr prefix).
-/// Returns the number of segments written to `out_bufs`.
+/// Matches wireguard-go tun/offload_linux.go gsoSplit().
 ///
-/// For TCP: adjusts IP total length, TCP sequence numbers, and checksums.
-/// For UDP: adjusts IP total length and UDP length.
+/// The input `pkt` is the raw IP packet (no vnet_hdr prefix — already stripped).
+/// Uses hdr.csum_start as the transport header offset (reliable, from kernel).
+/// For each segment: fixes IP header (total_length, ID, checksum), adjusts
+/// TCP seq/flags or UDP length, and computes full transport checksum.
 pub fn gsoSplit(
     hdr: VirtioNetHdr,
     pkt: []const u8,
@@ -149,10 +150,13 @@ pub fn gsoSplit(
     max_segments: usize,
 ) usize {
     if (hdr.gso_type == GSO_NONE) {
-        // Not a GSO packet — just copy as-is
         if (max_segments == 0) return 0;
+        // For non-GSO, just handle F_NEEDS_CSUM if set
         if (pkt.len > out_bufs[0].len) return 0;
         @memcpy(out_bufs[0][0..pkt.len], pkt);
+        if (hdr.flags & F_NEEDS_CSUM != 0) {
+            gsoNoneChecksum(out_bufs[0][0..pkt.len], hdr.csum_start, hdr.csum_offset);
+        }
         out_sizes[0] = pkt.len;
         return 1;
     }
@@ -161,105 +165,114 @@ pub fn gsoSplit(
     if (seg_size == 0) return 0;
 
     const ip_version = pkt[0] >> 4;
-    var iph_len: usize = undefined;
-    var transport_offset: usize = undefined;
+    const is_v6 = ip_version == 6;
+    const iph_len = @as(usize, hdr.csum_start); // trust virtio_net_hdr
+
+    // Determine protocol
     var protocol: u8 = undefined;
-
-    if (ip_version == 4) {
-        iph_len = @as(usize, pkt[0] & 0x0F) * 4;
-        if (pkt.len < iph_len) return 0;
-        protocol = pkt[9];
-        transport_offset = iph_len;
-    } else if (ip_version == 6) {
-        iph_len = 40;
-        if (pkt.len < 40) return 0;
-        protocol = pkt[6]; // next header
-        transport_offset = 40;
+    if (hdr.gso_type == GSO_TCPV4 or hdr.gso_type == GSO_TCPV6) {
+        protocol = IPPROTO_TCP;
+    } else if (hdr.gso_type == GSO_UDP_L4) {
+        protocol = IPPROTO_UDP;
     } else {
         return 0;
     }
 
-    var transport_hdr_len: usize = undefined;
-    if (protocol == IPPROTO_TCP) {
-        if (pkt.len < transport_offset + 20) return 0;
-        transport_hdr_len = @as(usize, pkt[transport_offset + 12] >> 4) * 4;
-        if (transport_hdr_len < 20 or transport_hdr_len > 60) return 0;
-    } else if (protocol == IPPROTO_UDP) {
-        transport_hdr_len = 8;
+    // Compute transport header length
+    var hdr_len: usize = undefined;
+    if (protocol == IPPROTO_UDP) {
+        hdr_len = iph_len + 8;
     } else {
-        return 0;
+        // TCP: parse data offset
+        if (pkt.len < iph_len + 13) return 0;
+        const tcp_data_off = @as(usize, pkt[iph_len + 12] >> 4) * 4;
+        if (tcp_data_off < 20 or tcp_data_off > 60) return 0;
+        hdr_len = iph_len + tcp_data_off;
     }
+    if (pkt.len < hdr_len) return 0;
 
-    const headers_len = transport_offset + transport_hdr_len;
-    if (pkt.len <= headers_len) return 0;
+    // Source/dest address offsets for pseudo-header checksum
+    const src_addr_off: usize = if (is_v6) 8 else 12;
+    const addr_len: usize = if (is_v6) 16 else 4;
 
-    const payload = pkt[headers_len..];
-    const seg_usize = @as(usize, seg_size);
-
-    var seg_count: usize = 0;
-    var offset: usize = 0;
-    var tcp_seq: u32 = if (protocol == IPPROTO_TCP)
-        std.mem.readInt(u32, pkt[transport_offset + 4 ..][0..4], .big)
+    // Read first TCP seq if TCP
+    const first_tcp_seq: u32 = if (protocol == IPPROTO_TCP)
+        std.mem.readInt(u32, pkt[iph_len + 4 ..][0..4], .big)
     else
         0;
 
-    while (offset < payload.len and seg_count < max_segments) : (seg_count += 1) {
-        const remaining = payload.len - offset;
-        const this_seg_len = @min(remaining, seg_usize);
-        const total_pkt_len = headers_len + this_seg_len;
+    const next_seg_start = hdr_len;
+    const seg_usize = @as(usize, seg_size);
+    var seg_count: usize = 0;
+    var data_offset: usize = next_seg_start;
 
-        if (total_pkt_len > out_bufs[seg_count].len) break;
+    while (data_offset < pkt.len and seg_count < max_segments) : (seg_count += 1) {
+        var seg_end = data_offset + seg_usize;
+        if (seg_end > pkt.len) seg_end = pkt.len;
+        const seg_data_len = seg_end - data_offset;
+        const total_len = hdr_len + seg_data_len;
 
-        // Copy headers
-        @memcpy(out_bufs[seg_count][0..headers_len], pkt[0..headers_len]);
-        // Copy payload segment
-        @memcpy(out_bufs[seg_count][headers_len..][0..this_seg_len], payload[offset..][0..this_seg_len]);
+        if (total_len > out_bufs[seg_count].len) break;
 
-        // Fix up IP total length
-        if (ip_version == 4) {
-            std.mem.writeInt(u16, out_bufs[seg_count][2..4], @intCast(total_pkt_len), .big);
-            // Clear IP identification for segments after the first
+        const out = out_bufs[seg_count];
+
+        // Copy IP header
+        @memcpy(out[0..iph_len], pkt[0..iph_len]);
+
+        if (!is_v6) {
+            // IPv4: update total_length, increment ID, recompute header checksum
             if (seg_count > 0) {
-                std.mem.writeInt(u16, out_bufs[seg_count][4..6], @intCast(seg_count), .big);
+                const orig_id = std.mem.readInt(u16, pkt[4..6], .big);
+                std.mem.writeInt(u16, out[4..6], orig_id +% @as(u16, @intCast(seg_count)), .big);
             }
-            // Zero IP checksum, recalculate
-            out_bufs[seg_count][10] = 0;
-            out_bufs[seg_count][11] = 0;
-            ipv4HeaderChecksum(out_bufs[seg_count][0..iph_len]);
+            std.mem.writeInt(u16, out[2..4], @intCast(total_len), .big);
+            out[10] = 0;
+            out[11] = 0;
+            const ip_csum = ~inetChecksum(out[0..iph_len], 0);
+            std.mem.writeInt(u16, out[10..12], ip_csum, .big);
         } else {
-            // IPv6 payload length = total - 40
-            std.mem.writeInt(u16, out_bufs[seg_count][4..6], @intCast(total_pkt_len - 40), .big);
+            // IPv6: update payload length
+            std.mem.writeInt(u16, out[4..6], @intCast(total_len - iph_len), .big);
         }
 
-        // Fix up TCP sequence number
-        if (protocol == IPPROTO_TCP) {
-            std.mem.writeInt(u32, out_bufs[seg_count][transport_offset + 4 ..][0..4], tcp_seq, .big);
-            tcp_seq +%= @intCast(this_seg_len);
+        // Copy transport header
+        @memcpy(out[iph_len..hdr_len], pkt[iph_len..hdr_len]);
 
-            // Clear PSH flag on non-final segments
-            if (offset + this_seg_len < payload.len) {
-                out_bufs[seg_count][transport_offset + 13] &= ~@as(u8, 0x08); // clear PSH
+        if (protocol == IPPROTO_TCP) {
+            // Set TCP sequence number
+            const tcp_seq = first_tcp_seq +% @as(u32, seg_size) *% @as(u32, @intCast(seg_count));
+            std.mem.writeInt(u32, out[iph_len + 4 ..][0..4], tcp_seq, .big);
+            // Clear FIN and PSH on non-final segments
+            if (seg_end != pkt.len) {
+                out[iph_len + 13] &= ~@as(u8, 0x01 | 0x08); // clear FIN|PSH
             }
-        } else if (protocol == IPPROTO_UDP) {
-            // Fix UDP length
-            std.mem.writeInt(u16, out_bufs[seg_count][transport_offset + 4 ..][0..2], @intCast(transport_hdr_len + this_seg_len), .big);
+        } else {
+            // UDP: fix UDP length
+            const transport_hdr_len_u = hdr_len - iph_len;
+            std.mem.writeInt(u16, out[iph_len + 4 ..][0..2], @intCast(seg_data_len + transport_hdr_len_u), .big);
         }
 
-        // Note: checksums are left as-is from the original. The kernel's
-        // partial checksum (pseudo-header + payload) needs to be recalculated
-        // for each segment since the payload changed. For now, we compute a
-        // proper TCP/UDP checksum for each segment.
-        if (protocol == IPPROTO_TCP) {
-            // Recompute TCP checksum for this segment
-            computeTcpChecksum(out_bufs[seg_count], transport_offset, total_pkt_len, ip_version == 6);
-        } else if (protocol == IPPROTO_UDP) {
-            // Zero UDP checksum (optional for IPv4, but compute for IPv6)
-            out_bufs[seg_count][transport_offset + 6] = 0;
-            out_bufs[seg_count][transport_offset + 7] = 0;
-        }
+        // Copy payload segment
+        @memcpy(out[hdr_len..][0..seg_data_len], pkt[data_offset..seg_end]);
 
-        out_sizes[seg_count] = total_pkt_len;
-        offset += this_seg_len;
+        // Compute transport checksum: pseudo-header + transport header + payload
+        // Zero the checksum field first
+        const csum_field_off = iph_len + @as(usize, hdr.csum_offset);
+        out[csum_field_off] = 0;
+        out[csum_field_off + 1] = 0;
+
+        const transport_total_len: u16 = @intCast(total_len - iph_len);
+        const pseudo_sum = pseudoHeaderChecksumNoFold(
+            protocol,
+            pkt[src_addr_off..][0..addr_len],
+            pkt[src_addr_off + addr_len ..][0..addr_len],
+            transport_total_len,
+        );
+        const transport_csum = ~inetChecksum(out[iph_len..total_len], pseudo_sum);
+        std.mem.writeInt(u16, out[csum_field_off..][0..2], transport_csum, .big);
+
+        out_sizes[seg_count] = total_len;
+        data_offset += seg_usize;
     }
 
     return seg_count;
@@ -369,77 +382,54 @@ pub fn canCoalesceTCP(pkt_a: []const u8, pkt_b: []const u8) usize {
     return pkt_b.len - th_b - tcph_len_b;
 }
 
-/// Compute IPv4 header checksum and write it at bytes 10-11.
-fn ipv4HeaderChecksum(hdr: []u8) void {
-    // Zero the checksum field first
-    hdr[10] = 0;
-    hdr[11] = 0;
+// ── Checksum helpers (matching wireguard-go tun/checksum.go) ──────────
 
-    var sum: u32 = 0;
-    var i: usize = 0;
-    while (i < hdr.len) : (i += 2) {
-        sum += @as(u32, hdr[i]) << 8;
-        if (i + 1 < hdr.len) {
-            sum += @as(u32, hdr[i + 1]);
-        }
-    }
-
-    // Fold carry
-    while (sum > 0xFFFF) {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-
-    const result = ~@as(u16, @intCast(sum & 0xFFFF));
-    hdr[10] = @intCast(result >> 8);
-    hdr[11] = @intCast(result & 0xFF);
+/// Internet checksum (RFC 1071) with initial accumulator.
+/// Returns the ones-complement of the ones-complement sum.
+pub fn inetChecksum(data: []const u8, initial: u64) u16 {
+    var ac = checksumNoFold(data, initial);
+    ac = (ac >> 16) + (ac & 0xffff);
+    ac = (ac >> 16) + (ac & 0xffff);
+    ac = (ac >> 16) + (ac & 0xffff);
+    ac = (ac >> 16) + (ac & 0xffff);
+    return @intCast(ac & 0xffff);
 }
 
-/// Compute TCP checksum for a packet and write it at the correct offset.
-/// Handles both IPv4 and IPv6 pseudo-headers.
-fn computeTcpChecksum(pkt: []u8, transport_offset: usize, total_len: usize, is_v6: bool) void {
-    if (total_len < transport_offset + 20) return;
-
-    // Zero the checksum field first
-    pkt[transport_offset + 16] = 0;
-    pkt[transport_offset + 17] = 0;
-
-    var sum: u32 = 0;
-    const tcp_len: u16 = @intCast(total_len - transport_offset);
-
-    // Pseudo-header
-    if (is_v6) {
-        // IPv6 pseudo-header: src(16) + dst(16) + tcp_len(4) + next_hdr(4)
-        var i: usize = 8;
-        while (i < 40) : (i += 2) {
-            sum += @as(u32, pkt[i]) << 8 | @as(u32, pkt[i + 1]);
-        }
-        sum += @as(u32, tcp_len);
-        sum += IPPROTO_TCP;
-    } else {
-        // IPv4 pseudo-header: src(4) + dst(4) + zero + proto + tcp_len
-        var i: usize = 12;
-        while (i < 20) : (i += 2) {
-            sum += @as(u32, pkt[i]) << 8 | @as(u32, pkt[i + 1]);
-        }
-        sum += IPPROTO_TCP;
-        sum += @as(u32, tcp_len);
+/// Accumulate data into a checksum without folding.
+fn checksumNoFold(data: []const u8, initial: u64) u64 {
+    var sum: u64 = initial;
+    var i: usize = 0;
+    // Process 2 bytes at a time (big-endian)
+    while (i + 1 < data.len) : (i += 2) {
+        sum += @as(u64, std.mem.readInt(u16, data[i..][0..2], .big));
     }
-
-    // TCP header + data
-    var i: usize = transport_offset;
-    while (i + 1 < total_len) : (i += 2) {
-        sum += @as(u32, pkt[i]) << 8 | @as(u32, pkt[i + 1]);
+    if (i < data.len) {
+        sum += @as(u64, data[i]) << 8;
     }
-    if (i < total_len) {
-        sum += @as(u32, pkt[i]) << 8;
-    }
+    return sum;
+}
 
-    // Fold carry
-    while (sum > 0xFFFF) {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
+/// Pseudo-header checksum for TCP/UDP (no fold).
+fn pseudoHeaderChecksumNoFold(protocol: u8, src_addr: []const u8, dst_addr: []const u8, total_len: u16) u64 {
+    var sum = checksumNoFold(src_addr, 0);
+    sum = checksumNoFold(dst_addr, sum);
+    var proto_buf: [2]u8 = .{ 0, protocol };
+    sum = checksumNoFold(&proto_buf, sum);
+    var len_buf: [2]u8 = undefined;
+    std.mem.writeInt(u16, &len_buf, total_len, .big);
+    return checksumNoFold(&len_buf, sum);
+}
 
-    const csum = ~@as(u16, @intCast(sum & 0xFFFF));
-    pkt[transport_offset + 16] = @intCast(csum >> 8);
-    pkt[transport_offset + 17] = @intCast(csum & 0xFF);
+/// Complete a partial checksum on a non-GSO packet with F_NEEDS_CSUM.
+/// Matches wireguard-go's gsoNoneChecksum().
+fn gsoNoneChecksum(pkt: []u8, csum_start: u16, csum_offset: u16) void {
+    const csum_at = @as(usize, csum_start) + @as(usize, csum_offset);
+    if (csum_at + 2 > pkt.len) return;
+    if (@as(usize, csum_start) >= pkt.len) return;
+    // The initial value is the pseudo-header checksum seed
+    const initial: u64 = @as(u64, std.mem.readInt(u16, pkt[csum_at..][0..2], .big));
+    pkt[csum_at] = 0;
+    pkt[csum_at + 1] = 0;
+    const csum = ~inetChecksum(pkt[@as(usize, csum_start)..], initial);
+    std.mem.writeInt(u16, pkt[csum_at..][0..2], csum, .big);
 }

@@ -31,3 +31,8 @@ docs/.vitepress/cache/
 # OS
 .DS_Store
 Thumbs.db
+
+# Benchmarks / Profiling
+bench-results/
+perf.data
+perf.data.old

@@ -168,3 +168,185 @@ pub const BatchSender = struct {
         self.count = 0;
     }
 };
+
+// ── GRO/GSO offload support ──
+
+const IPPROTO_UDP = 17;
+const UDP_GRO = 104;
+const UDP_SEGMENT = 103;
+const SOL_UDP = 17;
+
+// cmsg header (matches Linux kernel ABI)
+const Cmsghdr = extern struct {
+    len: usize, // cmsg_len (includes header)
+    level: i32,
+    type: i32,
+};
+
+/// GRO-aware receiver: uses a single 64KB recvmsg with cmsg to receive
+/// coalesced UDP packets. The kernel delivers N UDP segments as one buffer.
+pub const GROReceiver = struct {
+    buf: [65536]u8 = undefined,
+    addr: posix.sockaddr.in = undefined,
+    cmsg_buf: [128]u8 align(@alignOf(Cmsghdr)) = undefined,
+    received: usize = 0,
+    segment_size: u16 = 0,
+
+    /// Receive a GRO-coalesced batch. Returns total bytes received.
+    /// After this call, `segment_size` contains the per-segment size from
+    /// the kernel's cmsg (or 0 if no GRO info — treat entire buffer as one packet).
+    pub fn recvGRO(self: *GROReceiver, fd: posix.fd_t) usize {
+        self.segment_size = 0;
+        self.received = 0;
+
+        var iov = Iovec{
+            .base = &self.buf,
+            .len = self.buf.len,
+        };
+
+        self.addr = std.mem.zeroes(posix.sockaddr.in);
+        @memset(&self.cmsg_buf, 0);
+
+        var hdr = Msghdr{
+            .msg_name = @ptrCast(&self.addr),
+            .msg_namelen = @sizeOf(posix.sockaddr.in),
+            .msg_iov = @ptrCast(&iov),
+            .msg_iovlen = 1,
+            .msg_control = @ptrCast(&self.cmsg_buf),
+            .msg_controllen = self.cmsg_buf.len,
+            .msg_flags = 0,
+        };
+
+        // SYS_recvmsg = 47 on x86_64
+        const rc = linux.syscall3(
+            @enumFromInt(47),
+            @as(usize, @intCast(fd)),
+            @intFromPtr(&hdr),
+            @as(usize, linux.MSG.DONTWAIT),
+        );
+
+        const signed: isize = @bitCast(rc);
+        if (signed <= 0) return 0;
+
+        self.received = @intCast(signed);
+
+        // Parse cmsg to find UDP_GRO segment size
+        if (hdr.msg_controllen > 0) {
+            var offset: usize = 0;
+            while (offset + @sizeOf(Cmsghdr) <= hdr.msg_controllen) {
+                const cmsg: *const Cmsghdr = @ptrCast(@alignCast(&self.cmsg_buf[offset]));
+                if (cmsg.len < @sizeOf(Cmsghdr)) break;
+
+                if (cmsg.level == SOL_UDP and cmsg.type == UDP_GRO) {
+                    // Data is a u16 segment size
+                    const data_offset = offset + @sizeOf(Cmsghdr);
+                    if (data_offset + 2 <= hdr.msg_controllen) {
+                        self.segment_size = std.mem.readInt(u16, self.cmsg_buf[data_offset..][0..2], .little);
+                    }
+                    break;
+                }
+
+                // Advance to next cmsg (aligned to usize boundary)
+                const cmsg_aligned_len = (cmsg.len + @alignOf(Cmsghdr) - 1) & ~(@as(usize, @alignOf(Cmsghdr)) - 1);
+                offset += cmsg_aligned_len;
+            }
+        }
+
+        return self.received;
+    }
+
+    /// Get sender address and port.
+    pub fn getSender(self: *const GROReceiver) struct { addr: [4]u8, port: u16 } {
+        return .{
+            .addr = @bitCast(self.addr.addr),
+            .port = std.mem.bigToNative(u16, self.addr.port),
+        };
+    }
+};
+
+/// GSO-aware sender: packs encrypted segments into a linear buffer, sends
+/// with a single sendmsg + cmsg(UDP_SEGMENT) to let the kernel/NIC segment.
+/// Buffer is capped at ~10 segments to stay under the kernel's EMSGSIZE limit
+/// on veth interfaces (65KB total fails, ~15KB works).
+pub const GSOSender = struct {
+    pub const GSO_MAX_SIZE = 15000; // ~10 segments of 1456B each
+    buf: [GSO_MAX_SIZE]u8 = undefined,
+    used: usize = 0,
+    segment_size: u16 = 0,
+
+    pub fn reset(self: *GSOSender) void {
+        self.used = 0;
+        self.segment_size = 0;
+    }
+
+    /// Append an encrypted segment to the GSO buffer.
+    pub fn append(self: *GSOSender, data: []const u8) bool {
+        if (self.used + data.len > self.buf.len) return false;
+        @memcpy(self.buf[self.used..][0..data.len], data);
+        if (self.segment_size == 0) {
+            self.segment_size = @intCast(data.len);
+        }
+        self.used += data.len;
+        return true;
+    }
+
+    pub const SendResult = struct {
+        bytes_sent: usize,
+        err: usize, // raw Linux errno (0 = success)
+    };
+
+    /// Send all segments with UDP GSO (single syscall).
+    /// Returns bytes sent and errno for diagnostic purposes.
+    pub fn sendGSO(self: *GSOSender, fd: posix.fd_t, dest_addr: [4]u8, dest_port: u16) SendResult {
+        if (self.used == 0) return .{ .bytes_sent = 0, .err = 0 };
+
+        var addr = posix.sockaddr.in{
+            .family = linux.AF.INET,
+            .port = std.mem.nativeToBig(u16, dest_port),
+            .addr = @bitCast(dest_addr),
+            .zero = .{0} ** 8,
+        };
+
+        var iov = Iovec{
+            .base = &self.buf,
+            .len = self.used,
+        };
+
+        // Build cmsg with UDP_SEGMENT (u16 segment size)
+        // CMSG_LEN(sizeof(u16)) = sizeof(Cmsghdr) + 2 = 18 (for cmsg_len field)
+        // CMSG_SPACE(sizeof(u16)) = align_up(18, alignof(Cmsghdr)) = 24 (for msg_controllen)
+        const CMSG_LEN_U16 = @sizeOf(Cmsghdr) + 2;
+        const CMSG_SPACE_U16 = (CMSG_LEN_U16 + @alignOf(Cmsghdr) - 1) & ~(@as(usize, @alignOf(Cmsghdr)) - 1);
+
+        var cmsg_buf: [CMSG_SPACE_U16]u8 align(@alignOf(Cmsghdr)) = @splat(0);
+        const cmsg_hdr: *Cmsghdr = @ptrCast(@alignCast(&cmsg_buf));
+        cmsg_hdr.len = CMSG_LEN_U16;
+        cmsg_hdr.level = SOL_UDP;
+        cmsg_hdr.type = UDP_SEGMENT;
+        std.mem.writeInt(u16, cmsg_buf[@sizeOf(Cmsghdr)..][0..2], self.segment_size, .little);
+
+        var hdr = Msghdr{
+            .msg_name = @ptrCast(&addr),
+            .msg_namelen = @sizeOf(posix.sockaddr.in),
+            .msg_iov = @ptrCast(&iov),
+            .msg_iovlen = 1,
+            .msg_control = @ptrCast(&cmsg_buf),
+            .msg_controllen = CMSG_SPACE_U16,
+            .msg_flags = 0,
+        };
+
+        // SYS_sendmsg = 46 on x86_64
+        const rc = linux.syscall3(
+            @enumFromInt(46),
+            @as(usize, @intCast(fd)),
+            @intFromPtr(&hdr),
+            @as(usize, linux.MSG.DONTWAIT),
+        );
+
+        const signed: isize = @bitCast(rc);
+        if (signed < 0) {
+            return .{ .bytes_sent = 0, .err = @as(usize, @bitCast(-signed)) };
+        }
+        return .{ .bytes_sent = @intCast(signed), .err = 0 };
+    }
+};

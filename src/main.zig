@@ -50,6 +50,8 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    // Initialize libsodium (AVX2 ChaCha20-Poly1305 assembly)
+    @import("crypto/sodium.zig").init();
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
@@ -915,9 +917,10 @@ fn tunReaderPipeline(
     crypto_q: *lib.net.Pipeline.CryptoQueue,
 ) void {
     const Offload = lib.net.Offload;
+    const Pipeline = lib.net.Pipeline;
     const MAX_PEERS = lib.wireguard.Device.MAX_PEERS;
 
-    var tun_buf: [Offload.VNET_HDR_LEN + 65535]u8 = undefined;
+    var tun_buf: [Offload.VNET_HDR_LEN + 65535]u8 align(@alignOf(Offload.VirtioNetHdr)) = undefined;
     // Per-peer batch building: thread-local staging
     var local_batches: [MAX_PEERS]?u16 = .{null} ** MAX_PEERS;
 
@@ -955,17 +958,73 @@ fn tunReaderPipeline(
                 const ip_data = tun_buf[Offload.VNET_HDR_LEN..n];
 
                 if (vhdr.gso_type != Offload.GSO_NONE) {
-                    // GSO super-packet — split and stage each segment
+                    // ── ZERO-COPY GSO path ──
+                    // Split directly into pool buffers, eliminating the seg_bufs intermediate copy.
+                    // All segments share the same dst IP → one peer lookup for entire GSO batch.
+                    if (ip_data.len < 20) continue;
+                    const dst_ip: [4]u8 = ip_data[16..20].*;
+                    const peer_slot = wg_dev.lookupByMeshIp(dst_ip) orelse continue;
+                    const peer = wg_dev.peers[peer_slot] orelse continue;
+                    if (peer.endpoint_addr[0] == 0) continue;
+
+                    // Ensure we have enough buffers in local cache (up to 64 segments)
+                    const max_segs: usize = 64;
+                    while (buf_cache_count < max_segs) {
+                        const remaining = buf_cache[buf_cache_count..];
+                        const filled = pool.allocBufferBatch(remaining);
+                        if (filled == 0) break;
+                        buf_cache_count += filled;
+                    }
+                    if (buf_cache_count == 0) continue;
+
+                    const avail = @min(buf_cache_count, max_segs);
+
+                    // Build output slices pointing directly into pool buffer data areas
+                    var pool_slices: [64][]u8 = undefined;
+                    var pool_indices: [64]u16 = undefined;
+                    for (0..avail) |i| {
+                        const idx = buf_cache[buf_cache_count - 1 - i];
+                        pool_indices[i] = idx;
+                        pool_slices[i] = pool.buffers[idx].data[Pipeline.WG_HEADER_LEN..];
+                    }
+
                     var seg_sizes: [64]usize = undefined;
                     const seg_count = Offload.gsoSplit(
                         vhdr.*,
                         ip_data,
-                        &seg_slices,
+                        pool_slices[0..avail],
                         &seg_sizes,
-                        64,
+                        avail,
                     );
+
+                    if (seg_count == 0) continue;
+                    // Consume the used buffers from cache
+                    buf_cache_count -= seg_count;
+
+                    // Allocate or reuse batch for this peer
+                    if (local_batches[peer_slot] == null) {
+                        local_batches[peer_slot] = pool.allocBatch() orelse continue;
+                    }
+                    touched_peers[peer_slot] = true;
+
+                    // Stage all segments into the batch (no memcpy — data already in pool buffers)
                     for (0..seg_count) |s| {
-                        stageSegment(wg_dev, pool, crypto_q, seg_bufs[s][0..seg_sizes[s]], &local_batches, &touched_peers, &buf_cache, &buf_cache_count);
+                        const buf_idx = pool_indices[s];
+                        var pkt = &pool.buffers[buf_idx];
+                        pkt.len = @intCast(seg_sizes[s]);
+                        pkt.endpoint_addr = peer.endpoint_addr;
+                        pkt.endpoint_port = peer.endpoint_port;
+
+                        const batch_idx = local_batches[peer_slot].?;
+                        var batch = &pool.batches[batch_idx];
+                        batch.buf_indices[batch.count] = buf_idx;
+                        batch.lengths[batch.count] = @intCast(seg_sizes[s]);
+                        batch.count += 1;
+
+                        if (batch.count >= Pipeline.BATCH_SIZE) {
+                            dispatchBatch(wg_dev, pool, crypto_q, @intCast(peer_slot), batch_idx);
+                            local_batches[peer_slot] = pool.allocBatch();
+                        }
                     }
                 } else {
                     if (ip_data.len < 20) continue;
@@ -1133,8 +1192,8 @@ fn cryptoWorkerPipeline(
 
 /// Drain all Ready batches from a peer's TxRing in strict nonce order.
 /// Called while holding peer.tx_ring.send_lock.
-/// Uses UDP GSO (sendmsg with UDP_SEGMENT cmsg) to send all encrypted packets
-/// for this peer in a single syscall — ~45x fewer syscalls than sendmmsg.
+/// Tries UDP GSO first (single sendmsg per batch); falls back to per-packet sendto
+/// if GSO is unsupported by the kernel.
 fn flushPeerTxRing(
     peer: *lib.wireguard.Device.WgPeer,
     pool: *lib.net.Pipeline.DataPlanePool,
@@ -1142,7 +1201,15 @@ fn flushPeerTxRing(
 ) void {
     const Pipeline = lib.net.Pipeline;
     const BatchUdp = lib.net.BatchUdp;
-    var gso_tx = BatchUdp.GSOSender{};
+
+    // Track GSO availability — start optimistic, disable on first failure
+    const GsoState = struct {
+        var available: bool = true;
+        var logged: bool = false;
+    };
+
+    // Accumulate packets across batches for a single sendmmsg call
+    var mmsg_tx = BatchUdp.BatchSender{};
 
     while (!peer.tx_ring.isEmpty()) {
         const head_idx = peer.tx_ring.peekHead();
@@ -1151,30 +1218,65 @@ fn flushPeerTxRing(
         // Strict ROB: if next sequential batch isn't Ready, stop!
         if (head_batch.state.load(.acquire) != @intFromEnum(Pipeline.BatchState.Ready)) break;
 
-        // Pack encrypted packets into GSO buffer for single sendmsg
-        for (0..head_batch.count) |i| {
-            const pkt = &pool.buffers[head_batch.buf_indices[i]];
-            if (pkt.len > 0) {
-                if (!gso_tx.append(pkt.data[0..pkt.len])) {
-                    // GSO buffer full — flush and start a new one
-                    _ = gso_tx.sendGSO(udp_fd, peer.endpoint_addr, peer.endpoint_port);
-                    gso_tx.reset();
-                    _ = gso_tx.append(pkt.data[0..pkt.len]);
+        if (GsoState.available and head_batch.count > 1) {
+            // ── GSO path: pack all segments into one sendmsg ──
+            var gso_tx = BatchUdp.GSOSender{};
+            var pack_ok = true;
+            for (0..head_batch.count) |i| {
+                const pkt = &pool.buffers[head_batch.buf_indices[i]];
+                if (pkt.len > 0) {
+                    if (!gso_tx.append(pkt.data[0..pkt.len])) {
+                        // GSO buffer full — shouldn't happen with 64-packet batches
+                        pack_ok = false;
+                        break;
+                    }
+                }
+            }
+
+            if (pack_ok and gso_tx.used > 0) {
+                const result = gso_tx.sendGSO(udp_fd, peer.endpoint_addr, peer.endpoint_port);
+                if (result.bytes_sent > 0) {
+                    // GSO succeeded!
+                    pool.freeBuffers(head_batch.buf_indices[0..head_batch.count]);
+                    head_batch.state.store(@intFromEnum(Pipeline.BatchState.Empty), .release);
+                    pool.freeBatch(head_idx);
+                    peer.tx_ring.advanceHead();
+                    continue;
+                } else {
+                    // GSO failed — log errno once, fall through to sendmmsg
+                    GsoState.available = false;
+                    if (!GsoState.logged) {
+                        GsoState.logged = true;
+                        var err_buf: [128]u8 = undefined;
+                        const msg = std.fmt.bufPrint(&err_buf, "  GSO sendmsg failed: errno={d}, seg={d}B, total={d}B, using sendmmsg fallback\n", .{ result.err, gso_tx.segment_size, gso_tx.used }) catch "  GSO failed\n";
+                        _ = posix.write(2, msg) catch {};
+                    }
                 }
             }
         }
 
-        // Bulk-free all buffer indices from this batch (single lock acquisition)
+        // ── sendmmsg path: queue all packets from this batch ──
+        for (0..head_batch.count) |i| {
+            const pkt = &pool.buffers[head_batch.buf_indices[i]];
+            if (pkt.len > 0) {
+                mmsg_tx.queue(pkt.data[0..pkt.len], peer.endpoint_addr, peer.endpoint_port);
+            }
+        }
+
+        // If BatchSender is full or this is the last ready batch, flush
+        if (mmsg_tx.count >= BatchUdp.BATCH_SIZE - Pipeline.BATCH_SIZE) {
+            _ = mmsg_tx.flush(udp_fd);
+        }
+
         pool.freeBuffers(head_batch.buf_indices[0..head_batch.count]);
         head_batch.state.store(@intFromEnum(Pipeline.BatchState.Empty), .release);
         pool.freeBatch(head_idx);
-
         peer.tx_ring.advanceHead();
     }
 
-    // Flush remaining GSO buffer
-    if (gso_tx.used > 0) {
-        _ = gso_tx.sendGSO(udp_fd, peer.endpoint_addr, peer.endpoint_port);
+    // Flush any remaining queued packets
+    if (mmsg_tx.count > 0) {
+        _ = mmsg_tx.flush(udp_fd);
     }
 }
 
@@ -1191,7 +1293,7 @@ fn dataPlaneWorker(
     const Offload = lib.net.Offload;
 
     var tx = BatchUdp.BatchSender{};
-    var tun_buf: [Offload.VNET_HDR_LEN + 65535]u8 = undefined;
+    var tun_buf: [Offload.VNET_HDR_LEN + 65535]u8 align(@alignOf(Offload.VirtioNetHdr)) = undefined;
     var encrypt_bufs: [BatchUdp.BATCH_SIZE][1600]u8 = undefined;
     var seg_bufs: [BatchUdp.BATCH_SIZE][1500]u8 = undefined;
     var seg_slices: [BatchUdp.BATCH_SIZE][]u8 = undefined;
@@ -1481,11 +1583,6 @@ fn userspaceEventLoop(
 
     if (n_encrypt > 0) {
         writeFormatted(stdout, "  pipeline: {d} TUN readers + {d} encrypt workers (on {d} CPUs)\n", .{ n_tun_readers, n_encrypt, cpu_count }) catch {};
-
-        // Enable UDP GRO+GSO on the socket for coalesced I/O
-        udp_sock.enableGRO();
-        udp_sock.enableGSO();
-        writeFormatted(stdout, "  UDP offloads: GRO + GSO enabled\n", .{}) catch {};
     } else {
         writeFormatted(stdout, "  data-plane workers: {d} (on {d} CPUs, serial mode)\n", .{ n_tun_readers, cpu_count }) catch {};
     }
@@ -1540,6 +1637,19 @@ fn userspaceEventLoop(
         };
         crypto_queue.* = Pipeline.CryptoQueue{};
 
+        // Create dedicated GSO socket for data-plane sends (send-only, no bind).
+        // This socket has IP_PMTUDISC_PROBE (required for >MTU GSO sendmsg)
+        // so it's separate from the control-plane socket used for handshakes/SWIM.
+        const Udp = lib.net.Udp;
+        const gso_fd = blk: {
+            const sock = Udp.UdpSocket.createGSOSender() catch {
+                writeFormatted(stdout, "  warning: GSO socket failed, data-plane uses shared socket\n", .{}) catch {};
+                break :blk udp_sock.fd;
+            };
+            writeFormatted(stdout, "  GSO send socket: fd={d} (IP_PMTUDISC_PROBE, SO_SNDBUF=256K)\n", .{sock.fd}) catch {};
+            break :blk sock.fd;
+        };
+
         // Parallel pipeline: TUN readers + encrypt workers
         for (0..opened_workers) |w| {
             threads[spawned] = std.Thread.spawn(.{}, tunReaderPipeline, .{
@@ -1560,7 +1670,7 @@ fn userspaceEventLoop(
             threads[spawned] = std.Thread.spawn(.{}, cryptoWorkerPipeline, .{
                 &swim.running,
                 wg_dev,
-                udp_sock.fd,
+                gso_fd,
                 data_pool,
                 crypto_queue,
             }) catch {
@@ -1588,11 +1698,8 @@ fn userspaceEventLoop(
     writeFormatted(stdout, "  spawned {d} data-plane threads\n", .{spawned}) catch {};
 
     // ── Control-plane loop: SWIM + handshakes + decrypt on original gossip socket ──
-    // Use GRO receiver when pipeline is active (UDP GRO enabled), else batch receiver
-    var gro_rx = BatchUdp.GROReceiver{};
-    var batch_rx = BatchUdp.BatchReceiver{};
-    batch_rx.setupPointers();
-    const use_gro = n_encrypt > 0;
+    var rx = BatchUdp.BatchReceiver{};
+    rx.setupPointers();
 
     while (swim.running.load(.acquire)) {
         var fds = [_]posix.pollfd{
@@ -1608,54 +1715,22 @@ fn userspaceEventLoop(
             var decrypt_lens: [MAX_DECRYPTED]usize = undefined;
             var n_decrypted: usize = 0;
 
-            if (use_gro) {
-                // GRO path: single recvmsg returns coalesced buffer
-                const total = gro_rx.recvGRO(udp_sock.fd);
-                if (total > 0) {
-                    const sender = gro_rx.getSender();
-                    const seg_size: usize = if (gro_rx.segment_size > 0)
-                        @as(usize, gro_rx.segment_size)
-                    else
-                        total;
-
-                    var offset: usize = 0;
-                    while (offset < total) {
-                        const pkt_len = @min(seg_size, total - offset);
-                        const pkt = gro_rx.buf[offset..][0..pkt_len];
-                        processIncomingPacket(
-                            pkt,
-                            sender.addr,
-                            sender.port,
-                            wg_dev,
-                            swim,
-                            udp_sock,
-                            stdout,
-                            &decrypt_storage,
-                            &decrypt_lens,
-                            &n_decrypted,
-                        );
-                        offset += pkt_len;
-                    }
-                }
-            } else {
-                // Legacy batch path: recvmmsg returns individual packets
-                const count = batch_rx.recvBatch(udp_sock.fd);
-                for (0..count) |i| {
-                    const pkt = batch_rx.getPacket(i);
-                    const sender = batch_rx.getSender(i);
-                    processIncomingPacket(
-                        pkt,
-                        sender.addr,
-                        sender.port,
-                        wg_dev,
-                        swim,
-                        udp_sock,
-                        stdout,
-                        &decrypt_storage,
-                        &decrypt_lens,
-                        &n_decrypted,
-                    );
-                }
+            const count = rx.recvBatch(udp_sock.fd);
+            for (0..count) |i| {
+                const pkt = rx.getPacket(i);
+                const sender = rx.getSender(i);
+                processIncomingPacket(
+                    pkt,
+                    sender.addr,
+                    sender.port,
+                    wg_dev,
+                    swim,
+                    udp_sock,
+                    stdout,
+                    &decrypt_storage,
+                    &decrypt_lens,
+                    &n_decrypted,
+                );
             }
 
             // Pass 2: coalesce same-flow TCP segments and write to TUN

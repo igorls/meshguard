@@ -10,7 +10,7 @@
 ///! Reference: drivers/net/wireguard/send.c, receive.c
 const std = @import("std");
 const noise = @import("noise.zig");
-const ChaCha20Poly1305 = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
+const sodium = @import("../crypto/sodium.zig");
 
 pub const AUTHTAG_LEN: usize = 16;
 pub const TRANSPORT_HEADER_LEN: usize = 16; // sizeof(TransportHeader)
@@ -81,12 +81,62 @@ pub const Tunnel = struct {
             @memset(out[ct_start + plaintext.len ..][0..padding_len], 0);
         }
 
-        // Encrypt in-place: ChaCha20-Poly1305 supports src==dest
-        ChaCha20Poly1305.encrypt(
+        // Encrypt in-place: libsodium ChaCha20-Poly1305 AVX2 assembly
+        sodium.encrypt(
             out[ct_start..][0..padded_len],
             out[ct_start + padded_len ..][0..AUTHTAG_LEN],
             out[ct_start..][0..padded_len],
             &.{}, // No additional data for transport
+            nonce,
+            self.keys.sending_key,
+        );
+
+        self.last_send_ns = std.time.nanoTimestamp();
+
+        return total_len;
+    }
+
+    /// Encrypt in-place with a pre-assigned nonce (for parallel pipeline).
+    ///
+    /// The caller (TUN reader) places the IP payload at buf[16..16+plaintext_len]
+    /// and assigns nonces via fetchAdd(batch_count). The crypto worker then calls
+    /// this to encrypt in-place and write the WG transport header at buf[0..16].
+    ///
+    /// Returns total length: header(16) + padded_ciphertext + tag(16).
+    pub fn encryptPreassigned(self: *Tunnel, buf: []u8, plaintext_len: usize, nonce_val: u64) ?usize {
+        if (nonce_val >= REJECT_AFTER_MESSAGES) return null;
+
+        const elapsed = std.time.nanoTimestamp() - self.keys.birthdate_ns;
+        if (elapsed >= REJECT_AFTER_TIME_NS) return null;
+        if (elapsed >= REKEY_AFTER_TIME_NS or nonce_val >= REKEY_AFTER_MESSAGES)
+            self.needs_rekey = true;
+
+        // Pad plaintext to multiple of 16 bytes
+        const padding_len = (16 - (plaintext_len % 16)) % 16;
+        const padded_len = plaintext_len + padding_len;
+        const total_len = TRANSPORT_HEADER_LEN + padded_len + AUTHTAG_LEN;
+        if (buf.len < total_len) return null;
+
+        // Write transport header at buf[0..16]
+        std.mem.writeInt(u32, buf[0..4], 4, .little); // Type 4
+        std.mem.writeInt(u32, buf[4..8], self.keys.receiving_index, .little);
+        std.mem.writeInt(u64, buf[8..16], nonce_val, .little);
+
+        // Zero-pad after plaintext
+        if (padding_len > 0) {
+            @memset(buf[TRANSPORT_HEADER_LEN + plaintext_len ..][0..padding_len], 0);
+        }
+
+        // Build 12-byte nonce
+        var nonce: [12]u8 = .{0} ** 12;
+        std.mem.writeInt(u64, nonce[4..12], nonce_val, .little);
+
+        // Encrypt in-place (plaintext at buf[16..], ciphertext overwrites same region)
+        sodium.encrypt(
+            buf[TRANSPORT_HEADER_LEN..][0..padded_len],
+            buf[TRANSPORT_HEADER_LEN + padded_len ..][0..AUTHTAG_LEN],
+            buf[TRANSPORT_HEADER_LEN..][0..padded_len],
+            &.{},
             nonce,
             self.keys.sending_key,
         );
@@ -127,8 +177,8 @@ pub const Tunnel = struct {
         const plaintext_len = ciphertext.len - AUTHTAG_LEN;
         if (out.len < plaintext_len) return error.BufferTooSmall;
 
-        // Decrypt
-        ChaCha20Poly1305.decrypt(
+        // Decrypt (libsodium AVX2 assembly)
+        sodium.decrypt(
             out[0..plaintext_len],
             ciphertext[0..plaintext_len],
             ciphertext[plaintext_len..][0..AUTHTAG_LEN].*,

@@ -24,6 +24,7 @@ pub fn build(b: *std.Build) void {
         .name = "meshguard",
         .root_module = exe_mod,
     });
+    exe.linkSystemLibrary("sodium"); // AVX2 ChaCha20-Poly1305 assembly
     b.installArtifact(exe);
 
     // ─── WG interop test binary ───
@@ -37,6 +38,7 @@ pub fn build(b: *std.Build) void {
         .name = "wg-interop-test",
         .root_module = interop_mod,
     });
+    interop_exe.linkSystemLibrary("sodium");
     b.installArtifact(interop_exe);
 
     // ─── Run step ───

@@ -68,6 +68,8 @@ pub const WgPeer = struct {
     last_handshake_ns: i128 = 0,
     /// Number of handshake attempts
     handshake_attempts: u32 = 0,
+    /// Per-peer Tx ring for parallel pipeline ordering (only used when --encrypt-workers > 0)
+    tx_ring: @import("../net/pipeline.zig").PeerTxRing = .{},
 };
 
 /// Fixed-size open-addressed hash table for u32 → usize mapping.
