@@ -600,7 +600,7 @@ pub fn verifyMac1(our_static_public: [32]u8, msg: *const HandshakeInitiation) bo
     var expected: [16]u8 = undefined;
     Blake2s128.hash(msg_bytes[0..116], &expected, .{ .key = &mac1_key });
 
-    return std.crypto.utils.timingSafeEql([16]u8, expected, msg.mac1);
+    return crypto.timingSafeEql([16]u8, expected, msg.mac1);
 }
 
 // ─── MAC computation ───
