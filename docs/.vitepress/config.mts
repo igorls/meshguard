@@ -3,6 +3,7 @@ import { defineConfig } from 'vitepress'
 export default defineConfig({
   title: 'meshguard',
   description: 'Decentralized, serverless WireGuard mesh VPN daemon',
+  base: '/meshguard/',
   head: [
     ['meta', { name: 'theme-color', content: '#6366f1' }],
   ],
