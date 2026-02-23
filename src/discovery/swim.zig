@@ -794,8 +794,38 @@ test "swim creates sequential pings" {
     var membership = Membership.MembershipTable.init(allocator, 5000);
     defer membership.deinit();
 
-    // Can't actually bind a socket in tests without root, so just test createPing logic
-    const pubkey = [_]u8{0x01} ** 32;
-    _ = pubkey;
-    _ = &membership;
+    // Bind to port 0 for an ephemeral port — works without root
+    var socket = Udp.UdpSocket.bind(0) catch |err| {
+        std.debug.print("Skipping test: could not bind UDP socket: {}\n", .{err});
+        return;
+    };
+    defer socket.close();
+
+    var swim = SwimProtocol.init(
+        &membership,
+        socket,
+        .{}, // SwimConfig
+        [_]u8{1} ** 32, // our_pubkey
+        [_]u8{2} ** 32, // our_wg_pubkey
+        .{ 127, 0, 0, 1 }, // our_mesh_ip
+        51821, // our_wg_port
+        null, // handler
+    );
+
+    const target_pubkey = [_]u8{3} ** 32;
+    const target_addr = [4]u8{ 127, 0, 0, 1 };
+    const target_port = 12345;
+
+    // Send first ping
+    swim.sendPing(target_addr, target_port, target_pubkey);
+    try std.testing.expectEqual(@as(u64, 1), swim.seq);
+    try std.testing.expectEqual(@as(usize, 1), swim.pending_count);
+    try std.testing.expectEqual(target_pubkey, swim.pending[0].target_pubkey);
+    try std.testing.expectEqual(@as(u64, 1), swim.pending[0].seq);
+
+    // Send second ping
+    swim.sendPing(target_addr, target_port + 1, target_pubkey);
+    try std.testing.expectEqual(@as(u64, 2), swim.seq);
+    try std.testing.expectEqual(@as(usize, 2), swim.pending_count);
+    try std.testing.expectEqual(@as(u64, 2), swim.pending[1].seq);
 }
