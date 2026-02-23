@@ -15,7 +15,7 @@ export default defineConfig({
       { text: 'Guide', link: '/guide/getting-started' },
       { text: 'Concepts', link: '/concepts/architecture' },
       { text: 'Reference', link: '/reference/cli' },
-      { text: 'GitHub', link: 'https://github.com/zig-meshguard/meshguard' },
+      { text: 'GitHub', link: 'https://github.com/igorls/meshguard' },
     ],
 
     sidebar: [
@@ -48,7 +48,7 @@ export default defineConfig({
     ],
 
     socialLinks: [
-      { icon: 'github', link: 'https://github.com/zig-meshguard/meshguard' },
+      { icon: 'github', link: 'https://github.com/igorls/meshguard' },
     ],
 
     footer: {
