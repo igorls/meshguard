@@ -9,11 +9,11 @@ Zero central authority. Trust-agnostic. Single static binary.
 
 ## The Problem
 
-Building a secure mesh network between N nodes (blockchain validators, edge servers, IoT clusters) currently requires either:
+Building a secure mesh network between N nodes (blockchain validators, edge servers, IoT clusters) means choosing between:
 
-- **Tailscale/ZeroTier** — needs a central control plane. Unacceptable in trustless environments.
-- **Raw WireGuard** — no coordination. Managing N×(N-1)/2 peer entries manually breaks down at ~20 nodes.
-- **EasyTier/Yggdrasil/Tinc** — decentralized, but no permissioned membership. Anyone can join.
+- **Central control plane** — convenient, but requires trusting a third-party coordinator. Unacceptable in trustless environments.
+- **Manual WireGuard** — fully decentralized, but managing N×(N-1)/2 peer entries by hand breaks down at ~20 nodes.
+- **Open mesh overlays** — auto-discovery works, but no permissioned membership. Anyone can join.
 
 **meshguard** fills the gap: auto-discovers peers, negotiates WireGuard tunnels, traverses NATs, and enforces membership — all serverless.
 
