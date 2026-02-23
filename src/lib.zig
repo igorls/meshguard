@@ -43,6 +43,7 @@ pub const net = struct {
     pub const Offload = @import("net/offload.zig");
     pub const Io = @import("net/io.zig");
     pub const Tun = @import("net/tun.zig");
+    pub const Dns = @import("net/dns.zig");
 };
 
 pub const config = @import("config.zig");

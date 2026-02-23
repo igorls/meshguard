@@ -25,9 +25,11 @@ const usage =
     \\
     \\OPTIONS:
     \\  --config <path>     Path to config file
-    \\  --seed <ip:port>    Seed peer address (can be repeated)
-    \\  --seed-dns <domain> DNS domain for seed discovery
-    \\  --seed-mdns         Enable mDNS seed discovery
+    \\  --seed <host:port>   Seed peer (IP or hostname, can be repeated)
+    \\  --dns <domain>       Discover seeds via DNS TXT records
+    \\  --mdns               Discover seeds via mDNS on LAN
+    \\  --announce <ip>      Override public IP (skip STUN)
+    \\  --kernel             Use kernel WireGuard (requires root)
     \\  -h, --help          Show this help
     \\
 ;
@@ -300,24 +302,25 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     const stdout = getStdOut();
     const stderr = getStdErr();
 
-    // Parse --seed, --announce, and --kernel arguments
+    // Parse --seed, --announce, --kernel, --dns, and --mdns arguments
     const messages = @import("protocol/messages.zig");
     var seed_buf: [16]messages.Endpoint = undefined;
     var seed_count: usize = 0;
     var announce_addr: ?[4]u8 = null;
     var use_kernel_wg: bool = false;
+    var dns_domain: []const u8 = "";
+    var use_mdns: bool = false;
+    // Collect raw seed strings for hostname resolution
+    var seed_strs: [16][]const u8 = undefined;
+    var seed_str_count: usize = 0;
     {
         var i: usize = 0;
         while (i < extra_args.len) : (i += 1) {
             if (std.mem.eql(u8, extra_args[i], "--seed") and i + 1 < extra_args.len) {
                 i += 1;
-                if (lib.discovery.Seed.parseEndpoint(extra_args[i])) |ep| {
-                    if (seed_count < seed_buf.len) {
-                        seed_buf[seed_count] = ep;
-                        seed_count += 1;
-                    }
-                } else {
-                    try writeFormatted(stderr, "warning: ignoring invalid seed '{s}'\n", .{extra_args[i]});
+                if (seed_str_count < seed_strs.len) {
+                    seed_strs[seed_str_count] = extra_args[i];
+                    seed_str_count += 1;
                 }
             } else if (std.mem.eql(u8, extra_args[i], "--announce") and i + 1 < extra_args.len) {
                 i += 1;
@@ -329,11 +332,45 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
                 }
             } else if (std.mem.eql(u8, extra_args[i], "--kernel")) {
                 use_kernel_wg = true;
+            } else if (std.mem.eql(u8, extra_args[i], "--dns") and i + 1 < extra_args.len) {
+                i += 1;
+                dns_domain = extra_args[i];
+            } else if (std.mem.eql(u8, extra_args[i], "--mdns")) {
+                use_mdns = true;
             }
         }
     }
 
-    // Load identity
+    // Resolve seeds (static + DNS TXT + mDNS)
+    const has_discovery = dns_domain.len > 0 or use_mdns;
+    if (has_discovery) {
+        const resolved = lib.discovery.Seed.resolveSeeds(
+            allocator,
+            seed_strs[0..seed_str_count],
+            dns_domain,
+            use_mdns,
+        ) catch &.{};
+        defer if (resolved.len > 0) allocator.free(resolved);
+
+        for (resolved) |ep| {
+            if (seed_count < seed_buf.len) {
+                seed_buf[seed_count] = ep;
+                seed_count += 1;
+            }
+        }
+    } else {
+        // No DNS/mDNS — parse static seeds directly (fast path, no allocator)
+        for (seed_strs[0..seed_str_count]) |seed_str| {
+            if (lib.discovery.Seed.parseEndpoint(seed_str)) |ep| {
+                if (seed_count < seed_buf.len) {
+                    seed_buf[seed_count] = ep;
+                    seed_count += 1;
+                }
+            } else {
+                try writeFormatted(stderr, "warning: ignoring invalid seed '{s}'\n", .{seed_str});
+            }
+        }
+    }
     const kp = Identity.load(allocator, config_dir) catch |err| {
         if (err == error.FileNotFound) {
             try stderr.writeAll("error: no identity found. Run 'meshguard keygen' first.\n");
@@ -749,11 +786,9 @@ fn dataPlaneWorker(
                     const vhdr: *const Offload.VirtioNetHdr = @ptrCast(@alignCast(&tun_buf));
                     const ip_data = tun_buf[Offload.VNET_HDR_LEN..n];
 
-                    // Complete partial checksum if kernel used checksum offload
-                    Offload.completeChecksum(vhdr.*, ip_data);
-
                     if (vhdr.gso_type != Offload.GSO_NONE) {
-                        // GSO super-packet — split into segments, encrypt each
+                        // GSO super-packet — split into segments, encrypt each.
+                        // gsoSplit() handles all checksums internally per-segment.
                         var seg_sizes: [BatchUdp.BATCH_SIZE]usize = undefined;
                         const seg_count = Offload.gsoSplit(
                             vhdr.*,
@@ -767,9 +802,12 @@ fn dataPlaneWorker(
                             encryptAndQueue(wg_dev, seg_bufs[s][0..seg_sizes[s]], &encrypt_bufs[send_idx], &tx, &send_idx);
                         }
                     } else {
-                        // Non-GSO: standard single packet
+                        // Non-GSO: complete partial checksum if kernel used offload
                         if (ip_data.len < 20) continue;
-                        encryptAndQueue(wg_dev, ip_data, &encrypt_bufs[send_idx], &tx, &send_idx);
+                        // ip_data is a mutable slice of tun_buf, safe to call completeChecksum
+                        const mutable_data = tun_buf[Offload.VNET_HDR_LEN..n];
+                        Offload.completeChecksum(vhdr.*, mutable_data);
+                        encryptAndQueue(wg_dev, mutable_data, &encrypt_bufs[send_idx], &tx, &send_idx);
                     }
                 } else {
                     // No vnet_hdr — legacy single-packet mode
