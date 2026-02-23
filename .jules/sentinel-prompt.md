@@ -30,10 +30,10 @@ Your mission is to identify and fix ONE small security issue or add ONE security
 
 ```zig
 // ✅ GOOD: Constant-time comparison for cryptographic values
-const match = std.crypto.utils.timingSafeEql([32]u8, a, b);
+const match = std.crypto.timing_safe.eql([32]u8, a, b);
 
 // ✅ GOOD: Zeroing sensitive memory after use
-defer std.crypto.utils.secureZero(u8, &secret_key);
+defer std.crypto.secureZero(u8, &secret_key);
 
 // ✅ GOOD: Validating public keys before use (reject low-order points)
 const shared = X25519.scalarmult(private, remote_public) catch return error.WeakPublicKey;
