@@ -158,6 +158,41 @@ pub const SwimProtocol = struct {
         self.running.store(false, .release);
     }
 
+    /// Broadcast a leave announcement to all alive peers.
+    /// Called from signal handler before stop() — async-signal-safe.
+    /// Best-effort: sends a PING with piggybacked leave gossip to every
+    /// alive peer so they remove us immediately (no suspicion timeout).
+    pub fn broadcastLeave(self: *SwimProtocol) void {
+        self.membership.lamport += 1;
+
+        const leave_gossip = [1]messages.GossipEntry{.{
+            .subject_pubkey = self.our_pubkey,
+            .event = .leave,
+            .lamport = self.membership.lamport,
+            .endpoint = null,
+        }};
+
+        const ping = messages.Ping{
+            .sender_pubkey = self.our_pubkey,
+            .seq = self.seq +% 1,
+            .gossip = &leave_gossip,
+        };
+
+        var buf: [1500]u8 = undefined;
+        const written = codec.encodePing(&buf, ping) catch return;
+
+        // Send to every alive peer with a known endpoint
+        var iter = self.membership.peers.iterator();
+        while (iter.next()) |entry| {
+            const peer = entry.value_ptr;
+            if (peer.state == .alive or peer.state == .suspected) {
+                if (peer.gossip_endpoint) |ep| {
+                    _ = self.socket.sendTo(buf[0..written], ep.addr, ep.port) catch {};
+                }
+            }
+        }
+    }
+
     /// Single iteration of the SWIM protocol.
     pub fn tick(self: *SwimProtocol) !void {
         // 1. Process incoming messages (poll with gossip_interval timeout)

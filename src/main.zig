@@ -565,6 +565,7 @@ var g_swim_stop: ?*lib.discovery.Swim.SwimProtocol = null;
 fn signalHandler(sig: i32) callconv(.c) void {
     _ = sig;
     if (g_swim_stop) |swim_ref| {
+        swim_ref.broadcastLeave();
         swim_ref.stop();
     }
 }
