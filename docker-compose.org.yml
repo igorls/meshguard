@@ -1,0 +1,88 @@
+# MeshGuard — 3-node org fleet simulation (org trust mode)
+#
+# Usage:
+#   zig build -Doptimize=ReleaseSafe
+#   docker compose -f docker-compose.org.yml up --build
+#   docker compose -f docker-compose.org.yml down
+#
+# node-a is the org admin (generates org key, signs all peers)
+# All nodes trust the org key and present org-signed certificates
+
+services:
+  node-a:
+    build:
+      context: .
+      dockerfile: Dockerfile.org
+    container_name: mg-org-a
+    hostname: node-a
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      - net.ipv4.ip_forward=1
+    volumes:
+      - org-shared:/shared/org
+    networks:
+      mesh:
+        ipv4_address: 172.31.0.10
+    environment:
+      - MESHGUARD_CONFIG_DIR=/etc/meshguard
+      - ORG_ADMIN=1
+      - SEED_DELAY=3
+
+  node-b:
+    build:
+      context: .
+      dockerfile: Dockerfile.org
+    container_name: mg-org-b
+    hostname: node-b
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      - net.ipv4.ip_forward=1
+    volumes:
+      - org-shared:/shared/org
+    depends_on:
+      - node-a
+    networks:
+      mesh:
+        ipv4_address: 172.31.0.11
+    environment:
+      - MESHGUARD_CONFIG_DIR=/etc/meshguard
+      - SEED_PEERS=172.31.0.10:51821
+
+  node-c:
+    build:
+      context: .
+      dockerfile: Dockerfile.org
+    container_name: mg-org-c
+    hostname: node-c
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      - net.ipv4.ip_forward=1
+    volumes:
+      - org-shared:/shared/org
+    depends_on:
+      - node-a
+    networks:
+      mesh:
+        ipv4_address: 172.31.0.12
+    environment:
+      - MESHGUARD_CONFIG_DIR=/etc/meshguard
+      - SEED_PEERS=172.31.0.10:51821
+
+volumes:
+  org-shared:
+
+networks:
+  mesh:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24
