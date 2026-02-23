@@ -81,18 +81,6 @@ pub fn mixHash(hash: *[HASH_LEN]u8, data: []const u8) void {
     h.final(hash);
 }
 
-/// Constant-time comparison to prevent timing attacks.
-/// Works for any type that can be represented as bytes (arrays, structs).
-pub fn timingSafeEql(comptime T: type, a: T, b: T) bool {
-    const a_bytes = std.mem.asBytes(&a);
-    const b_bytes = std.mem.asBytes(&b);
-    var acc: u8 = 0;
-    for (a_bytes, b_bytes) |x, y| {
-        acc |= x ^ y;
-    }
-    return acc == 0;
-}
-
 // ─── Tests ───
 
 test "HMAC-Blake2s basic" {
@@ -128,13 +116,4 @@ test "mixHash updates hash" {
     const original = hash;
     mixHash(&hash, "data");
     try std.testing.expect(!std.mem.eql(u8, &hash, &original));
-}
-
-test "timingSafeEql compares correctly" {
-    const a: [16]u8 = .{1} ** 16;
-    const b: [16]u8 = .{1} ** 16;
-    const c: [16]u8 = .{2} ** 16;
-
-    try std.testing.expect(timingSafeEql([16]u8, a, b));
-    try std.testing.expect(!timingSafeEql([16]u8, a, c));
 }
