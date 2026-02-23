@@ -31,11 +31,12 @@ pub const Tunnel = struct {
     /// Transport keys from completed handshake
     keys: noise.TransportKeys,
 
-    /// Sending nonce counter (monotonically increasing)
-    send_counter: u64 = 0,
+    /// Sending nonce counter (monotonically increasing, atomic for multi-thread)
+    send_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
-    /// Anti-replay window for receiving
+    /// Anti-replay window for receiving (mutex-protected for multi-thread)
     replay_window: ReplayWindow = .{},
+    replay_lock: std.Thread.Mutex = .{},
 
     /// Last time we sent data (for keepalive scheduling)
     last_send_ns: i128 = 0,
@@ -48,11 +49,14 @@ pub const Tunnel = struct {
     /// Encrypt an outgoing IP packet into a WG transport message.
     /// Returns: [header(16) || encrypted_padded_data || tag(16)]
     pub fn encrypt(self: *Tunnel, plaintext: []const u8, out: []u8) !usize {
-        if (self.send_counter >= REJECT_AFTER_MESSAGES) return error.KeyExpired;
+        // Atomically fetch-add the counter for thread safety
+        const counter = self.send_counter.fetchAdd(1, .monotonic);
+
+        if (counter >= REJECT_AFTER_MESSAGES) return error.KeyExpired;
 
         const elapsed = std.time.nanoTimestamp() - self.keys.birthdate_ns;
         if (elapsed >= REJECT_AFTER_TIME_NS) return error.KeyExpired;
-        if (elapsed >= REKEY_AFTER_TIME_NS or self.send_counter >= REKEY_AFTER_MESSAGES)
+        if (elapsed >= REKEY_AFTER_TIME_NS or counter >= REKEY_AFTER_MESSAGES)
             self.needs_rekey = true;
 
         // Pad plaintext to multiple of 16 bytes (WG spec: prevents traffic analysis)
@@ -63,14 +67,12 @@ pub const Tunnel = struct {
 
         // Write transport header
         std.mem.writeInt(u32, out[0..4], 4, .little); // Type 4
-        std.mem.writeInt(u32, out[4..8], self.keys.receiving_index, .little); // Peer's receiver index
-        std.mem.writeInt(u64, out[8..16], self.send_counter, .little); // Counter/nonce
+        std.mem.writeInt(u32, out[4..8], self.keys.receiving_index, .little);
+        std.mem.writeInt(u64, out[8..16], counter, .little);
 
         // Build 12-byte nonce: 4 zero bytes || 8-byte LE counter
-        // WG spec: "counter is prepended with four bytes of zeros"
-        // Kernel: put_unaligned_le64(nonce, iv + 4)
         var nonce: [12]u8 = .{0} ** 12;
-        std.mem.writeInt(u64, nonce[4..12], self.send_counter, .little);
+        std.mem.writeInt(u64, nonce[4..12], counter, .little);
 
         // Copy plaintext + zero padding into output buffer temporarily
         const ct_start = TRANSPORT_HEADER_LEN;
@@ -89,7 +91,6 @@ pub const Tunnel = struct {
             self.keys.sending_key,
         );
 
-        self.send_counter += 1;
         self.last_send_ns = std.time.nanoTimestamp();
 
         return total_len;
@@ -107,8 +108,12 @@ pub const Tunnel = struct {
 
         const counter = std.mem.readInt(u64, packet[8..16], .little);
 
-        // Anti-replay check
-        if (!self.replay_window.check(counter)) return error.ReplayedPacket;
+        // Anti-replay check (mutex-protected for multi-thread)
+        {
+            self.replay_lock.lock();
+            defer self.replay_lock.unlock();
+            if (!self.replay_window.check(counter)) return error.ReplayedPacket;
+        }
 
         // Check key expiration
         const elapsed = std.time.nanoTimestamp() - self.keys.birthdate_ns;

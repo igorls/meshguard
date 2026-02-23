@@ -18,6 +18,7 @@ pub const TunDevice = struct {
     const TUNSETIFF: u32 = 0x400454ca;
     const IFF_TUN: u16 = 0x0001;
     const IFF_NO_PI: u16 = 0x1000; // No packet info (no 4-byte header)
+    const IFF_MULTI_QUEUE: u16 = 0x0100; // Multi-queue TUN for parallel I/O
 
     // ifreq structure for ioctl
     const Ifreq = extern struct {
@@ -27,15 +28,15 @@ pub const TunDevice = struct {
     };
 
     /// Open a TUN device with the given name.
-    /// Requires CAP_NET_ADMIN.
+    /// Requires CAP_NET_ADMIN. Uses IFF_MULTI_QUEUE to allow parallel I/O.
     pub fn open(name: []const u8) !TunDevice {
         // Open /dev/net/tun
         const fd = try posix.open("/dev/net/tun", .{ .ACCMODE = .RDWR }, 0);
         errdefer posix.close(fd);
 
-        // Set up ifreq
+        // Set up ifreq with MULTI_QUEUE
         var ifr = Ifreq{};
-        ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
+        ifr.ifr_flags = IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE;
         const copy_len = @min(name.len, 15);
         @memcpy(ifr.ifr_name[0..copy_len], name[0..copy_len]);
 
@@ -61,6 +62,33 @@ pub const TunDevice = struct {
             .fd = fd,
             .name = ifr.ifr_name,
             .name_len = name_len,
+        };
+    }
+
+    /// Open an additional queue fd above an existing multi-queue TUN device.
+    /// The kernel distributes packets across queues by flow hash.
+    pub fn openQueue(self: *const TunDevice) !TunDevice {
+        const fd = try posix.open("/dev/net/tun", .{ .ACCMODE = .RDWR }, 0);
+        errdefer posix.close(fd);
+
+        var ifr = Ifreq{};
+        ifr.ifr_flags = IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE;
+        @memcpy(ifr.ifr_name[0..self.name_len], self.name[0..self.name_len]);
+
+        const rc = std.os.linux.ioctl(
+            @intCast(fd),
+            TUNSETIFF,
+            @intFromPtr(&ifr),
+        );
+        if (rc != 0) {
+            posix.close(fd);
+            return error.TunSetupFailed;
+        }
+
+        return .{
+            .fd = fd,
+            .name = self.name,
+            .name_len = self.name_len,
         };
     }
 

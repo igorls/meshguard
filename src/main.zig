@@ -693,9 +693,67 @@ fn wgOnPeerPunched(ctx: *anyopaque, peer: *const lib.discovery.Membership.Peer, 
     }
 }
 
-/// Userspace multiplexed event loop.
-/// Polls both the UDP socket (for WG/SWIM/STUN) and the TUN device (for outgoing IP).
-/// Uses recvmmsg/sendmmsg for batch UDP I/O to minimize syscall overhead.
+/// Maximum data-plane worker threads.
+const MAX_WORKERS: usize = 8;
+
+/// Data-plane worker: reads TUN, encrypts, sends UDP via shared fd.
+/// Each worker has its own TUN fd (multi-queue). UDP send is thread-safe on DGRAM sockets.
+fn dataPlaneWorker(
+    running: *const std.atomic.Value(bool),
+    wg_dev: *lib.wireguard.Device.WgDevice,
+    tun_fd: posix.fd_t,
+    udp_fd: posix.fd_t,
+) void {
+    const BatchUdp = lib.net.BatchUdp;
+
+    var tx = BatchUdp.BatchSender{};
+    var tun_buf: [1500]u8 = undefined;
+    var encrypt_bufs: [BatchUdp.BATCH_SIZE][1600]u8 = undefined;
+
+    while (running.load(.acquire)) {
+        // Poll TUN fd only — workers handle send path (TUN→encrypt→UDP)
+        var fds = [_]posix.pollfd{
+            .{ .fd = tun_fd, .events = posix.POLL.IN, .revents = 0 },
+        };
+        _ = posix.poll(&fds, 50) catch continue;
+
+        if (fds[0].revents & posix.POLL.IN != 0) {
+            tx.reset();
+            var send_idx: usize = 0;
+
+            while (send_idx < BatchUdp.BATCH_SIZE) {
+                const n = posix.read(tun_fd, &tun_buf) catch break;
+                if (n == 0) break;
+
+                if (n < 20) continue;
+                const ip_packet = tun_buf[0..n];
+                const dst_ip: [4]u8 = ip_packet[16..20].*;
+
+                const target_slot = wg_dev.lookupByMeshIp(dst_ip);
+                if (target_slot) |slot| {
+                    if (wg_dev.encryptForPeer(slot, ip_packet, &encrypt_bufs[send_idx])) |enc_len| {
+                        if (wg_dev.peers[slot]) |peer| {
+                            if (peer.endpoint_addr[0] != 0) {
+                                tx.queue(encrypt_bufs[send_idx][0..enc_len], peer.endpoint_addr, peer.endpoint_port);
+                                send_idx += 1;
+                            }
+                        }
+                    } else |_| {}
+                }
+            }
+
+            _ = tx.flush(udp_fd);
+        }
+    }
+}
+
+/// Userspace multiplexed event loop with multi-threaded data plane.
+///
+/// Architecture:
+/// - N data-plane workers: each reads from its own TUN fd (multi-queue),
+///   encrypts, and sends via the shared UDP fd. Workers handle TUN→UDP.
+/// - Control-plane (this function): receives all UDP, dispatches handshakes
+///   to WG device, SWIM gossip, and decrypts transport → TUN. Handles UDP→TUN.
 fn userspaceEventLoop(
     swim: *lib.discovery.Swim.SwimProtocol,
     wg_dev: *lib.wireguard.Device.WgDevice,
@@ -706,28 +764,64 @@ fn userspaceEventLoop(
     const Device = lib.wireguard.Device;
     const BatchUdp = lib.net.BatchUdp;
 
-    // Set TUN to non-blocking for poll
-    var tun_mut = tun_dev;
-    try tun_mut.setNonBlocking();
+    // Determine worker count: min(cpus, MAX_WORKERS), at least 1
+    const cpu_count = std.Thread.getCpuCount() catch 1;
+    const n_workers = @min(cpu_count, MAX_WORKERS);
 
-    // Batch I/O state — pre-allocated for zero-alloc hot path
+    writeFormatted(stdout, "  data-plane workers: {d} (on {d} CPUs)\n", .{ n_workers, cpu_count }) catch {};
+
+    // Open additional TUN queue fds for workers
+    var tun_fds: [MAX_WORKERS]posix.fd_t = undefined;
+    var opened_workers: usize = 0;
+
+    for (0..n_workers) |w| {
+        if (w == 0) {
+            tun_fds[0] = tun_dev.fd;
+        } else {
+            const extra_tun = tun_dev.openQueue() catch {
+                writeFormatted(stdout, "  warning: could not open TUN queue {d}\n", .{w}) catch {};
+                break;
+            };
+            tun_fds[w] = extra_tun.fd;
+        }
+        opened_workers += 1;
+    }
+
+    writeFormatted(stdout, "  opened {d} TUN queues\n", .{opened_workers}) catch {};
+
+    // Set all TUN fds to non-blocking
+    for (0..opened_workers) |w| {
+        const flags = posix.fcntl(tun_fds[w], posix.F.GETFL, 0) catch continue;
+        _ = posix.fcntl(tun_fds[w], posix.F.SETFL, flags | @as(usize, 0x800)) catch {};
+    }
+
+    // Spawn worker threads — all share the same UDP fd for sending
+    var threads: [MAX_WORKERS]std.Thread = undefined;
+    var spawned: usize = 0;
+    for (0..opened_workers) |w| {
+        threads[w] = std.Thread.spawn(.{}, dataPlaneWorker, .{
+            &swim.running,
+            wg_dev,
+            tun_fds[w],
+            udp_sock.fd,
+        }) catch {
+            writeFormatted(stdout, "  warning: failed to spawn worker {d}\n", .{w}) catch {};
+            continue;
+        };
+        spawned += 1;
+    }
+    writeFormatted(stdout, "  spawned {d} data-plane workers\n", .{spawned}) catch {};
+
+    // ── Control-plane loop: SWIM + handshakes + decrypt on original gossip socket ──
     var rx = BatchUdp.BatchReceiver{};
-    rx.setupPointers(); // Must be called after struct is at final stack location
-    var tx = BatchUdp.BatchSender{};
-
-    var tun_buf: [1500]u8 = undefined;
-    // Encrypt buffers: one per batch slot so sendmmsg can reference them simultaneously
-    var encrypt_bufs: [BatchUdp.BATCH_SIZE][1600]u8 = undefined;
+    rx.setupPointers();
 
     while (swim.running.load(.acquire)) {
-        // Poll both fds with 50ms timeout
         var fds = [_]posix.pollfd{
             .{ .fd = udp_sock.fd, .events = posix.POLL.IN, .revents = 0 },
-            .{ .fd = tun_dev.fd, .events = posix.POLL.IN, .revents = 0 },
         };
         _ = posix.poll(&fds, 50) catch continue;
 
-        // ── Batch-receive incoming UDP packets ──
         if (fds[0].revents & posix.POLL.IN != 0) {
             const count = rx.recvBatch(udp_sock.fd);
             for (0..count) |i| {
@@ -760,7 +854,7 @@ fn userspaceEventLoop(
                     .wg_transport => {
                         var decrypt_buf: [1500]u8 = undefined;
                         if (wg_dev.decryptTransport(pkt, &decrypt_buf)) |result| {
-                            tun_mut.write(decrypt_buf[0..result.len]) catch {};
+                            _ = posix.write(tun_dev.fd, decrypt_buf[0..result.len]) catch {};
                         } else |_| {}
                     },
                     .wg_cookie => {},
@@ -771,38 +865,17 @@ fn userspaceEventLoop(
             }
         }
 
-        // ── Batch-send outgoing IP packets TUN → encrypt → UDP ──
-        if (fds[1].revents & posix.POLL.IN != 0) {
-            tx.reset();
-            var send_idx: usize = 0;
-
-            while (send_idx < BatchUdp.BATCH_SIZE) {
-                const n = tun_mut.read(&tun_buf) catch break;
-                if (n == 0) break;
-
-                const ip_packet = tun_buf[0..n];
-                if (n < 20) continue;
-                const dst_ip: [4]u8 = ip_packet[16..20].*;
-
-                const target_slot = wg_dev.lookupByMeshIp(dst_ip);
-                if (target_slot) |slot| {
-                    if (wg_dev.encryptForPeer(slot, ip_packet, &encrypt_bufs[send_idx])) |enc_len| {
-                        if (wg_dev.peers[slot]) |peer| {
-                            if (peer.endpoint_addr[0] != 0) {
-                                tx.queue(encrypt_bufs[send_idx][0..enc_len], peer.endpoint_addr, peer.endpoint_port);
-                                send_idx += 1;
-                            }
-                        }
-                    } else |_| {}
-                }
-            }
-
-            // Flush all queued encrypted packets in one sendmmsg call
-            _ = tx.flush(udp_sock.fd);
-        }
-
-        // ── Run SWIM timers (gossip probes, expiry, hole punch) ──
         swim.tickTimersOnly();
+    }
+
+    // Wait for worker threads to finish
+    for (0..spawned) |w| {
+        threads[w].join();
+    }
+
+    // Close extra TUN fds (skip tun_fds[0] — primary, closed by caller)
+    for (1..opened_workers) |w| {
+        posix.close(tun_fds[w]);
     }
 }
 
