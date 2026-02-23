@@ -614,7 +614,8 @@ fn wgOnPeerJoin(ctx: *anyopaque, peer: *const lib.discovery.Membership.Peer) voi
             const peer_addr = if (peer.gossip_endpoint) |ep| ep.addr else if (peer.public_endpoint) |pub_ep| pub_ep.addr else [4]u8{ 0, 0, 0, 0 };
             const peer_port = if (peer.gossip_endpoint) |ep| ep.port else if (peer.public_endpoint) |pub_ep| pub_ep.port else @as(u16, 0);
 
-            const slot = dev.addPeer(peer.pubkey, wg_key, peer_addr, peer_port) catch {
+            // Pass peer.mesh_ip as allowed_ip to enable O(1) lookup
+            const slot = dev.addPeer(peer.pubkey, wg_key, peer.mesh_ip, peer_addr, peer_port) catch {
                 writeFormatted(handler.stdout, "  warning: failed to add userspace WG peer {s}\n", .{ip_str}) catch {};
                 return;
             };
@@ -790,7 +791,8 @@ fn userspaceEventLoop(
                 const dst_ip: [4]u8 = ip_packet[16..20].*;
 
                 // Look up destination peer by mesh IP and encrypt
-                const target_slot = findPeerByMeshIp(wg_dev, swim, dst_ip);
+                // Optimization: use O(1) WgDevice lookup instead of scanning SWIM membership
+                const target_slot = wg_dev.findByAllowedIp(dst_ip);
                 if (target_slot) |slot| {
                     if (wg_dev.encryptForPeer(slot, ip_packet, &encrypt_buf)) |enc_len| {
                         const peer = &(wg_dev.peers[slot].?);
@@ -805,24 +807,6 @@ fn userspaceEventLoop(
         // ── Run SWIM timers (gossip probes, expiry, hole punch) ──
         swim.tickTimersOnly();
     }
-}
-
-/// Look up which WgDevice peer slot corresponds to a mesh IP address.
-fn findPeerByMeshIp(
-    wg_dev: *const lib.wireguard.Device.WgDevice,
-    swim: *const lib.discovery.Swim.SwimProtocol,
-    mesh_ip: [4]u8,
-) ?usize {
-    // Walk membership table to find identity_key for this mesh IP,
-    // then map to WgDevice slot
-    var iter = swim.membership.peers.iterator();
-    while (iter.next()) |entry| {
-        const peer = entry.value_ptr;
-        if (std.mem.eql(u8, &peer.mesh_ip, &mesh_ip)) {
-            return wg_dev.findByIdentity(entry.key_ptr.*);
-        }
-    }
-    return null;
 }
 
 /// Parse a dotted-decimal IPv4 address like "1.2.3.4" into [4]u8.

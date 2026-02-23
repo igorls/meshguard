@@ -130,7 +130,7 @@ pub fn main() !void {
     try writeFormatted(stdout, "  UDP listening on :{d}\n", .{listen_port});
 
     // Add peer
-    const slot = wg_dev.addPeer(.{0} ** 32, peer_pub, ep.addr, ep.port) catch |err| {
+    const slot = wg_dev.addPeer(.{0} ** 32, peer_pub, .{0} ** 4, ep.addr, ep.port) catch |err| {
         try writeFormatted(stderr, "error: addPeer: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };

@@ -59,6 +59,8 @@ pub const WgPeer = struct {
     active_tunnel: ?tunnel.Tunnel = null,
     /// Our sender index for this peer
     sender_index: u32 = 0,
+    /// Allowed IP (mesh IP) for this peer
+    allowed_ip: [4]u8 = .{0} ** 4,
     /// Peer's endpoint
     endpoint_addr: [4]u8 = .{0} ** 4,
     endpoint_port: u16 = 0,
@@ -230,12 +232,14 @@ pub const WgDevice = struct {
 
     /// Add or update a peer by their WG public key.
     /// Returns the peer slot index.
-    pub fn addPeer(self: *WgDevice, identity_key: [32]u8, wg_pubkey: [32]u8, addr: [4]u8, port: u16) !usize {
+    pub fn addPeer(self: *WgDevice, identity_key: [32]u8, wg_pubkey: [32]u8, allowed_ip: [4]u8, addr: [4]u8, port: u16) !usize {
         // Check if peer already exists
         if (self.static_map.get(wg_pubkey)) |existing| {
             if (self.peers[existing]) |*peer| {
                 peer.endpoint_addr = addr;
                 peer.endpoint_port = port;
+                // Also update allowed_ip if it changed (e.g. peer re-joined)
+                peer.allowed_ip = allowed_ip;
                 return existing;
             }
         }
@@ -253,6 +257,7 @@ pub const WgDevice = struct {
                     .identity_key = identity_key,
                     .wg_pubkey = wg_pubkey,
                     .handshake = handshake,
+                    .allowed_ip = allowed_ip,
                     .endpoint_addr = addr,
                     .endpoint_port = port,
                     .sender_index = sender_idx,
@@ -396,6 +401,19 @@ pub const WgDevice = struct {
     pub fn findByWgPubkey(self: *const WgDevice, wg_pubkey: [32]u8) ?usize {
         return self.static_map.get(wg_pubkey);
     }
+
+    /// Find a peer slot by allowed IP (mesh IP).
+    /// Used for outgoing packet routing.
+    /// Optimization: Iterates over WgDevice peers (max 64) instead of full membership table (thousands).
+    pub fn findByAllowedIp(self: *const WgDevice, ip: [4]u8) ?usize {
+        for (self.peers, 0..) |slot, i| {
+            if (slot) |peer| {
+                // Compare 4 bytes of IP address
+                if (std.mem.eql(u8, &peer.allowed_ip, &ip)) return i;
+            }
+        }
+        return null;
+    }
 };
 
 // ─── Tests ───
@@ -412,16 +430,22 @@ test "WgDevice add/remove peer" {
     std.crypto.random.bytes(&peer_secret);
     const peer_pub = try X25519.recoverPublicKey(peer_secret);
 
-    const slot = try dev.addPeer(.{0} ** 32, peer_pub, .{ 10, 0, 0, 1 }, 51821);
+    const mesh_ip = [4]u8{ 10, 99, 0, 5 };
+    const slot = try dev.addPeer(.{0} ** 32, peer_pub, mesh_ip, .{ 10, 0, 0, 1 }, 51821);
     try std.testing.expectEqual(dev.peer_count, 1);
     try std.testing.expect(dev.peers[slot] != null);
 
     // Verify O(1) lookup works
     try std.testing.expectEqual(dev.findByWgPubkey(peer_pub), slot);
 
+    // Verify IP lookup works
+    try std.testing.expectEqual(dev.findByAllowedIp(mesh_ip), slot);
+    try std.testing.expectEqual(dev.findByAllowedIp(.{ 1, 2, 3, 4 }), null);
+
     dev.removePeer(peer_pub);
     try std.testing.expectEqual(dev.peer_count, 0);
     try std.testing.expectEqual(dev.findByWgPubkey(peer_pub), null);
+    try std.testing.expectEqual(dev.findByAllowedIp(mesh_ip), null);
 }
 
 test "IndexTable put/get/remove" {
