@@ -141,3 +141,26 @@ docker compose up
 ```
 
 See `meshguard/docker-compose.yml` for the full configuration.
+
+## Run as a service
+
+The installer automatically sets up a systemd service. To use it:
+
+```bash
+# Configure seed peers
+sudo vi /etc/default/meshguard
+
+# Enable and start
+sudo systemctl enable meshguard
+sudo systemctl start meshguard
+
+# View logs
+sudo journalctl -u meshguard -f
+```
+
+Edit `/etc/default/meshguard` to set your options:
+
+```bash
+# Seed peers and flags
+MESHGUARD_OPTS="--seed 1.2.3.4:51821"
+```

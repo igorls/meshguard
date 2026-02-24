@@ -1,0 +1,11 @@
+# meshguard daemon options
+# See: meshguard --help
+
+# Seed peers (space-separated flags)
+MESHGUARD_OPTS="--seed 1.2.3.4:51821"
+
+# Examples:
+# MESHGUARD_OPTS="--seed 1.2.3.4:51821 --seed 5.6.7.8:51821"
+# MESHGUARD_OPTS="--seed 1.2.3.4:51821 --kernel"
+# MESHGUARD_OPTS="--dns meshguard.example.com"
+# MESHGUARD_OPTS="--mdns"

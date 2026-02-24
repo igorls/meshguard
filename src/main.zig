@@ -5,7 +5,7 @@ const Config = lib.config.Config;
 const Identity = lib.identity.Keys;
 const posix = std.posix;
 
-const version = "0.3.0";
+const version = "0.3.1";
 
 const usage =
     \\meshguard — decentralized WireGuard mesh VPN daemon
@@ -574,7 +574,10 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     {
         var i: usize = 0;
         while (i < extra_args.len) : (i += 1) {
-            if (std.mem.eql(u8, extra_args[i], "--seed") and i + 1 < extra_args.len) {
+            if (std.mem.eql(u8, extra_args[i], "--help") or std.mem.eql(u8, extra_args[i], "-h")) {
+                try getStdOut().writeAll(usage);
+                return;
+            } else if (std.mem.eql(u8, extra_args[i], "--seed") and i + 1 < extra_args.len) {
                 i += 1;
                 if (seed_str_count < seed_strs.len) {
                     seed_strs[seed_str_count] = extra_args[i];

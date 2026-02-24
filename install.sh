@@ -69,12 +69,27 @@ fi
 
 chmod +x "$TMPFILE"
 
-# Install
+# Install binary
 echo "📦 Installing to ${INSTALL_DIR}/${BINARY}..."
 if [ -w "$INSTALL_DIR" ]; then
   mv "$TMPFILE" "${INSTALL_DIR}/${BINARY}"
 else
   sudo mv "$TMPFILE" "${INSTALL_DIR}/${BINARY}"
+fi
+
+# Install systemd service (if systemd is present)
+if command -v systemctl &>/dev/null; then
+  echo "🔧 Installing systemd service..."
+  BRANCH="main"
+  DIST_URL="https://raw.githubusercontent.com/${REPO}/${BRANCH}/dist"
+  sudo curl -fsSL -o /etc/systemd/system/meshguard.service "${DIST_URL}/meshguard.service"
+  if [ ! -f /etc/default/meshguard ]; then
+    sudo curl -fsSL -o /etc/default/meshguard "${DIST_URL}/meshguard.default"
+  fi
+  sudo systemctl daemon-reload
+  SYSTEMD_INSTALLED=true
+else
+  SYSTEMD_INSTALLED=false
 fi
 
 # Verify
@@ -89,5 +104,13 @@ fi
 
 echo ""
 echo "Get started:"
-echo "  meshguard keygen       # generate identity"
-echo "  meshguard --help       # see all commands"
+echo "  meshguard keygen                  # generate identity"
+echo "  meshguard --help                  # see all commands"
+if [ "$SYSTEMD_INSTALLED" = true ]; then
+  echo ""
+  echo "Run as a service:"
+  echo "  sudo vi /etc/default/meshguard    # set seed peers"
+  echo "  sudo systemctl enable meshguard   # start on boot"
+  echo "  sudo systemctl start meshguard    # start now"
+  echo "  sudo journalctl -u meshguard -f   # view logs"
+fi
