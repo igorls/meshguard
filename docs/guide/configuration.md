@@ -29,8 +29,8 @@ $MESHGUARD_CONFIG_DIR/
 | Flag         | Default  | Description                                      |
 | ------------ | -------- | ------------------------------------------------ |
 | `--seed`     | _(none)_ | Seed peer address (`ip:port`). Can be repeated.  |
-| `--port`     | `51821`  | UDP port for gossip + discovery                  |
-| `--wg-port`  | `51820`  | WireGuard listen port                            |
+| `--dns`      | _(none)_ | Discover seeds via DNS TXT records               |
+| `--mdns`     | `false`  | Discover seeds via mDNS on LAN                   |
 | `--announce` | _(auto)_ | Manually announce this IP to peers               |
 | `--kernel`   | `false`  | Use kernel WireGuard module instead of userspace |
 
@@ -51,7 +51,7 @@ $MESHGUARD_CONFIG_DIR/
 | Parameter         | Value          | Source             |
 | ----------------- | -------------- | ------------------ |
 | Gossip port       | `51821`        | `config.zig`       |
-| WireGuard port    | `51820`        | `config.zig`       |
+| WireGuard port    | `51830`        | `config.zig`       |
 | Mesh prefix       | `10.99.0.0/16` | `wireguard/ip.zig` |
 | Interface name    | `mg0`          | `wg_config.zig`    |
 | MTU               | `1420`         | `tun.zig`          |

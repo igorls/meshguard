@@ -76,8 +76,8 @@ meshguard up [options]
 | Flag         | Default  | Description                                 |
 | ------------ | -------- | ------------------------------------------- |
 | `--seed`     | _(none)_ | Seed peer `ip:port`. Can be repeated.       |
-| `--port`     | `51821`  | UDP gossip port                             |
-| `--wg-port`  | `51820`  | WireGuard listen port                       |
+| `--dns`      | _(none)_ | Discover seeds via DNS TXT records          |
+| `--mdns`     | `false`  | Discover seeds via mDNS on LAN              |
 | `--announce` | _(auto)_ | Manually specify public IP for announcement |
 | `--kernel`   | `false`  | Use kernel WireGuard instead of userspace   |
 
