@@ -15,7 +15,7 @@ meshguard version
 ```
 
 ::: tip Other architectures
-Replace `amd64` with `arm64` (Raspberry Pi, AWS Graviton) or `386` (32-bit x86).
+Replace `amd64` with `arm64` for Raspberry Pi, AWS Graviton, and other ARM64 platforms.
 :::
 
 ::: warning Runtime dependency

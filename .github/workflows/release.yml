@@ -10,17 +10,15 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
     strategy:
       matrix:
         include:
-          - target: x86_64-linux-gnu
+          - runner: ubuntu-latest
             artifact: meshguard-linux-amd64
-          - target: aarch64-linux-gnu
+          - runner: ubuntu-24.04-arm
             artifact: meshguard-linux-arm64
-          - target: x86-linux-gnu
-            artifact: meshguard-linux-386
 
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
@@ -33,7 +31,7 @@ jobs:
           version: 0.15.0
 
       - name: Build
-        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
+        run: zig build -Doptimize=ReleaseFast
 
       - name: Rename binary
         run: mv zig-out/bin/meshguard ${{ matrix.artifact }}
@@ -69,7 +67,7 @@ jobs:
             ## Install
 
             ```bash
-            # Download (replace amd64 with arm64 or 386 as needed)
+            # Download (replace amd64 with arm64 as needed)
             curl -Lo meshguard https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/meshguard-linux-amd64
             chmod +x meshguard
             sudo mv meshguard /usr/local/bin/
