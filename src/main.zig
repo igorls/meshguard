@@ -5,7 +5,7 @@ const Config = lib.config.Config;
 const Identity = lib.identity.Keys;
 const posix = std.posix;
 
-const version = "0.1.0";
+const version = "0.3.0";
 
 const usage =
     \\meshguard — decentralized WireGuard mesh VPN daemon
@@ -25,6 +25,7 @@ const usage =
     \\  org-keygen  Generate a new org keypair
     \\  org-sign    Sign a node's key with org key (--name <label>)
     \\  org-vouch   Vouch for an external node (auto-propagates to org members)
+    \\  config show Show local node configuration (works offline)
     \\  version     Print version
     \\
     \\OPTIONS:
@@ -136,6 +137,15 @@ pub fn main() !void {
             std.process.exit(1);
         }
         try cmdOrgVouch(allocator, args[2]);
+        return;
+    }
+
+    if (std.mem.eql(u8, command, "config")) {
+        if (args.len < 3 or !std.mem.eql(u8, args[2], "show")) {
+            try getStdErr().writeAll("usage: meshguard config show\n");
+            std.process.exit(1);
+        }
+        try cmdConfigShow(allocator);
         return;
     }
 
@@ -2333,4 +2343,167 @@ fn formatBytes(bytes: u64) FormattedBytes {
         const rem = bytes % (1024 * 1024 * 1024);
         return .{ .whole = gib, .frac = rem * 10 / (1024 * 1024 * 1024), .unit = "GiB" };
     }
+}
+
+// ─── Config Show ───
+
+fn cmdConfigShow(allocator: std.mem.Allocator) !void {
+    const stdout = getStdOut();
+    const stderr = getStdErr();
+
+    const config_dir = Config.defaultConfigDir(allocator) catch {
+        try stderr.writeAll("error: cannot determine config directory\n");
+        std.process.exit(1);
+    };
+    defer allocator.free(config_dir);
+
+    try stdout.writeAll("meshguard v" ++ version ++ " — node configuration\n\n");
+    try writeFormatted(stdout, "  config dir: {s}/\n", .{config_dir});
+
+    // ─── Identity ───
+    const has_identity = blk: {
+        if (Identity.load(allocator, config_dir)) |kp| {
+            try stdout.writeAll("\n\x1b[1m─── Identity ───────────────────────────────────\x1b[0m\n");
+
+            // Ed25519 public key (base64)
+            var pk_b64: [44]u8 = undefined;
+            const pub_b64 = std.base64.standard.Encoder.encode(&pk_b64, &kp.public_key.toBytes());
+            try writeFormatted(stdout, "  public key (Ed25519):   {s}\n", .{pub_b64});
+
+            // Derive WG X25519 public key from Ed25519 secret key
+            const sk_bytes = kp.secret_key.seed();
+            var hash: [64]u8 = undefined;
+            std.crypto.hash.sha2.Sha512.hash(&sk_bytes, &hash, .{});
+            var wg_private_key: [32]u8 = hash[0..32].*;
+            wg_private_key[0] &= 248;
+            wg_private_key[31] &= 127;
+            wg_private_key[31] |= 64;
+
+            if (std.crypto.dh.X25519.recoverPublicKey(wg_private_key)) |wg_pub| {
+                var wg_b64: [44]u8 = undefined;
+                const wg_pub_b64 = std.base64.standard.Encoder.encode(&wg_b64, &wg_pub);
+                try writeFormatted(stdout, "  public key (WG X25519): {s}\n", .{wg_pub_b64});
+            } else |_| {}
+
+            // Mesh IP
+            const pub_key = std.crypto.sign.Ed25519.PublicKey.fromBytes(kp.public_key.toBytes()) catch unreachable;
+            const mesh_ip = lib.wireguard.Ip.deriveFromPubkey(pub_key);
+            var ip_buf: [15]u8 = undefined;
+            const ip_str = lib.wireguard.Ip.formatIp(mesh_ip, &ip_buf);
+            try writeFormatted(stdout, "  mesh IP:                {s}\n", .{ip_str});
+
+            break :blk true;
+        } else |_| {
+            break :blk false;
+        }
+    };
+
+    if (!has_identity) {
+        try stdout.writeAll("\n  ⚠ No identity found. Run 'meshguard keygen' to create one.\n");
+    }
+
+    // ─── Org Membership (node.cert) ───
+    const cert_path = std.fs.path.join(allocator, &.{ config_dir, "node.cert" }) catch null;
+    defer if (cert_path) |p| allocator.free(p);
+
+    if (cert_path) |cp| {
+        if (lib.identity.Org.loadCertificate(allocator, cp)) |cert| {
+            try stdout.writeAll("\n\x1b[1m─── Org Membership ─────────────────────────────\x1b[0m\n");
+
+            var org_b64: [44]u8 = undefined;
+            const org_pub_b64 = std.base64.standard.Encoder.encode(&org_b64, &cert.org_pubkey);
+            try writeFormatted(stdout, "  org public key: {s}\n", .{org_pub_b64});
+
+            const node_name = cert.getName();
+            try writeFormatted(stdout, "  node name:      {s}\n", .{node_name});
+
+            const domain = lib.identity.Org.deriveOrgDomain(cert.org_pubkey);
+            var domain_buf: [64]u8 = undefined;
+            const mesh_domain = lib.identity.Org.formatMeshDomain(node_name, domain, &domain_buf);
+            try writeFormatted(stdout, "  mesh domain:    {s}\n", .{mesh_domain});
+
+            try writeFormatted(stdout, "  issued at:      {d}\n", .{cert.issued_at});
+            if (cert.expires_at == 0) {
+                try stdout.writeAll("  expires:        never\n");
+            } else {
+                try writeFormatted(stdout, "  expires:        {d}\n", .{cert.expires_at});
+            }
+
+            if (!cert.isValid()) {
+                try stdout.writeAll("  ⚠ certificate is EXPIRED or INVALID\n");
+            }
+        } else |_| {}
+    }
+
+    // ─── Org Admin (org/org.pub) ───
+    if (lib.identity.Org.loadOrgKeyPair(allocator, config_dir)) |org_kp| {
+        try stdout.writeAll("\n\x1b[1m─── Org Admin ──────────────────────────────────\x1b[0m\n");
+
+        var org_pk_b64: [44]u8 = undefined;
+        const org_pk_str = std.base64.standard.Encoder.encode(&org_pk_b64, &org_kp.public_key.toBytes());
+        try writeFormatted(stdout, "  org public key: {s}\n", .{org_pk_str});
+
+        const org_domain = lib.identity.Org.deriveOrgDomain(org_kp.public_key.toBytes());
+        try writeFormatted(stdout, "  org domain:     {s}.mesh\n", .{org_domain});
+    } else |_| {}
+
+    // ─── Trusted Peers ───
+    const peers = lib.identity.Trust.loadAuthorizedKeys(allocator, config_dir) catch &.{};
+    defer {
+        for (peers) |peer| {
+            allocator.free(peer.name);
+        }
+        allocator.free(peers);
+    }
+
+    if (peers.len > 0) {
+        try stdout.writeAll("\n");
+        try writeFormatted(stdout, "\x1b[1m─── Trusted Peers ({d}) ──────────────────────────\x1b[0m\n", .{peers.len});
+        for (peers) |peer| {
+            var peer_b64: [44]u8 = undefined;
+            const peer_str = std.base64.standard.Encoder.encode(&peer_b64, &peer.public_key.toBytes());
+            try writeFormatted(stdout, "  • {s: <12} {s}\n", .{ peer.name, peer_str });
+        }
+    }
+
+    // ─── Trusted Orgs ───
+    const orgs = lib.identity.Trust.loadTrustedOrgs(allocator, config_dir) catch &.{};
+    defer {
+        for (orgs) |org| {
+            allocator.free(org.name);
+        }
+        allocator.free(orgs);
+    }
+
+    if (orgs.len > 0) {
+        try stdout.writeAll("\n");
+        try writeFormatted(stdout, "\x1b[1m─── Trusted Orgs ({d}) ───────────────────────────\x1b[0m\n", .{orgs.len});
+        for (orgs) |org| {
+            var org_b64_buf: [44]u8 = undefined;
+            const org_str = std.base64.standard.Encoder.encode(&org_b64_buf, &org.public_key);
+            const org_dom = lib.identity.Org.deriveOrgDomain(org.public_key);
+            try writeFormatted(stdout, "  • {s: <12} {s}  ({s}.mesh)\n", .{ org.name, org_str, org_dom });
+        }
+    }
+
+    // ─── Vouched Nodes ───
+    const vouch_dir = std.fs.path.join(allocator, &.{ config_dir, "vouched" }) catch null;
+    defer if (vouch_dir) |vd| allocator.free(vd);
+
+    if (vouch_dir) |vd| {
+        if (std.fs.openDirAbsolute(vd, .{ .iterate = true })) |dir| {
+            var vouch_count: usize = 0;
+            var iter = dir.iterate();
+            while (iter.next() catch null) |entry| {
+                if (std.mem.endsWith(u8, entry.name, ".vouch")) vouch_count += 1;
+            }
+            if (vouch_count > 0) {
+                try stdout.writeAll("\n");
+                try writeFormatted(stdout, "\x1b[1m─── Vouched Nodes ({d}) ──────────────────────────\x1b[0m\n", .{vouch_count});
+                try writeFormatted(stdout, "  {d} pending vouch(es)\n", .{vouch_count});
+            }
+        } else |_| {}
+    }
+
+    try stdout.writeAll("\n");
 }

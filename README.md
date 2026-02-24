@@ -286,7 +286,7 @@ Core functionality is implemented and under active benchmarking:
 - [ ] Multi-queue TUN (`IFF_MULTI_QUEUE`)
 - [ ] `io_uring` event loop
 - [ ] IPv6 support
-- [ ] DNS / mDNS seed discovery
+- [x] DNS / mDNS seed discovery
 - [ ] macOS support (utun)
 - [ ] FreeBSD support
 - [ ] Windows support (wintun)
