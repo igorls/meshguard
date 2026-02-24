@@ -138,7 +138,8 @@ pub const CryptoQueue = struct {
     slots: [CRYPTO_QUEUE_SIZE]std.atomic.Value(u32) = init_slots(),
     head: std.atomic.Value(u64) align(CACHE_LINE) = std.atomic.Value(u64).init(0),
     tail: std.atomic.Value(u64) align(CACHE_LINE) = std.atomic.Value(u64).init(0),
-    closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    // Control fields on their own cache line to avoid false sharing with head/tail
+    closed: std.atomic.Value(bool) align(CACHE_LINE) = std.atomic.Value(bool).init(false),
     waiters: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     // Condition variable for blocking pop

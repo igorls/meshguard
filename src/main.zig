@@ -2073,7 +2073,17 @@ fn userspaceEventLoop(
     // Enable UDP GRO: kernel coalesces consecutive UDP segments into one 64KB buffer,
     // reducing recvmsg syscalls by ~40x compared to recvmmsg with individual buffers.
     udp_sock.enableGRO();
+
+    // Enable busy-polling: kernel spins for 50μs inside poll() before sleeping,
+    // reducing wake-up latency for high-throughput bursts.
+    const SO_BUSY_POLL = 46;
+    const busy_poll_us: u32 = 50; // microseconds
+    posix.setsockopt(udp_sock.fd, posix.SOL.SOCKET, SO_BUSY_POLL, std.mem.asBytes(&busy_poll_us)) catch {};
+
     var gro_rx = BatchUdp.GROReceiver{};
+    const MAX_DECRYPTED = 64;
+    var decrypt_storage: [MAX_DECRYPTED][1500]u8 = undefined;
+    var decrypt_lens: [MAX_DECRYPTED]usize = undefined;
 
     while (swim.running.load(.acquire)) {
         var fds = [_]posix.pollfd{
@@ -2082,14 +2092,13 @@ fn userspaceEventLoop(
         _ = posix.poll(&fds, 50) catch continue;
 
         if (fds[0].revents & posix.POLL.IN != 0) {
-            // ── GRO receive: one syscall delivers up to 64KB of coalesced segments ──
-            const MAX_DECRYPTED = 64;
-            var decrypt_storage: [MAX_DECRYPTED][1500]u8 = undefined;
-            var decrypt_lens: [MAX_DECRYPTED]usize = undefined;
             var n_decrypted: usize = 0;
 
-            const total_bytes = gro_rx.recvGRO(udp_sock.fd);
-            if (total_bytes > 0) {
+            // Drain loop: process all pending GRO batches before returning to poll()
+            while (true) {
+                const total_bytes = gro_rx.recvGRO(udp_sock.fd);
+                if (total_bytes == 0) break; // EAGAIN — socket drained
+
                 const sender = gro_rx.getSender();
                 const seg_size: usize = if (gro_rx.segment_size > 0) gro_rx.segment_size else total_bytes;
 
@@ -2114,9 +2123,23 @@ fn userspaceEventLoop(
 
                     offset += pkt_len;
                 }
+
+                // Flush decrypted packets to TUN if buffer is filling up
+                if (n_decrypted >= MAX_DECRYPTED - 44) {
+                    if (n_decrypted > 0) {
+                        if (tun_dev.vnet_hdr) {
+                            writeCoalescedToTun(&tun_dev, &decrypt_storage, &decrypt_lens, n_decrypted);
+                        } else {
+                            for (0..n_decrypted) |d| {
+                                _ = posix.write(tun_dev.fd, decrypt_storage[d][0..decrypt_lens[d]]) catch {};
+                            }
+                        }
+                        n_decrypted = 0;
+                    }
+                }
             }
 
-            // Pass 2: coalesce same-flow TCP segments and write to TUN
+            // Final flush of remaining decrypted packets
             if (n_decrypted > 0) {
                 if (tun_dev.vnet_hdr) {
                     writeCoalescedToTun(&tun_dev, &decrypt_storage, &decrypt_lens, n_decrypted);
