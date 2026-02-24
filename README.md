@@ -173,15 +173,34 @@ Trust is **bidirectional** — both peers must have each other's key (or mutual 
 - NAT: HolepunchRequest (`0x33`), HolepunchResponse (`0x34`)
 - Org: OrgAliasAnnounce (`0x41`), OrgCertRevoke (`0x42`)
 
-## Benchmarking
+## Benchmarks
 
-A 4-way benchmark compares meshguard against kernel WG, wireguard-go, and boringtun on LXC containers:
+### Throughput (iperf3, 10s, single peer)
+
+> **Hardware**: Intel i9-12900KF (16C/24T, 5.2 GHz), 64 GB DDR5, Ubuntu 24.04  
+> **Setup**: Two LXC containers on localhost, 8 encrypt workers, MTU 1420
+
+| Implementation                 | Download      | Upload        | Notes                                   |
+| ------------------------------ | ------------- | ------------- | --------------------------------------- |
+| **meshguard** (Zig, userspace) | **3.16 Gbps** | **2.56 Gbps** | libsodium AVX2, sendmmsg, zero-copy GSO |
+| wireguard-go (Go, userspace)   | 8.32 Gbps     | —             | Go asm ChaCha20, goroutine parallelism  |
+| WireGuard (kernel module)      | ~10 Gbps      | —             | In-kernel, zero-copy                    |
+
+### Optimization History
+
+| Optimization              | Download  | Δ    |
+| ------------------------- | --------- | ---- |
+| Baseline                  | 2.26 Gbps | —    |
+| + Zero-copy GSO split     | 2.65 Gbps | +17% |
+| + `sendmmsg` batch sends  | 2.72 Gbps | +20% |
+| + libsodium AVX2 ChaCha20 | 3.16 Gbps | +40% |
+
+### Run benchmarks
 
 ```bash
-bash docker/lxc-4way-bench.sh 10   # 10-second tests
+bash docker/lxc-mg-bench.sh 10 8    # 10s, 8 encrypt workers
+bash docker/lxc-4way-bench.sh 10     # Compare all implementations
 ```
-
-Measures latency (50 pings) and throughput (iperf3 download + upload) for each implementation.
 
 ## Docker
 
@@ -197,6 +216,7 @@ docker compose -f docker-compose.bench.yml up
 
 - **Zig 0.15+**
 - **Linux** (kernel WireGuard module _or_ TUN device support)
+- **libsodium** (`libsodium-dev` for building, `libsodium23` at runtime)
 - `sudo` or `CAP_NET_ADMIN` for interface creation
 
 ## Building
@@ -236,10 +256,11 @@ Core functionality is implemented and under active benchmarking:
 - [x] Deterministic mesh DNS domains (Blake3 → `*.a1b2c3.mesh`)
 - [x] Org alias system via SWIM gossip
 - [x] Org certificate revocation via gossip
-- [ ] `recvmmsg`/`sendmmsg` batched I/O
-- [ ] GRO/GSO via `IFF_VNET_HDR` for TUN
+- [x] `recvmmsg`/`sendmmsg` batched I/O
+- [x] GRO/GSO via `IFF_VNET_HDR` for TUN
+- [x] libsodium AVX2 ChaCha20-Poly1305
 - [ ] Multi-queue TUN (`IFF_MULTI_QUEUE`)
-- [ ] epoll/io_uring event loop
+- [ ] `io_uring` event loop
 - [ ] IPv6 support
 - [ ] DNS / mDNS seed discovery
 - [ ] macOS support (utun)
