@@ -350,3 +350,90 @@ pub const GSOSender = struct {
         return .{ .bytes_sent = @intCast(signed), .err = 0 };
     }
 };
+
+/// Zero-copy GSO sender: builds an iovec array pointing directly into pool
+/// buffers (no memcpy). Supports up to 64 segments / 65535 bytes total.
+/// When the buffer is full, the caller should sendGSO(), reset(), and continue.
+pub const ZeroCopyGSOSender = struct {
+    iovs: [64]Iovec = undefined,
+    used: usize = 0,
+    segment_size: u16 = 0,
+    total_bytes: usize = 0,
+
+    pub fn reset(self: *ZeroCopyGSOSender) void {
+        self.used = 0;
+        self.segment_size = 0;
+        self.total_bytes = 0;
+    }
+
+    /// Append a pointer to an encrypted segment (zero-copy — no memcpy).
+    /// Returns false if appending would exceed 64 segments or GSO_MAX_SIZE bytes.
+    /// GSO_MAX_SIZE is capped at 15000 to stay under veth's EMSGSIZE limit;
+    /// when full, the caller should sendGSO(), reset(), and continue.
+    pub const GSO_MAX_SIZE: usize = 15000;
+    pub fn append(self: *ZeroCopyGSOSender, data: []const u8) bool {
+        if (self.used >= 64 or self.total_bytes + data.len > GSO_MAX_SIZE) return false;
+        self.iovs[self.used] = .{
+            // sendmsg only reads from the buffer; the cast is safe.
+            .base = @constCast(data.ptr),
+            .len = data.len,
+        };
+        if (self.segment_size == 0) {
+            self.segment_size = @intCast(data.len);
+        }
+        self.used += 1;
+        self.total_bytes += data.len;
+        return true;
+    }
+
+    pub const SendResult = struct {
+        bytes_sent: usize,
+        err: usize, // raw Linux errno (0 = success)
+    };
+
+    /// Send all segments with UDP GSO (single syscall, zero-copy from pool).
+    pub fn sendGSO(self: *ZeroCopyGSOSender, fd: posix.fd_t, dest_addr: [4]u8, dest_port: u16) SendResult {
+        if (self.used == 0) return .{ .bytes_sent = 0, .err = 0 };
+
+        var addr = posix.sockaddr.in{
+            .family = linux.AF.INET,
+            .port = std.mem.nativeToBig(u16, dest_port),
+            .addr = @bitCast(dest_addr),
+            .zero = .{0} ** 8,
+        };
+
+        // Build cmsg with UDP_SEGMENT
+        const CMSG_LEN_U16 = @sizeOf(Cmsghdr) + 2;
+        const CMSG_SPACE_U16 = (CMSG_LEN_U16 + @alignOf(Cmsghdr) - 1) & ~(@as(usize, @alignOf(Cmsghdr)) - 1);
+
+        var cmsg_buf: [CMSG_SPACE_U16]u8 align(@alignOf(Cmsghdr)) = @splat(0);
+        const cmsg_hdr: *Cmsghdr = @ptrCast(@alignCast(&cmsg_buf));
+        cmsg_hdr.len = CMSG_LEN_U16;
+        cmsg_hdr.level = SOL_UDP;
+        cmsg_hdr.type = UDP_SEGMENT;
+        std.mem.writeInt(u16, cmsg_buf[@sizeOf(Cmsghdr)..][0..2], self.segment_size, .little);
+
+        var hdr = Msghdr{
+            .msg_name = @ptrCast(&addr),
+            .msg_namelen = @sizeOf(posix.sockaddr.in),
+            .msg_iov = @ptrCast(&self.iovs),
+            .msg_iovlen = self.used,
+            .msg_control = @ptrCast(&cmsg_buf),
+            .msg_controllen = CMSG_SPACE_U16,
+            .msg_flags = 0,
+        };
+
+        const rc = linux.syscall3(
+            @enumFromInt(46), // SYS_sendmsg
+            @as(usize, @intCast(fd)),
+            @intFromPtr(&hdr),
+            @as(usize, linux.MSG.DONTWAIT),
+        );
+
+        const signed: isize = @bitCast(rc);
+        if (signed < 0) {
+            return .{ .bytes_sent = 0, .err = @as(usize, @bitCast(-signed)) };
+        }
+        return .{ .bytes_sent = @intCast(signed), .err = 0 };
+    }
+};

@@ -2,14 +2,16 @@
 # Org Fleet Mode entrypoint — trust via org certificates instead of individual keys.
 #
 # Architecture:
-#   1. First node (SEED_DELAY=1) acts as org admin: generates org key, waits for peers
+#   1. First node (ORG_ADMIN=1) acts as org admin: generates org key, waits for peers
 #   2. All nodes generate identities and publish pubkeys
-#   3. Org admin signs all node keys, publishes certs + org pubkey
-#   4. All nodes trust the org and install their cert
+#   3. Org admin signs node keys + vouches for standalone nodes
+#   4. Org nodes trust the org and install their cert
+#   5. Standalone nodes (STANDALONE=1) trust the org but get no cert — accepted via vouch
 #
 # Environment:
-#   ORG_ADMIN=1       — this node generates the org keypair and signs peers
-#   SEED_PEERS        — comma-separated seed endpoints
+#   ORG_ADMIN=1       — this node generates the org keypair, signs peers, vouches standalone
+#   STANDALONE=1      — this node is NOT an org member (no cert), just trusts the org
+#   SEED_PEERS        — space-separated seed endpoints
 #   SEED_DELAY        — seconds to wait before starting
 
 set -e
@@ -28,10 +30,15 @@ OUR_KEY=$(cat "$MESHGUARD_CONFIG_DIR/identity.pub" 2>/dev/null || echo 'unknown'
 HOSTNAME=$(hostname)
 echo "[org-fleet] Node '$HOSTNAME' pubkey: $OUR_KEY"
 
-# Publish our pubkey for the org admin to sign
+# Publish our pubkey for the org admin to sign/vouch
 echo "$OUR_KEY" > "$SHARED_DIR/pubkeys/$HOSTNAME.pub"
 
-# ── Step 2: Org admin generates org key and signs all nodes ──
+# Mark standalone nodes so the admin knows to vouch instead of sign
+if [ "$STANDALONE" = "1" ]; then
+    touch "$SHARED_DIR/pubkeys/$HOSTNAME.standalone"
+fi
+
+# ── Step 2: Org admin generates org key, signs members, vouches standalone ──
 if [ "$ORG_ADMIN" = "1" ]; then
     echo "[org-fleet] === ORG ADMIN MODE ==="
 
@@ -47,28 +54,36 @@ if [ "$ORG_ADMIN" = "1" ]; then
     echo "[org-fleet] Waiting ${SEED_DELAY:-3}s for peer pubkeys..."
     sleep "${SEED_DELAY:-3}"
 
-    # Sign all node pubkeys (including our own)
+    # Sign org member certs / vouch for standalone nodes
     for pubfile in "$SHARED_DIR/pubkeys"/*.pub; do
         [ -f "$pubfile" ] || continue
         PEER_NAME=$(basename "$pubfile" .pub)
         PEER_KEY=$(cat "$pubfile")
-        echo "[org-fleet] Signing cert for: $PEER_NAME"
 
-        meshguard org-sign "$pubfile" --name "$PEER_NAME" 2>/dev/null || true
-
-        # Copy cert to shared dir
-        if [ -f "$MESHGUARD_CONFIG_DIR/$PEER_NAME.cert" ]; then
-            cp "$MESHGUARD_CONFIG_DIR/$PEER_NAME.cert" "$SHARED_DIR/certs/$PEER_NAME.cert"
-            echo "[org-fleet]   → $PEER_NAME.cert signed"
+        if [ -f "$SHARED_DIR/pubkeys/$PEER_NAME.standalone" ]; then
+            # Standalone node → vouch (not sign)
+            echo "[org-fleet] Vouching for standalone: $PEER_NAME"
+            meshguard org-vouch "$pubfile" 2>/dev/null || true
+            # Also individually trust the standalone node on the admin
+            meshguard trust "$PEER_KEY" --name "$PEER_NAME" 2>/dev/null || true
+            echo "[org-fleet]   → $PEER_NAME vouched"
+        else
+            # Org member → sign cert
+            echo "[org-fleet] Signing cert for: $PEER_NAME"
+            meshguard org-sign "$pubfile" --name "$PEER_NAME" 2>/dev/null || true
+            if [ -f "$MESHGUARD_CONFIG_DIR/$PEER_NAME.cert" ]; then
+                cp "$MESHGUARD_CONFIG_DIR/$PEER_NAME.cert" "$SHARED_DIR/certs/$PEER_NAME.cert"
+                echo "[org-fleet]   → $PEER_NAME.cert signed"
+            fi
         fi
     done
 
     # Signal that signing is complete
     touch "$SHARED_DIR/signing-done"
-    echo "[org-fleet] All certs signed."
+    echo "[org-fleet] All certs/vouches done."
 else
     # Wait for org admin to finish signing
-    echo "[org-fleet] Waiting for org admin to sign certificates..."
+    echo "[org-fleet] Waiting for org admin..."
     WAIT=0
     while [ ! -f "$SHARED_DIR/signing-done" ] && [ $WAIT -lt 30 ]; do
         sleep 1
@@ -81,7 +96,7 @@ else
     fi
 fi
 
-# ── Step 3: Trust the org (all nodes) ──
+# ── Step 3: Trust the org (all nodes, including standalone) ──
 if [ -f "$SHARED_DIR/org.pub" ]; then
     ORG_PUB=$(cat "$SHARED_DIR/org.pub")
     echo "[org-fleet] Trusting org: $ORG_PUB"
@@ -90,12 +105,16 @@ else
     echo "[org-fleet] WARNING: No org pubkey found"
 fi
 
-# ── Step 4: Install our node certificate ──
-if [ -f "$SHARED_DIR/certs/$HOSTNAME.cert" ]; then
-    cp "$SHARED_DIR/certs/$HOSTNAME.cert" "$MESHGUARD_CONFIG_DIR/node.cert"
-    echo "[org-fleet] Installed node.cert ($(wc -c < "$MESHGUARD_CONFIG_DIR/node.cert") bytes)"
+# ── Step 4: Install cert (org members only) ──
+if [ "$STANDALONE" != "1" ]; then
+    if [ -f "$SHARED_DIR/certs/$HOSTNAME.cert" ]; then
+        cp "$SHARED_DIR/certs/$HOSTNAME.cert" "$MESHGUARD_CONFIG_DIR/node.cert"
+        echo "[org-fleet] Installed node.cert ($(wc -c < "$MESHGUARD_CONFIG_DIR/node.cert") bytes)"
+    else
+        echo "[org-fleet] WARNING: No cert found for $HOSTNAME"
+    fi
 else
-    echo "[org-fleet] WARNING: No cert found for $HOSTNAME"
+    echo "[org-fleet] Standalone mode — no cert, relying on org vouch"
 fi
 
 # ── Step 5: Start meshguard ──
@@ -106,5 +125,5 @@ if [ -n "$SEED_PEERS" ]; then
     done
 fi
 
-echo "[org-fleet] Starting meshguard daemon (org fleet mode)..."
+echo "[org-fleet] Starting meshguard daemon..."
 exec meshguard up $SEED_ARGS

@@ -177,6 +177,10 @@ pub const SwimProtocol = struct {
                 if (self.isOrgAuthorizedPeer(self.vouched_org_keys[i])) return true;
             }
         }
+        // If we have trusted orgs, allow unknown peers through to handshake
+        // where their org cert will be verified. Without this, org cert members
+        // get dropped at the SWIM layer before handshake can happen.
+        if (self.trusted_org_count > 0) return true;
         return false;
     }
 

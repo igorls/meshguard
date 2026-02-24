@@ -112,6 +112,9 @@ meshguard org-sign /path/to/node.pub --name db-1
 
 # Trust an org (auto-accept all signed nodes)
 meshguard trust <org-pubkey> --org --name eosrio
+
+# Vouch for an external standalone node
+meshguard org-vouch <solo-node-pubkey>
 ```
 
 ### Authorization Flow
@@ -135,19 +138,33 @@ meshguard org-revoke <node-pubkey>
 
 Revoked nodes are disconnected immediately by peers that receive the revocation.
 
-## Mutual Trust Requirement
+### Org Vouch (External Peers)
 
-Trust is **bidirectional** — for two nodes to form a WireGuard tunnel, each must have the other's key in their `authorized_keys/` directory, or both must have mutual org trust. If only one side trusts the other, the untrusting side will reject the handshake.
+Org admins can **vouch for external standalone nodes** without issuing them a full certificate. The vouch is gossip-propagated:
 
-## Gossip Filtering
+```bash
+meshguard org-vouch <solo-node-pubkey>
+# → saved to ~/.config/meshguard/vouched/<hex>.vouch
+# → gossiped to all org members on next 'meshguard up'
+```
 
-SWIM gossip messages from unauthorized nodes are silently dropped during the handshake phase. The sequence is:
+All nodes trusting the vouching org will auto-accept the standalone node. This is useful for:
 
-1. Node A discovers Node B via gossip
-2. A looks up B's Ed25519 public key in its local `authorized_keys/`
-3. If not found → check org certificate (if presented)
-4. If no valid cert → connection refused, gossip entry discarded
-5. If authorized → signed handshake exchange, mutual authentication, WireGuard tunnel establishment
+- Cross-org peering without full membership
+- Onboarding partners to a fleet
+- Temporary trust grants (revocable via `org-revoke`)
+
+### Authorization Flow
+
+When a new peer connects, trust is evaluated in order:
+
+1. **Individual key check** — is the peer's pubkey in `authorized_keys/`?
+2. **Org certificate check** — does the peer present a valid `NodeCertificate`?
+   - Verify Ed25519 signature
+   - Check certificate expiry
+   - Confirm issuing org is in `trusted_orgs/`
+3. **Org vouch check** — has a trusted org vouched for this peer?
+4. **Revocation check** — has the cert/vouch been revoked via gossip?
 
 ## Key Validation
 
@@ -171,5 +188,6 @@ Keys are validated at multiple levels:
 | Revocation              | Delete file / gossip  | Dashboard/API       | CRL                 |
 | Key distribution        | Manual / out-of-band  | Automatic           | Certificate signing |
 | Hierarchical trust      | Org certificates      | Teams/ACLs          | Groups              |
+| External vouching       | Org vouch (gossip)    | Share nodes         | N/A                 |
 | Mesh DNS                | Deterministic + alias | MagicDNS            | Lighthouse          |
 | Single point of failure | None                  | Coordination server | CA server           |

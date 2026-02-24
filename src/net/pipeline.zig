@@ -132,14 +132,16 @@ pub const DataPlanePool = struct {
 };
 
 /// Bounded MPMC queue for dispatching batches to crypto workers.
-/// Lock-free using atomic head/tail with futex for blocking pop.
+/// Lock-free using atomic head/tail with cmpxchg. Condvar signaling
+/// is gated by a waiter count to avoid futex storms on every push.
 pub const CryptoQueue = struct {
     slots: [CRYPTO_QUEUE_SIZE]std.atomic.Value(u32) = init_slots(),
     head: std.atomic.Value(u64) align(CACHE_LINE) = std.atomic.Value(u64).init(0),
     tail: std.atomic.Value(u64) align(CACHE_LINE) = std.atomic.Value(u64).init(0),
     closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    waiters: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
-    // Condition variable for blocking pop (simpler than futex for correctness)
+    // Condition variable for blocking pop
     mutex: std.Thread.Mutex = .{},
     not_empty: std.Thread.Condition = .{},
 
@@ -173,10 +175,12 @@ pub const CryptoQueue = struct {
 
         _ = self.tail.fetchAdd(1, .release);
 
-        // Signal any waiting consumer
-        self.mutex.lock();
-        self.not_empty.signal();
-        self.mutex.unlock();
+        // Only signal condvar if there are sleeping consumers
+        if (self.waiters.load(.acquire) > 0) {
+            self.mutex.lock();
+            self.not_empty.signal();
+            self.mutex.unlock();
+        }
         return true;
     }
 
@@ -184,7 +188,6 @@ pub const CryptoQueue = struct {
     pub fn push(self: *CryptoQueue, batch_idx: u16) void {
         while (!self.tryPush(batch_idx)) {
             if (self.closed.load(.acquire)) return;
-            // Brief spin before yield
             std.atomic.spinLoopHint();
         }
     }
@@ -220,7 +223,9 @@ pub const CryptoQueue = struct {
                 self.mutex.unlock();
                 return null;
             }
+            _ = self.waiters.fetchAdd(1, .release);
             self.not_empty.wait(&self.mutex);
+            _ = self.waiters.fetchSub(1, .release);
             self.mutex.unlock();
         }
     }

@@ -32,6 +32,7 @@ SWIM messages use a **1-byte type tag**:
 | `0x40` | OrgCertPresent      | Org Trust | A → B           |
 | `0x41` | OrgAliasAnnounce    | Org Trust | Gossip          |
 | `0x42` | OrgCertRevoke       | Org Trust | Gossip          |
+| `0x43` | OrgTrustVouch       | Org Trust | Gossip          |
 
 ## Ping
 
@@ -137,6 +138,16 @@ Broadcast to invalidate a node certificate.
 ```
 
 Total: **138 bytes**. Reason codes: `0`=unspecified, `1`=key_compromised, `2`=admin_removed.
+
+## OrgTrustVouch
+
+Propagated via gossip. Org admin vouches for an external standalone node — all nodes trusting the org auto-accept the vouched peer.
+
+```
+[0x43][32B org_pubkey][32B vouched_pubkey][8B lamport (LE)][64B signature]
+```
+
+Total: **137 bytes**. Signature covers `vouched_pubkey ‖ lamport`. Revocable via OrgCertRevoke.
 
 ## Endpoint Encoding
 

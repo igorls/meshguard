@@ -100,6 +100,9 @@ meshguard trust <org-pubkey> --org --name eosrio
 cp node-1.cert ~/.config/meshguard/node.cert
 meshguard up --seed 1.2.3.4:51821
 # → auto-accepted by any peer trusting the org
+
+# Vouch for an external standalone node (propagates to all org members)
+meshguard org-vouch <solo-node-pubkey>
 ```
 
 ## Trust Model
@@ -131,7 +134,21 @@ For fleets, trust one org public key instead of N individual keys:
 
 Each org gets a **deterministic mesh domain**: `Blake3(org_pubkey)[0..3].hex()` → `*.a1b2c3.mesh`. Orgs can also claim human-readable aliases via gossip (e.g. `*.eosrio.mesh`).
 
-Trust is **bidirectional** — both peers must have each other's key (or mutual org trust) for a tunnel to form.
+Trust is **bidirectional** — both peers must have each other's key (or mutual org trust / vouch) for a tunnel to form.
+
+### Org Vouch (External Peers)
+
+Org admins can **vouch for standalone nodes** without making them full org members. The vouch is gossip-propagated — all nodes trusting the org auto-accept the vouched node:
+
+```bash
+meshguard org-vouch <solo-node-pubkey>
+```
+
+Trust authorization order:
+
+1. Individual key in `authorized_keys/`?
+2. Valid org cert from a trusted org?
+3. Vouched by a trusted org?
 
 ## Architecture
 
@@ -171,7 +188,7 @@ Trust is **bidirectional** — both peers must have each other's key (or mutual 
 - SWIM: Ping (`0x01`), Ack (`0x03`), PingReq (`0x02`)
 - Handshake: Standard WireGuard Noise_IKpsk2 (Type 1, Type 2)
 - NAT: HolepunchRequest (`0x33`), HolepunchResponse (`0x34`)
-- Org: OrgAliasAnnounce (`0x41`), OrgCertRevoke (`0x42`)
+- Org: OrgAliasAnnounce (`0x41`), OrgCertRevoke (`0x42`), OrgTrustVouch (`0x43`)
 
 ## Benchmarks
 
@@ -257,6 +274,7 @@ Core functionality is implemented and under active benchmarking:
 - [x] Deterministic mesh DNS domains (Blake3 → `*.a1b2c3.mesh`)
 - [x] Org alias system via SWIM gossip
 - [x] Org certificate revocation via gossip
+- [x] Org vouch for external nodes via gossip
 - [x] `recvmmsg`/`sendmmsg` batched I/O
 - [x] GRO/GSO via `IFF_VNET_HDR` for TUN
 - [x] libsodium AVX2 ChaCha20-Poly1305

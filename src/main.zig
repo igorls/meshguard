@@ -735,6 +735,33 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
         try writeFormatted(stdout, "  trust: {d} authorized peer(s)\n", .{authorized_peers.len});
     }
 
+    // Load trusted organizations
+    const trusted_orgs = lib.identity.Trust.loadTrustedOrgs(allocator, config_dir) catch &.{};
+    defer {
+        for (trusted_orgs) |org| {
+            allocator.free(org.name);
+        }
+        allocator.free(trusted_orgs);
+    }
+    if (trusted_orgs.len > 0) {
+        for (trusted_orgs) |org| {
+            swim.addTrustedOrg(org.public_key);
+        }
+        // Enable trust enforcement when org trust is configured
+        if (!swim.enforce_trust) swim.enableTrust();
+        try writeFormatted(stdout, "  org trust: {d} trusted org(s)\n", .{trusted_orgs.len});
+    }
+
+    // Load our own org certificate (if present)
+    const cert_path = try std.fs.path.join(allocator, &.{ config_dir, "node.cert" });
+    defer allocator.free(cert_path);
+    if (lib.identity.Org.loadCertificate(allocator, cert_path)) |cert| {
+        var cert_wire: [186]u8 = undefined;
+        cert.serialize(&cert_wire);
+        swim.setOrgCert(cert_wire);
+        try writeFormatted(stdout, "  org cert: {s} (org member)\n", .{cert.getName()});
+    } else |_| {}
+
     // Determine public endpoint: --announce overrides STUN
     if (announce_addr) |addr| {
         const announced_ep = messages.Endpoint{ .addr = addr, .port = gossip_port };
@@ -1467,8 +1494,8 @@ fn cryptoWorkerPipeline(
 
 /// Drain all Ready batches from a peer's TxRing in strict nonce order.
 /// Called while holding peer.tx_ring.send_lock.
-/// Tries UDP GSO first (single sendmsg per batch); falls back to per-packet sendto
-/// if GSO is unsupported by the kernel.
+/// Uses zero-copy GSO (iovec into pool buffers) with flush-and-continue;
+/// falls back to sendmmsg only if the kernel rejects GSO.
 fn flushPeerTxRing(
     peer: *lib.wireguard.Device.WgPeer,
     pool: *lib.net.Pipeline.DataPlanePool,
@@ -1483,7 +1510,9 @@ fn flushPeerTxRing(
         var logged: bool = false;
     };
 
-    // Accumulate packets across batches for a single sendmmsg call
+    // Zero-copy GSO sender — builds iovec array pointing into pool buffers
+    var gso_tx = BatchUdp.ZeroCopyGSOSender{};
+    // Sendmmsg fallback — only used if GSO fails
     var mmsg_tx = BatchUdp.BatchSender{};
 
     while (!peer.tx_ring.isEmpty()) {
@@ -1494,43 +1523,57 @@ fn flushPeerTxRing(
         if (head_batch.state.load(.acquire) != @intFromEnum(Pipeline.BatchState.Ready)) break;
 
         if (GsoState.available and head_batch.count > 1) {
-            // ── GSO path: pack all segments into one sendmsg ──
-            var gso_tx = BatchUdp.GSOSender{};
-            var pack_ok = true;
+            // ── Zero-copy GSO path ──
             for (0..head_batch.count) |i| {
                 const pkt = &pool.buffers[head_batch.buf_indices[i]];
                 if (pkt.len > 0) {
                     if (!gso_tx.append(pkt.data[0..pkt.len])) {
-                        // GSO buffer full — shouldn't happen with 64-packet batches
-                        pack_ok = false;
-                        break;
+                        // Buffer full — flush current chunk, reset, continue
+                        const result = gso_tx.sendGSO(udp_fd, peer.endpoint_addr, peer.endpoint_port);
+                        if (result.bytes_sent == 0 and result.err != 0) {
+                            // GSO syscall failed — fall through to sendmmsg
+                            GsoState.available = false;
+                            if (!GsoState.logged) {
+                                GsoState.logged = true;
+                                var err_buf: [128]u8 = undefined;
+                                const msg = std.fmt.bufPrint(&err_buf, "  GSO failed: errno={d}, using sendmmsg fallback\n", .{result.err}) catch "  GSO failed\n";
+                                _ = posix.write(2, msg) catch {};
+                            }
+                            break;
+                        }
+                        gso_tx.reset();
+                        _ = gso_tx.append(pkt.data[0..pkt.len]);
                     }
                 }
             }
 
-            if (pack_ok and gso_tx.used > 0) {
+            // Flush remaining GSO segments for this batch
+            if (GsoState.available and gso_tx.used > 0) {
                 const result = gso_tx.sendGSO(udp_fd, peer.endpoint_addr, peer.endpoint_port);
-                if (result.bytes_sent > 0) {
-                    // GSO succeeded!
-                    pool.freeBuffers(head_batch.buf_indices[0..head_batch.count]);
-                    head_batch.state.store(@intFromEnum(Pipeline.BatchState.Empty), .release);
-                    pool.freeBatch(head_idx);
-                    peer.tx_ring.advanceHead();
-                    continue;
-                } else {
-                    // GSO failed — log errno once, fall through to sendmmsg
+                if (result.bytes_sent == 0 and result.err != 0) {
                     GsoState.available = false;
                     if (!GsoState.logged) {
                         GsoState.logged = true;
                         var err_buf: [128]u8 = undefined;
-                        const msg = std.fmt.bufPrint(&err_buf, "  GSO sendmsg failed: errno={d}, seg={d}B, total={d}B, using sendmmsg fallback\n", .{ result.err, gso_tx.segment_size, gso_tx.used }) catch "  GSO failed\n";
+                        const msg = std.fmt.bufPrint(&err_buf, "  GSO failed: errno={d}, using sendmmsg fallback\n", .{result.err}) catch "  GSO failed\n";
                         _ = posix.write(2, msg) catch {};
                     }
                 }
+                gso_tx.reset();
             }
+
+            if (GsoState.available) {
+                // GSO succeeded — free resources and advance
+                pool.freeBuffers(head_batch.buf_indices[0..head_batch.count]);
+                head_batch.state.store(@intFromEnum(Pipeline.BatchState.Empty), .release);
+                pool.freeBatch(head_idx);
+                peer.tx_ring.advanceHead();
+                continue;
+            }
+            // If GSO just failed, fall through to sendmmsg for this batch
         }
 
-        // ── sendmmsg path: queue all packets from this batch ──
+        // ── sendmmsg fallback path ──
         for (0..head_batch.count) |i| {
             const pkt = &pool.buffers[head_batch.buf_indices[i]];
             if (pkt.len > 0) {
@@ -1538,7 +1581,6 @@ fn flushPeerTxRing(
             }
         }
 
-        // If BatchSender is full or this is the last ready batch, flush
         if (mmsg_tx.count >= BatchUdp.BATCH_SIZE - Pipeline.BATCH_SIZE) {
             _ = mmsg_tx.flush(udp_fd);
         }
