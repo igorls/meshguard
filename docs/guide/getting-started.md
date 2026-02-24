@@ -1,14 +1,49 @@
 # Getting Started
 
-## Requirements
+## Install
+
+Download a prebuilt binary from [GitHub Releases](https://github.com/igorls/meshguard/releases/latest):
+
+```bash
+# Download the latest release (Linux x86_64)
+curl -Lo meshguard https://github.com/igorls/meshguard/releases/latest/download/meshguard-linux-amd64
+chmod +x meshguard
+sudo mv meshguard /usr/local/bin/
+
+# Verify
+meshguard version
+```
+
+::: tip Other architectures
+Replace `amd64` with `arm64` (Raspberry Pi, AWS Graviton) or `386` (32-bit x86).
+:::
+
+::: warning Runtime dependency
+meshguard requires **libsodium** at runtime:
+
+```bash
+# Debian / Ubuntu
+sudo apt-get install libsodium23
+
+# Fedora / RHEL
+sudo dnf install libsodium
+
+# Arch
+sudo pacman -S libsodium
+```
+
+:::
+
+## Building from source
+
+Alternatively, build from source with [Zig](https://ziglang.org/download/) 0.15+:
 
 | Requirement     | Details                                          |
 | --------------- | ------------------------------------------------ |
 | **Zig**         | 0.15 or later                                    |
+| **libsodium**   | `libsodium-dev` for building                     |
 | **OS**          | Linux (kernel WireGuard module _or_ TUN support) |
 | **Permissions** | `sudo` or `CAP_NET_ADMIN` for interface creation |
-
-## Building
 
 ```bash
 # Debug build
