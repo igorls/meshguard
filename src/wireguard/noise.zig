@@ -145,6 +145,18 @@ pub const Handshake = struct {
         };
     }
 
+    /// Securely zero out all sensitive key material.
+    pub fn deinit(self: *Handshake) void {
+        std.crypto.secureZero(u8, &self.static_private);
+        std.crypto.secureZero(u8, &self.precomputed_ss);
+        std.crypto.secureZero(u8, &self.preshared_key);
+        std.crypto.secureZero(u8, &self.ephemeral_private);
+        std.crypto.secureZero(u8, &self.chaining_key);
+        std.crypto.secureZero(u8, &self.hash);
+        std.crypto.secureZero(u8, &self.remote_ephemeral);
+        self.state = .zeroed;
+    }
+
     /// Create a Handshake Initiation message (Type 1).
     /// We are the initiator: -> e, es, s, ss, {t}
     pub fn createInitiation(self: *Handshake, sender_index: u32) !HandshakeInitiation {
@@ -392,9 +404,11 @@ pub const Handshake = struct {
         const keys = crypto.kdf2(self.chaining_key, &.{});
         const is_initiator = (self.state == .consumed_response);
 
-        // PFS: Destroy ephemeral private key immediately after use
-        // Use @memset as Zig 0.15 doesn't have std.crypto.utils.secureZero
-        @memset(&self.ephemeral_private, 0);
+        // PFS: Destroy ephemeral secrets immediately after use
+        std.crypto.secureZero(u8, &self.ephemeral_private);
+        std.crypto.secureZero(u8, &self.chaining_key);
+        std.crypto.secureZero(u8, &self.hash);
+        std.crypto.secureZero(u8, &self.remote_ephemeral);
 
         return .{
             // Initiator sends with key1, receives with key2
@@ -700,4 +714,36 @@ test "wire format sizes" {
     try std.testing.expectEqual(@sizeOf(HandshakeInitiation), 148);
     try std.testing.expectEqual(@sizeOf(HandshakeResponse), 92);
     try std.testing.expectEqual(@sizeOf(TransportHeader), 16);
+}
+
+test "handshake deinit zeros state" {
+    const alice_private = generateSecret();
+    const alice_public = try X25519.recoverPublicKey(alice_private);
+    const bob_private = generateSecret();
+    const bob_public = try X25519.recoverPublicKey(bob_private);
+
+    var alice = try Handshake.init(alice_private, alice_public, bob_public);
+
+    // Simulate some state
+    const initiation = try alice.createInitiation(42);
+    _ = initiation;
+
+    // Deinit
+    alice.deinit();
+
+    // Verify state is reset
+    try std.testing.expectEqual(alice.state, .zeroed);
+
+    // Check if secrets are zeroed
+    var all_zeros = true;
+    for (alice.static_private) |b| {
+        if (b != 0) all_zeros = false;
+    }
+    try std.testing.expect(all_zeros);
+
+    all_zeros = true;
+    for (alice.ephemeral_private) |b| {
+        if (b != 0) all_zeros = false;
+    }
+    try std.testing.expect(all_zeros);
 }
