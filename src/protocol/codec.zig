@@ -192,6 +192,31 @@ pub fn encodeOrgCertRevoke(buf: []u8, msg: messages.OrgCertRevoke) !usize {
     return pos;
 }
 
+/// Encode an OrgTrustVouch message.
+/// Wire: [0x43][32B org_pubkey][32B vouched_pubkey][8B lamport][64B signature]
+pub fn encodeOrgTrustVouch(buf: []u8, msg: messages.OrgTrustVouch) !usize {
+    const required = 1 + 32 + 32 + 8 + 64;
+    if (buf.len < required) return error.BufferTooShort;
+    var pos: usize = 0;
+
+    buf[pos] = @intFromEnum(messages.MessageType.org_trust_vouch);
+    pos += 1;
+
+    @memcpy(buf[pos..][0..32], &msg.org_pubkey);
+    pos += 32;
+
+    @memcpy(buf[pos..][0..32], &msg.vouched_pubkey);
+    pos += 32;
+
+    std.mem.writeInt(u64, buf[pos..][0..8], msg.lamport, .little);
+    pos += 8;
+
+    @memcpy(buf[pos..][0..64], &msg.signature);
+    pos += 64;
+
+    return pos;
+}
+
 fn encodeGossipEntry(buf: []u8, entry: messages.GossipEntry) usize {
     var pos: usize = 0;
 
@@ -270,6 +295,7 @@ pub const DecodedMessage = union(enum) {
     holepunch_response: messages.HolepunchResponse,
     org_alias_announce: messages.OrgAliasAnnounce,
     org_cert_revoke: messages.OrgCertRevoke,
+    org_trust_vouch: messages.OrgTrustVouch,
 };
 
 /// Decoded Ping with owned gossip slice.
@@ -312,6 +338,7 @@ pub fn decode(data: []const u8) DecodeError!DecodedMessage {
         .holepunch_response => .{ .holepunch_response = try decodeHolepunchResponse(data[1..]) },
         .org_alias_announce => .{ .org_alias_announce = try decodeOrgAliasAnnounce(data[1..]) },
         .org_cert_revoke => .{ .org_cert_revoke = try decodeOrgCertRevoke(data[1..]) },
+        .org_trust_vouch => .{ .org_trust_vouch = try decodeOrgTrustVouch(data[1..]) },
         else => error.InvalidMessageType,
     };
 }
@@ -473,6 +500,18 @@ fn decodeOrgCertRevoke(data: []const u8) DecodeError!messages.OrgCertRevoke {
     return result;
 }
 
+fn decodeOrgTrustVouch(data: []const u8) DecodeError!messages.OrgTrustVouch {
+    if (data.len < 32 + 32 + 8 + 64) return error.BufferTooShort;
+
+    var result: messages.OrgTrustVouch = undefined;
+    @memcpy(&result.org_pubkey, data[0..32]);
+    @memcpy(&result.vouched_pubkey, data[32..64]);
+    result.lamport = std.mem.readInt(u64, data[64..72], .little);
+    @memcpy(&result.signature, data[72..136]);
+
+    return result;
+}
+
 // ─── Tests ───
 
 test "ping roundtrip" {
@@ -624,6 +663,36 @@ test "org cert revoke roundtrip" {
             try std.testing.expectEqualSlices(u8, &node_pk, &r.node_pubkey);
             try std.testing.expectEqual(r.reason, 1);
             try std.testing.expectEqual(r.lamport, 42);
+        },
+        else => return error.InvalidMessageType,
+    }
+}
+
+test "org trust vouch roundtrip" {
+    const org_pk = [_]u8{0xEE} ** 32;
+    const vouched_pk = [_]u8{0xFF} ** 32;
+    const sig = [_]u8{0x11} ** 64;
+
+    const msg = messages.OrgTrustVouch{
+        .org_pubkey = org_pk,
+        .vouched_pubkey = vouched_pk,
+        .lamport = 777,
+        .signature = sig,
+    };
+
+    var buf: [256]u8 = undefined;
+    const written = try encodeOrgTrustVouch(&buf, msg);
+
+    // Verify wire size: 1 + 32 + 32 + 8 + 64 = 137
+    try std.testing.expectEqual(written, 137);
+
+    const decoded = try decode(buf[0..written]);
+    switch (decoded) {
+        .org_trust_vouch => |v| {
+            try std.testing.expectEqualSlices(u8, &org_pk, &v.org_pubkey);
+            try std.testing.expectEqualSlices(u8, &vouched_pk, &v.vouched_pubkey);
+            try std.testing.expectEqual(v.lamport, 777);
+            try std.testing.expectEqualSlices(u8, &sig, &v.signature);
         },
         else => return error.InvalidMessageType,
     }

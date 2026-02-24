@@ -35,6 +35,7 @@ pub const MessageType = enum(u8) {
     org_cert_present = 0x40,
     org_alias_announce = 0x41,
     org_cert_revoke = 0x42,
+    org_trust_vouch = 0x43,
 
     _,
 };
@@ -190,10 +191,21 @@ pub const OrgCertRevoke = struct {
     signature: [64]u8, // sign(node_pubkey ‖ reason ‖ lamport, org_privkey)
 };
 
+/// Org trust vouch — org admin vouches for an external standalone node.
+/// Propagated via gossip. All nodes trusting this org will auto-accept
+/// the vouched node without individual key exchange.
+pub const OrgTrustVouch = struct {
+    org_pubkey: [32]u8,
+    vouched_pubkey: [32]u8, // external node being vouched for
+    lamport: u64,
+    signature: [64]u8, // sign(vouched_pubkey ‖ lamport, org_privkey)
+};
+
 test "message type values" {
     try std.testing.expectEqual(@as(u8, 0x01), @intFromEnum(MessageType.ping));
     try std.testing.expectEqual(@as(u8, 0x10), @intFromEnum(MessageType.handshake_init));
     try std.testing.expectEqual(@as(u8, 0x30), @intFromEnum(MessageType.relay_request));
     try std.testing.expectEqual(@as(u8, 0x33), @intFromEnum(MessageType.holepunch_request));
     try std.testing.expectEqual(@as(u8, 0x34), @intFromEnum(MessageType.holepunch_response));
+    try std.testing.expectEqual(@as(u8, 0x43), @intFromEnum(MessageType.org_trust_vouch));
 }

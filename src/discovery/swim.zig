@@ -104,6 +104,11 @@ pub const SwimProtocol = struct {
     revoked_nodes: [64][32]u8 = std.mem.zeroes([64][32]u8),
     revoked_count: usize = 0,
 
+    // Vouched external nodes: org admin vouches for standalone nodes (propagated via gossip)
+    vouched_org_keys: [64][32]u8 = std.mem.zeroes([64][32]u8),
+    vouched_node_keys: [64][32]u8 = std.mem.zeroes([64][32]u8),
+    vouched_count: usize = 0,
+
     // Node's own org certificate (if any, loaded at init)
     our_org_cert: ?[186]u8 = null,
 
@@ -164,6 +169,13 @@ pub const SwimProtocol = struct {
         // Check if revoked
         for (self.revoked_nodes[0..self.revoked_count]) |revoked| {
             if (std.mem.eql(u8, &revoked, &pubkey)) return false;
+        }
+        // Check if vouched by a trusted org
+        for (0..self.vouched_count) |i| {
+            if (std.mem.eql(u8, &self.vouched_node_keys[i], &pubkey)) {
+                // Verify the vouching org is trusted
+                if (self.isOrgAuthorizedPeer(self.vouched_org_keys[i])) return true;
+            }
         }
         return false;
     }
@@ -376,6 +388,7 @@ pub const SwimProtocol = struct {
             .holepunch_response => |resp| resp.sender_pubkey,
             .org_alias_announce => |ann| ann.org_pubkey,
             .org_cert_revoke => |rev| rev.org_pubkey,
+            .org_trust_vouch => |v| v.org_pubkey,
         };
         if (!self.isAuthorizedPeer(sender_pubkey)) return;
 
@@ -387,6 +400,7 @@ pub const SwimProtocol = struct {
             .holepunch_response => |resp| self.handleHolepunchResponse(resp),
             .org_alias_announce => |ann| self.handleOrgAlias(ann),
             .org_cert_revoke => |rev| self.handleOrgRevoke(rev),
+            .org_trust_vouch => |v| self.handleOrgVouch(v),
         }
     }
 
@@ -460,6 +474,38 @@ pub const SwimProtocol = struct {
                     }
                 }
             }
+        }
+    }
+
+    /// Handle an OrgTrustVouch: org admin vouches for an external standalone node.
+    /// All nodes trusting this org will auto-accept the vouched node.
+    fn handleOrgVouch(self: *SwimProtocol, vouch: messages.OrgTrustVouch) void {
+        // Only process vouches from trusted orgs
+        if (!self.isOrgAuthorizedPeer(vouch.org_pubkey)) return;
+
+        // Check if already vouched (same org + same node)
+        for (0..self.vouched_count) |i| {
+            if (std.mem.eql(u8, &self.vouched_node_keys[i], &vouch.vouched_pubkey) and
+                std.mem.eql(u8, &self.vouched_org_keys[i], &vouch.org_pubkey))
+            {
+                return; // Already registered
+            }
+        }
+
+        // Don't vouch for revoked nodes
+        for (self.revoked_nodes[0..self.revoked_count]) |revoked| {
+            if (std.mem.eql(u8, &revoked, &vouch.vouched_pubkey)) {
+                log.warn("org vouch rejected: node is revoked", .{});
+                return;
+            }
+        }
+
+        // Register the vouch
+        if (self.vouched_count < self.vouched_org_keys.len) {
+            self.vouched_org_keys[self.vouched_count] = vouch.org_pubkey;
+            self.vouched_node_keys[self.vouched_count] = vouch.vouched_pubkey;
+            self.vouched_count += 1;
+            log.info("org vouched for external node", .{});
         }
     }
 

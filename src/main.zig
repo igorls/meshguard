@@ -24,6 +24,7 @@ const usage =
     \\  export      Print this node's public key
     \\  org-keygen  Generate a new org keypair
     \\  org-sign    Sign a node's key with org key (--name <label>)
+    \\  org-vouch   Vouch for an external node (auto-propagates to org members)
     \\  version     Print version
     \\
     \\OPTIONS:
@@ -126,6 +127,15 @@ pub fn main() !void {
             std.process.exit(1);
         }
         try cmdOrgSign(allocator, args[2], args[3..]);
+        return;
+    }
+
+    if (std.mem.eql(u8, command, "org-vouch")) {
+        if (args.len < 3) {
+            try getStdErr().writeAll("error: 'org-vouch' requires a node public key or .pub file\n");
+            std.process.exit(1);
+        }
+        try cmdOrgVouch(allocator, args[2]);
         return;
     }
 
@@ -440,6 +450,87 @@ fn cmdOrgSign(allocator: std.mem.Allocator, node_key_path: []const u8, extra_arg
         try writeFormatted(stdout, "  expires:     {d}\n", .{expires_at});
     }
     try writeFormatted(stdout, "\nCopy this file to the node as: ~/.config/meshguard/node.cert\n", .{});
+}
+
+fn cmdOrgVouch(allocator: std.mem.Allocator, node_key_arg: []const u8) !void {
+    const config_dir = try Config.ensureConfigDir(allocator);
+    defer allocator.free(config_dir);
+
+    const stdout = getStdOut();
+    const stderr = getStdErr();
+    const Org = lib.identity.Org;
+
+    // Load org keypair
+    const org_kp = Org.loadOrgKeyPair(allocator, config_dir) catch {
+        try stderr.writeAll("error: no org keypair found. Run 'meshguard org-keygen' first.\n");
+        std.process.exit(1);
+    };
+
+    // Validate the external node pubkey
+    var key_b64_buf: [44]u8 = undefined;
+    var node_pk_bytes: [32]u8 = undefined;
+    if (lib.identity.Trust.validateKey(node_key_arg, &key_b64_buf, &node_pk_bytes)) |err_msg| {
+        try writeFormatted(stderr, "error: {s}\n", .{err_msg});
+        std.process.exit(1);
+    }
+
+    // Create lamport timestamp (unix seconds — good enough for vouch ordering)
+    const lamport: u64 = @intCast(@divTrunc(std.time.timestamp(), 1));
+
+    // Sign the vouch: Ed25519(vouched_pubkey ‖ lamport)
+    var sign_buf: [40]u8 = undefined;
+    @memcpy(sign_buf[0..32], &node_pk_bytes);
+    std.mem.writeInt(u64, sign_buf[32..40], lamport, .little);
+
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const kp = Ed25519.KeyPair.fromSecretKey(org_kp.secret_key) catch {
+        try stderr.writeAll("error: failed to derive signing key\n");
+        std.process.exit(1);
+    };
+    const signature = kp.sign(&sign_buf, null) catch {
+        try stderr.writeAll("error: failed to sign vouch\n");
+        std.process.exit(1);
+    };
+
+    // Save vouch to config dir for gossip broadcast
+    const vouch_dir = try std.fs.path.join(allocator, &.{ config_dir, "vouched" });
+    defer allocator.free(vouch_dir);
+    std.fs.makeDirAbsolute(vouch_dir) catch {};
+
+    // Use first 8 hex chars of node pubkey as filename
+    var hex_buf: [16]u8 = undefined;
+    const hex = std.fmt.bufPrint(&hex_buf, "{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{
+        node_pk_bytes[0], node_pk_bytes[1], node_pk_bytes[2], node_pk_bytes[3],
+        node_pk_bytes[4], node_pk_bytes[5], node_pk_bytes[6], node_pk_bytes[7],
+    }) catch "vouch";
+
+    const vouch_filename = try std.fmt.allocPrint(allocator, "{s}.vouch", .{hex});
+    defer allocator.free(vouch_filename);
+
+    const vouch_path = try std.fs.path.join(allocator, &.{ vouch_dir, vouch_filename });
+    defer allocator.free(vouch_path);
+
+    // Write binary vouch: [32B org_pubkey][32B vouched_pubkey][8B lamport][64B signature]
+    const org_pub_bytes = org_kp.public_key.toBytes();
+    var vouch_data: [136]u8 = undefined;
+    @memcpy(vouch_data[0..32], &org_pub_bytes);
+    @memcpy(vouch_data[32..64], &node_pk_bytes);
+    std.mem.writeInt(u64, vouch_data[64..72], lamport, .little);
+    @memcpy(vouch_data[72..136], &signature.toBytes());
+
+    const file = try std.fs.createFileAbsolute(vouch_path, .{});
+    defer file.close();
+    try file.writeAll(&vouch_data);
+
+    const b64 = std.base64.standard.Encoder;
+    var node_b64: [44]u8 = undefined;
+    _ = b64.encode(&node_b64, &node_pk_bytes);
+
+    try writeFormatted(stdout, "Vouch signed for external node.\n", .{});
+    try writeFormatted(stdout, "  node pubkey: {s}\n", .{node_b64});
+    try writeFormatted(stdout, "  saved to:    {s}\n", .{vouch_path});
+    try stdout.writeAll("\nThis vouch will be gossiped to all org members on next 'meshguard up'.\n");
+    try stdout.writeAll("All nodes trusting this org will auto-accept the vouched node.\n");
 }
 
 fn cmdRevoke(allocator: std.mem.Allocator, key_or_name: []const u8) !void {
