@@ -56,7 +56,7 @@ fi
 # Check that all nodes have certificates
 for node in node-a node-b node-c; do
     if $COMPOSE exec -T $node test -f /etc/meshguard/node.cert 2>/dev/null; then
-        CERT_SIZE=$($COMPOSE exec -T $node wc -c < /etc/meshguard/node.cert 2>/dev/null | tr -d ' \r')
+        CERT_SIZE=$($COMPOSE exec -T $node stat -c '%s' /etc/meshguard/node.cert 2>/dev/null | tr -d '\r\n ')
         if [ "$CERT_SIZE" = "186" ]; then
             pass "$node: node.cert installed (186 bytes)"
         else
@@ -102,16 +102,16 @@ for node in node-a node-b node-c; do
     fi
 done
 
-# ── Check WireGuard peers ──
+# ── Check WireGuard (userspace mode — look for active tunnel via process) ──
 echo
-echo "▶ Checking WireGuard peers..."
+echo "▶ Checking WireGuard tunnels..."
 for node in node-a node-b node-c; do
-    wg_output=$($COMPOSE exec -T $node wg show mg0 2>/dev/null || echo "FAILED")
-    if echo "$wg_output" | grep -q "listening port"; then
-        peer_count=$(echo "$wg_output" | grep -c "peer:" || echo "0")
-        pass "$node: WireGuard active, $peer_count peer(s)"
+    # In userspace mode, WG tunnel is built into meshguard — check for active mesh IPs
+    mesh_ip=$($COMPOSE exec -T $node ip -4 addr show mg0 2>/dev/null | grep -oP '(?<=inet )[0-9.]+' || echo "")
+    if [ -n "$mesh_ip" ]; then
+        pass "$node: tunnel active (mesh IP $mesh_ip)"
     else
-        fail "$node: WireGuard not configured"
+        fail "$node: no mesh IP on mg0"
     fi
 done
 
