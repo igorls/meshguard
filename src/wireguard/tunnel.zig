@@ -272,14 +272,41 @@ pub const ReplayWindow = struct {
             @memset(&self.bitmap, 0);
             return;
         }
-        // For smaller shifts, we clear the bits that correspond to
-        // the positions that will be reused
-        var i: u64 = 0;
-        while (i < shift) : (i += 1) {
-            const pos = (self.counter + 1 + i) % COUNTER_WINDOW_SIZE;
-            const word = pos / 64;
-            const bit: u6 = @intCast(pos % 64);
-            self.bitmap[word] &= ~(@as(u64, 1) << bit);
+
+        // Optimization: For small shifts (common case), use simple loop (fast setup).
+        // For large shifts (packet loss), use word-level clearing (avoid O(shift) loop).
+        if (shift <= 64) {
+            var i: u64 = 0;
+            while (i < shift) : (i += 1) {
+                const pos = (self.counter + 1 + i) % COUNTER_WINDOW_SIZE;
+                const word = pos / 64;
+                const bit: u6 = @intCast(pos % 64);
+                self.bitmap[word] &= ~(@as(u64, 1) << bit);
+            }
+            return;
+        }
+
+        // Large shift: clear words efficiently
+        var current = (self.counter + 1) % COUNTER_WINDOW_SIZE;
+        var remaining = shift;
+
+        while (remaining > 0) {
+            const word_idx = current / 64;
+            const bit_idx = current % 64;
+            const bits_in_word = 64 - bit_idx;
+            const to_clear = @min(remaining, bits_in_word);
+
+            if (to_clear == 64) {
+                // Clear entire word
+                self.bitmap[word_idx] = 0;
+            } else {
+                // Clear range of bits: [bit_idx, bit_idx + to_clear)
+                const mask = (@as(u64, 1) << @intCast(to_clear)) - 1;
+                self.bitmap[word_idx] &= ~(mask << @intCast(bit_idx));
+            }
+
+            remaining -= to_clear;
+            current = (current + to_clear) % COUNTER_WINDOW_SIZE;
         }
     }
 };
@@ -315,15 +342,19 @@ test "transport encrypt/decrypt roundtrip" {
 
     // Encrypt
     const packet_len = try sender.encrypt(plaintext, &packet_buf);
-    try std.testing.expectEqual(packet_len, TRANSPORT_HEADER_LEN + plaintext.len + AUTHTAG_LEN);
+    // Plaintext len is 24 ("Hello, WireGuard tunnel!"). Padded to 32.
+    const padded_len = std.mem.alignForward(usize, plaintext.len, 16);
+    try std.testing.expectEqual(packet_len, TRANSPORT_HEADER_LEN + padded_len + AUTHTAG_LEN);
 
     // Verify header
     try std.testing.expectEqual(std.mem.readInt(u32, packet_buf[0..4], .little), 4); // Type 4
 
     // Decrypt
     const decrypted_len = try receiver.decrypt(packet_buf[0..packet_len], &decrypt_buf);
-    try std.testing.expectEqual(decrypted_len, plaintext.len);
-    try std.testing.expectEqualSlices(u8, plaintext, decrypt_buf[0..decrypted_len]);
+    // Since plaintext is not a valid IP packet, decrypt() cannot determine true length from header.
+    // It returns the full padded length.
+    try std.testing.expectEqual(decrypted_len, padded_len);
+    try std.testing.expectEqualSlices(u8, plaintext, decrypt_buf[0..plaintext.len]);
 }
 
 test "anti-replay window" {
@@ -368,7 +399,58 @@ test "transport nonce counter increments" {
     var buf: [256]u8 = undefined;
 
     _ = try tunnel.encrypt("test", &buf);
-    try std.testing.expectEqual(tunnel.send_counter, 1);
+    try std.testing.expectEqual(tunnel.send_counter.load(.monotonic), 1);
     _ = try tunnel.encrypt("test", &buf);
-    try std.testing.expectEqual(tunnel.send_counter, 2);
+    try std.testing.expectEqual(tunnel.send_counter.load(.monotonic), 2);
+}
+
+test "anti-replay window large shift" {
+    var w = ReplayWindow{};
+
+    // Fill window with some values
+    // Window size 2048.
+    // Set 0, 100, 200.
+    w.update(0);
+    w.update(100);
+    w.update(200);
+    try std.testing.expect(!w.check(0));
+    try std.testing.expect(!w.check(100));
+    try std.testing.expect(!w.check(200));
+
+    // Shift by 1000 (large shift, triggers optimized path)
+    // New max = 1200. Shift = 1000.
+    // Range cleared: 201 ... 1200.
+    // 0, 100, 200 remain (since they are < 201).
+    w.update(1200);
+    try std.testing.expect(!w.check(0)); // still in window, still seen
+    try std.testing.expect(!w.check(100)); // still in window, still seen
+    try std.testing.expect(!w.check(200)); // still in window, still seen
+    try std.testing.expect(!w.check(1200)); // new max, seen
+
+    // Shift by another 1000. New max = 2200.
+    // Clears 1201...2200.
+    // 0 is now outside window (2200 - 2048 = 152).
+    // 100 is outside window.
+    // 200 is inside window (200 >= 153).
+    w.update(2200);
+
+    // Check old values (check returns false if too old)
+    try std.testing.expect(!w.check(0));
+    try std.testing.expect(!w.check(100));
+
+    // 200 should still be marked as seen?
+    // Wait, 200 was set. It wasn't cleared by 1200 update.
+    // And it wasn't cleared by 2200 update (cleared 1201..2200).
+    // So 200 bit is still set.
+    // check(200) -> false (seen).
+    try std.testing.expect(!w.check(200));
+
+    // Verify a value that was cleared is acceptable
+    // 1500 was in the cleared range of the first large shift?
+    // First shift: cleared 201..1200.
+    // Second shift: cleared 1201..2200.
+    // So 1500 was cleared in second shift.
+    // It is within window [2200-2048+1, 2200] = [153, 2200].
+    // So 1500 is valid range. And bit should be 0.
+    try std.testing.expect(w.check(1500));
 }

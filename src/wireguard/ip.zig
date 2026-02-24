@@ -65,14 +65,14 @@ pub fn fromU32(val: u32) [4]u8 {
 // ─── Tests ───
 
 test "derived IPs are deterministic" {
-    const kp = try Keys.generate();
+    const kp = Keys.generate();
     const ip1 = deriveFromPubkey(kp.public_key);
     const ip2 = deriveFromPubkey(kp.public_key);
     try std.testing.expectEqualSlices(u8, &ip1, &ip2);
 }
 
 test "derived IPs use correct prefix" {
-    const kp = try Keys.generate();
+    const kp = Keys.generate();
     const ip = deriveFromPubkey(kp.public_key);
     try std.testing.expectEqual(ip[0], 10);
     try std.testing.expectEqual(ip[1], 99);
@@ -82,7 +82,7 @@ test "derived IPs avoid reserved addresses" {
     // Generate many keys and check none produce .0 or .255
     var i: usize = 0;
     while (i < 100) : (i += 1) {
-        const kp = try Keys.generate();
+        const kp = Keys.generate();
         const ip = deriveFromPubkey(kp.public_key);
         try std.testing.expect(ip[2] != 0);
         try std.testing.expect(ip[3] != 0);
