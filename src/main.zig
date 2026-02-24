@@ -1050,6 +1050,190 @@ fn tunReaderPipeline(
     }
 }
 
+/// io_uring-based TUN reader pipeline.
+/// Replaces poll()+read() with pre-submitted io_uring read SQEs (32 in-flight).
+/// All packet processing (GSO split, peer lookup, batch staging) is identical
+/// to tunReaderPipeline.
+fn tunReaderIoUring(
+    running: *const std.atomic.Value(bool),
+    wg_dev: *lib.wireguard.Device.WgDevice,
+    tun_fd: posix.fd_t,
+    vnet_hdr: bool,
+    pool: *lib.net.Pipeline.DataPlanePool,
+    crypto_q: *lib.net.Pipeline.CryptoQueue,
+) void {
+    const Offload = lib.net.Offload;
+    const Pipeline = lib.net.Pipeline;
+    const MAX_PEERS = lib.wireguard.Device.MAX_PEERS;
+    const IoUringReader = lib.net.IoUring.TunRingReader;
+
+    // Initialize io_uring reader — if this fails, fall back to poll+read
+    var reader = IoUringReader.init(tun_fd) catch {
+        // Fallback to legacy poll+read path
+        tunReaderPipeline(running, wg_dev, tun_fd, vnet_hdr, pool, crypto_q);
+        return;
+    };
+    defer reader.deinit();
+
+    // Per-peer batch building: thread-local staging
+    var local_batches: [MAX_PEERS]?u16 = .{null} ** MAX_PEERS;
+
+    // Thread-local buffer cache to avoid per-packet mutex contention
+    const BUF_CACHE_SIZE: usize = 128;
+    var buf_cache: [BUF_CACHE_SIZE]u16 = undefined;
+    var buf_cache_count: usize = 0;
+
+    // CQE batch buffer
+    var cqes: [IoUringReader.RING_DEPTH]std.os.linux.io_uring_cqe = undefined;
+
+    while (running.load(.acquire)) {
+        // Wait for at least 1 completed read
+        const n_cqes = reader.waitCompletions(&cqes, 1) catch continue;
+        if (n_cqes == 0) continue;
+
+        // Track which peers have partial batches to flush
+        var touched_peers: [MAX_PEERS]bool = .{false} ** MAX_PEERS;
+
+        // Process each completed read
+        for (cqes[0..n_cqes]) |cqe| {
+            const slot: u32 = @intCast(cqe.user_data);
+
+            // Get the read data from this CQE
+            const data = reader.getReadData(cqe) orelse {
+                // Error or zero-length read — resubmit and continue
+                reader.resubmit(slot, tun_fd) catch {};
+                continue;
+            };
+
+            const n = data.len;
+
+            if (vnet_hdr) {
+                if (n <= Offload.VNET_HDR_LEN) {
+                    reader.resubmit(slot, tun_fd) catch {};
+                    continue;
+                }
+                const vhdr: *const Offload.VirtioNetHdr = @ptrCast(@alignCast(data.ptr));
+                const ip_data = data[Offload.VNET_HDR_LEN..];
+
+                if (vhdr.gso_type != Offload.GSO_NONE) {
+                    // ── ZERO-COPY GSO path (identical to tunReaderPipeline) ──
+                    if (ip_data.len < 20) {
+                        reader.resubmit(slot, tun_fd) catch {};
+                        continue;
+                    }
+                    const dst_ip: [4]u8 = ip_data[16..20].*;
+                    const peer_slot = wg_dev.lookupByMeshIp(dst_ip) orelse {
+                        reader.resubmit(slot, tun_fd) catch {};
+                        continue;
+                    };
+                    const peer = wg_dev.peers[peer_slot] orelse {
+                        reader.resubmit(slot, tun_fd) catch {};
+                        continue;
+                    };
+                    if (peer.endpoint_addr[0] == 0) {
+                        reader.resubmit(slot, tun_fd) catch {};
+                        continue;
+                    }
+
+                    const max_segs: usize = 64;
+                    while (buf_cache_count < max_segs) {
+                        const remaining = buf_cache[buf_cache_count..];
+                        const filled = pool.allocBufferBatch(remaining);
+                        if (filled == 0) break;
+                        buf_cache_count += filled;
+                    }
+                    if (buf_cache_count == 0) {
+                        reader.resubmit(slot, tun_fd) catch {};
+                        continue;
+                    }
+
+                    const avail = @min(buf_cache_count, max_segs);
+                    var pool_slices: [64][]u8 = undefined;
+                    var pool_indices: [64]u16 = undefined;
+                    for (0..avail) |i| {
+                        const idx = buf_cache[buf_cache_count - 1 - i];
+                        pool_indices[i] = idx;
+                        pool_slices[i] = pool.buffers[idx].data[Pipeline.WG_HEADER_LEN..];
+                    }
+
+                    var seg_sizes: [64]usize = undefined;
+                    const seg_count = Offload.gsoSplit(
+                        vhdr.*,
+                        ip_data,
+                        pool_slices[0..avail],
+                        &seg_sizes,
+                        avail,
+                    );
+
+                    if (seg_count == 0) {
+                        reader.resubmit(slot, tun_fd) catch {};
+                        continue;
+                    }
+                    buf_cache_count -= seg_count;
+
+                    if (local_batches[peer_slot] == null) {
+                        local_batches[peer_slot] = pool.allocBatch() orelse {
+                            reader.resubmit(slot, tun_fd) catch {};
+                            continue;
+                        };
+                    }
+                    touched_peers[peer_slot] = true;
+
+                    for (0..seg_count) |s| {
+                        const buf_idx = pool_indices[s];
+                        var pkt = &pool.buffers[buf_idx];
+                        pkt.len = @intCast(seg_sizes[s]);
+                        pkt.endpoint_addr = peer.endpoint_addr;
+                        pkt.endpoint_port = peer.endpoint_port;
+
+                        const batch_idx = local_batches[peer_slot].?;
+                        var batch = &pool.batches[batch_idx];
+                        batch.buf_indices[batch.count] = buf_idx;
+                        batch.lengths[batch.count] = @intCast(seg_sizes[s]);
+                        batch.count += 1;
+
+                        if (batch.count >= Pipeline.BATCH_SIZE) {
+                            dispatchBatch(wg_dev, pool, crypto_q, @intCast(peer_slot), batch_idx);
+                            local_batches[peer_slot] = pool.allocBatch();
+                        }
+                    }
+                } else {
+                    if (ip_data.len < 20) {
+                        reader.resubmit(slot, tun_fd) catch {};
+                        continue;
+                    }
+                    // Need mutable slice for checksum — copy into a temp buffer
+                    // because io_uring slot buffer may be const
+                    var mutable_buf: [65535]u8 = undefined;
+                    const pkt_len = ip_data.len;
+                    @memcpy(mutable_buf[0..pkt_len], ip_data);
+                    Offload.completeChecksum(vhdr.*, mutable_buf[0..pkt_len]);
+                    stageSegment(wg_dev, pool, crypto_q, mutable_buf[0..pkt_len], &local_batches, &touched_peers, &buf_cache, &buf_cache_count);
+                }
+            } else {
+                if (n < 20) {
+                    reader.resubmit(slot, tun_fd) catch {};
+                    continue;
+                }
+                stageSegment(wg_dev, pool, crypto_q, data[0..n], &local_batches, &touched_peers, &buf_cache, &buf_cache_count);
+            }
+
+            // Resubmit read SQE for this slot
+            reader.resubmit(slot, tun_fd) catch {};
+        }
+
+        // Flush partial batches for all touched peers
+        for (0..MAX_PEERS) |slot_idx| {
+            if (touched_peers[slot_idx]) {
+                if (local_batches[slot_idx]) |batch_idx| {
+                    dispatchBatch(wg_dev, pool, crypto_q, @intCast(slot_idx), batch_idx);
+                    local_batches[slot_idx] = null;
+                }
+            }
+        }
+    }
+}
+
 /// Stage a single IP segment into the per-peer batch.
 fn stageSegment(
     wg_dev: *lib.wireguard.Device.WgDevice,
@@ -1606,10 +1790,14 @@ fn userspaceEventLoop(
 
     writeFormatted(stdout, "  opened {d} TUN queues\n", .{opened_workers}) catch {};
 
-    // Set all TUN fds to non-blocking
-    for (0..opened_workers) |w| {
-        const flags = posix.fcntl(tun_fds[w], posix.F.GETFL, 0) catch continue;
-        _ = posix.fcntl(tun_fds[w], posix.F.SETFL, flags | @as(usize, 0x800)) catch {};
+    // Set all TUN fds to non-blocking (only for legacy poll+read path).
+    // io_uring manages its own waiting and needs blocking fds.
+    const use_io_uring = lib.net.IoUring.isAvailable();
+    if (!use_io_uring) {
+        for (0..opened_workers) |w| {
+            const flags = posix.fcntl(tun_fds[w], posix.F.GETFL, 0) catch continue;
+            _ = posix.fcntl(tun_fds[w], posix.F.SETFL, flags | @as(usize, 0x800)) catch {};
+        }
     }
 
     // Total thread pool
@@ -1650,16 +1838,29 @@ fn userspaceEventLoop(
             break :blk sock.fd;
         };
 
+        // Log io_uring TUN reader choice (detection happened above)
+        if (use_io_uring) {
+            writeFormatted(stdout, "  io_uring: available, using ring-based TUN reader\n", .{}) catch {};
+        } else {
+            writeFormatted(stdout, "  io_uring: unavailable, using poll+read TUN reader\n", .{}) catch {};
+        }
+
         // Parallel pipeline: TUN readers + encrypt workers
         for (0..opened_workers) |w| {
-            threads[spawned] = std.Thread.spawn(.{}, tunReaderPipeline, .{
+            const args = .{
                 &swim.running,
                 wg_dev,
                 tun_fds[w],
                 tun_dev.vnet_hdr,
                 data_pool,
                 crypto_queue,
-            }) catch {
+            };
+            const thread = if (use_io_uring)
+                std.Thread.spawn(.{}, tunReaderIoUring, args)
+            else
+                std.Thread.spawn(.{}, tunReaderPipeline, args);
+
+            threads[spawned] = thread catch {
                 writeFormatted(stdout, "  warning: failed to spawn TUN reader {d}\n", .{w}) catch {};
                 continue;
             };

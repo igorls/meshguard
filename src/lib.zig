@@ -46,6 +46,7 @@ pub const net = struct {
     pub const Tun = @import("net/tun.zig");
     pub const Dns = @import("net/dns.zig");
     pub const Pipeline = @import("net/pipeline.zig");
+    pub const IoUring = @import("net/io_uring.zig");
 };
 
 pub const config = @import("config.zig");
