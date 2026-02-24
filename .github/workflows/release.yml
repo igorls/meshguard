@@ -10,15 +10,7 @@ permissions:
 
 jobs:
   build:
-    strategy:
-      matrix:
-        include:
-          - runner: ubuntu-latest
-            artifact: meshguard-linux-amd64
-          - runner: ubuntu-24.04-arm
-            artifact: meshguard-linux-arm64
-
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -34,43 +26,31 @@ jobs:
         run: zig build -Doptimize=ReleaseFast
 
       - name: Rename binary
-        run: mv zig-out/bin/meshguard ${{ matrix.artifact }}
+        run: mv zig-out/bin/meshguard meshguard-linux-amd64
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
-
-  release:
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          merge-multiple: true
-
-      - name: Generate checksums
-        working-directory: artifacts
-        run: sha256sum meshguard-* > checksums.txt
+      - name: Generate checksum
+        run: sha256sum meshguard-linux-amd64 > checksums.txt
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           files: |
-            artifacts/meshguard-*
-            artifacts/checksums.txt
+            meshguard-linux-amd64
+            checksums.txt
           body: |
             ## Install
 
             ```bash
-            # Download (replace amd64 with arm64 as needed)
-            curl -Lo meshguard https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/meshguard-linux-amd64
+            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | bash
+            ```
+
+            Or download manually and install:
+
+            ```bash
+            curl -fSLo meshguard https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/meshguard-linux-amd64
             chmod +x meshguard
             sudo mv meshguard /usr/local/bin/
             ```
 
-            **Runtime dependency:** `libsodium23` — install with `sudo apt-get install libsodium23` (Debian/Ubuntu) or equivalent.
+            **Runtime dependency:** `libsodium` — the install script handles this automatically.

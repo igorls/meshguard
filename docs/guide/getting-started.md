@@ -2,36 +2,19 @@
 
 ## Install
 
-Download a prebuilt binary from [GitHub Releases](https://github.com/igorls/meshguard/releases/latest):
-
 ```bash
-# Download the latest release (Linux x86_64)
-curl -Lo meshguard https://github.com/igorls/meshguard/releases/latest/download/meshguard-linux-amd64
-chmod +x meshguard
-sudo mv meshguard /usr/local/bin/
-
-# Verify
-meshguard version
+curl -fsSL https://raw.githubusercontent.com/igorls/meshguard/main/install.sh | bash
 ```
 
-::: tip Other architectures
-Replace `amd64` with `arm64` for Raspberry Pi, AWS Graviton, and other ARM64 platforms.
-:::
+This will:
 
-::: warning Runtime dependency
-meshguard requires **libsodium** at runtime:
+- Detect your architecture (x86_64 / arm64)
+- Install **libsodium** if not present
+- Download the latest release from [GitHub Releases](https://github.com/igorls/meshguard/releases/latest)
+- Install to `/usr/local/bin/meshguard`
 
-```bash
-# Debian / Ubuntu
-sudo apt-get install libsodium23
-
-# Fedora / RHEL
-sudo dnf install libsodium
-
-# Arch
-sudo pacman -S libsodium
-```
-
+::: tip Manual download
+You can also download binaries directly from the [releases page](https://github.com/igorls/meshguard/releases/latest).
 :::
 
 ## Building from source
