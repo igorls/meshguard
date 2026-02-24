@@ -134,13 +134,13 @@ meshguard status
 
 ## Docker
 
-A Dockerfile and docker-compose file are provided for containerised deployments:
+A `docker-compose.yml` file is provided specifically for **performance benchmarking** and testing the multi-node mesh locally. It is not intended for production daemon deployments.
 
 ```bash
 docker compose up
 ```
 
-See `meshguard/docker-compose.yml` for the full configuration.
+See `docker-compose.yml` for the benchmark topology configuration.
 
 ## Run as a service
 
