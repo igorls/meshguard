@@ -182,9 +182,10 @@ Trust is **bidirectional** — both peers must have each other's key (or mutual 
 
 | Implementation                 | Download      | Upload        | Notes                                   |
 | ------------------------------ | ------------- | ------------- | --------------------------------------- |
-| **meshguard** (Zig, userspace) | **3.16 Gbps** | **2.56 Gbps** | libsodium AVX2, sendmmsg, zero-copy GSO |
-| wireguard-go (Go, userspace)   | 8.32 Gbps     | —             | Go asm ChaCha20, goroutine parallelism  |
-| WireGuard (kernel module)      | ~10 Gbps      | —             | In-kernel, zero-copy                    |
+| wireguard-go (Go, userspace)   | 10.6 Gbps     | 11.1 Gbps     | Go asm ChaCha20, goroutine parallelism  |
+| WireGuard (kernel module)      | 4.98 Gbps     | 4.99 Gbps     | In-kernel datapath                      |
+| **meshguard** (Zig, userspace) | **2.13 Gbps** | **2.24 Gbps** | libsodium AVX2, sendmmsg, zero-copy GSO |
+| boringtun (Rust, userspace)    | 1.82 Gbps     | 1.81 Gbps     | Cloudflare userspace WG                 |
 
 ### Optimization History
 
