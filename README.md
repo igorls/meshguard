@@ -197,27 +197,30 @@ Trust authorization order:
 > **Hardware**: Intel i9-12900KF (16C/24T, 5.2 GHz), 128 GB DDR5, Ubuntu 24.04  
 > **Setup**: Two LXC containers on localhost, 8 encrypt workers, MTU 1420
 
-| Implementation                 | Download      | Upload        | Notes                                   |
-| ------------------------------ | ------------- | ------------- | --------------------------------------- |
-| wireguard-go (Go, userspace)   | 10.6 Gbps     | 11.1 Gbps     | Go asm ChaCha20, goroutine parallelism  |
-| WireGuard (kernel module)      | 4.98 Gbps     | 4.99 Gbps     | In-kernel datapath                      |
-| **meshguard** (Zig, userspace) | **2.13 Gbps** | **2.24 Gbps** | libsodium AVX2, sendmmsg, zero-copy GSO |
-| boringtun (Rust, userspace)    | 1.82 Gbps     | 1.81 Gbps     | Cloudflare userspace WG                 |
+| Implementation                 | Download      | Upload        | Notes                                                  |
+| ------------------------------ | ------------- | ------------- | ------------------------------------------------------ |
+| wireguard-go (Go, userspace)   | 10.6 Gbps     | 11.1 Gbps     | Go asm ChaCha20, goroutine parallelism                 |
+| WireGuard (kernel module)      | 4.98 Gbps     | 4.99 Gbps     | In-kernel datapath                                     |
+| **meshguard** (Zig, userspace) | **3.93 Gbps** | **3.94 Gbps** | libsodium AVX2, UDP GRO, zero-copy GSO, NAPI busy-poll |
+| boringtun (Rust, userspace)    | 1.82 Gbps     | 1.81 Gbps     | Cloudflare userspace WG                                |
 
 ### Optimization History
 
-| Optimization              | Download  | Δ    |
-| ------------------------- | --------- | ---- |
-| Baseline                  | 2.26 Gbps | —    |
-| + Zero-copy GSO split     | 2.65 Gbps | +17% |
-| + `sendmmsg` batch sends  | 2.72 Gbps | +20% |
-| + libsodium AVX2 ChaCha20 | 3.16 Gbps | +40% |
+| Optimization                    | Download  | Δ    |
+| ------------------------------- | --------- | ---- |
+| Baseline                        | 2.26 Gbps | —    |
+| + Zero-copy GSO split           | 2.65 Gbps | +17% |
+| + `sendmmsg` batch sends        | 2.72 Gbps | +20% |
+| + libsodium AVX2 ChaCha20       | 3.07 Gbps | +36% |
+| + UDP GRO (64KB coalesced recv) | 3.89 Gbps | +72% |
+| + SO_BUSY_POLL + drain loop     | 3.93 Gbps | +74% |
 
 ### Run benchmarks
 
 ```bash
 bash docker/lxc-mg-bench.sh 10 8    # 10s, 8 encrypt workers
 bash docker/lxc-4way-bench.sh 10     # Compare all implementations
+bash docker/perf-capture.sh 10 8     # Flamegraph + perf report
 ```
 
 ## Docker
@@ -278,6 +281,8 @@ Core functionality is implemented and under active benchmarking:
 - [x] `recvmmsg`/`sendmmsg` batched I/O
 - [x] GRO/GSO via `IFF_VNET_HDR` for TUN
 - [x] libsodium AVX2 ChaCha20-Poly1305
+- [x] UDP GRO on control-plane socket
+- [x] NAPI busy-poll + GRO drain loop
 - [ ] Multi-queue TUN (`IFF_MULTI_QUEUE`)
 - [ ] `io_uring` event loop
 - [ ] IPv6 support
