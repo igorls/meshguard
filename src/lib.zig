@@ -54,4 +54,13 @@ pub const config = @import("config.zig");
 test {
     // Run all module tests
     @import("std").testing.refAllDecls(@This());
+    _ = wireguard.Tunnel;
+    _ = wireguard.Device;
+    _ = wireguard.Noise;
+    _ = wireguard.Crypto;
+    _ = wireguard.Ip;
+    _ = wireguard.Config;
+    _ = wireguard.Netlink;
+    _ = wireguard.RtNetlink;
+    _ = wireguard.NlSocket;
 }
