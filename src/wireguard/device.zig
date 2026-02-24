@@ -303,13 +303,15 @@ pub const WgDevice = struct {
     /// Remove a peer by WG public key.
     pub fn removePeer(self: *WgDevice, wg_pubkey: [32]u8) void {
         if (self.static_map.get(wg_pubkey)) |slot| {
-            if (self.peers[slot]) |peer| {
+            if (self.peers[slot]) |*peer| {
                 self.index_map.remove(peer.sender_index);
                 // Clear mesh IP routing
                 if (peer.mesh_ip[0] != 0 or peer.mesh_ip[1] != 0) {
                     self.ip_to_slot[meshIpHostId(peer.mesh_ip)] = 0xFF;
                 }
                 self.static_map.remove(wg_pubkey);
+                // Securely zero out key material before removal
+                peer.handshake.deinit();
                 self.peers[slot] = null;
                 self.peer_count -|= 1;
             }
