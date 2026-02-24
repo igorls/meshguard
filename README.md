@@ -177,7 +177,7 @@ Trust is **bidirectional** — both peers must have each other's key (or mutual 
 
 ### Throughput (iperf3, 10s, single peer)
 
-> **Hardware**: Intel i9-12900KF (16C/24T, 5.2 GHz), 64 GB DDR5, Ubuntu 24.04  
+> **Hardware**: Intel i9-12900KF (16C/24T, 5.2 GHz), 128 GB DDR5, Ubuntu 24.04  
 > **Setup**: Two LXC containers on localhost, 8 encrypt workers, MTU 1420
 
 | Implementation                 | Download      | Upload        | Notes                                   |
