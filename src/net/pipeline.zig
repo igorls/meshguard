@@ -270,3 +270,94 @@ pub const PeerTxRing = struct {
         self.head +%= 1;
     }
 };
+
+/// Pre-allocated slot for an encrypted UDP packet awaiting decryption.
+pub const DecryptSlot = struct {
+    data: [2048]u8 = undefined,
+    len: u16 = 0,
+};
+
+/// Bounded SPMC queue for dispatching encrypted transport packets from the
+/// control thread (single producer) to N decrypt worker threads (multiple consumers).
+/// Same proven design as CryptoQueue: atomic head/tail + condvar for blocking pop.
+pub const DECRYPT_QUEUE_SIZE: usize = 2048; // must be power of 2
+pub const DecryptQueue = struct {
+    pub const PopResult = struct { idx: usize };
+    slots: [DECRYPT_QUEUE_SIZE]DecryptSlot = undefined,
+    head: std.atomic.Value(u64) align(CACHE_LINE) = std.atomic.Value(u64).init(0),
+    tail: std.atomic.Value(u64) align(CACHE_LINE) = std.atomic.Value(u64).init(0),
+    closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    waiters: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    mutex: std.Thread.Mutex = .{},
+    not_empty: std.Thread.Condition = .{},
+
+    /// Push an encrypted packet into the queue (called from control thread only).
+    /// Returns false if queue is full.
+    pub fn tryPush(self: *DecryptQueue, pkt: []const u8) bool {
+        const tail = self.tail.load(.monotonic);
+        const head = self.head.load(.acquire);
+        if (tail -% head >= DECRYPT_QUEUE_SIZE) return false;
+
+        const slot_idx = tail % DECRYPT_QUEUE_SIZE;
+        const copy_len = @min(pkt.len, 2048);
+        @memcpy(self.slots[slot_idx].data[0..copy_len], pkt[0..copy_len]);
+        self.slots[slot_idx].len = @intCast(copy_len);
+
+        _ = self.tail.fetchAdd(1, .release);
+
+        if (self.waiters.load(.acquire) > 0) {
+            self.mutex.lock();
+            self.not_empty.signal();
+            self.mutex.unlock();
+        }
+        return true;
+    }
+
+    /// Try to pop a packet slot without blocking. Returns null if empty.
+    pub fn tryPop(self: *DecryptQueue) ?PopResult {
+        const head = self.head.load(.monotonic);
+        const tail = self.tail.load(.acquire);
+        if (head >= tail) return null;
+
+        // CAS to claim this slot (SPMC: only consumers race)
+        if (self.head.cmpxchgStrong(head, head + 1, .acq_rel, .monotonic) != null) return null;
+
+        return .{ .idx = head % DECRYPT_QUEUE_SIZE };
+    }
+
+    /// Pop a packet slot, blocking if empty. Returns null if closed.
+    pub fn pop(self: *DecryptQueue) ?PopResult {
+        while (true) {
+            if (self.tryPop()) |result| return result;
+            if (self.closed.load(.acquire)) return null;
+
+            self.mutex.lock();
+            if (self.tryPop()) |result| {
+                self.mutex.unlock();
+                return result;
+            }
+            if (self.closed.load(.acquire)) {
+                self.mutex.unlock();
+                return null;
+            }
+            _ = self.waiters.fetchAdd(1, .release);
+            self.not_empty.wait(&self.mutex);
+            _ = self.waiters.fetchSub(1, .release);
+            self.mutex.unlock();
+        }
+    }
+
+    /// Get packet data from a slot.
+    pub fn getPacket(self: *DecryptQueue, idx: usize) []const u8 {
+        return self.slots[idx].data[0..self.slots[idx].len];
+    }
+
+    /// Close the queue, waking all blocked consumers.
+    pub fn close(self: *DecryptQueue) void {
+        self.closed.store(true, .release);
+        self.mutex.lock();
+        self.not_empty.broadcast();
+        self.mutex.unlock();
+    }
+};

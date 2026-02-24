@@ -25,9 +25,12 @@ pub const UdpSocket = struct {
         );
         errdefer posix.close(fd);
 
-        // Enable SO_REUSEADDR
+        // Enable SO_REUSEADDR + SO_REUSEPORT
+        // REUSEPORT allows multiple sockets to bind to the same port;
+        // the kernel distributes incoming packets by 4-tuple hash.
         const one: u32 = 1;
         try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one));
+        try posix.setsockopt(fd, posix.SOL.SOCKET, linux.SO.REUSEPORT, std.mem.asBytes(&one));
 
         var addr = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, port);
         try posix.bind(fd, &addr.any, addr.getOsSockLen());

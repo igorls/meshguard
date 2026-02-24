@@ -1019,6 +1019,7 @@ fn wgOnPeerPunched(ctx: *anyopaque, peer: *const lib.discovery.Membership.Peer, 
 
 /// Maximum data-plane worker threads (TUN readers + encrypt workers combined).
 const MAX_WORKERS: usize = 8;
+const MAX_RX_WORKERS: usize = 8; // Parallel UDP RX + decrypt workers
 const MAX_ENCRYPT_WORKERS: usize = 16;
 
 // ── Zero-copy parallel encryption pipeline ──────────────────────────────
@@ -1814,6 +1815,43 @@ fn writeCoalescedToTun(
     }
 }
 
+/// Parallel decrypt worker: pulls encrypted transport packets from the DecryptQueue,
+/// decrypts them using wg_dev.decryptTransport (thread-safe via replay_lock), and writes
+/// plaintext to TUN. This parallelizes the download path across N cores.
+///
+/// Each worker has its own TUN queue fd for parallel writev calls.
+fn decryptRxWorker(
+    running: *const std.atomic.Value(bool),
+    wg_dev: *lib.wireguard.Device.WgDevice,
+    tun_dev_ptr: *const lib.net.Tun.TunDevice,
+    tun_fd: posix.fd_t,
+    decrypt_q: *lib.net.Pipeline.DecryptQueue,
+) void {
+    const Offload = lib.net.Offload;
+
+    // Per-worker decrypt buffer
+    var out_buf: [1500]u8 = undefined;
+
+    while (running.load(.acquire)) {
+        const result = decrypt_q.pop() orelse break; // null = closed
+
+        const pkt = decrypt_q.getPacket(result.idx);
+        if (wg_dev.decryptTransport(pkt, &out_buf)) |dec| {
+            // Write decrypted packet to TUN
+            if (tun_dev_ptr.vnet_hdr) {
+                var vhdr_bytes = std.mem.zeroes([Offload.VNET_HDR_LEN]u8);
+                var iov = [_]posix.iovec_const{
+                    .{ .base = &vhdr_bytes, .len = Offload.VNET_HDR_LEN },
+                    .{ .base = out_buf[0..dec.len].ptr, .len = dec.len },
+                };
+                _ = posix.writev(tun_fd, &iov) catch {};
+            } else {
+                _ = posix.write(tun_fd, out_buf[0..dec.len]) catch {};
+            }
+        } else |_| {}
+    }
+}
+
 /// Process a single incoming UDP packet: classify and dispatch to the appropriate handler.
 /// Shared by both GRO (single coalesced buffer) and legacy batch (recvmmsg) receive paths.
 fn processIncomingPacket(
@@ -1934,7 +1972,7 @@ fn userspaceEventLoop(
     }
 
     // Total thread pool
-    const MAX_TOTAL_THREADS = MAX_WORKERS + MAX_ENCRYPT_WORKERS;
+    const MAX_TOTAL_THREADS = MAX_WORKERS + MAX_ENCRYPT_WORKERS + MAX_RX_WORKERS;
     var threads: [MAX_TOTAL_THREADS]std.Thread = undefined;
     var spawned: usize = 0;
 
@@ -2072,7 +2110,6 @@ fn userspaceEventLoop(
                 if (tun_dev.vnet_hdr) {
                     writeCoalescedToTun(&tun_dev, &decrypt_storage, &decrypt_lens, n_decrypted);
                 } else {
-                    // No vnet_hdr — write each packet individually
                     for (0..n_decrypted) |d| {
                         _ = posix.write(tun_dev.fd, decrypt_storage[d][0..decrypt_lens[d]]) catch {};
                     }
