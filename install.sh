@@ -86,6 +86,20 @@ if command -v systemctl &>/dev/null; then
   if [ ! -f /etc/default/meshguard ]; then
     sudo curl -fsSL -o /etc/default/meshguard "${DIST_URL}/meshguard.default"
   fi
+
+  # Setup /etc/meshguard config directory
+  sudo mkdir -p /etc/meshguard/authorized_keys /etc/meshguard/trusted_orgs
+  USER_CONFIG="${HOME}/.config/meshguard"
+  if [ -d "$USER_CONFIG" ] && [ ! -f /etc/meshguard/identity.key ]; then
+    echo "  copying identity from ${USER_CONFIG}/ → /etc/meshguard/"
+    sudo cp -n "${USER_CONFIG}/identity.key" /etc/meshguard/ 2>/dev/null || true
+    sudo cp -n "${USER_CONFIG}/identity.pub" /etc/meshguard/ 2>/dev/null || true
+    sudo cp -rn "${USER_CONFIG}/authorized_keys/"* /etc/meshguard/authorized_keys/ 2>/dev/null || true
+    sudo cp -rn "${USER_CONFIG}/trusted_orgs/"* /etc/meshguard/trusted_orgs/ 2>/dev/null || true
+    sudo cp -n "${USER_CONFIG}/node.cert" /etc/meshguard/ 2>/dev/null || true
+    sudo chmod 600 /etc/meshguard/identity.key 2>/dev/null || true
+  fi
+
   sudo systemctl daemon-reload
   SYSTEMD_INSTALLED=true
 else
