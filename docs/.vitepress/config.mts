@@ -6,6 +6,7 @@ export default defineConfig({
   base: '/meshguard/',
   appearance: 'dark',
   head: [
+    ['link', { rel: 'icon', type: 'image/svg+xml', href: '/meshguard/favicon.svg' }],
     ['meta', { name: 'theme-color', content: '#00ff88' }],
     ['link', { rel: 'preconnect', href: 'https://fonts.googleapis.com' }],
     ['link', { rel: 'preconnect', href: 'https://fonts.gstatic.com', crossorigin: '' }],
