@@ -5,7 +5,10 @@ export default defineConfig({
   description: 'Decentralized, serverless WireGuard mesh VPN daemon',
   base: '/meshguard/',
   head: [
-    ['meta', { name: 'theme-color', content: '#6366f1' }],
+    ['meta', { name: 'theme-color', content: '#00ff88' }],
+    ['link', { rel: 'preconnect', href: 'https://fonts.googleapis.com' }],
+    ['link', { rel: 'preconnect', href: 'https://fonts.gstatic.com', crossorigin: '' }],
+    ['link', { rel: 'stylesheet', href: 'https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap' }],
   ],
   themeConfig: {
     logo: undefined,
