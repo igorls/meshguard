@@ -76,20 +76,34 @@ pub const Tunnel = struct {
 
         // Copy plaintext + zero padding into output buffer temporarily
         const ct_start = TRANSPORT_HEADER_LEN;
-        @memcpy(out[ct_start..][0..plaintext.len], plaintext);
-        if (padding_len > 0) {
-            @memset(out[ct_start + plaintext.len ..][0..padding_len], 0);
-        }
 
-        // Encrypt in-place: libsodium ChaCha20-Poly1305 AVX2 assembly
-        sodium.encrypt(
-            out[ct_start..][0..padded_len],
-            out[ct_start + padded_len ..][0..AUTHTAG_LEN],
-            out[ct_start..][0..padded_len],
-            &.{}, // No additional data for transport
-            nonce,
-            self.keys.sending_key,
-        );
+        if (padding_len == 0) {
+            // Optimization: For 16-byte aligned packets, avoid the copy
+            // Encrypt directly from input plaintext to output buffer
+            sodium.encrypt(
+                out[ct_start..][0..padded_len],
+                out[ct_start + padded_len ..][0..AUTHTAG_LEN],
+                plaintext,
+                &.{}, // No additional data for transport
+                nonce,
+                self.keys.sending_key,
+            );
+        } else {
+            @memcpy(out[ct_start..][0..plaintext.len], plaintext);
+            if (padding_len > 0) {
+                @memset(out[ct_start + plaintext.len ..][0..padding_len], 0);
+            }
+
+            // Encrypt in-place: libsodium ChaCha20-Poly1305 AVX2 assembly
+            sodium.encrypt(
+                out[ct_start..][0..padded_len],
+                out[ct_start + padded_len ..][0..AUTHTAG_LEN],
+                out[ct_start..][0..padded_len],
+                &.{}, // No additional data for transport
+                nonce,
+                self.keys.sending_key,
+            );
+        }
 
         self.last_send_ns = std.time.nanoTimestamp();
 
@@ -402,6 +416,42 @@ test "transport nonce counter increments" {
     try std.testing.expectEqual(tunnel.send_counter.load(.monotonic), 1);
     _ = try tunnel.encrypt("test", &buf);
     try std.testing.expectEqual(tunnel.send_counter.load(.monotonic), 2);
+}
+
+test "transport encrypt zero-copy (aligned)" {
+    const keys = noise.TransportKeys{
+        .sending_key = .{0x42} ** 32,
+        .receiving_key = .{0x99} ** 32,
+        .sending_index = 1,
+        .receiving_index = 2,
+        .is_initiator = true,
+        .birthdate_ns = std.time.nanoTimestamp(),
+    };
+    var sender = Tunnel{ .keys = keys };
+    var receiver = Tunnel{
+        .keys = .{
+            .sending_key = keys.receiving_key,
+            .receiving_key = keys.sending_key,
+            .sending_index = keys.receiving_index,
+            .receiving_index = keys.sending_index,
+            .is_initiator = false,
+            .birthdate_ns = keys.birthdate_ns,
+        },
+    };
+
+    const plaintext = "0123456789abcdef"; // 16 bytes, aligned
+    var packet_buf: [256]u8 = undefined;
+    var decrypt_buf: [256]u8 = undefined;
+
+    // Encrypt (should trigger zero-copy path)
+    const packet_len = try sender.encrypt(plaintext, &packet_buf);
+    const expected_len = TRANSPORT_HEADER_LEN + plaintext.len + AUTHTAG_LEN;
+    try std.testing.expectEqual(packet_len, expected_len);
+
+    // Decrypt
+    const decrypted_len = try receiver.decrypt(packet_buf[0..packet_len], &decrypt_buf);
+    try std.testing.expectEqual(decrypted_len, plaintext.len);
+    try std.testing.expectEqualSlices(u8, plaintext, decrypt_buf[0..plaintext.len]);
 }
 
 test "anti-replay window large shift" {
