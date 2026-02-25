@@ -132,16 +132,6 @@ This tears down the `mg0` interface.
 meshguard status
 ```
 
-## Docker
-
-A `docker-compose.yml` file is provided specifically for **performance benchmarking** and testing the multi-node mesh locally. It is not intended for production daemon deployments.
-
-```bash
-docker compose up
-```
-
-See `docker-compose.yml` for the benchmark topology configuration.
-
 ## Run as a service
 
 The installer automatically sets up a systemd service. To use it:
