@@ -4,6 +4,7 @@ export default defineConfig({
   title: 'meshguard',
   description: 'Decentralized, serverless WireGuard mesh VPN daemon',
   base: '/meshguard/',
+  appearance: 'dark',
   head: [
     ['meta', { name: 'theme-color', content: '#00ff88' }],
     ['link', { rel: 'preconnect', href: 'https://fonts.googleapis.com' }],

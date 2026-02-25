@@ -4,7 +4,18 @@ import { useData } from "vitepress";
 
 const { isDark } = useData();
 const canvasRef = ref(null);
-const terminalVisible = ref(false);
+const copied = ref(false);
+
+const installCmd =
+  "curl -fsSL https://raw.githubusercontent.com/igorls/meshguard/main/install.sh | bash";
+
+function copyInstall() {
+  navigator.clipboard.writeText(installCmd);
+  copied.value = true;
+  setTimeout(() => {
+    copied.value = false;
+  }, 2000);
+}
 
 // Animated mesh network canvas
 onMounted(() => {
@@ -40,7 +51,6 @@ onMounted(() => {
     const h = canvas.offsetHeight;
     ctx.clearRect(0, 0, w, h);
 
-    // Update positions
     for (const node of nodes) {
       node.x += node.vx;
       node.y += node.vy;
@@ -48,7 +58,6 @@ onMounted(() => {
       if (node.y < 0 || node.y > h) node.vy *= -1;
     }
 
-    // Draw connections
     for (let i = 0; i < nodes.length; i++) {
       for (let j = i + 1; j < nodes.length; j++) {
         const dx = nodes[i].x - nodes[j].x;
@@ -66,7 +75,6 @@ onMounted(() => {
       }
     }
 
-    // Draw nodes
     for (const node of nodes) {
       ctx.beginPath();
       ctx.arc(node.x, node.y, node.radius, 0, Math.PI * 2);
@@ -87,32 +95,39 @@ onMounted(() => {
     initNodes();
     draw();
   });
-
-  // Trigger terminal animation
-  setTimeout(() => {
-    terminalVisible.value = true;
-  }, 500);
 });
 
 const terminalLines = [
-  { type: "comment", text: "# install meshguard" },
-  {
-    type: "command",
-    text: "curl -fsSL https://raw.githubusercontent.com/igorls/meshguard/main/install.sh | bash",
-  },
-  { type: "output", text: "✓ meshguard 0.3.1" },
-  { type: "blank" },
-  { type: "comment", text: "# generate identity & join the mesh" },
+  { type: "comment", text: "# 1. generate an Ed25519 identity" },
   { type: "command", text: "meshguard keygen" },
   { type: "output", text: "Identity keypair generated." },
+  { type: "output", text: "  ~/.config/meshguard/identity.key" },
+  { type: "output", text: "  ~/.config/meshguard/identity.pub" },
+  { type: "blank" },
+  { type: "comment", text: "# 2. export your public key" },
+  { type: "command", text: "meshguard export > my-node.pub" },
+  { type: "blank" },
+  { type: "comment", text: "# 3. trust a peer" },
+  {
+    type: "command",
+    text: "meshguard trust /path/to/peer.pub --name validator-3",
+  },
+  { type: "output", text: "Peer trusted: validator-3" },
+  { type: "blank" },
+  { type: "comment", text: "# 4. join the mesh" },
   { type: "command", text: "sudo meshguard up --seed 1.2.3.4:51821" },
-  { type: "output", text: "meshguard starting..." },
+  { type: "output", text: "meshguard is running (userspace WG mode)." },
   { type: "highlight", text: "  mesh IP: 10.99.189.145" },
   {
     type: "highlight",
     text: "  public endpoint: 203.0.113.42:8591 (behind NAT, cone)",
   },
-  { type: "output", text: "  peer joined: 10.99.42.17 [handshake sent]" },
+  { type: "output", text: "  TUN device: mg0 (fd=6, mtu=1420)" },
+  { type: "output", text: "  data-plane workers: 8" },
+  {
+    type: "highlight",
+    text: "  peer joined: 10.99.42.17 validator-3 [handshake complete]",
+  },
 ];
 
 const features = [
@@ -167,7 +182,7 @@ const features = [
         </p>
         <div class="hero-actions">
           <a href="/meshguard/guide/getting-started" class="btn-primary"
-            >$ install</a
+            >getting started</a
           >
           <a href="/meshguard/concepts/architecture" class="btn-secondary"
             >architecture →</a
@@ -179,17 +194,26 @@ const features = [
             >github ↗</a
           >
         </div>
+
+        <!-- Copy-to-clipboard install -->
+        <div class="install-block">
+          <div class="install-cmd" @click="copyInstall">
+            <span class="install-prompt">$</span>
+            <span class="install-text">{{ installCmd }}</span>
+            <span class="install-copy">{{ copied ? "✓" : "⧉" }}</span>
+          </div>
+        </div>
       </div>
     </section>
 
-    <!-- Terminal demo -->
-    <section class="terminal-section" v-if="terminalVisible">
+    <!-- Terminal: real setup flow -->
+    <section class="terminal-section">
       <div class="terminal">
         <div class="terminal-header">
           <span class="terminal-dot red" />
           <span class="terminal-dot yellow" />
           <span class="terminal-dot green" />
-          <span class="terminal-title">meshguard — bash</span>
+          <span class="terminal-title">quick start — bash</span>
         </div>
         <div class="terminal-body">
           <span
