@@ -73,13 +73,14 @@ Start the meshguard daemon.
 meshguard up [options]
 ```
 
-| Flag         | Default  | Description                                 |
-| ------------ | -------- | ------------------------------------------- |
-| `--seed`     | _(none)_ | Seed peer `ip:port`. Can be repeated.       |
-| `--dns`      | _(none)_ | Discover seeds via DNS TXT records          |
-| `--mdns`     | `false`  | Discover seeds via mDNS on LAN              |
-| `--announce` | _(auto)_ | Manually specify public IP for announcement |
-| `--kernel`   | `false`  | Use kernel WireGuard instead of userspace   |
+| Flag                | Default  | Description                                 |
+| ------------------- | -------- | ------------------------------------------- |
+| `--seed`            | _(none)_ | Seed peer `ip:port`. Can be repeated.       |
+| `--dns`             | _(none)_ | Discover seeds via DNS TXT records          |
+| `--mdns`            | `false`  | Discover seeds via mDNS on LAN              |
+| `--announce`        | _(auto)_ | Manually specify public IP for announcement |
+| `--encrypt-workers` | `0`      | Number of encryption threads (0 = serial)   |
+| `--kernel`          | `false`  | Use kernel WireGuard instead of userspace   |
 
 **Startup sequence**:
 
@@ -111,6 +112,16 @@ Display the current mesh state.
 
 ```bash
 meshguard status
+```
+
+---
+
+## `meshguard config show`
+
+Display the current node configuration.
+
+```bash
+meshguard config show
 ```
 
 ---
