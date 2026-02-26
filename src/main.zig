@@ -2217,37 +2217,55 @@ fn writeCoalescedToTun(
                 const total_len = headers_len + total_payload;
 
                 if (total_len <= 65535) {
-                    // Build the super-packet in a stack buffer
-                    var super_pkt: [65535]u8 = undefined;
-                    @memcpy(super_pkt[0..headers_len], pkt_a[0..headers_len]);
+                    // Zero-copy scatter-gather GSO write
+                    // Eliminates memcpy of large payloads, only copying headers.
 
-                    // Copy payloads from all segments
-                    var off: usize = headers_len;
-                    var k: usize = i;
-                    while (k <= coalesce_end) : (k += 1) {
-                        const seg = storage[k][0..lens[k]];
-                        const seg_payload = seg[headers_len..];
-                        @memcpy(super_pkt[off..][0..seg_payload.len], seg_payload);
-                        off += seg_payload.len;
-                    }
+                    var header_buf: [128]u8 = undefined;
+                    @memcpy(header_buf[0..headers_len], pkt_a[0..headers_len]);
 
-                    // Fix IP total length and last segment's TCP flags (PSH)
+                    // Fix IP total length and IP checksum
                     if (ip_version == 4) {
-                        std.mem.writeInt(u16, super_pkt[2..4], @intCast(total_len), .big);
+                        std.mem.writeInt(u16, header_buf[2..4], @intCast(total_len), .big);
                         // Recalculate IP checksum
-                        super_pkt[10] = 0;
-                        super_pkt[11] = 0;
+                        header_buf[10] = 0;
+                        header_buf[11] = 0;
                         var csum: u32 = 0;
                         var ci: usize = 0;
                         while (ci < iph_len) : (ci += 2) {
-                            csum += @as(u32, super_pkt[ci]) << 8 | @as(u32, super_pkt[ci + 1]);
+                            csum += @as(u32, header_buf[ci]) << 8 | @as(u32, header_buf[ci + 1]);
                         }
                         while (csum > 0xFFFF) csum = (csum & 0xFFFF) + (csum >> 16);
                         const ip_csum = ~@as(u16, @intCast(csum & 0xFFFF));
-                        super_pkt[10] = @intCast(ip_csum >> 8);
-                        super_pkt[11] = @intCast(ip_csum & 0xFF);
+                        header_buf[10] = @intCast(ip_csum >> 8);
+                        header_buf[11] = @intCast(ip_csum & 0xFF);
                     } else {
-                        std.mem.writeInt(u16, super_pkt[4..6], @intCast(total_len - 40), .big);
+                        std.mem.writeInt(u16, header_buf[4..6], @intCast(total_len - 40), .big);
+                    }
+
+                    // Propagate PSH flag from last segment if set
+                    const last_seg = storage[coalesce_end][0..lens[coalesce_end]];
+                    const tcp_flags_off = headers_len - tcph_len + 13;
+                    if (last_seg.len > tcp_flags_off) {
+                        if (last_seg[tcp_flags_off] & 0x08 != 0) {
+                            header_buf[tcp_flags_off] |= 0x08;
+                        }
+                    }
+
+                    // Construct IOV array: [Header] + [Payload 1] + [Payload 2] ...
+                    var iovs: [128]posix.iovec_const = undefined;
+                    iovs[0] = .{ .base = &header_buf, .len = headers_len };
+
+                    // First packet payload
+                    const p1 = pkt_a[headers_len..];
+                    iovs[1] = .{ .base = p1.ptr, .len = p1.len };
+
+                    var iov_idx: usize = 2;
+                    var k: usize = i + 1;
+                    while (k <= coalesce_end) : (k += 1) {
+                        const seg = storage[k][0..lens[k]];
+                        const seg_payload = seg[headers_len..];
+                        iovs[iov_idx] = .{ .base = seg_payload.ptr, .len = seg_payload.len };
+                        iov_idx += 1;
                     }
 
                     // Build GSO header
@@ -2260,8 +2278,8 @@ fn writeCoalescedToTun(
                         @intCast(first_seg_payload),
                     );
 
-                    // Write super-packet with GSO header to TUN
-                    tun_dev.writeGSO(vhdr, super_pkt[0..total_len]) catch {};
+                    // Write GSO scatter
+                    tun_dev.writeGSOScatter(vhdr, iovs[0..iov_idx]) catch {};
 
                     i = coalesce_end + 1;
                     continue;

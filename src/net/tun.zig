@@ -165,6 +165,24 @@ pub const TunDevice = struct {
         _ = try posix.writev(self.fd, &iov);
     }
 
+    /// Write an IP packet using scatter-gather I/O with a GSO virtio_net_hdr.
+    /// The kernel will segment the large packet for us.
+    /// Input: vhdr + array of iovecs (header + payloads).
+    pub fn writeGSOScatter(self: *const TunDevice, vhdr: Offload.VirtioNetHdr, iovecs: []const posix.iovec_const) !void {
+        var hdr_bytes: [Offload.VNET_HDR_LEN]u8 = undefined;
+        @memcpy(&hdr_bytes, std.mem.asBytes(&vhdr));
+
+        // Stack buffer for iovecs including the vhdr.
+        // Max 64 coalesced packets -> ~65 iovecs from caller + 1 for vhdr.
+        var all_iovecs: [128]posix.iovec_const = undefined;
+        if (iovecs.len + 1 > all_iovecs.len) return error.TooManySegments;
+
+        all_iovecs[0] = .{ .base = &hdr_bytes, .len = Offload.VNET_HDR_LEN };
+        @memcpy(all_iovecs[1..][0..iovecs.len], iovecs);
+
+        _ = try posix.writev(self.fd, all_iovecs[0 .. iovecs.len + 1]);
+    }
+
     /// Set the TUN fd to non-blocking mode.
     pub fn setNonBlocking(self: *TunDevice) !void {
         const flags = try posix.fcntl(self.fd, posix.F.GETFL, 0);
