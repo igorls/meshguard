@@ -5,7 +5,7 @@ const Config = lib.config.Config;
 const Identity = lib.identity.Keys;
 const posix = std.posix;
 
-const version = "0.3.1";
+const version = "0.4.0";
 
 const usage =
     \\meshguard — decentralized WireGuard mesh VPN daemon
@@ -17,6 +17,7 @@ const usage =
     \\  up          Start the daemon and join the mesh
     \\  down        Stop the daemon
     \\  status      Show mesh status
+    \\  connect     Direct peer connection via token exchange (no seed needed)
     \\  keygen      Generate a new identity keypair (--force to overwrite)
     \\  trust       Authorize a peer's public key (--name <label>)
     \\  trust --org Trust an organization's public key
@@ -26,6 +27,7 @@ const usage =
     \\  org-sign    Sign a node's key with org key (--name <label>)
     \\  org-vouch   Vouch for an external node (auto-propagates to org members)
     \\  config show Show local node configuration (works offline)
+    \\  upgrade     Upgrade to the latest release from GitHub
     \\  version     Print version
     \\
     \\OPTIONS:
@@ -107,6 +109,11 @@ pub fn main() !void {
         return;
     }
 
+    if (std.mem.eql(u8, command, "connect")) {
+        try cmdConnect(allocator, args[2..]);
+        return;
+    }
+
     if (std.mem.eql(u8, command, "down")) {
         try cmdDown(allocator);
         return;
@@ -114,6 +121,11 @@ pub fn main() !void {
 
     if (std.mem.eql(u8, command, "status")) {
         try cmdStatus(allocator);
+        return;
+    }
+
+    if (std.mem.eql(u8, command, "upgrade")) {
+        try cmdUpgrade(allocator);
         return;
     }
 
@@ -635,6 +647,38 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
             }
         }
     }
+
+    // Also load seeds from config file (written by `meshguard connect`)
+    {
+        const seeds_path = std.fs.path.join(allocator, &.{ config_dir, "seeds" }) catch null;
+        defer if (seeds_path) |p| allocator.free(p);
+
+        if (seeds_path) |path| {
+            const file = std.fs.openFileAbsolute(path, .{}) catch null;
+            if (file) |f| {
+                defer f.close();
+                var file_buf: [1024]u8 = undefined;
+                const read = f.readAll(&file_buf) catch 0;
+                if (read > 0) {
+                    // Parse line by line: "host:port\n"
+                    var rest: []const u8 = file_buf[0..read];
+                    while (rest.len > 0) {
+                        const nl = std.mem.indexOfScalar(u8, rest, '\n');
+                        const line = if (nl) |n| rest[0..n] else rest;
+                        rest = if (nl) |n| rest[n + 1 ..] else rest[rest.len..];
+                        const trimmed = std.mem.trimRight(u8, line, "\r \t");
+                        if (trimmed.len == 0) continue;
+                        if (lib.discovery.Seed.parseEndpoint(trimmed)) |ep| {
+                            if (seed_count < seed_buf.len) {
+                                seed_buf[seed_count] = ep;
+                                seed_count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     const kp = Identity.load(allocator, config_dir) catch |err| {
         if (err == error.FileNotFound) {
             try stderr.writeAll("error: no identity found. Run 'meshguard keygen' first.\n");
@@ -878,12 +922,400 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
         };
     }
 
+    // Send leave announcement safely from the main thread (covers kernel mode)
+    swim.broadcastLeave();
+
     // Cleanup
     try stdout.writeAll("\nmeshguard stopping...\n");
     if (use_kernel_wg) {
         lib.wireguard.Config.teardown(lib.wireguard.Config.DEFAULT_IFNAME) catch {};
     }
     try stdout.writeAll("meshguard stopped.\n");
+}
+
+// ─── Coordinated Punch (meshguard connect) ───
+
+fn cmdConnect(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
+    const config_dir = try Config.ensureConfigDir(allocator);
+    defer allocator.free(config_dir);
+
+    const stdout = getStdOut();
+    const stderr = getStdErr();
+    const CoordinatedPunch = lib.nat.CoordinatedPunch;
+    const Stun = lib.nat.Stun;
+
+    // Parse subcommand
+    var mode: enum { generate, join } = .generate;
+    var join_token_arg: ?[]const u8 = null;
+    var punch_delay_min: u64 = 1; // default: 1 minute
+
+    {
+        var i: usize = 0;
+        while (i < extra_args.len) : (i += 1) {
+            if (std.mem.eql(u8, extra_args[i], "--generate")) {
+                mode = .generate;
+            } else if (std.mem.eql(u8, extra_args[i], "--join") and i + 1 < extra_args.len) {
+                mode = .join;
+                i += 1;
+                join_token_arg = extra_args[i];
+            } else if (std.mem.eql(u8, extra_args[i], "--in") and i + 1 < extra_args.len) {
+                i += 1;
+                punch_delay_min = std.fmt.parseInt(u64, extra_args[i], 10) catch 1;
+            } else if (std.mem.eql(u8, extra_args[i], "--help") or std.mem.eql(u8, extra_args[i], "-h")) {
+                try stdout.writeAll(
+                    \\meshguard connect — Direct peer connection via token exchange
+                    \\
+                    \\USAGE:
+                    \\  meshguard connect --generate [--in <minutes>]
+                    \\  meshguard connect --join <mg://token>
+                    \\
+                    \\FLOW:
+                    \\  1. Initiator runs --generate, shares mg:// token with peer
+                    \\  2. Peer runs --join <token>, shares response token back
+                    \\  3. Initiator pastes response token
+                    \\  4. Both sides punch simultaneously (NTP-synced)
+                    \\
+                    \\OPTIONS:
+                    \\  --in <minutes>  Punch delay (default: 1 minute)
+                    \\
+                );
+                return;
+            }
+        }
+    }
+
+    // Load identity
+    const kp = Identity.load(allocator, config_dir) catch |err| {
+        if (err == error.FileNotFound) {
+            try stderr.writeAll("error: no identity found. Run 'meshguard keygen' first.\n");
+            std.process.exit(1);
+        }
+        return err;
+    };
+
+    // Derive WG keys (same as cmdUp)
+    const sk_bytes = kp.secret_key.seed();
+    var hash: [64]u8 = undefined;
+    std.crypto.hash.sha2.Sha512.hash(&sk_bytes, &hash, .{});
+    var wg_private_key: [32]u8 = hash[0..32].*;
+    wg_private_key[0] &= 248;
+    wg_private_key[31] &= 127;
+    wg_private_key[31] |= 64;
+    const wg_public_key = std.crypto.dh.X25519.recoverPublicKey(wg_private_key) catch {
+        try stderr.writeAll("error: failed to derive WG public key\n");
+        std.process.exit(1);
+    };
+
+    // Derive mesh IP
+    const mesh_ip = lib.wireguard.Ip.deriveFromPubkey(kp.public_key);
+
+    // Must use the same gossip port the daemon will bind to,
+    // so the NAT hole punched here stays valid after restart.
+    const gossip_port: u16 = 51821;
+
+    // Stop running service first (otherwise we can't bind the port)
+    const was_running = blk: {
+        const stat = std.fs.openFileAbsolute("/etc/systemd/system/meshguard.service", .{}) catch break :blk false;
+        stat.close();
+        // Check if service is active
+        var child = std.process.Child.init(&.{ "systemctl", "is-active", "--quiet", "meshguard" }, allocator);
+        child.stderr_behavior = .Ignore;
+        child.stdout_behavior = .Ignore;
+        const term = child.spawnAndWait() catch break :blk false;
+        break :blk (term.Exited == 0);
+    };
+
+    if (was_running) {
+        try stdout.writeAll("  stopping meshguard service (need gossip port)...\n");
+        var stop = std.process.Child.init(&.{ "systemctl", "stop", "meshguard" }, allocator);
+        stop.stderr_behavior = .Ignore;
+        stop.stdout_behavior = .Ignore;
+        _ = stop.spawnAndWait() catch {};
+        // Brief pause for port to be released
+        const ts = std.os.linux.timespec{ .sec = 1, .nsec = 0 };
+        _ = std.os.linux.nanosleep(&ts, null);
+    }
+
+    // Bind to the gossip port (same port meshguard up will use)
+    var socket = lib.net.Udp.UdpSocket.bind(gossip_port) catch {
+        try stderr.writeAll("error: failed to bind gossip port 51821\n");
+        try stderr.writeAll("  hint: is meshguard already running? Stop it first.\n");
+        std.process.exit(1);
+    };
+    defer socket.close();
+
+    // STUN discovery
+    try stdout.writeAll("  discovering public endpoint (STUN)...\n");
+    const stun_result = Stun.discover(&socket, gossip_port, &Stun.DEFAULT_STUN_SERVERS);
+    if (stun_result.nat_type == .unknown) {
+        try stderr.writeAll("error: STUN failed — could not determine public endpoint\n");
+        try stderr.writeAll("  hint: check internet connectivity or firewall\n");
+        std.process.exit(1);
+    }
+
+    var pub_ip_buf: [15]u8 = undefined;
+    const pub_ip = lib.wireguard.Ip.formatIp(stun_result.external.addr, &pub_ip_buf);
+    const nat_label: []const u8 = switch (stun_result.nat_type) {
+        .public => "no NAT",
+        .cone => "cone NAT",
+        .symmetric => "symmetric NAT",
+        .unknown => "unknown",
+    };
+    try writeFormatted(stdout, "  public endpoint: {s}:{d} ({s})\n", .{ pub_ip, stun_result.external.port, nat_label });
+
+    if (stun_result.nat_type == .symmetric) {
+        try stderr.writeAll("warning: symmetric NAT detected — coordinated punch may fail\n");
+    }
+
+    // Get synchronized time
+    try stdout.writeAll("  syncing time (NTP)...\n");
+    const ntp_time = CoordinatedPunch.currentTimeSecs();
+
+    // Pick STUN server used (for token)
+    const stun_server = Stun.DEFAULT_STUN_SERVERS[0];
+
+    switch (mode) {
+        .generate => {
+            // ── Initiator flow ──
+            try stdout.writeAll("\n── Coordinated Punch (initiator) ──\n\n");
+
+            const punch_time = ntp_time + (punch_delay_min * 60);
+
+            // Generate nonce
+            var nonce: [8]u8 = undefined;
+            std.crypto.random.bytes(&nonce);
+
+            // Build token
+            var token = CoordinatedPunch.Token{
+                .pubkey = kp.public_key.toBytes(),
+                .wg_pubkey = wg_public_key,
+                .stun_addr = stun_result.external.addr,
+                .stun_port = stun_result.external.port,
+                .mesh_ip = mesh_ip,
+                .punch_time = punch_time,
+                .nonce = nonce,
+                .stun_server = stun_server.host,
+                .stun_server_port = stun_server.port,
+                .nat_type = @intFromEnum(stun_result.nat_type),
+                .signature = .{ 0, 0, 0, 0, 0, 0 },
+            };
+            CoordinatedPunch.signTokenHash(&token);
+
+            // Encode and print
+            var uri_buf: [156]u8 = undefined;
+            const uri = CoordinatedPunch.encodeTokenUri(&token, &uri_buf);
+
+            var mesh_ip_buf: [15]u8 = undefined;
+            const mesh_ip_str = lib.wireguard.Ip.formatIp(mesh_ip, &mesh_ip_buf);
+
+            try writeFormatted(stdout, "  your mesh IP: {s}\n", .{mesh_ip_str});
+            try writeFormatted(stdout, "  punch in: {d} minute(s)\n\n", .{punch_delay_min});
+            try stdout.writeAll("Send this command to your peer:\n\n  meshguard connect --join ");
+            try stdout.writeAll(uri);
+            try stdout.writeAll("\n\n");
+            try stdout.writeAll("Paste peer's response token: ");
+
+            // Read peer's response token from stdin
+            const stdin: std.fs.File = .{ .handle = std.posix.STDIN_FILENO };
+            var input_buf: [256]u8 = undefined;
+            const input_len = stdin.read(&input_buf) catch {
+                try stderr.writeAll("\nerror: failed to read stdin\n");
+                std.process.exit(1);
+            };
+            if (input_len == 0) {
+                try stderr.writeAll("\nerror: no input received\n");
+                std.process.exit(1);
+            }
+            const peer_uri = std.mem.trimRight(u8, input_buf[0..input_len], "\n\r \t");
+
+            // Decode peer's token
+            const peer_token = CoordinatedPunch.decodeTokenUri(peer_uri) catch {
+                try stderr.writeAll("error: invalid peer token\n");
+                std.process.exit(1);
+            };
+
+            var peer_ip_buf: [15]u8 = undefined;
+            const peer_ip = lib.wireguard.Ip.formatIp(peer_token.mesh_ip, &peer_ip_buf);
+            var peer_ep_buf: [15]u8 = undefined;
+            const peer_ep = lib.wireguard.Ip.formatIp(peer_token.stun_addr, &peer_ep_buf);
+            try writeFormatted(stdout, "\n  peer: {s} at {s}:{d}\n", .{ peer_ip, peer_ep, peer_token.stun_port });
+
+            // Run punch loop
+            const result = CoordinatedPunch.runPunchLoop(
+                &socket,
+                kp.public_key.toBytes(),
+                nonce,
+                peer_token.nonce,
+                peer_token.stun_addr,
+                peer_token.stun_port,
+                punch_time,
+                stun_server,
+                stdout,
+            );
+
+            if (result) |punch| {
+                try finalizePunch(allocator, config_dir, stdout, stderr, punch, peer_token);
+            } else {
+                try stderr.writeAll("\n  ✗ punch failed after 3 attempts\n");
+                try stderr.writeAll("  hint: ensure both peers are running and behind cone NAT\n");
+                std.process.exit(1);
+            }
+        },
+        .join => {
+            // ── Joiner flow ──
+            const peer_uri = join_token_arg orelse {
+                try stderr.writeAll("error: --join requires a mg:// token\n");
+                std.process.exit(1);
+            };
+
+            const peer_token = CoordinatedPunch.decodeTokenUri(peer_uri) catch {
+                try stderr.writeAll("error: invalid token\n");
+                std.process.exit(1);
+            };
+
+            try stdout.writeAll("\n── Coordinated Punch (joiner) ──\n\n");
+
+            var peer_ip_buf: [15]u8 = undefined;
+            const peer_ip = lib.wireguard.Ip.formatIp(peer_token.mesh_ip, &peer_ip_buf);
+            var peer_ep_buf: [15]u8 = undefined;
+            const peer_ep = lib.wireguard.Ip.formatIp(peer_token.stun_addr, &peer_ep_buf);
+            try writeFormatted(stdout, "  peer: {s} at {s}:{d}\n", .{ peer_ip, peer_ep, peer_token.stun_port });
+
+            // Use same punch_time from initiator's token
+            const punch_time = peer_token.punch_time;
+
+            // Generate our nonce
+            var nonce: [8]u8 = undefined;
+            std.crypto.random.bytes(&nonce);
+
+            // Build response token
+            var response_token = CoordinatedPunch.Token{
+                .pubkey = kp.public_key.toBytes(),
+                .wg_pubkey = wg_public_key,
+                .stun_addr = stun_result.external.addr,
+                .stun_port = stun_result.external.port,
+                .mesh_ip = mesh_ip,
+                .punch_time = punch_time,
+                .nonce = nonce,
+                .stun_server = stun_server.host,
+                .stun_server_port = stun_server.port,
+                .nat_type = @intFromEnum(stun_result.nat_type),
+                .signature = .{ 0, 0, 0, 0, 0, 0 },
+            };
+            CoordinatedPunch.signTokenHash(&response_token);
+
+            var uri_buf: [156]u8 = undefined;
+            const uri = CoordinatedPunch.encodeTokenUri(&response_token, &uri_buf);
+
+            try stdout.writeAll("\nPaste this response token on your peer's terminal:\n\n  ");
+            try stdout.writeAll(uri);
+            try stdout.writeAll("\n\n");
+
+            const secs_until = if (punch_time > ntp_time) punch_time - ntp_time else 0;
+            try writeFormatted(stdout, "  punch in ~{d}s — waiting...\n", .{secs_until});
+
+            // Run punch loop
+            const result = CoordinatedPunch.runPunchLoop(
+                &socket,
+                kp.public_key.toBytes(),
+                nonce,
+                peer_token.nonce,
+                peer_token.stun_addr,
+                peer_token.stun_port,
+                punch_time,
+                stun_server,
+                stdout,
+            );
+
+            if (result) |punch| {
+                try finalizePunch(allocator, config_dir, stdout, stderr, punch, peer_token);
+            } else {
+                try stderr.writeAll("\n  ✗ punch failed after 3 attempts\n");
+                try stderr.writeAll("  hint: ensure both peers are running and behind cone NAT\n");
+                std.process.exit(1);
+            }
+        },
+    }
+}
+
+/// Post-punch: auto-trust peer, save seed, offer systemd restart.
+fn finalizePunch(
+    allocator: std.mem.Allocator,
+    config_dir: []const u8,
+    stdout: std.fs.File,
+    stderr: std.fs.File,
+    punch: lib.nat.CoordinatedPunch.PunchResult,
+    peer_token: lib.nat.CoordinatedPunch.Token,
+) !void {
+    var peer_ep_buf: [21]u8 = undefined;
+    const peer_ep = std.fmt.bufPrint(&peer_ep_buf, "{d}.{d}.{d}.{d}:{d}", .{
+        punch.peer_addr[0], punch.peer_addr[1], punch.peer_addr[2], punch.peer_addr[3],
+        punch.peer_port,
+    }) catch "?";
+
+    var peer_mesh_buf: [15]u8 = undefined;
+    const peer_mesh = lib.wireguard.Ip.formatIp(peer_token.mesh_ip, &peer_mesh_buf);
+
+    try stdout.writeAll("\n  ✓ Direct connection established!\n");
+    try writeFormatted(stdout, "    peer: {s}\n", .{peer_mesh});
+    try writeFormatted(stdout, "    endpoint: {s}\n\n", .{peer_ep});
+
+    // Auto-trust the peer
+    const b64 = std.base64.standard.Encoder;
+    var pk_b64_buf: [44]u8 = undefined;
+    _ = b64.encode(&pk_b64_buf, &peer_token.pubkey);
+
+    lib.identity.Trust.addAuthorizedKey(allocator, config_dir, &pk_b64_buf, "punch-peer") catch |err| {
+        try writeFormatted(stderr, "  warning: could not auto-trust peer: {s}\n", .{@errorName(err)});
+    };
+    try stdout.writeAll("  peer trusted (auto-added to authorized keys)\n");
+
+    // Save punched endpoint as seed
+    lib.nat.CoordinatedPunch.savePunchedSeed(allocator, config_dir, punch.peer_addr, punch.peer_port) catch |err| {
+        try writeFormatted(stderr, "  warning: could not save seed: {s}\n", .{@errorName(err)});
+    };
+    try stdout.writeAll("  seed saved to config\n\n");
+
+    // Offer next steps
+    try stdout.writeAll("  To start the mesh:\n");
+    try writeFormatted(stdout, "    meshguard up --seed {s}\n\n", .{peer_ep});
+
+    // Check if systemd service exists and offer auto-restart
+    const service_exists = blk: {
+        const stat = std.fs.openFileAbsolute("/etc/systemd/system/meshguard.service", .{}) catch break :blk false;
+        stat.close();
+        break :blk true;
+    };
+
+    if (service_exists) {
+        try stdout.writeAll("  systemd service detected. Restart now? [Y/n] ");
+
+        const stdin: std.fs.File = .{ .handle = std.posix.STDIN_FILENO };
+        var input_buf: [16]u8 = undefined;
+        const input_len = stdin.read(&input_buf) catch 0;
+        const answer = std.mem.trimRight(u8, input_buf[0..input_len], "\n\r \t");
+
+        if (answer.len == 0 or answer[0] == 'Y' or answer[0] == 'y') {
+            try stdout.writeAll("  restarting meshguard service...\n");
+            var child = std.process.Child.init(&.{ "systemctl", "restart", "meshguard" }, allocator);
+            child.stderr_behavior = .Ignore;
+            child.stdout_behavior = .Ignore;
+            const term = child.spawnAndWait() catch {
+                try stderr.writeAll("  warning: failed to restart service. Run manually:\n");
+                try stderr.writeAll("    sudo systemctl restart meshguard\n");
+                return;
+            };
+            if (term.Exited == 0) {
+                try stdout.writeAll("  ✓ meshguard service restarted\n");
+            } else {
+                try stderr.writeAll("  warning: systemctl returned non-zero. Run manually:\n");
+                try stderr.writeAll("    sudo systemctl restart meshguard\n");
+            }
+        } else {
+            try stdout.writeAll("  Remember to restart the service soon (NAT mapping expires):\n");
+            try stdout.writeAll("    sudo systemctl restart meshguard\n");
+        }
+    }
 }
 
 // ─── Signal handling ───
@@ -893,7 +1325,6 @@ var g_swim_stop: ?*lib.discovery.Swim.SwimProtocol = null;
 fn signalHandler(sig: i32) callconv(.c) void {
     _ = sig;
     if (g_swim_stop) |swim_ref| {
-        swim_ref.broadcastLeave();
         swim_ref.stop();
     }
 }
@@ -2167,8 +2598,13 @@ fn userspaceEventLoop(
         swim.tickTimersOnly();
     }
 
+    // Send leave announcement safely from the main thread
+    swim.broadcastLeave();
+
     // Signal encrypt workers to stop, then wait for all threads
-    crypto_queue.close();
+    if (n_encrypt > 0) {
+        crypto_queue.close();
+    }
     for (0..spawned) |w| {
         threads[w].join();
     }
@@ -2240,7 +2676,6 @@ fn cmdDown(allocator: std.mem.Allocator) !void {
 }
 
 fn cmdStatus(allocator: std.mem.Allocator) !void {
-    _ = allocator;
     const stdout = getStdOut();
     const stderr = getStdErr();
 
@@ -2260,7 +2695,102 @@ fn cmdStatus(allocator: std.mem.Allocator) !void {
 
     // Query device info
     const dev = Netlink.getDevice(family_id, "mg0") catch {
-        try writeFormatted(stdout, "meshguard is running.\n  interface: mg0 (index {d})\n  (could not query device status)\n", .{ifindex});
+        // Fallback for userspace WG mode — kernel doesn't know about the device
+        try writeFormatted(stdout, "meshguard is running.\n  interface: mg0 (index {d})\n  mode: userspace\n", .{ifindex});
+
+        // Show config info
+        const config_dir = lib.config.Config.ensureConfigDir(allocator) catch null;
+        if (config_dir) |dir| {
+            defer allocator.free(dir);
+
+            // Identity
+            const kp = Identity.load(allocator, dir) catch null;
+            if (kp) |k| {
+                const pk = k.public_key.toBytes();
+                try writeFormatted(stdout, "  public key: {x:0>2}{x:0>2}{x:0>2}{x:0>2}...{x:0>2}{x:0>2}\n", .{
+                    pk[0], pk[1], pk[2], pk[3], pk[30], pk[31],
+                });
+                const mesh_ip = lib.wireguard.Ip.deriveFromPubkey(k.public_key);
+                try writeFormatted(stdout, "  mesh IP: {d}.{d}.{d}.{d}\n", .{ mesh_ip[0], mesh_ip[1], mesh_ip[2], mesh_ip[3] });
+            }
+
+            // Authorized peers
+            const peers = lib.identity.Trust.loadAuthorizedKeys(allocator, dir) catch null;
+            if (peers) |p| {
+                defer {
+                    for (p) |peer| allocator.free(peer.name);
+                    allocator.free(p);
+                }
+                try writeFormatted(stdout, "  peers trusted: {d}\n", .{p.len});
+            }
+
+            // Seeds from file
+            const seeds_path = std.fs.path.join(allocator, &.{ dir, "seeds" }) catch null;
+            if (seeds_path) |sp| {
+                defer allocator.free(sp);
+                const sf = std.fs.openFileAbsolute(sp, .{}) catch null;
+                if (sf) |f| {
+                    defer f.close();
+                    var sbuf: [512]u8 = undefined;
+                    const sread = f.readAll(&sbuf) catch 0;
+                    if (sread > 0) {
+                        const seeds_data = std.mem.trimRight(u8, sbuf[0..sread], "\n\r \t");
+                        // Count lines
+                        var seed_count: u32 = 0;
+                        var rest: []const u8 = seeds_data;
+                        while (rest.len > 0) {
+                            const nl = std.mem.indexOfScalar(u8, rest, '\n');
+                            const line = if (nl) |n| rest[0..n] else rest;
+                            rest = if (nl) |n| rest[n + 1 ..] else rest[rest.len..];
+                            if (std.mem.trimRight(u8, line, "\r \t").len > 0) seed_count += 1;
+                        }
+                        try writeFormatted(stdout, "  seeds: {d}\n", .{seed_count});
+                    }
+                }
+            }
+        }
+
+        // Systemd uptime and memory
+        {
+            var child = std.process.Child.init(&.{
+                "systemctl",                                     "show",       "meshguard",
+                "--property=ActiveEnterTimestamp,MemoryCurrent", "--no-pager",
+            }, allocator);
+            child.stdout_behavior = .Pipe;
+            child.stderr_behavior = .Ignore;
+            if (child.spawn()) |_| {} else |_| return;
+
+            var out_buf: [512]u8 = undefined;
+            const out_read = child.stdout.?.readAll(&out_buf) catch 0;
+            _ = child.wait() catch {};
+
+            if (out_read > 0) {
+                const output = out_buf[0..out_read];
+
+                // Parse ActiveEnterTimestamp
+                if (std.mem.indexOf(u8, output, "ActiveEnterTimestamp=")) |pos| {
+                    const line_start = pos + "ActiveEnterTimestamp=".len;
+                    const line_end = std.mem.indexOfScalarPos(u8, output, line_start, '\n') orelse output.len;
+                    const ts_str = std.mem.trimRight(u8, output[line_start..line_end], "\r \t");
+                    if (ts_str.len > 0) {
+                        try writeFormatted(stdout, "  started: {s}\n", .{ts_str});
+                    }
+                }
+
+                // Parse MemoryCurrent
+                if (std.mem.indexOf(u8, output, "MemoryCurrent=")) |pos| {
+                    const line_start = pos + "MemoryCurrent=".len;
+                    const line_end = std.mem.indexOfScalarPos(u8, output, line_start, '\n') orelse output.len;
+                    const mem_str = std.mem.trimRight(u8, output[line_start..line_end], "\r \t");
+                    const mem_bytes = std.fmt.parseInt(u64, mem_str, 10) catch 0;
+                    if (mem_bytes > 0) {
+                        const mb_whole = mem_bytes / (1024 * 1024);
+                        const mb_frac = (mem_bytes * 10 / (1024 * 1024)) % 10;
+                        try writeFormatted(stdout, "  memory: {d}.{d}M\n", .{ mb_whole, mb_frac });
+                    }
+                }
+            }
+        }
         return;
     };
 
@@ -2509,4 +3039,191 @@ fn cmdConfigShow(allocator: std.mem.Allocator) !void {
     }
 
     try stdout.writeAll("\n");
+}
+
+fn cmdUpgrade(allocator: std.mem.Allocator) !void {
+    const stdout = getStdOut();
+    const stderr = getStdErr();
+
+    const current = version;
+    try writeFormatted(stdout, "meshguard upgrade\n  current version: {s}\n", .{current});
+
+    // Query GitHub API for latest release tag
+    try stdout.writeAll("  checking for updates...\n");
+
+    const api_tmp = "/tmp/meshguard-api-response";
+    {
+        var api_curl = std.process.Child.init(&.{
+            "curl",                                                          "-fsSL", "-o", api_tmp,
+            "https://api.github.com/repos/igorls/meshguard/releases/latest",
+        }, allocator);
+        api_curl.stderr_behavior = .Ignore;
+        api_curl.stdout_behavior = .Ignore;
+        const api_term = api_curl.spawnAndWait() catch {
+            try stderr.writeAll("error: failed to query GitHub API (is curl installed?)\n");
+            std.process.exit(1);
+        };
+        if (api_term.Exited != 0) {
+            try stderr.writeAll("error: failed to fetch latest release info from GitHub\n");
+            try stderr.writeAll("  hint: check internet connectivity\n");
+            std.process.exit(1);
+        }
+    }
+
+    // Parse tag_name from JSON response
+    const api_file = std.fs.openFileAbsolute(api_tmp, .{}) catch {
+        try stderr.writeAll("error: could not read API response\n");
+        std.process.exit(1);
+    };
+    defer api_file.close();
+    defer std.fs.deleteFileAbsolute(api_tmp) catch {};
+
+    var api_buf: [8192]u8 = undefined;
+    const api_len = api_file.readAll(&api_buf) catch 0;
+    if (api_len == 0) {
+        try stderr.writeAll("error: empty API response\n");
+        std.process.exit(1);
+    }
+    const api_data = api_buf[0..api_len];
+
+    // Find "tag_name" in JSON — handle optional whitespace after colon
+    const tag_key = "\"tag_name\"";
+    const tag_key_pos = std.mem.indexOf(u8, api_data, tag_key) orelse {
+        try stderr.writeAll("error: could not parse release tag from GitHub API\n");
+        std.process.exit(1);
+    };
+    // Skip past the key, colon, whitespace, and opening quote
+    var tag_scan = tag_key_pos + tag_key.len;
+    while (tag_scan < api_data.len and (api_data[tag_scan] == ':' or api_data[tag_scan] == ' ' or api_data[tag_scan] == '"')) : (tag_scan += 1) {}
+    // Now tag_scan points to the first char of the version string
+    // But we went one past the opening quote, so back up: actually we skipped the quote too
+    // Find the closing quote
+    const tag_end = std.mem.indexOfScalarPos(u8, api_data, tag_scan, '"') orelse {
+        try stderr.writeAll("error: malformed tag in API response\n");
+        std.process.exit(1);
+    };
+    const tag = api_data[tag_scan..tag_end]; // e.g. "v0.3.1"
+
+    // Strip 'v' prefix for comparison
+    const latest = if (tag.len > 0 and tag[0] == 'v') tag[1..] else tag;
+    try writeFormatted(stdout, "  latest version:  {s}\n", .{latest});
+
+    if (std.mem.eql(u8, latest, current)) {
+        try stdout.writeAll("  ✓ already up to date\n");
+        return;
+    }
+
+    // Download binary
+    const download_path = "/tmp/meshguard-upgrade";
+    var url_buf: [256]u8 = undefined;
+    const download_url = std.fmt.bufPrint(&url_buf, "https://github.com/igorls/meshguard/releases/download/{s}/meshguard-linux-amd64", .{tag}) catch {
+        try stderr.writeAll("error: URL too long\n");
+        std.process.exit(1);
+    };
+
+    try writeFormatted(stdout, "\n  downloading {s}...\n", .{tag});
+    {
+        var dl_curl = std.process.Child.init(&.{
+            "curl", "-fSL", "-o", download_path, download_url,
+        }, allocator);
+        dl_curl.stderr_behavior = .Pipe;
+        dl_curl.stdout_behavior = .Ignore;
+        const dl_term = dl_curl.spawnAndWait() catch {
+            try stderr.writeAll("error: failed to download release\n");
+            std.process.exit(1);
+        };
+        if (dl_term.Exited != 0) {
+            try writeFormatted(stderr, "error: download failed (exit {d})\n", .{dl_term.Exited});
+            std.process.exit(1);
+        }
+    }
+
+    // Make downloaded binary executable
+    {
+        var chmod = std.process.Child.init(&.{ "chmod", "+x", download_path }, allocator);
+        chmod.stderr_behavior = .Ignore;
+        chmod.stdout_behavior = .Ignore;
+        _ = chmod.spawnAndWait() catch {};
+    }
+
+    // Verify downloaded binary
+    try stdout.writeAll("  verifying download...\n");
+    {
+        var verify = std.process.Child.init(&.{ download_path, "version" }, allocator);
+        verify.stdout_behavior = .Pipe;
+        verify.stderr_behavior = .Ignore;
+        if (verify.spawn()) |_| {} else |_| {
+            try stderr.writeAll("error: downloaded binary is not executable\n");
+            std.process.exit(1);
+        }
+        var ver_buf: [128]u8 = undefined;
+        const ver_len = verify.stdout.?.readAll(&ver_buf) catch 0;
+        _ = verify.wait() catch {};
+        if (ver_len > 0) {
+            const ver_str = std.mem.trimRight(u8, ver_buf[0..ver_len], "\n\r \t");
+            try writeFormatted(stdout, "  downloaded: {s}\n", .{ver_str});
+        }
+    }
+
+    // Determine install path
+    const install_path = "/usr/local/bin/meshguard";
+
+    // Stop service if running
+    try stdout.writeAll("\n  stopping meshguard service...\n");
+    {
+        var stop = std.process.Child.init(&.{ "systemctl", "stop", "meshguard" }, allocator);
+        stop.stderr_behavior = .Ignore;
+        stop.stdout_behavior = .Ignore;
+        _ = stop.spawnAndWait() catch {};
+    }
+
+    // Brief pause for port release
+    const ts = std.os.linux.timespec{ .sec = 1, .nsec = 0 };
+    _ = std.os.linux.nanosleep(&ts, null);
+
+    // Swap binary: rm old, copy new
+    try stdout.writeAll("  installing new binary...\n");
+    std.fs.deleteFileAbsolute(install_path) catch {};
+    {
+        var cp = std.process.Child.init(&.{ "cp", download_path, install_path }, allocator);
+        cp.stderr_behavior = .Ignore;
+        cp.stdout_behavior = .Ignore;
+        const cp_term = cp.spawnAndWait() catch {
+            try stderr.writeAll("error: failed to install binary\n");
+            std.process.exit(1);
+        };
+        if (cp_term.Exited != 0) {
+            try stderr.writeAll("error: cp failed — check permissions (run with sudo)\n");
+            std.process.exit(1);
+        }
+    }
+    {
+        var chmod = std.process.Child.init(&.{ "chmod", "+x", install_path }, allocator);
+        chmod.stderr_behavior = .Ignore;
+        chmod.stdout_behavior = .Ignore;
+        _ = chmod.spawnAndWait() catch {};
+    }
+
+    // Restart service
+    try stdout.writeAll("  restarting meshguard service...\n");
+    {
+        var restart = std.process.Child.init(&.{ "systemctl", "start", "meshguard" }, allocator);
+        restart.stderr_behavior = .Ignore;
+        restart.stdout_behavior = .Ignore;
+        const restart_term = restart.spawnAndWait() catch {
+            try stderr.writeAll("warning: could not restart service\n");
+            return;
+        };
+        if (restart_term.Exited == 0) {
+            try stdout.writeAll("  ✓ meshguard service restarted\n");
+        } else {
+            try stderr.writeAll("  warning: service restart failed — start manually\n");
+        }
+    }
+
+    // Cleanup
+    std.fs.deleteFileAbsolute(download_path) catch {};
+
+    try stdout.writeAll("\n  ✓ upgrade complete\n");
+    try writeFormatted(stdout, "  {s} → {s}\n", .{ current, latest });
 }

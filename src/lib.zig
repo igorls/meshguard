@@ -19,6 +19,7 @@ pub const nat = struct {
     pub const Stun = @import("nat/stun.zig");
     pub const Holepunch = @import("nat/holepunch.zig");
     pub const Relay = @import("nat/relay.zig");
+    pub const CoordinatedPunch = @import("nat/coordinated_punch.zig");
 };
 
 pub const wireguard = struct {

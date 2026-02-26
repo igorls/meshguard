@@ -31,10 +31,19 @@ pub const Config = struct {
     authorized_keys_dir: []const u8 = "./authorized_keys/",
     watch_interval_s: u32 = 30,
 
-    /// Get the default config directory path: ~/.config/meshguard/
+    /// Get the default config directory path.
+    /// - If MESHGUARD_CONFIG_DIR is set, use that.
+    /// - If running as root (uid 0): /etc/meshguard/  (system-wide, for systemd)
+    /// - Otherwise: ~/.config/meshguard/  (per-user)
     pub fn defaultConfigDir(allocator: std.mem.Allocator) ![]const u8 {
         if (std.posix.getenv("MESHGUARD_CONFIG_DIR")) |dir| {
             return allocator.dupe(u8, dir);
+        }
+
+        // System-wide config when running as root (systemd, sudo)
+        const uid = std.os.linux.getuid();
+        if (uid == 0) {
+            return allocator.dupe(u8, "/etc/meshguard");
         }
 
         if (std.posix.getenv("XDG_CONFIG_HOME")) |xdg| {
