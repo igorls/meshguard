@@ -3041,6 +3041,27 @@ fn cmdConfigShow(allocator: std.mem.Allocator) !void {
     try stdout.writeAll("\n");
 }
 
+/// Compare two semver strings "X.Y.Z" — returns true if `remote` is strictly newer than `current`.
+fn isNewerVersion(current: []const u8, remote: []const u8) bool {
+    const cur = parseSemver(current) orelse return false;
+    const rem = parseSemver(remote) orelse return false;
+    if (rem[0] != cur[0]) return rem[0] > cur[0];
+    if (rem[1] != cur[1]) return rem[1] > cur[1];
+    return rem[2] > cur[2];
+}
+
+fn parseSemver(s: []const u8) ?[3]u32 {
+    var parts: [3]u32 = .{ 0, 0, 0 };
+    var rest = s;
+    for (0..3) |i| {
+        const dot = std.mem.indexOfScalar(u8, rest, '.');
+        const part = if (dot) |d| rest[0..d] else rest;
+        parts[i] = std.fmt.parseInt(u32, part, 10) catch return null;
+        rest = if (dot) |d| rest[d + 1 ..] else rest[rest.len..];
+    }
+    return parts;
+}
+
 fn cmdUpgrade(allocator: std.mem.Allocator) !void {
     const stdout = getStdOut();
     const stderr = getStdErr();
@@ -3110,6 +3131,12 @@ fn cmdUpgrade(allocator: std.mem.Allocator) !void {
 
     if (std.mem.eql(u8, latest, current)) {
         try stdout.writeAll("  ✓ already up to date\n");
+        return;
+    }
+
+    // Simple semver comparison to prevent downgrades
+    if (!isNewerVersion(current, latest)) {
+        try writeFormatted(stdout, "  ✓ already up to date (local {s} >= remote {s})\n", .{ current, latest });
         return;
     }
 
