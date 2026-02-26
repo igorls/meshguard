@@ -4,7 +4,7 @@ meshguard uses the **SWIM** (Scalable Weakly-consistent Infection-style Process 
 
 ## Protocol Overview
 
-SWIM operates in periodic **protocol rounds** (default: 1 second). Each round, a node:
+SWIM operates in periodic **protocol rounds** (default: 5 seconds). Each round, a node:
 
 1. **Selects a random peer** from the membership table
 2. **Sends a Ping** (with piggybacked gossip)
