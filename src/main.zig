@@ -5,7 +5,7 @@ const Config = lib.config.Config;
 const Identity = lib.identity.Keys;
 const posix = std.posix;
 
-const version = "0.4.0";
+const version = "0.5.0";
 
 const usage =
     \\meshguard — decentralized WireGuard mesh VPN daemon
@@ -841,12 +841,33 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
                 const pub_ip = lib.wireguard.Ip.formatIp(stun_result.external.addr, &pub_ip_buf);
                 try writeFormatted(stdout, "  public endpoint: {s}:{d} (no NAT)\n", .{ pub_ip, stun_result.external.port });
             },
-            .cone => {
+            .cone, .symmetric => {
                 var pub_ip_buf: [15]u8 = undefined;
                 const pub_ip = lib.wireguard.Ip.formatIp(stun_result.external.addr, &pub_ip_buf);
-                try writeFormatted(stdout, "  public endpoint: {s}:{d} (behind NAT, cone)\n", .{ pub_ip, stun_result.external.port });
+                const nat_type_str = if (stun_result.nat_type == .cone) "cone" else "symmetric";
+                try writeFormatted(stdout, "  public endpoint: {s}:{d} (behind NAT, {s})\n", .{ pub_ip, stun_result.external.port, nat_type_str });
+
+                // Try UPnP port forwarding
+                try stdout.writeAll("  trying UPnP port forwarding...\n");
+                const UPnP = lib.nat.UPnP;
+                if (UPnP.addPortMapping(gossip_port, gossip_port, "meshguard", 3600)) |upnp_result| {
+                    // Use UPnP external IP if available, otherwise fall back to STUN IP
+                    const effective_ip = if (upnp_result.external_ip[0] == 0 and upnp_result.external_ip[1] == 0)
+                        stun_result.external.addr
+                    else
+                        upnp_result.external_ip;
+                    var upnp_ip_buf: [15]u8 = undefined;
+                    const upnp_ip = lib.wireguard.Ip.formatIp(effective_ip, &upnp_ip_buf);
+                    try writeFormatted(stdout, "  ✓ UPnP: port {d} forwarded (external IP: {s})\n", .{ gossip_port, upnp_ip });
+                    // Update public endpoint — UPnP makes us directly reachable
+                    swim.setPublicEndpoint(
+                        messages.Endpoint{ .addr = effective_ip, .port = gossip_port },
+                        .public,
+                    );
+                } else |upnp_err| {
+                    try writeFormatted(stdout, "  UPnP: {s} (will use hole punching)\n", .{@errorName(upnp_err)});
+                }
             },
-            .symmetric => try stdout.writeAll("  NAT type: symmetric (hole punching may fail)\n"),
             .unknown => try stdout.writeAll("  STUN: could not determine public endpoint\n"),
         }
     }
