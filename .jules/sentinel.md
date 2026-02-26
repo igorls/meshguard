@@ -11,3 +11,8 @@
 **Learning:** Zig structs do not have automatic destructors (RAII) like C++ or Rust. Developers must manually implement `deinit` methods and ensure they are called. `WgDevice.removePeer` simply set the peer slot to `null`, which leaves the old memory content intact in the fixed-size array until overwritten by a new peer.
 
 **Prevention:** Implement `deinit` methods for all structs holding sensitive data that use `std.crypto.secureZero`. Audit all lifecycle management points (like `removePeer`) to ensure explicit cleanup is performed before releasing references.
+
+## 2025-05-24 - [MEDIUM] Insecure Key File Permissions
+**Vulnerability:** The functions `save` in `src/identity/keys.zig` and `saveOrgKeyPair` in `src/identity/org.zig` created sensitive key files with default permissions (usually 0o644 or 0o666 depending on umask) before calling `chmod(0o600)`. This introduced a race condition where the file was world-readable for a brief moment. Additionally, the `chmod` result was ignored, potentially leaving files insecure if the operation failed.
+**Learning:** `std.fs.createFileAbsolute` accepts a `File.CreateFlags` struct which includes a `mode` field. Setting this field ensures atomic permission setting at creation time. However, on POSIX, `open/creat` with `O_CREAT` ignores the mode if the file already exists. Therefore, a subsequent `chmod` is still necessary to correct permissions on existing files.
+**Prevention:** Always use `.mode = 0o600` in `createFileAbsolute` / `createFile` options for sensitive files. Additionally, verify if the file might already exist and if so, explicitly check/fix permissions or use `chmod` ensuring errors are handled.
