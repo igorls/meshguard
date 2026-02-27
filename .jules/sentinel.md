@@ -11,3 +11,10 @@
 **Learning:** Zig structs do not have automatic destructors (RAII) like C++ or Rust. Developers must manually implement `deinit` methods and ensure they are called. `WgDevice.removePeer` simply set the peer slot to `null`, which leaves the old memory content intact in the fixed-size array until overwritten by a new peer.
 
 **Prevention:** Implement `deinit` methods for all structs holding sensitive data that use `std.crypto.secureZero`. Audit all lifecycle management points (like `removePeer`) to ensure explicit cleanup is performed before releasing references.
+
+## 2026-02-26 - [HIGH] Transport Keys Not Zeroed in Tunnel Destruction
+**Vulnerability:** The `Tunnel` struct in `src/wireguard/tunnel.zig` holds `TransportKeys` (sending and receiving keys) which were not being cleared when a peer was removed or a session was torn down. While `Handshake` cleanup was partially addressed, the active traffic keys remained in heap/stack memory until overwritten.
+
+**Learning:** It's easy to miss nested structs when implementing manual cleanup. The `WgPeer` struct held both `Handshake` and `Tunnel` (optional), but `removePeer` only cleaned up the handshake.
+
+**Prevention:** Recursively implement `deinit` for all structs in the ownership chain (`WgPeer` -> `Tunnel` -> `TransportKeys`). Ensure `removePeer` calls the top-level `deinit` rather than reaching into internal members.
