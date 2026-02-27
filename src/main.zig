@@ -1956,6 +1956,13 @@ fn cryptoWorkerPipeline(
 
         // STAGE 2: Encrypt all packets in-place (100% cache-local, no locks)
         for (0..batch.count) |i| {
+            // Optimization: Prefetch next packet buffer (distance 2) to hide memory latency
+            if (i + 2 < batch.count) {
+                const next_idx = batch.buf_indices[i + 2];
+                // Prefetch for write (RFO) since encryption modifies the buffer
+                @prefetch(&pool.buffers[next_idx].data, .{ .rw = .write, .locality = 3, .cache = .data });
+            }
+
             var pkt = &pool.buffers[batch.buf_indices[i]];
             if (tun.encryptPreassigned(&pkt.data, batch.lengths[i], batch.nonces[i])) |enc_len| {
                 pkt.len = @intCast(enc_len);
