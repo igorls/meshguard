@@ -16,8 +16,13 @@ pub const UdpSocket = struct {
     fd: posix.fd_t,
     port: u16,
 
-    /// Bind a UDP socket to the given port on all interfaces.
+    /// Bind a UDP socket to the given port on all interfaces (or a specific address).
     pub fn bind(port: u16) !UdpSocket {
+        return bindAddr(.{ 0, 0, 0, 0 }, port);
+    }
+
+    /// Bind a UDP socket to a specific address and port.
+    pub fn bindAddr(addr: [4]u8, port: u16) !UdpSocket {
         const fd = try posix.socket(
             linux.AF.INET,
             @intCast(linux.SOCK.DGRAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC),
@@ -26,16 +31,21 @@ pub const UdpSocket = struct {
         errdefer posix.close(fd);
 
         // Enable SO_REUSEADDR + SO_REUSEPORT
-        // REUSEPORT allows multiple sockets to bind to the same port;
-        // the kernel distributes incoming packets by 4-tuple hash.
         const one: u32 = 1;
         try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one));
         try posix.setsockopt(fd, posix.SOL.SOCKET, linux.SO.REUSEPORT, std.mem.asBytes(&one));
 
-        var addr = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, port);
-        try posix.bind(fd, &addr.any, addr.getOsSockLen());
+        var bind_addr = std.net.Address.initIp4(addr, port);
+        try posix.bind(fd, &bind_addr.any, bind_addr.getOsSockLen());
 
-        return .{ .fd = fd, .port = port };
+        // Resolve actual port (important when binding to ephemeral port 0)
+        var actual_port = port;
+        var bound_addr = bind_addr;
+        var bound_len = bind_addr.getOsSockLen();
+        posix.getsockname(fd, &bound_addr.any, &bound_len) catch {};
+        actual_port = bound_addr.getPort();
+
+        return .{ .fd = fd, .port = actual_port };
     }
 
     /// Create a UDP socket for GSO data-plane sends (send-only, no bind).
@@ -124,15 +134,18 @@ pub const UdpSocket = struct {
     /// Poll the socket for readability with a timeout (milliseconds).
     /// Returns true if data is available.
     pub fn pollRead(self: UdpSocket, timeout_ms: i32) !bool {
-        var fds = [1]linux.pollfd{.{
+        // Use libc poll() instead of raw linux syscall.
+        // Android's seccomp blocks the old poll syscall (7) on modern Android.
+        const c = @cImport(@cInclude("poll.h"));
+        var fds = [1]c.struct_pollfd{.{
             .fd = self.fd,
-            .events = linux.POLL.IN,
+            .events = c.POLLIN,
             .revents = 0,
         }};
 
-        const rc = linux.poll(&fds, 1, timeout_ms);
+        const rc = c.poll(&fds, 1, timeout_ms);
         if (rc < 0) return error.PollFailed;
-        return (fds[0].revents & linux.POLL.IN) != 0;
+        return (fds[0].revents & c.POLLIN) != 0;
     }
 
     /// Close the socket.

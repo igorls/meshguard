@@ -5,7 +5,7 @@ const Config = lib.config.Config;
 const Identity = lib.identity.Keys;
 const posix = std.posix;
 
-const version = "0.5.0";
+const version = "0.6.0";
 
 const usage =
     \\meshguard — decentralized WireGuard mesh VPN daemon
@@ -37,6 +37,7 @@ const usage =
     \\  --mdns               Discover seeds via mDNS on LAN
     \\  --announce <ip>      Override public IP (skip STUN)
     \\  --kernel             Use kernel WireGuard (requires root)
+    \\  --open               Accept all peers (skip trust enforcement)
     \\  -h, --help          Show this help
     \\
 ;
@@ -580,6 +581,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     var dns_domain: []const u8 = "";
     var use_mdns: bool = false;
     var encrypt_workers: usize = 0; // 0 = auto (CPU count)
+    var open_mode: bool = false; // --open: skip trust, accept any peer
     // Collect raw seed strings for hostname resolution
     var seed_strs: [16][]const u8 = undefined;
     var seed_str_count: usize = 0;
@@ -613,6 +615,8 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
             } else if (std.mem.eql(u8, extra_args[i], "--encrypt-workers") and i + 1 < extra_args.len) {
                 i += 1;
                 encrypt_workers = std.fmt.parseInt(usize, extra_args[i], 10) catch 0;
+            } else if (std.mem.eql(u8, extra_args[i], "--open")) {
+                open_mode = true;
             }
         }
     }
@@ -743,10 +747,21 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
 
     // Bind gossip UDP socket
     const gossip_port: u16 = 51821;
-    var gossip_socket = lib.net.Udp.UdpSocket.bind(gossip_port) catch {
-        try stderr.writeAll("error: failed to bind gossip port 51821\n");
-        lib.wireguard.Config.teardown(lib.wireguard.Config.DEFAULT_IFNAME) catch {};
-        std.process.exit(1);
+    var gossip_socket = blk: {
+        if (announce_addr) |addr| {
+            // Bind to announced IP for correct source-based routing on multi-homed servers
+            break :blk lib.net.Udp.UdpSocket.bindAddr(addr, gossip_port) catch {
+                try stderr.writeAll("error: failed to bind gossip port to announced address\n");
+                lib.wireguard.Config.teardown(lib.wireguard.Config.DEFAULT_IFNAME) catch {};
+                std.process.exit(1);
+            };
+        } else {
+            break :blk lib.net.Udp.UdpSocket.bind(gossip_port) catch {
+                try stderr.writeAll("error: failed to bind gossip port 51821\n");
+                lib.wireguard.Config.teardown(lib.wireguard.Config.DEFAULT_IFNAME) catch {};
+                std.process.exit(1);
+            };
+        }
     };
     defer gossip_socket.close();
 
@@ -776,37 +791,41 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
         },
     );
 
-    // Load authorized keys and enable trust enforcement
-    const authorized_peers = lib.identity.Trust.loadAuthorizedKeys(allocator, config_dir) catch &.{};
-    defer {
-        for (authorized_peers) |peer| {
-            allocator.free(peer.name);
+    // Load authorized keys and enable trust enforcement (unless --open)
+    if (!open_mode) {
+        const authorized_peers = lib.identity.Trust.loadAuthorizedKeys(allocator, config_dir) catch &.{};
+        defer {
+            for (authorized_peers) |peer| {
+                allocator.free(peer.name);
+            }
+            allocator.free(authorized_peers);
         }
-        allocator.free(authorized_peers);
-    }
-    if (authorized_peers.len > 0) {
-        for (authorized_peers) |peer| {
-            swim.addAuthorizedKey(peer.public_key.toBytes());
+        if (authorized_peers.len > 0) {
+            for (authorized_peers) |peer| {
+                swim.addAuthorizedKey(peer.public_key.toBytes());
+            }
+            swim.enableTrust();
+            try writeFormatted(stdout, "  trust: {d} authorized peer(s)\n", .{authorized_peers.len});
         }
-        swim.enableTrust();
-        try writeFormatted(stdout, "  trust: {d} authorized peer(s)\n", .{authorized_peers.len});
-    }
 
-    // Load trusted organizations
-    const trusted_orgs = lib.identity.Trust.loadTrustedOrgs(allocator, config_dir) catch &.{};
-    defer {
-        for (trusted_orgs) |org| {
-            allocator.free(org.name);
+        // Load trusted organizations
+        const trusted_orgs = lib.identity.Trust.loadTrustedOrgs(allocator, config_dir) catch &.{};
+        defer {
+            for (trusted_orgs) |org| {
+                allocator.free(org.name);
+            }
+            allocator.free(trusted_orgs);
         }
-        allocator.free(trusted_orgs);
-    }
-    if (trusted_orgs.len > 0) {
-        for (trusted_orgs) |org| {
-            swim.addTrustedOrg(org.public_key);
+        if (trusted_orgs.len > 0) {
+            for (trusted_orgs) |org| {
+                swim.addTrustedOrg(org.public_key);
+            }
+            // Enable trust enforcement when org trust is configured
+            if (!swim.enforce_trust) swim.enableTrust();
+            try writeFormatted(stdout, "  org trust: {d} trusted org(s)\n", .{trusted_orgs.len});
         }
-        // Enable trust enforcement when org trust is configured
-        if (!swim.enforce_trust) swim.enableTrust();
-        try writeFormatted(stdout, "  org trust: {d} trusted org(s)\n", .{trusted_orgs.len});
+    } else {
+        try stdout.writeAll("  trust: OPEN (accepting all peers)\n");
     }
 
     // Load our own org certificate (if present)

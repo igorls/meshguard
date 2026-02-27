@@ -13,6 +13,7 @@ pub const discovery = struct {
     pub const Swim = @import("discovery/swim.zig");
     pub const Membership = @import("discovery/membership.zig");
     pub const Seed = @import("discovery/seed.zig");
+    pub const Lan = @import("discovery/lan.zig");
 };
 
 pub const nat = struct {

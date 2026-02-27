@@ -30,6 +30,7 @@ pub const EventHandler = struct {
     onPeerJoin: *const fn (ctx: *anyopaque, peer: *const Membership.Peer) void,
     onPeerDead: *const fn (ctx: *anyopaque, pubkey: [32]u8) void,
     onPeerPunched: ?*const fn (ctx: *anyopaque, peer: *const Membership.Peer, endpoint: messages.Endpoint) void = null,
+    onAppMessage: ?*const fn (ctx: *anyopaque, data: []const u8) void = null,
 };
 
 /// Gossip entry with broadcast remaining counter.
@@ -111,6 +112,12 @@ pub const SwimProtocol = struct {
 
     // Node's own org certificate (if any, loaded at init)
     our_org_cert: ?[186]u8 = null,
+
+    // Debug counters
+    pkts_sent: u32 = 0,
+    pkts_recv: u32 = 0,
+    raw_recv: u32 = 0,
+    tick_count: u32 = 0,
 
     pub fn init(
         membership: *Membership.MembershipTable,
@@ -254,6 +261,7 @@ pub const SwimProtocol = struct {
 
     /// Single iteration of the SWIM protocol.
     pub fn tick(self: *SwimProtocol) !void {
+        self.tick_count += 1;
         // 1. Process incoming messages (poll with gossip_interval timeout)
         const poll_ms: i32 = @min(@as(i32, @intCast(self.config.gossip_interval_ms)), 200);
         if (try self.socket.pollRead(poll_ms)) {
@@ -263,6 +271,7 @@ pub const SwimProtocol = struct {
                 const result = try self.socket.recvFrom(&recv_buf);
                 if (result == null) break;
                 const recv = result.?;
+                self.raw_recv += 1;
                 self.handleMessage(recv.data, recv.sender_addr, recv.sender_port);
             }
         }
@@ -381,7 +390,15 @@ pub const SwimProtocol = struct {
             return;
         }
 
+        // Check for app messages (type 0x50) — relay or deliver locally
+        // Wire: [0x50][32B dest][32B sender][12B nonce][N ciphertext][16B tag]
+        if (data.len > 0 and data[0] == 0x50) {
+            self.handleAppMessage(data, sender_addr, sender_port);
+            return;
+        }
+
         const decoded = codec.decode(data) catch return;
+        self.pkts_recv += 1;
 
         // Trust enforcement: check sender's pubkey against authorized set
         const sender_pubkey: [32]u8 = switch (decoded) {
@@ -406,6 +423,50 @@ pub const SwimProtocol = struct {
             .org_cert_revoke => |rev| self.handleOrgRevoke(rev),
             .org_trust_vouch => |v| self.handleOrgVouch(v),
         }
+    }
+
+    /// Handle an incoming 0x50 app message: deliver locally or relay.
+    /// Wire: [0x50][32B dest_pubkey][32B sender_pubkey][12B nonce][N ciphertext][16B tag]
+    fn handleAppMessage(self: *SwimProtocol, data: []const u8, sender_addr: [4]u8, sender_port: u16) void {
+        _ = sender_addr;
+        _ = sender_port;
+        // Min size: 1 + 32 + 32 + 12 + 0 + 16 = 93 (empty payload)
+        if (data.len < 93) return;
+
+        const dest_pubkey = data[1..33];
+
+        // Is this message for us?
+        if (std.mem.eql(u8, dest_pubkey, &self.our_pubkey)) {
+            // Deliver locally via callback
+            if (self.handler) |h| {
+                if (h.onAppMessage) |cb| {
+                    cb(h.ctx, data);
+                }
+            }
+            std.debug.print("  📨 APP msg delivered locally ({d}B)\n", .{data.len});
+            return;
+        }
+
+        // Not for us — relay to destination peer
+        var dest_key: [32]u8 = undefined;
+        @memcpy(&dest_key, dest_pubkey);
+        const peer = self.membership.peers.get(dest_key) orelse {
+            std.debug.print("  📨 APP msg relay FAILED: unknown dest\n", .{});
+            return;
+        };
+        const ep = peer.gossip_endpoint orelse {
+            std.debug.print("  📨 APP msg relay FAILED: no endpoint\n", .{});
+            return;
+        };
+
+        // Forward the entire message as-is (encrypted, we can't read it)
+        _ = self.socket.sendTo(data, ep.addr, ep.port) catch {
+            std.debug.print("  📨 APP msg relay FAILED: sendTo error\n", .{});
+            return;
+        };
+        std.debug.print("  📨 APP msg relayed ({d}B) → {d}.{d}.{d}.{d}:{d}\n", .{
+            data.len, ep.addr[0], ep.addr[1], ep.addr[2], ep.addr[3], ep.port,
+        });
     }
 
     /// Handle an OrgAliasAnnounce: register or update org alias, with Lamport conflict resolution.
@@ -534,7 +595,17 @@ pub const SwimProtocol = struct {
 
         var buf: [1500]u8 = undefined;
         const written = codec.encodeAck(&buf, ack) catch return;
-        _ = self.socket.sendTo(buf[0..written], sender_addr, sender_port) catch {};
+        const send_result = self.socket.sendTo(buf[0..written], sender_addr, sender_port);
+        if (send_result) |bytes| {
+            std.debug.print("  ACK sent ({d}B) → {d}.{d}.{d}.{d}:{d}\n", .{
+                bytes, sender_addr[0], sender_addr[1], sender_addr[2], sender_addr[3], sender_port,
+            });
+        } else |err| {
+            std.debug.print("  ACK FAILED → {d}.{d}.{d}.{d}:{d} err={s}\n", .{
+                sender_addr[0],  sender_addr[1], sender_addr[2], sender_addr[3], sender_port,
+                @errorName(err),
+            });
+        }
     }
 
     fn handleAck(self: *SwimProtocol, ack: *const codec.DecodedAck, sender_addr: [4]u8, sender_port: u16) void {
@@ -684,7 +755,7 @@ pub const SwimProtocol = struct {
 
     // ─── Peer management ───
 
-    fn registerOrUpdatePeer(self: *SwimProtocol, pubkey: [32]u8, addr: [4]u8, port: u16) void {
+    pub fn registerOrUpdatePeer(self: *SwimProtocol, pubkey: [32]u8, addr: [4]u8, port: u16) void {
         // Skip self
         if (std.mem.eql(u8, &pubkey, &self.our_pubkey)) return;
         // Skip zero pubkey (used for initial seed pings)
@@ -733,12 +804,16 @@ pub const SwimProtocol = struct {
                 .nat_type = self.our_nat_type,
             });
 
-            // Also enqueue gossip about the new peer
+            // Also enqueue gossip about the new peer (include wg/nat info if already known)
+            const peer_info = self.membership.peers.get(pubkey);
             self.enqueueGossip(.{
                 .subject_pubkey = pubkey,
                 .event = .join,
                 .lamport = self.membership.lamport,
                 .endpoint = .{ .addr = addr, .port = port },
+                .wg_pubkey = if (peer_info) |p| p.wg_pubkey else null,
+                .public_endpoint = if (peer_info) |p| p.public_endpoint else null,
+                .nat_type = if (peer_info) |p| p.nat_type else .unknown,
             });
         }
     }
@@ -758,6 +833,7 @@ pub const SwimProtocol = struct {
         var buf: [1500]u8 = undefined;
         const written = codec.encodePing(&buf, ping) catch return;
         _ = self.socket.sendTo(buf[0..written], addr, port) catch return;
+        self.pkts_sent += 1;
 
         // Track pending
         if (self.pending_count < self.pending.len) {

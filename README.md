@@ -29,30 +29,37 @@ Building a secure mesh network between N nodes (blockchain validators, edge serv
 │  │ Ed25519  │  │ SWIM Protocol │  │  Noise IK Handshake      │  │
 │  │ Keys     │  │ Membership    │  │  ChaCha20-Poly1305       │  │
 │  │ Trust    │  │ Seed peers    │  │  Transport tunnels       │  │
-│  └──────────┘  └───────────────┘  │  Anti-replay window      │  │
-│                                   └──────────────────────────┘  │
+│  └──────────┘  │ LAN multicast │  │  Anti-replay window      │  │
+│                └───────────────┘  └──────────────────────────┘  │
 │  ┌──────────┐  ┌───────────────┐  ┌──────────────────────────┐  │
 │  │   NAT    │  │   Protocol    │  │       Network I/O        │  │
 │  │          │  │               │  │                          │  │
 │  │ STUN     │  │ Wire codec    │  │  UDP socket (gossip)     │  │
 │  │ Holepunch│  │ Message types │  │  TUN device (packets)    │  │
-│  │ Relay    │  │ Binary format │  │  Netlink (kernel WG)     │  │
+│  │ UPnP-IGD │  │ Binary format │  │  Netlink (kernel WG)     │  │
 │  └──────────┘  └───────────────┘  └──────────────────────────┘  │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │                    FFI / Mobile Embedding                 │  │
+│  │  C-ABI shared library · SWIM gossip · Encrypted messages │  │
+│  │  LAN discovery · No WireGuard TUN (app-level only)       │  │
+│  └───────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
 ### Key Design Decisions
 
-| Decision                     | Rationale                                                                                                           |
-| ---------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| **Ed25519 identity keys**    | Separate from WireGuard X25519 — rotate transport keys without changing identity                                    |
-| **Single-port multiplexing** | WireGuard, SWIM gossip, STUN, and hole punching share one UDP port (51821). Packet type classified by first 4 bytes |
-| **SWIM gossip protocol**     | O(log N) convergence, built-in failure detection, no coordinator                                                    |
-| **Dual WireGuard modes**     | Kernel module (fastest) or full userspace (portable, zero dependencies)                                             |
-| **Trust-agnostic**           | `authorized_keys/` directory — you decide how keys get there                                                        |
-| **Org trust (hierarchical)** | Trust one org key → auto-accept all nodes signed by that org                                                        |
-| **Deterministic mesh IPs**   | Blake3(pubkey) → `10.99.X.Y`. No DHCP, no conflicts, no coordination                                                |
-| **Deterministic mesh DNS**   | Blake3(org_pubkey) → `*.a1b2c3.mesh`. Per-org deterministic subdomains                                              |
+| Decision                     | Rationale                                                                                                                             |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| **Ed25519 identity keys**    | Separate from WireGuard X25519 — rotate transport keys without changing identity                                                      |
+| **Single-port multiplexing** | WireGuard, SWIM gossip, STUN, and hole punching share one UDP port (51821). Packet type classified by first 4 bytes                   |
+| **SWIM gossip protocol**     | O(log N) convergence, built-in failure detection, no coordinator                                                                      |
+| **Dual WireGuard modes**     | Kernel module (fastest) or full userspace (portable, zero dependencies)                                                               |
+| **Trust-agnostic**           | `authorized_keys/` directory — you decide how keys get there                                                                          |
+| **Org trust (hierarchical)** | Trust one org key → auto-accept all nodes signed by that org                                                                          |
+| **Deterministic mesh IPs**   | Blake3(pubkey) → `10.99.X.Y`. No DHCP, no conflicts, no coordination                                                                  |
+| **Deterministic mesh DNS**   | Blake3(org_pubkey) → `*.a1b2c3.mesh`. Per-org deterministic subdomains                                                                |
+| **Android FFI embedding**    | C-ABI shared library — SWIM gossip + encrypted messaging without WireGuard TUN. Build with `zig build -Dtarget=aarch64-linux-android` |
+| **libc `poll()` compat**     | Uses POSIX `poll()` via libc instead of raw Linux syscall — required for Android seccomp                                              |
 
 ## Quick Start
 
@@ -235,15 +242,23 @@ docker compose -f docker-compose.bench.yml up
 
 ## Requirements
 
+### Linux Server / Desktop
+
 - **Zig 0.15+**
 - **Linux** (kernel WireGuard module _or_ TUN device support)
 - **libsodium** (`libsodium-dev` for building, `libsodium23` at runtime)
 - `sudo` or `CAP_NET_ADMIN` for interface creation
 
+### Android (FFI)
+
+- **Zig 0.15+** (cross-compiles to Android targets)
+- **No libsodium** — the FFI library uses `std.crypto` only
+- Android NDK **not required** — Zig's bundled libc includes Bionic headers
+
 ## Building
 
 ```bash
-# Debug build
+# Debug build (Linux server — exe + static lib + FFI shared lib)
 zig build
 
 # Release (optimized, static binary)
@@ -252,9 +267,17 @@ zig build -Doptimize=ReleaseFast
 # Run tests
 zig build test
 
-# Cross-compile for aarch64
+# Cross-compile for aarch64 Linux
 zig build -Dtarget=aarch64-linux-gnu -Doptimize=ReleaseFast
+
+# Android aarch64 (produces libmeshguard-ffi.so only)
+zig build -Dtarget=aarch64-linux-android -Doptimize=ReleaseFast
+
+# Android x86_64 (for emulators)
+zig build -Dtarget=x86_64-linux-android -Doptimize=ReleaseFast
 ```
+
+Android builds produce only `libmeshguard-ffi.so` — the CLI binary, static library, and unit tests are excluded (they require kernel APIs not available on Android).
 
 ## Status
 
@@ -283,6 +306,12 @@ Core functionality is implemented and under active benchmarking:
 - [x] libsodium AVX2 ChaCha20-Poly1305
 - [x] UDP GRO on control-plane socket
 - [x] NAPI busy-poll + GRO drain loop
+- [x] Android FFI shared library (`libmeshguard-ffi.so`)
+- [x] App-level encrypted messaging (wire type `0x50`)
+- [x] LAN multicast discovery
+- [x] UPnP-IGD port forwarding
+- [x] Coordinated punch (token-based direct connect)
+- [x] Open mode (`--open` flag for trust-free operation)
 - [ ] Multi-queue TUN (`IFF_MULTI_QUEUE`)
 - [ ] `io_uring` event loop
 - [ ] IPv6 support
@@ -290,6 +319,20 @@ Core functionality is implemented and under active benchmarking:
 - [ ] macOS support (utun)
 - [ ] FreeBSD support
 - [ ] Windows support (wintun)
+
+## Mobile / Embedded
+
+meshguard provides a **C-ABI shared library** (`libmeshguard-ffi.so`) for embedding in mobile apps. The FFI surface exposes:
+
+- **Lifecycle**: `meshguard_init`, `meshguard_join`, `meshguard_join_lan`, `meshguard_leave`, `meshguard_destroy`
+- **Messaging**: `meshguard_send`, `meshguard_recv` — end-to-end encrypted app-level messages
+- **Discovery**: SWIM gossip + LAN multicast — no seed server required on local networks
+- **Callbacks**: `meshguard_set_on_message`, `meshguard_set_on_peer_event` — push notifications for peer events
+- **Query**: `meshguard_peer_count`, `meshguard_get_peers`, `meshguard_get_peer_info`, `meshguard_debug_info`
+
+The FFI library does **not** include WireGuard TUN — it's designed for application-level encrypted messaging over the SWIM gossip mesh. Uses `std.crypto` only (no libsodium dependency).
+
+See [Android embedding guide](https://igorls.github.io/meshguard/guide/android-embedding) for JNI integration details.
 
 ## Documentation
 

@@ -33,6 +33,7 @@ SWIM messages use a **1-byte type tag**:
 | `0x41` | OrgAliasAnnounce    | Org Trust | Gossip          |
 | `0x42` | OrgCertRevoke       | Org Trust | Gossip          |
 | `0x43` | OrgTrustVouch       | Org Trust | Gossip          |
+| `0x50` | AppMessage          | App       | A → B (relayed) |
 
 ## Ping
 
@@ -148,6 +149,21 @@ Propagated via gossip. Org admin vouches for an external standalone node — all
 ```
 
 Total: **137 bytes**. Signature covers `vouched_pubkey ‖ lamport`. Revocable via OrgCertRevoke.
+
+## AppMessage
+
+End-to-end encrypted application-level message, relayed through the mesh.
+
+```
+[0x50][32B dest_pubkey][32B sender_pubkey][12B nonce][N ciphertext][16B tag]
+```
+
+Minimum size: **93 bytes** (empty payload). Maximum payload: 1024 bytes.
+
+- **Key derivation**: X25519(sender_private, dest_wg_pubkey) → HKDF("meshguard-app-v1") → symmetric key
+- **AD**: sender's Ed25519 public key
+- **Routing**: intermediate peers forward the entire packet as-is (encrypted, opaque) to the destination by pubkey lookup
+- **Delivery**: when `dest_pubkey` matches our own, the message is decrypted and delivered via callback
 
 ## Endpoint Encoding
 

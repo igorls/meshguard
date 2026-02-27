@@ -80,6 +80,7 @@ meshguard up [options]
 | `--mdns`     | `false`  | Discover seeds via mDNS on LAN              |
 | `--announce` | _(auto)_ | Manually specify public IP for announcement |
 | `--kernel`   | `false`  | Use kernel WireGuard instead of userspace   |
+| `--open`     | `false`  | Accept all peers (skip trust enforcement)   |
 
 **Startup sequence**:
 

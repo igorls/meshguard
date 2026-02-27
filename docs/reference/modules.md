@@ -4,11 +4,12 @@ Reference map of all source modules and their responsibilities.
 
 ## Top-Level
 
-| File         | Purpose                                                          |
-| ------------ | ---------------------------------------------------------------- |
-| `main.zig`   | CLI entry point, command dispatch, daemon event loop             |
-| `lib.zig`    | Library root — re-exports all modules for embedders              |
-| `config.zig` | Configuration struct with network, discovery, and trust defaults |
+| File                | Purpose                                                          |
+| ------------------- | ---------------------------------------------------------------- |
+| `main.zig`          | CLI entry point, command dispatch, daemon event loop             |
+| `lib.zig`           | Library root — re-exports all modules for embedders              |
+| `config.zig`        | Configuration struct with network, discovery, and trust defaults |
+| `meshguard_ffi.zig` | C-ABI FFI surface for mobile embedding (Android JNI)             |
 
 ## `identity/`
 
@@ -24,6 +25,7 @@ Reference map of all source modules and their responsibilities.
 | `swim.zig`       | SWIM protocol engine: ping/ack loop, gossip propagation, handshake coordination, hole punch triggers          |
 | `membership.zig` | Membership table: peer states (alive/suspected/dead), Lamport clocks, suspicion expiry, random peer selection |
 | `seed.zig`       | Seed peer resolution: static IP parsing, DNS/mDNS placeholders                                                |
+| `lan.zig`        | LAN multicast discovery: UDP beacon broadcast/receive on `239.99.99.1`, app ID filtering                      |
 
 ## `wireguard/`
 
@@ -41,11 +43,13 @@ Reference map of all source modules and their responsibilities.
 
 ## `nat/`
 
-| File            | Purpose                                                                                                                |
-| --------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `stun.zig`      | STUN client (RFC 5389): Binding Request/Response encoding, XOR-MAPPED-ADDRESS parsing, NAT type detection              |
-| `holepunch.zig` | UDP hole punching: `Holepuncher` state machine, probe magic (`MGHP`), rendezvous-mediated exchange, 4 concurrent slots |
-| `relay.zig`     | Relay selection: best public-IP peer by RTT, capacity checking, `RelayInfo` struct                                     |
+| File                    | Purpose                                                                                                                |
+| ----------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `stun.zig`              | STUN client (RFC 5389): Binding Request/Response encoding, XOR-MAPPED-ADDRESS parsing, NAT type detection              |
+| `holepunch.zig`         | UDP hole punching: `Holepuncher` state machine, probe magic (`MGHP`), rendezvous-mediated exchange, 4 concurrent slots |
+| `relay.zig`             | Relay selection: best public-IP peer by RTT, capacity checking, `RelayInfo` struct                                     |
+| `upnp.zig`              | UPnP-IGD port forwarding: SSDP discovery, SOAP AddPortMapping, lease renewal                                           |
+| `coordinated_punch.zig` | Token-based coordinated punch: `meshguard connect` token exchange for direct peer setup                                |
 
 ## `protocol/`
 

@@ -30,6 +30,7 @@ export default defineConfig({
           { text: 'Getting Started', link: '/guide/getting-started' },
           { text: 'Trust Model', link: '/guide/trust-model' },
           { text: 'Configuration', link: '/guide/configuration' },
+          { text: 'Android / Mobile', link: '/guide/android-embedding' },
         ],
       },
       {
