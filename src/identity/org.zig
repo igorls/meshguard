@@ -149,9 +149,9 @@ pub fn saveOrgKeyPair(allocator: std.mem.Allocator, config_dir: []const u8, kp: 
     var sk_buf: [88]u8 = undefined;
     const sk_b64 = std.base64.standard.Encoder.encode(&sk_buf, &kp.secret_key.toBytes());
 
-    const sk_file = try std.fs.createFileAbsolute(sk_path, .{});
+    const sk_file = try std.fs.createFileAbsolute(sk_path, .{ .mode = 0o600 });
     defer sk_file.close();
-    sk_file.chmod(0o600) catch {};
+    try sk_file.chmod(0o600);
     try sk_file.writeAll(sk_b64);
     try sk_file.writeAll("\n");
 
