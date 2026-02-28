@@ -7,3 +7,8 @@
 **Gap:** CLI flags `--port` and `--wg-port` were documented but not implemented in `src/main.zig`. Default WireGuard port was documented as `51820` but hardcoded as `51830`.
 **Learning:** `src/main.zig` uses hardcoded values and manual argument parsing instead of the `src/config.zig` struct or a centralized CLI parser, leading to drift between the config module, the main entry point, and the docs.
 **Prevention:** Refactor `src/main.zig` to use a CLI library that auto-generates help text from the `Config` struct, or add a CI check that grep's `main.zig` for every flag listed in `docs/reference/cli.md`.
+
+## 2024-05-23 - SWIM Protocol Period Drift
+**Gap:** The documentation stated the SWIM protocol period was 1000ms (1s), but the implementation uses 5000ms (5s) in both `src/config.zig` and `src/discovery/swim.zig`.
+**Learning:** The documentation likely reflected an early design decision or standard SWIM defaults, but the implementation settled on a more conservative 5s interval for WAN stability, and docs were not updated.
+**Prevention:** Add a CI check that grep's `docs/guide/configuration.md` for values that match constants exported in `src/config.zig`.

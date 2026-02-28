@@ -71,7 +71,7 @@ $MESHGUARD_CONFIG_DIR/
 
 | Parameter          | Value     | Description                            |
 | ------------------ | --------- | -------------------------------------- |
-| Protocol period    | `1000 ms` | Interval between SWIM probe rounds     |
+| Protocol period    | `5000 ms` | Interval between SWIM probe rounds     |
 | Suspicion timeout  | `5000 ms` | Time before suspected → dead           |
 | Max gossip entries | `8`       | Gossip entries piggybacked per message |
 
