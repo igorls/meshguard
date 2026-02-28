@@ -24,7 +24,8 @@ pub fn hmac(key: []const u8, data: []const u8) [HASH_LEN]u8 {
 /// Kernel reference: noise.c:344-390
 pub fn kdf1(chaining_key: [HASH_LEN]u8, data: []const u8) struct { ck: [HASH_LEN]u8 } {
     // Extract
-    const secret = hmac(&chaining_key, data);
+    var secret = hmac(&chaining_key, data);
+    defer std.crypto.secureZero(u8, &secret);
 
     // Expand T1: HMAC(secret, 0x01)
     const t1 = hmac(&secret, &[_]u8{0x01});
@@ -35,13 +36,15 @@ pub fn kdf1(chaining_key: [HASH_LEN]u8, data: []const u8) struct { ck: [HASH_LEN
 /// HKDF-Blake2s: Extract + Expand, 2 output keys.
 pub fn kdf2(chaining_key: [HASH_LEN]u8, data: []const u8) struct { ck: [HASH_LEN]u8, key: [KEY_LEN]u8 } {
     // Extract
-    const secret = hmac(&chaining_key, data);
+    var secret = hmac(&chaining_key, data);
+    defer std.crypto.secureZero(u8, &secret);
 
     // Expand T1: HMAC(secret, 0x01)
     const t1 = hmac(&secret, &[_]u8{0x01});
 
     // Expand T2: HMAC(secret, T1 || 0x02)
     var t1_plus: [HASH_LEN + 1]u8 = undefined;
+    defer std.crypto.secureZero(u8, &t1_plus);
     @memcpy(t1_plus[0..HASH_LEN], &t1);
     t1_plus[HASH_LEN] = 0x02;
     const t2 = hmac(&secret, &t1_plus);
@@ -52,19 +55,22 @@ pub fn kdf2(chaining_key: [HASH_LEN]u8, data: []const u8) struct { ck: [HASH_LEN
 /// HKDF-Blake2s: Extract + Expand, 3 output keys.
 pub fn kdf3(chaining_key: [HASH_LEN]u8, data: []const u8) struct { ck: [HASH_LEN]u8, key1: [KEY_LEN]u8, key2: [KEY_LEN]u8 } {
     // Extract
-    const secret = hmac(&chaining_key, data);
+    var secret = hmac(&chaining_key, data);
+    defer std.crypto.secureZero(u8, &secret);
 
     // Expand T1
     const t1 = hmac(&secret, &[_]u8{0x01});
 
     // Expand T2
     var t1_plus: [HASH_LEN + 1]u8 = undefined;
+    defer std.crypto.secureZero(u8, &t1_plus);
     @memcpy(t1_plus[0..HASH_LEN], &t1);
     t1_plus[HASH_LEN] = 0x02;
     const t2 = hmac(&secret, &t1_plus);
 
     // Expand T3
     var t2_plus: [HASH_LEN + 1]u8 = undefined;
+    defer std.crypto.secureZero(u8, &t2_plus);
     @memcpy(t2_plus[0..HASH_LEN], &t2);
     t2_plus[HASH_LEN] = 0x03;
     const t3 = hmac(&secret, &t2_plus);
