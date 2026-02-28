@@ -42,6 +42,7 @@ meshguard trust <key-or-path> [--name <name>]
 | Argument        | Description                                            |
 | --------------- | ------------------------------------------------------ |
 | `<key-or-path>` | Base64 public key string _or_ path to a `.pub` file    |
+| `--org`         | Trust an organization's public key                     |
 | `--name`        | Human-readable name (default: auto-generated from key) |
 
 **Validation**:
@@ -62,6 +63,23 @@ meshguard revoke <name>
 ```
 
 Deletes `$MESHGUARD_CONFIG_DIR/authorized_keys/<name>.pub`.
+
+---
+
+## `meshguard connect`
+
+Direct peer connection via token exchange (no seed needed).
+
+```bash
+meshguard connect --generate [--in <minutes>]
+meshguard connect --join <mg://token>
+```
+
+| Flag             | Description                                 |
+| ---------------- | ------------------------------------------- |
+| `--generate`     | Generate a connection token                 |
+| `--join <token>` | Join using a peer's connection token        |
+| `--in <minutes>` | Punch delay (default: 1 minute)             |
 
 ---
 
@@ -104,6 +122,46 @@ meshguard down
 ```
 
 Uses `RTM_DELLINK` via RTNETLINK to remove the interface.
+
+---
+
+## `meshguard org-keygen`
+
+Generate a new org keypair.
+
+```bash
+meshguard org-keygen
+```
+
+---
+
+## `meshguard org-sign`
+
+Sign a node's key with an org key.
+
+```bash
+meshguard org-sign <node.pub> [--name <label>] [--expires <unix-timestamp>]
+```
+
+---
+
+## `meshguard org-vouch`
+
+Vouch for an external node (auto-propagates to org members).
+
+```bash
+meshguard org-vouch <node.pub>
+```
+
+---
+
+## `meshguard upgrade`
+
+Upgrade to the latest release from GitHub.
+
+```bash
+meshguard upgrade
+```
 
 ---
 

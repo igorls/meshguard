@@ -12,3 +12,8 @@
 **Gap:** The documentation stated the SWIM protocol period was 1000ms (1s), but the implementation uses 5000ms (5s) in both `src/config.zig` and `src/discovery/swim.zig`.
 **Learning:** The documentation likely reflected an early design decision or standard SWIM defaults, but the implementation settled on a more conservative 5s interval for WAN stability, and docs were not updated.
 **Prevention:** Add a CI check that grep's `docs/guide/configuration.md` for values that match constants exported in `src/config.zig`.
+
+## 2025-03-09 - Missing CLI Commands Documentation
+**Gap:** Several CLI commands (`connect`, `org-keygen`, `org-sign`, `org-vouch`, `upgrade`) and the `--org` flag for `trust` were implemented in `src/main.zig` but entirely missing from the reference documentation in `docs/reference/cli.md`.
+**Learning:** Adding new features to the CLI requires updating the documentation. Because command parsing and help messages are manually defined in `src/main.zig` rather than using a generator framework, the `docs/reference/cli.md` drift happens frequently if not updated in the same PR.
+**Prevention:** Regularly compare the usage string in `src/main.zig` with `docs/reference/cli.md`, or ideally, auto-generate the markdown reference from the CLI parser configuration.
