@@ -70,6 +70,14 @@ pub const WgPeer = struct {
     handshake_attempts: u32 = 0,
     /// Per-peer Tx ring for parallel pipeline ordering (only used when --encrypt-workers > 0)
     tx_ring: @import("../net/pipeline.zig").PeerTxRing = .{},
+
+    pub fn deinit(self: *WgPeer) void {
+        self.handshake.deinit();
+        if (self.active_tunnel) |*t| {
+            t.deinit();
+            self.active_tunnel = null;
+        }
+    }
 };
 
 /// Fixed-size open-addressed hash table for u32 → usize mapping.
@@ -311,7 +319,7 @@ pub const WgDevice = struct {
                 }
                 self.static_map.remove(wg_pubkey);
                 // Securely zero out key material before removal
-                peer.handshake.deinit();
+                peer.deinit();
                 self.peers[slot] = null;
                 self.peer_count -|= 1;
             }

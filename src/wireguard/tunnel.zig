@@ -86,6 +86,12 @@ pub const Tunnel = struct {
     /// Whether this tunnel needs rekeying
     needs_rekey: bool = false,
 
+    /// Securely zero out key material.
+    pub fn deinit(self: *Tunnel) void {
+        std.crypto.secureZero(u8, &self.keys.sending_key);
+        std.crypto.secureZero(u8, &self.keys.receiving_key);
+    }
+
     /// Encrypt an outgoing IP packet into a WG transport message.
     /// Returns: [header(16) || encrypted_padded_data || tag(16)]
     pub fn encrypt(self: *Tunnel, plaintext: []const u8, out: []u8) !usize {
@@ -493,4 +499,36 @@ test "anti-replay window large shift" {
     // It is within window [2200-2048+1, 2200] = [153, 2200].
     // So 1500 is valid range. And bit should be 0.
     try std.testing.expect(w.check(1500));
+}
+
+test "transport tunnel deinit zeros keys" {
+    const keys = noise.TransportKeys{
+        .sending_key = .{0x42} ** 32,
+        .receiving_key = .{0x99} ** 32,
+        .sending_index = 1,
+        .receiving_index = 2,
+        .is_initiator = true,
+        .birthdate_ns = std.time.nanoTimestamp(),
+    };
+    var t = Tunnel{ .keys = keys };
+
+    // Verify keys are set
+    try std.testing.expectEqual(t.keys.sending_key[0], 0x42);
+    try std.testing.expectEqual(t.keys.receiving_key[0], 0x99);
+
+    // Deinit
+    t.deinit();
+
+    // Verify keys are zeroed
+    var all_zeros = true;
+    for (t.keys.sending_key) |b| {
+        if (b != 0) all_zeros = false;
+    }
+    try std.testing.expect(all_zeros);
+
+    all_zeros = true;
+    for (t.keys.receiving_key) |b| {
+        if (b != 0) all_zeros = false;
+    }
+    try std.testing.expect(all_zeros);
 }
