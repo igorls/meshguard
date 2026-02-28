@@ -43,6 +43,7 @@ export default defineConfig({
           { text: 'WireGuard Integration', link: '/concepts/wireguard-integration' },
           { text: 'NAT Traversal', link: '/concepts/nat-traversal' },
           { text: 'Wire Protocol', link: '/concepts/wire-protocol' },
+          { text: 'Security Model', link: '/concepts/security' },
         ],
       },
       {
