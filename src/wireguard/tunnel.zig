@@ -10,7 +10,47 @@
 ///! Reference: drivers/net/wireguard/send.c, receive.c
 const std = @import("std");
 const noise = @import("noise.zig");
-const sodium = @import("../crypto/sodium.zig");
+
+// Compile-time AEAD backend selection:
+// - Linux/native: libsodium (AVX2 assembly, ~2× faster)
+// - Android/FFI: std.crypto (no libsodium dependency)
+const is_android = @import("builtin").target.abi == .android;
+
+const aead = struct {
+    const StdAead = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
+
+    pub fn encrypt(
+        c: []u8,
+        tag: *[16]u8,
+        m: []const u8,
+        ad: []const u8,
+        npub: [12]u8,
+        k: [32]u8,
+    ) void {
+        if (comptime !is_android) {
+            const sodium = @import("../crypto/sodium.zig");
+            sodium.encrypt(c, tag, m, ad, npub, k);
+        } else {
+            StdAead.encrypt(c[0..m.len], tag, m, if (ad.len > 0) ad else "", npub, k);
+        }
+    }
+
+    pub fn decrypt(
+        m: []u8,
+        c: []const u8,
+        tag: [16]u8,
+        ad: []const u8,
+        npub: [12]u8,
+        k: [32]u8,
+    ) !void {
+        if (comptime !is_android) {
+            const sodium = @import("../crypto/sodium.zig");
+            return sodium.decrypt(m, c, tag, ad, npub, k);
+        } else {
+            StdAead.decrypt(m[0..c.len], c, tag, if (ad.len > 0) ad else "", npub, k) catch return error.AuthenticationFailed;
+        }
+    }
+};
 
 pub const AUTHTAG_LEN: usize = 16;
 pub const TRANSPORT_HEADER_LEN: usize = 16; // sizeof(TransportHeader)
@@ -81,8 +121,8 @@ pub const Tunnel = struct {
             @memset(out[ct_start + plaintext.len ..][0..padding_len], 0);
         }
 
-        // Encrypt in-place: libsodium ChaCha20-Poly1305 AVX2 assembly
-        sodium.encrypt(
+        // Encrypt in-place: libaead ChaCha20-Poly1305 AVX2 assembly
+        aead.encrypt(
             out[ct_start..][0..padded_len],
             out[ct_start + padded_len ..][0..AUTHTAG_LEN],
             out[ct_start..][0..padded_len],
@@ -132,7 +172,7 @@ pub const Tunnel = struct {
         std.mem.writeInt(u64, nonce[4..12], nonce_val, .little);
 
         // Encrypt in-place (plaintext at buf[16..], ciphertext overwrites same region)
-        sodium.encrypt(
+        aead.encrypt(
             buf[TRANSPORT_HEADER_LEN..][0..padded_len],
             buf[TRANSPORT_HEADER_LEN + padded_len ..][0..AUTHTAG_LEN],
             buf[TRANSPORT_HEADER_LEN..][0..padded_len],
@@ -177,8 +217,8 @@ pub const Tunnel = struct {
         const plaintext_len = ciphertext.len - AUTHTAG_LEN;
         if (out.len < plaintext_len) return error.BufferTooSmall;
 
-        // Decrypt (libsodium AVX2 assembly)
-        sodium.decrypt(
+        // Decrypt (libaead AVX2 assembly)
+        aead.decrypt(
             out[0..plaintext_len],
             ciphertext[0..plaintext_len],
             ciphertext[plaintext_len..][0..AUTHTAG_LEN].*,

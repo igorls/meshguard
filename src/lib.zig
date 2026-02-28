@@ -54,6 +54,10 @@ pub const net = struct {
 
 pub const config = @import("config.zig");
 
+pub const services = struct {
+    pub const Policy = @import("services/policy.zig");
+};
+
 test {
     // Run all module tests
     @import("std").testing.refAllDecls(@This());
@@ -66,4 +70,5 @@ test {
     _ = wireguard.Netlink;
     _ = wireguard.RtNetlink;
     _ = wireguard.NlSocket;
+    _ = services.Policy;
 }

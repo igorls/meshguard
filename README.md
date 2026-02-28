@@ -39,9 +39,14 @@ Building a secure mesh network between N nodes (blockchain validators, edge serv
 │  │ UPnP-IGD │  │ Binary format │  │  Netlink (kernel WG)     │  │
 │  └──────────┘  └───────────────┘  └──────────────────────────┘  │
 │  ┌───────────────────────────────────────────────────────────┐  │
+│  │                    Service Access Control                 │  │
+│  │  Per-peer/org/global rules · Port-level allow/deny       │  │
+│  │  File-based policies · In-process at decrypt→TUN         │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│  ┌───────────────────────────────────────────────────────────┐  │
 │  │                    FFI / Mobile Embedding                 │  │
 │  │  C-ABI shared library · SWIM gossip · Encrypted messages │  │
-│  │  LAN discovery · No WireGuard TUN (app-level only)       │  │
+│  │  WireGuard tunnels · LAN discovery                       │  │
 │  └───────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -135,8 +140,15 @@ For fleets, trust one org public key instead of N individual keys:
 ├── node.cert                      # Org-signed certificate (186 bytes)
 ├── authorized_keys/               # Individual peer trust
 │   └── validator-1.pub
-└── trusted_orgs/                  # Org trust (auto-accept members)
-    └── eosrio.org
+├── trusted_orgs/                  # Org trust (auto-accept members)
+│   └── eosrio.org
+└── services/                      # Service access control (optional)
+    ├── default                    # Default action: "allow" or "deny"
+    ├── global.policy              # Global rules (all peers)
+    ├── peer/                      # Per-peer policies
+    │   └── node-1.policy
+    └── org/                       # Per-org policies
+        └── eosrio.policy
 ```
 
 Each org gets a **deterministic mesh domain**: `Blake3(org_pubkey)[0..3].hex()` → `*.a1b2c3.mesh`. Orgs can also claim human-readable aliases via gossip (e.g. `*.eosrio.mesh`).
@@ -312,6 +324,9 @@ Core functionality is implemented and under active benchmarking:
 - [x] UPnP-IGD port forwarding
 - [x] Coordinated punch (token-based direct connect)
 - [x] Open mode (`--open` flag for trust-free operation)
+- [x] Service access control (`meshguard service` — per-peer/org/global port policies)
+- [x] WireGuard tunnel FFI API (open/send/recv/close for encrypted audio/data channels)
+- [x] Compile-time AEAD backend selection (libsodium on Linux, std.crypto on Android)
 - [ ] Multi-queue TUN (`IFF_MULTI_QUEUE`)
 - [ ] `io_uring` event loop
 - [ ] IPv6 support
@@ -326,11 +341,12 @@ meshguard provides a **C-ABI shared library** (`libmeshguard-ffi.so`) for embedd
 
 - **Lifecycle**: `meshguard_init`, `meshguard_join`, `meshguard_join_lan`, `meshguard_leave`, `meshguard_destroy`
 - **Messaging**: `meshguard_send`, `meshguard_recv` — end-to-end encrypted app-level messages
+- **Tunnels**: `meshguard_tunnel_open`, `meshguard_tunnel_send`, `meshguard_tunnel_recv`, `meshguard_tunnel_close` — WireGuard-encrypted data channels (e.g., VoIP audio)
 - **Discovery**: SWIM gossip + LAN multicast — no seed server required on local networks
 - **Callbacks**: `meshguard_set_on_message`, `meshguard_set_on_peer_event` — push notifications for peer events
 - **Query**: `meshguard_peer_count`, `meshguard_get_peers`, `meshguard_get_peer_info`, `meshguard_debug_info`
 
-The FFI library does **not** include WireGuard TUN — it's designed for application-level encrypted messaging over the SWIM gossip mesh. Uses `std.crypto` only (no libsodium dependency).
+The FFI library uses WireGuard Noise IK for encrypted tunnels but does **not** create TUN interfaces — tunnel data is delivered via an in-process ring buffer, suitable for VoIP audio or app-level data streams. Uses `std.crypto` only (no libsodium dependency).
 
 See [Android embedding guide](https://igorls.github.io/meshguard/guide/android-embedding) for JNI integration details.
 

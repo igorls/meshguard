@@ -1,0 +1,38 @@
+services:
+  node-a:
+    image: meshguard-test
+    container_name: meshguard-node-a
+    hostname: node-a
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    networks:
+      - meshnet
+    volumes:
+      - node-a-config:/etc/meshguard
+    command: ["sleep", "infinity"]
+
+  node-b:
+    image: meshguard-test
+    container_name: meshguard-node-b
+    hostname: node-b
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    networks:
+      - meshnet
+    volumes:
+      - node-b-config:/etc/meshguard
+    command: ["sleep", "infinity"]
+
+networks:
+  meshnet:
+    driver: bridge
+
+volumes:
+  node-a-config:
+  node-b-config:

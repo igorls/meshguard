@@ -5,7 +5,7 @@ const Config = lib.config.Config;
 const Identity = lib.identity.Keys;
 const posix = std.posix;
 
-const version = "0.6.0";
+const version = "0.7.0";
 
 const usage =
     \\meshguard — decentralized WireGuard mesh VPN daemon
@@ -27,6 +27,7 @@ const usage =
     \\  org-sign    Sign a node's key with org key (--name <label>)
     \\  org-vouch   Vouch for an external node (auto-propagates to org members)
     \\  config show Show local node configuration (works offline)
+    \\  service     Manage service access policies
     \\  upgrade     Upgrade to the latest release from GitHub
     \\  version     Print version
     \\
@@ -159,6 +160,11 @@ pub fn main() !void {
             std.process.exit(1);
         }
         try cmdConfigShow(allocator);
+        return;
+    }
+
+    if (std.mem.eql(u8, command, "service")) {
+        try cmdService(allocator, args[2..]);
         return;
     }
 
@@ -828,6 +834,20 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
         try stdout.writeAll("  trust: OPEN (accepting all peers)\n");
     }
 
+    // Load service access policies
+    const ServicePolicy = lib.services.Policy;
+    var service_filter = ServicePolicy.ServiceFilter.loadFromDir(config_dir);
+    service_filter.resolveAliases(config_dir);
+    service_filter.resolveOrgNames(config_dir);
+    if (service_filter.global != null or service_filter.peer_count > 0 or service_filter.org_count > 0) {
+        try writeFormatted(stdout, "  services: {d} peer, {d} org, {s} global, default={s}\n", .{
+            @as(usize, service_filter.peer_count),
+            @as(usize, service_filter.org_count),
+            if (service_filter.global != null) @as([]const u8, "yes") else @as([]const u8, "no"),
+            if (service_filter.default_action == .allow) @as([]const u8, "allow") else @as([]const u8, "deny"),
+        });
+    }
+
     // Load our own org certificate (if present)
     const cert_path = try std.fs.path.join(allocator, &.{ config_dir, "node.cert" });
     defer allocator.free(cert_path);
@@ -957,7 +977,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
         }
 
         // Run multiplexed event loop
-        userspaceEventLoop(&swim, &wg_device, &gossip_socket, tun_dev, stdout, encrypt_workers) catch |err| {
+        userspaceEventLoop(&swim, &wg_device, &gossip_socket, tun_dev, stdout, encrypt_workers, &service_filter) catch |err| {
             try writeFormatted(stderr, "error: event loop failed: {s}\n", .{@errorName(err)});
         };
     }
@@ -2310,6 +2330,8 @@ fn decryptRxWorker(
     tun_dev_ptr: *const lib.net.Tun.TunDevice,
     tun_fd: posix.fd_t,
     decrypt_q: *lib.net.Pipeline.DecryptQueue,
+    service_filter: *const lib.services.Policy.ServiceFilter,
+    membership: *lib.discovery.Membership.MembershipTable,
 ) void {
     const Offload = lib.net.Offload;
 
@@ -2321,6 +2343,13 @@ fn decryptRxWorker(
 
         const pkt = decrypt_q.getPacket(result.idx);
         if (wg_dev.decryptTransport(pkt, &out_buf)) |dec| {
+            // Service filter: check port access before TUN write
+            if (lib.services.Policy.parseTransportHeader(out_buf[0..dec.len])) |ti| {
+                const peer = wg_dev.peers[dec.slot] orelse continue;
+                const org_pk = if (membership.peers.getPtr(peer.identity_key)) |mp| mp.org_pubkey else null;
+                if (!service_filter.check(peer.identity_key, org_pk, ti.proto, ti.dst_port)) continue;
+            }
+
             // Write decrypted packet to TUN
             if (tun_dev_ptr.vnet_hdr) {
                 var vhdr_bytes = std.mem.zeroes([Offload.VNET_HDR_LEN]u8);
@@ -2348,7 +2377,9 @@ fn processIncomingPacket(
     stdout: std.fs.File,
     decrypt_storage: *[64][1500]u8,
     decrypt_lens: *[64]usize,
+    decrypt_slots: *[64]usize,
     n_decrypted: *usize,
+    service_filter: *const lib.services.Policy.ServiceFilter,
 ) void {
     const Device = lib.wireguard.Device;
 
@@ -2378,7 +2409,16 @@ fn processIncomingPacket(
         .wg_transport => {
             if (n_decrypted.* < 64) {
                 if (wg_dev.decryptTransport(pkt, &decrypt_storage[n_decrypted.*])) |result| {
+                    // Check service filter before buffering
+                    const PolicyMod = lib.services.Policy;
+                    if (PolicyMod.parseTransportHeader(decrypt_storage[n_decrypted.*][0..result.len])) |ti| {
+                        if (wg_dev.peers[result.slot]) |peer| {
+                            const org_pk = if (swim.membership.peers.getPtr(peer.identity_key)) |mp| mp.org_pubkey else null;
+                            if (!service_filter.check(peer.identity_key, org_pk, ti.proto, ti.dst_port)) return;
+                        }
+                    }
                     decrypt_lens[n_decrypted.*] = result.len;
+                    decrypt_slots[n_decrypted.*] = result.slot;
                     n_decrypted.* += 1;
                 } else |_| {}
             }
@@ -2407,6 +2447,7 @@ fn userspaceEventLoop(
     tun_dev: lib.net.Tun.TunDevice,
     stdout: std.fs.File,
     encrypt_workers_arg: usize,
+    service_filter: *const lib.services.Policy.ServiceFilter,
 ) !void {
     const BatchUdp = lib.net.BatchUdp;
 
@@ -2568,6 +2609,7 @@ fn userspaceEventLoop(
     const MAX_DECRYPTED = 64;
     var decrypt_storage: [MAX_DECRYPTED][1500]u8 = undefined;
     var decrypt_lens: [MAX_DECRYPTED]usize = undefined;
+    var decrypt_slots: [MAX_DECRYPTED]usize = undefined;
 
     while (swim.running.load(.acquire)) {
         var fds = [_]posix.pollfd{
@@ -2602,7 +2644,9 @@ fn userspaceEventLoop(
                         stdout,
                         &decrypt_storage,
                         &decrypt_lens,
+                        &decrypt_slots,
                         &n_decrypted,
+                        service_filter,
                     );
 
                     offset += pkt_len;
@@ -2916,6 +2960,382 @@ fn formatBytes(bytes: u64) FormattedBytes {
         const rem = bytes % (1024 * 1024 * 1024);
         return .{ .whole = gib, .frac = rem * 10 / (1024 * 1024 * 1024), .unit = "GiB" };
     }
+}
+
+// ─── Service Access Control ───
+
+const service_usage =
+    \\meshguard service — manage service access policies
+    \\
+    \\USAGE:
+    \\  meshguard service <command> [options]
+    \\
+    \\COMMANDS:
+    \\  list                        List all service policies
+    \\  allow <proto> <port>        Add an allow rule
+    \\  deny <proto> <port>         Add a deny rule
+    \\  default <allow|deny>        Set default action (when no rule matches)
+    \\  show [peer-name]            Show effective policy for a peer (or global)
+    \\  reset                       Remove all service policies
+    \\
+    \\OPTIONS:
+    \\  --peer <name>               Target a specific peer (by alias or pubkey)
+    \\  --org <name>                Target an org
+    \\  (no flag)                   Target the global policy
+    \\
+    \\EXAMPLES:
+    \\  meshguard service allow tcp 22              # Global: allow SSH
+    \\  meshguard service deny all                  # Global: deny everything else
+    \\  meshguard service allow --peer node-1 tcp 5432  # Peer: allow Postgres
+    \\  meshguard service default deny              # Switch to default-deny
+    \\  meshguard service list                      # Show all policies
+    \\
+;
+
+fn cmdService(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
+    const stdout = getStdOut();
+    const stderr = getStdErr();
+
+    const config_dir = try Config.ensureConfigDir(allocator);
+    defer allocator.free(config_dir);
+
+    if (extra_args.len == 0) {
+        try stdout.writeAll(service_usage);
+        return;
+    }
+
+    const subcmd = extra_args[0];
+
+    if (std.mem.eql(u8, subcmd, "-h") or std.mem.eql(u8, subcmd, "--help") or std.mem.eql(u8, subcmd, "help")) {
+        try stdout.writeAll(service_usage);
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "list")) {
+        try cmdServiceList(allocator, config_dir);
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "default")) {
+        if (extra_args.len < 2) {
+            try stderr.writeAll("usage: meshguard service default <allow|deny>\n");
+            std.process.exit(1);
+        }
+        try cmdServiceDefault(allocator, config_dir, extra_args[1]);
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "show")) {
+        const target = if (extra_args.len >= 2) extra_args[1] else null;
+        try cmdServiceShow(allocator, config_dir, target);
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "reset")) {
+        try cmdServiceReset(allocator, config_dir);
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "allow") or std.mem.eql(u8, subcmd, "deny")) {
+        try cmdServiceAddRule(allocator, config_dir, extra_args);
+        return;
+    }
+
+    try writeFormatted(stderr, "error: unknown service command '{s}'\n\n", .{subcmd});
+    try stdout.writeAll(service_usage);
+    std.process.exit(1);
+}
+
+fn ensureServicesDir(allocator: std.mem.Allocator, config_dir: []const u8) !void {
+    const services_dir = try std.fs.path.join(allocator, &.{ config_dir, "services" });
+    defer allocator.free(services_dir);
+    std.fs.makeDirAbsolute(services_dir) catch |err| {
+        if (err != error.PathAlreadyExists) return err;
+    };
+
+    const peer_dir = try std.fs.path.join(allocator, &.{ config_dir, "services", "peer" });
+    defer allocator.free(peer_dir);
+    std.fs.makeDirAbsolute(peer_dir) catch |err| {
+        if (err != error.PathAlreadyExists) return err;
+    };
+
+    const org_dir = try std.fs.path.join(allocator, &.{ config_dir, "services", "org" });
+    defer allocator.free(org_dir);
+    std.fs.makeDirAbsolute(org_dir) catch |err| {
+        if (err != error.PathAlreadyExists) return err;
+    };
+}
+
+fn cmdServiceDefault(allocator: std.mem.Allocator, config_dir: []const u8, action: []const u8) !void {
+    const stdout = getStdOut();
+    const stderr = getStdErr();
+
+    if (!std.mem.eql(u8, action, "allow") and !std.mem.eql(u8, action, "deny")) {
+        try stderr.writeAll("error: default must be 'allow' or 'deny'\n");
+        std.process.exit(1);
+    }
+
+    try ensureServicesDir(allocator, config_dir);
+
+    const path = try std.fs.path.join(allocator, &.{ config_dir, "services", "default" });
+    defer allocator.free(path);
+
+    const file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(action);
+    try file.writeAll("\n");
+
+    try writeFormatted(stdout, "Default policy set to: {s}\n", .{action});
+}
+
+fn cmdServiceAddRule(allocator: std.mem.Allocator, config_dir: []const u8, args: []const []const u8) !void {
+    const stdout = getStdOut();
+    const stderr = getStdErr();
+
+    // Parse: allow/deny [--peer <name>] [--org <name>] <proto> <port>
+    const action = args[0]; // "allow" or "deny"
+    var peer_target: ?[]const u8 = null;
+    var org_target: ?[]const u8 = null;
+    var proto_str: ?[]const u8 = null;
+    var port_str: ?[]const u8 = null;
+
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--peer") and i + 1 < args.len) {
+            i += 1;
+            peer_target = args[i];
+        } else if (std.mem.eql(u8, args[i], "--org") and i + 1 < args.len) {
+            i += 1;
+            org_target = args[i];
+        } else if (proto_str == null) {
+            proto_str = args[i];
+        } else if (port_str == null) {
+            port_str = args[i];
+        }
+    }
+
+    if (proto_str == null) {
+        try stderr.writeAll("usage: meshguard service allow|deny [--peer <name>] [--org <name>] <proto> [<port>]\n");
+        std.process.exit(1);
+    }
+
+    // Build the rule line
+    var rule_buf: [128]u8 = undefined;
+    const rule_line = blk: {
+        // "deny all" shorthand
+        if (std.mem.eql(u8, proto_str.?, "all") and port_str == null) {
+            break :blk std.fmt.bufPrint(&rule_buf, "{s} all\n", .{action}) catch unreachable;
+        }
+        if (port_str) |ps| {
+            break :blk std.fmt.bufPrint(&rule_buf, "{s} {s} {s}\n", .{ action, proto_str.?, ps }) catch unreachable;
+        }
+        try stderr.writeAll("error: missing port (use a port number, range, or 'all')\n");
+        std.process.exit(1);
+    };
+
+    // Validate the rule
+    const PolicyMod = lib.services.Policy;
+    _ = PolicyMod.parseRule(rule_line) catch {
+        try stderr.writeAll("error: invalid rule syntax\n");
+        std.process.exit(1);
+    };
+
+    try ensureServicesDir(allocator, config_dir);
+
+    // Determine target file
+    const policy_path = if (peer_target) |peer|
+        try std.fmt.allocPrint(allocator, "{s}/services/peer/{s}.policy", .{ config_dir, peer })
+    else if (org_target) |org|
+        try std.fmt.allocPrint(allocator, "{s}/services/org/{s}.policy", .{ config_dir, org })
+    else
+        try std.fmt.allocPrint(allocator, "{s}/services/global.policy", .{config_dir});
+    defer allocator.free(policy_path);
+
+    // Append rule to file
+    const file = std.fs.createFileAbsolute(policy_path, .{
+        .truncate = false,
+        .exclusive = false,
+    }) catch |err| {
+        try writeFormatted(stderr, "error: cannot open policy file: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer file.close();
+
+    // Seek to end for append
+    file.seekFromEnd(0) catch {};
+    file.writeAll(rule_line) catch |err| {
+        try writeFormatted(stderr, "error: cannot write rule: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+
+    // Print confirmation
+    const target_desc: []const u8 = if (peer_target) |p| p else if (org_target) |o| o else "global";
+    const scope: []const u8 = if (peer_target != null) "peer" else if (org_target != null) "org" else "global";
+    try writeFormatted(stdout, "Rule added ({s} '{s}'): {s}", .{ scope, target_desc, rule_line });
+}
+
+fn cmdServiceList(allocator: std.mem.Allocator, config_dir: []const u8) !void {
+    const stdout = getStdOut();
+
+    const services_dir = try std.fs.path.join(allocator, &.{ config_dir, "services" });
+    defer allocator.free(services_dir);
+
+    // Check if services/ exists
+    std.fs.accessAbsolute(services_dir, .{}) catch {
+        try stdout.writeAll("No service policies configured (default: allow all)\n");
+        return;
+    };
+
+    // Default action
+    const default_path = try std.fs.path.join(allocator, &.{ services_dir, "default" });
+    defer allocator.free(default_path);
+    const default_action = blk: {
+        const file = std.fs.openFileAbsolute(default_path, .{}) catch break :blk "allow";
+        defer file.close();
+        var buf: [16]u8 = undefined;
+        const n = file.readAll(&buf) catch break :blk "allow";
+        const trimmed = std.mem.trim(u8, buf[0..n], " \t\r\n");
+        if (std.mem.eql(u8, trimmed, "deny")) break :blk "deny";
+        break :blk "allow";
+    };
+    try writeFormatted(stdout, "Default: {s}\n\n", .{default_action});
+
+    // Global policy
+    const global_path = try std.fs.path.join(allocator, &.{ services_dir, "global.policy" });
+    defer allocator.free(global_path);
+    try printPolicyFile(stdout, global_path, "Global");
+
+    // Peer policies
+    const peer_dir = try std.fs.path.join(allocator, &.{ services_dir, "peer" });
+    defer allocator.free(peer_dir);
+    try printPoliciesInDir(stdout, allocator, peer_dir, "Peer");
+
+    // Org policies
+    const org_dir = try std.fs.path.join(allocator, &.{ services_dir, "org" });
+    defer allocator.free(org_dir);
+    try printPoliciesInDir(stdout, allocator, org_dir, "Org");
+}
+
+fn printPolicyFile(stdout: std.fs.File, path: []const u8, label: []const u8) !void {
+    const file = std.fs.openFileAbsolute(path, .{}) catch return;
+    defer file.close();
+    var buf: [4096]u8 = undefined;
+    const n = file.readAll(&buf) catch return;
+    if (n == 0) return;
+
+    try writeFormatted(stdout, "[{s}]\n", .{label});
+    var lines = std.mem.splitScalar(u8, buf[0..n], '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0) continue;
+        if (trimmed[0] == '#') continue;
+        try writeFormatted(stdout, "  {s}\n", .{trimmed});
+    }
+    try stdout.writeAll("\n");
+}
+
+fn printPoliciesInDir(stdout: std.fs.File, allocator: std.mem.Allocator, dir_path: []const u8, scope: []const u8) !void {
+    var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch return;
+    defer dir.close();
+
+    var iter = dir.iterate();
+    while (iter.next() catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".policy")) continue;
+
+        const name = entry.name[0 .. entry.name.len - 7]; // strip .policy
+        const file_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
+        defer allocator.free(file_path);
+
+        var label_buf: [128]u8 = undefined;
+        const label = std.fmt.bufPrint(&label_buf, "{s}: {s}", .{ scope, name }) catch continue;
+        try printPolicyFile(stdout, file_path, label);
+    }
+}
+
+fn cmdServiceShow(allocator: std.mem.Allocator, config_dir: []const u8, target: ?[]const u8) !void {
+    const stdout = getStdOut();
+
+    const PolicyMod = lib.services.Policy;
+    var filter = PolicyMod.ServiceFilter.loadFromDir(config_dir);
+    filter.resolveAliases(config_dir);
+    filter.resolveOrgNames(config_dir);
+
+    if (target) |name| {
+        try writeFormatted(stdout, "Effective policy for '{s}':\n\n", .{name});
+
+        // Try to resolve peer pubkey from alias
+        const ak_path = try std.fmt.allocPrint(allocator, "{s}/authorized_keys/{s}.pub", .{ config_dir, name });
+        defer allocator.free(ak_path);
+
+        var peer_pk: [32]u8 = .{0} ** 32;
+        var found_peer = false;
+        if (std.fs.openFileAbsolute(ak_path, .{})) |file| {
+            defer file.close();
+            var pk_buf: [64]u8 = undefined;
+            const n = file.readAll(&pk_buf) catch 0;
+            if (n > 0) {
+                const trimmed = std.mem.trim(u8, pk_buf[0..n], " \t\r\n");
+                _ = std.base64.standard.Decoder.decode(&peer_pk, trimmed) catch {};
+                found_peer = true;
+            }
+        } else |_| {}
+
+        // Test common ports
+        const test_ports = [_]struct { port: u16, name: []const u8 }{
+            .{ .port = 22, .name = "SSH" },
+            .{ .port = 80, .name = "HTTP" },
+            .{ .port = 443, .name = "HTTPS" },
+            .{ .port = 3306, .name = "MySQL" },
+            .{ .port = 5432, .name = "PostgreSQL" },
+            .{ .port = 6379, .name = "Redis" },
+            .{ .port = 8080, .name = "Alt HTTP" },
+            .{ .port = 8443, .name = "Alt HTTPS" },
+            .{ .port = 27017, .name = "MongoDB" },
+        };
+
+        const pk: [32]u8 = if (found_peer) peer_pk else .{0} ** 32;
+        try writeFormatted(stdout, "  {s:<6} {s:<14} {s}\n", .{ "PORT", "SERVICE", "ACCESS" });
+        try writeFormatted(stdout, "  {s:<6} {s:<14} {s}\n", .{ "----", "-------", "------" });
+        for (test_ports) |tp| {
+            const tcp_ok = filter.check(pk, null, .tcp, tp.port);
+            try writeFormatted(stdout, "  {d:<6} {s:<14} {s}\n", .{
+                @as(usize, tp.port),
+                tp.name,
+                if (tcp_ok) @as([]const u8, "✓ allow") else @as([]const u8, "✗ deny"),
+            });
+        }
+    } else {
+        // Show summary
+        try writeFormatted(stdout, "Default: {s}\n", .{
+            if (filter.default_action == .allow) @as([]const u8, "allow") else @as([]const u8, "deny"),
+        });
+        try writeFormatted(stdout, "Global policy: {s}\n", .{
+            if (filter.global != null) @as([]const u8, "yes") else @as([]const u8, "no"),
+        });
+        try writeFormatted(stdout, "Peer policies: {d}\n", .{@as(usize, filter.peer_count)});
+        try writeFormatted(stdout, "Org policies: {d}\n", .{@as(usize, filter.org_count)});
+    }
+}
+
+fn cmdServiceReset(allocator: std.mem.Allocator, config_dir: []const u8) !void {
+    const stdout = getStdOut();
+    const stderr = getStdErr();
+
+    const services_dir = try std.fs.path.join(allocator, &.{ config_dir, "services" });
+    defer allocator.free(services_dir);
+
+    // Delete everything under services/
+    std.fs.deleteTreeAbsolute(services_dir) catch |err| {
+        if (err == error.FileNotFound) {
+            try stdout.writeAll("No service policies to reset.\n");
+            return;
+        }
+        try writeFormatted(stderr, "error: cannot remove services/: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+
+    try stdout.writeAll("Service policies reset (default: allow all)\n");
 }
 
 // ─── Config Show ───

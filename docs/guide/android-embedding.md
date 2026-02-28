@@ -1,6 +1,6 @@
 # Android / Mobile Embedding
 
-meshguard provides a **C-ABI shared library** (`libmeshguard-ffi.so`) for embedding mesh networking in mobile apps. The library exposes SWIM gossip discovery, LAN multicast, and end-to-end encrypted messaging — without the WireGuard TUN dataplane.
+meshguard provides a **C-ABI shared library** (`libmeshguard-ffi.so`) for embedding mesh networking in mobile apps. The library exposes SWIM gossip discovery, LAN multicast, end-to-end encrypted messaging, and WireGuard-encrypted data tunnels (suitable for VoIP audio or real-time data).
 
 ## What's Included
 
@@ -10,7 +10,7 @@ meshguard provides a **C-ABI shared library** (`libmeshguard-ffi.so`) for embedd
 | LAN multicast discovery  | ✅                | ✅                          |
 | Encrypted app messages   | ✅                | ✅                          |
 | Peer events (join/leave) | ✅                | ✅                          |
-| WireGuard TUN tunnels    | ✅                | ❌                          |
+| WireGuard data tunnels   | ✅ (TUN)          | ✅ (ring buffer)            |
 | Kernel WireGuard         | ✅                | ❌                          |
 | Trust enforcement        | ✅                | Open by default             |
 | libsodium dependency     | ✅ (AVX2 accel)   | ❌ (`std.crypto` only)      |
@@ -91,6 +91,60 @@ MeshGuardFFI.meshguard_leave(ctx)
 MeshGuardFFI.meshguard_destroy(ctx)
 ```
 
+### 4. WireGuard tunnel for audio calling
+
+The FFI library provides WireGuard-encrypted data tunnels suitable for VoIP audio or real-time data. Tunnel data is delivered via an in-process ring buffer — no TUN device or root required.
+
+```kotlin
+// In MeshGuardFFI object, add tunnel declarations:
+object MeshGuardFFI {
+    // ... existing declarations ...
+
+    // Tunnels (WireGuard-encrypted data channels)
+    external fun meshguard_tunnel_open(ctx: Long, peerPubkey: ByteArray): Int
+    external fun meshguard_tunnel_send(ctx: Long, peerPubkey: ByteArray, data: ByteArray, len: Int): Int
+    external fun meshguard_tunnel_recv(ctx: Long, outData: ByteArray, outLen: IntArray, outSender: ByteArray): Int
+    external fun meshguard_tunnel_close(ctx: Long, peerPubkey: ByteArray)
+}
+```
+
+**Usage**:
+
+```kotlin
+// Open a WireGuard tunnel to a peer (initiates Noise IK handshake)
+val result = MeshGuardFFI.meshguard_tunnel_open(ctx, peerPubkey)
+if (result == 0) {
+    // Send audio frame through encrypted tunnel
+    val opusFrame = encodeAudio() // e.g., Opus-encoded audio
+    MeshGuardFFI.meshguard_tunnel_send(ctx, peerPubkey, opusFrame, opusFrame.size)
+
+    // Receive from tunnel (poll in a separate thread)
+    val buf = ByteArray(1500)
+    val len = IntArray(1)
+    val sender = ByteArray(32)
+    while (MeshGuardFFI.meshguard_tunnel_recv(ctx, buf, len, sender) == 0) {
+        val audioData = buf.copyOf(len[0])
+        playAudio(audioData)
+    }
+}
+
+// Close the tunnel when done
+MeshGuardFFI.meshguard_tunnel_close(ctx, peerPubkey)
+```
+
+**Tunnel error codes** (`meshguard_tunnel_open`):
+
+| Code | Meaning                      |
+| ---- | ---------------------------- |
+| `0`  | Success                      |
+| `-2` | Not running                  |
+| `-3` | Peer not found in membership |
+| `-4` | Peer has no WG public key    |
+| `-5` | Peer has no endpoint         |
+| `-6` | Peer table full              |
+| `-7` | Handshake failed             |
+| `-8` | Send failed                  |
+
 ## FFI API Reference
 
 ### Lifecycle
@@ -131,6 +185,15 @@ MeshGuardFFI.meshguard_destroy(ctx)
 | `meshguard_get_peer_info(ctx, pk, out)` | `0` or `-1` | Peer endpoint, mesh IP, state, WG pubkey.   |
 | `meshguard_debug_info(ctx, out)`        | `void`      | Write 30-byte diagnostic struct.            |
 
+### Tunnel Operations
+
+| Function                                                | Returns                             | Description                                          |
+| ------------------------------------------------------- | ----------------------------------- | ---------------------------------------------------- |
+| `meshguard_tunnel_open(ctx, peer_pk)`                   | `0` success, negative on error      | Open WG tunnel (Noise IK handshake + key exchange).  |
+| `meshguard_tunnel_send(ctx, peer_pk, data, len)`        | `0` success, negative on error      | Send data through encrypted tunnel (max 1400 bytes). |
+| `meshguard_tunnel_recv(ctx, out_data, out_len, out_pk)` | `0` received, `1` empty, `-1` error | Poll tunnel inbox for next decrypted message.        |
+| `meshguard_tunnel_close(ctx, peer_pk)`                  | `void`                              | Close a tunnel, remove peer from WG device.          |
+
 ## App Message Wire Format (`0x50`)
 
 Messages are encrypted end-to-end using X25519 key agreement + ChaCha20-Poly1305:
@@ -150,3 +213,4 @@ Messages are encrypted end-to-end using X25519 key agreement + ChaCha20-Poly1305
 - **Battery-friendly** — gossip interval is 3s (vs 1s on server), ping timeout 5s
 - **Ephemeral ports** — pass port `0` to `meshguard_init` for OS-assigned port (recommended on mobile)
 - **Identity persistence** — use `meshguard_get_seed` to export the 32-byte seed, store in Android Keystore, and pass back to `meshguard_init` on restart
+- **Tunnel ring buffer** — the tunnel inbox holds 256 messages (1500 bytes each). At 50 fps audio (20ms frames), this gives ~5 seconds of buffer before dropping. Poll `meshguard_tunnel_recv` from a dedicated thread.

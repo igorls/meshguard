@@ -126,6 +126,76 @@ meshguard version
 
 ---
 
+## `meshguard service`
+
+Manage service access control policies (port-level allow/deny rules).
+
+```bash
+meshguard service <command> [options]
+```
+
+### Subcommands
+
+| Subcommand              | Description                                          |
+| ----------------------- | ---------------------------------------------------- |
+| `list`                  | List all service policies                            |
+| `allow <proto> <port>`  | Add an allow rule                                    |
+| `deny <proto> <port>`   | Add a deny rule                                      |
+| `default <allow\|deny>` | Set default action (when no rule matches)            |
+| `show [peer-name]`      | Show effective policy for a peer (or global summary) |
+| `reset`                 | Remove all service policies                          |
+
+### Options
+
+| Flag            | Description                                 |
+| --------------- | ------------------------------------------- |
+| `--peer <name>` | Target a specific peer (by alias or pubkey) |
+| `--org <name>`  | Target an organization                      |
+| _(no flag)_     | Target the global policy                    |
+
+### Protocol and Port
+
+- **Proto**: `tcp`, `udp`, or `all`
+- **Port**: single port (`22`), range (`8000-9000`), or `all`
+
+### Examples
+
+```bash
+# Global: allow SSH and HTTPS, deny everything else
+meshguard service allow tcp 22
+meshguard service allow tcp 443
+meshguard service deny all
+
+# Set default-deny mode (when no services/ directory exists, default is allow)
+meshguard service default deny
+
+# Peer-specific: allow Postgres for node-1
+meshguard service allow --peer node-1 tcp 5432
+
+# Org-specific: allow HTTP for all eosrio members
+meshguard service allow --org eosrio tcp 80
+
+# List all policies
+meshguard service list
+
+# Show effective policy for a peer
+meshguard service show node-1
+
+# Clear all policies
+meshguard service reset
+```
+
+### Evaluation Order
+
+Rules are evaluated in this order (first match wins):
+
+1. Peer-specific policy (by pubkey or alias)
+2. Org-specific policy (by org name)
+3. Global policy (`global.policy`)
+4. Default action (`services/default` file, defaults to `allow`)
+
+---
+
 ## Environment Variables
 
 | Variable               | Description                                                |

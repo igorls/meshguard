@@ -320,7 +320,7 @@ pub const WgDevice = struct {
 
     /// Initiate a handshake with a peer.
     pub fn initiateHandshake(self: *WgDevice, slot: usize) !noise.HandshakeInitiation {
-        const peer = &(self.peers[slot] orelse return error.PeerNotFound);
+        const peer = if (self.peers[slot]) |*p| p else return error.PeerNotFound;
         const now = std.time.nanoTimestamp();
 
         // Rate limit: 1 handshake per 5 seconds
@@ -358,7 +358,7 @@ pub const WgDevice = struct {
 
         // Step 2: O(1) lookup by decrypted static key
         const slot = self.static_map.get(preamble.initiator_static) orelse return error.UnknownPeer;
-        const peer = &(self.peers[slot] orelse return error.PeerNotFound);
+        const peer = if (self.peers[slot]) |*p| p else return error.PeerNotFound;
 
         // Step 3: Continue from preamble state (no redundant X25519)
         try peer.handshake.consumeInitiationFast(msg, preamble);
@@ -386,7 +386,7 @@ pub const WgDevice = struct {
         // Look up by receiver_index (which is our sender_index)
         const recv_idx = std.mem.littleToNative(u32, msg.receiver_index);
         const peer_slot = self.index_map.get(recv_idx) orelse return error.UnknownIndex;
-        const peer = &(self.peers[peer_slot] orelse return error.PeerNotFound);
+        const peer = if (self.peers[peer_slot]) |*p| p else return error.PeerNotFound;
 
         try peer.handshake.consumeResponse(msg);
 
@@ -403,8 +403,8 @@ pub const WgDevice = struct {
 
     /// Encrypt an IP packet for a specific peer.
     pub fn encryptForPeer(self: *WgDevice, slot: usize, plaintext: []const u8, out: []u8) !usize {
-        const peer = &(self.peers[slot] orelse return error.PeerNotFound);
-        const tun = &(peer.active_tunnel orelse return error.NoTunnel);
+        const peer = if (self.peers[slot]) |*p| p else return error.PeerNotFound;
+        const tun = if (peer.active_tunnel) |*t| t else return error.NoTunnel;
         return tun.encrypt(plaintext, out);
     }
 
@@ -416,8 +416,8 @@ pub const WgDevice = struct {
         // Look up peer by receiver_index (which is the index they assigned us)
         const recv_idx = std.mem.readInt(u32, packet[4..8], .little);
         const peer_slot = self.index_map.get(recv_idx) orelse return error.UnknownIndex;
-        const peer = &(self.peers[peer_slot] orelse return error.PeerNotFound);
-        const tun = &(peer.active_tunnel orelse return error.NoTunnel);
+        const peer = if (self.peers[peer_slot]) |*p| p else return error.PeerNotFound;
+        const tun = if (peer.active_tunnel) |*t| t else return error.NoTunnel;
 
         const len = try tun.decrypt(packet, out);
         return .{ .slot = peer_slot, .len = len };

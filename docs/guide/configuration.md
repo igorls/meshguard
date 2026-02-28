@@ -17,9 +17,18 @@ meshguard up --seed 1.2.3.4:51821
 $MESHGUARD_CONFIG_DIR/
 ├── identity.key           # Ed25519 secret key (permissions: 0600)
 ├── identity.pub           # Ed25519 public key
-└── authorized_keys/       # Trusted peer keys
-    ├── peer-a.pub
-    └── peer-b.pub
+├── authorized_keys/       # Trusted peer keys
+│   ├── peer-a.pub
+│   └── peer-b.pub
+├── trusted_orgs/          # Org trust (auto-accept org members)
+│   └── eosrio.org
+└── services/              # Service access control (optional)
+    ├── default            # Default action: "allow" or "deny"
+    ├── global.policy      # Global rules applied to all peers
+    ├── peer/              # Per-peer policies (by alias)
+    │   └── node-1.policy
+    └── org/               # Per-org policies
+        └── eosrio.policy
 ```
 
 ## CLI Flags

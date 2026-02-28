@@ -30,6 +30,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .link_libc = true, // Always link libc — Android needs Bionic for TLS (__tls_get_addr)
+        // Strip debug info for Android — Zig's panic handler crashes when trying
+        // to read DWARF from a .so embedded inside an APK (ElfModule.load → null deref)
+        .strip = if (is_android) true else null,
     });
 
     // ─── Shared library (for Android JNI / mobile FFI) ───

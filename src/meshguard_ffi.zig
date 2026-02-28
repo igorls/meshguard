@@ -10,7 +10,46 @@
 //! encrypted messaging only.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const lib = @import("lib.zig");
+
+// Android panic handler: Zig's default panic handler tries to load DWARF debug
+// info from the .so file. On Android the library is embedded inside the APK and
+// can't be opened as a regular file, causing a null-pointer crash in
+// debug.Dwarf.ElfModule.load. Override to simply abort.
+pub const std_options: std.Options = .{
+    .logFn = if (builtin.abi == .android) androidLogFn else std.log.defaultLog,
+};
+
+fn androidLogFn(
+    comptime level: std.log.Level,
+    comptime scope: @TypeOf(.enum_literal),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    _ = level;
+    _ = scope;
+    _ = format;
+    _ = args;
+    // On Android embedded in APK, logging is best-effort via std.debug.print
+    // which writes to stderr (logcat picks it up).
+}
+
+pub const panic = if (builtin.abi == .android)
+    std.debug.FullPanic(androidPanic)
+else
+    std.debug.FullPanic(std.debug.defaultPanic);
+
+fn androidPanic(msg: []const u8, _: ?usize) noreturn {
+    // On Android, bypass the DWARF-based stack trace completely.
+    // Write to stderr via POSIX write() syscall — logcat picks this up.
+    const stderr_fd: std.posix.fd_t = 2; // stderr
+    const prefix = "MESHGUARD PANIC: ";
+    _ = std.posix.write(stderr_fd, prefix) catch {};
+    _ = std.posix.write(stderr_fd, msg) catch {};
+    _ = std.posix.write(stderr_fd, "\n") catch {};
+    std.process.abort();
+}
 
 const Membership = lib.discovery.Membership;
 const SwimProtocol = lib.discovery.Swim.SwimProtocol;
@@ -20,6 +59,8 @@ const LanDiscovery = lib.discovery.Lan.LanDiscovery;
 const Udp = lib.net.Udp;
 const noise = lib.wireguard.Noise;
 const crypto = lib.wireguard.Crypto;
+const Device = lib.wireguard.Device;
+const WgDevice = Device.WgDevice;
 const messages = @import("protocol/messages.zig");
 const codec = @import("protocol/codec.zig");
 const X25519 = std.crypto.dh.X25519;
@@ -55,14 +96,32 @@ pub const MeshguardContext = struct {
     inbox_write: std.atomic.Value(u32),
     inbox_read: std.atomic.Value(u32),
 
+    // WireGuard tunnel device (for encrypted audio/data tunnels)
+    wg_device: ?WgDevice,
+    // RwLock: exclusive for handshake/add/remove, shared for encrypt/decrypt
+    wg_lock: std.Thread.RwLock,
+
+    // Tunnel data inbox (separate from app messages, higher throughput)
+    tunnel_inbox: [256]TunnelMessage,
+    tunnel_inbox_write: std.atomic.Value(u32),
+    tunnel_inbox_read: std.atomic.Value(u32),
+
     // Allocator for this context's heap needs
-    allocator: std.heap.GeneralPurposeAllocator(.{}),
+    alloc: std.mem.Allocator,
 };
 
 /// Application-level encrypted message in the inbox.
 const AppMessage = struct {
     sender_pubkey: [32]u8,
     data: [1024]u8,
+    len: u16,
+    valid: bool,
+};
+
+/// Tunnel data message in the tunnel inbox.
+const TunnelMessage = struct {
+    sender_identity: [32]u8,
+    data: [1500]u8,
     len: u16,
     valid: bool,
 };
@@ -79,8 +138,13 @@ export fn meshguard_init(
     identity_seed: ?[*]const u8,
     listen_port: u16,
 ) ?*MeshguardContext {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
+    // Use c_allocator on Android (Bionic's malloc), GPA elsewhere
+    const allocator = if (builtin.abi == .android)
+        std.heap.c_allocator
+    else blk: {
+        // For non-Android, use GPA for debug safety
+        break :blk std.heap.c_allocator; // TODO: restore GPA for desktop when needed
+    };
 
     const ctx = allocator.create(MeshguardContext) catch return null;
     ctx.* = .{
@@ -99,7 +163,12 @@ export fn meshguard_init(
         .inbox = std.mem.zeroes([64]AppMessage),
         .inbox_write = std.atomic.Value(u32).init(0),
         .inbox_read = std.atomic.Value(u32).init(0),
-        .allocator = gpa,
+        .wg_device = null, // Initialized after key derivation
+        .wg_lock = .{},
+        .tunnel_inbox = std.mem.zeroes([256]TunnelMessage),
+        .tunnel_inbox_write = std.atomic.Value(u32).init(0),
+        .tunnel_inbox_read = std.atomic.Value(u32).init(0),
+        .alloc = allocator,
     };
 
     // Identity: use provided seed or generate
@@ -130,6 +199,9 @@ export fn meshguard_init(
         return null;
     };
 
+    // Initialize WireGuard device for tunnel support
+    ctx.wg_device = WgDevice.init(ctx.x25519_private, ctx.x25519_public);
+
     // Bind UDP socket — use ephemeral port (0) on mobile for reliability
     ctx.socket = Udp.UdpSocket.bind(listen_port) catch {
         allocator.destroy(ctx);
@@ -148,9 +220,7 @@ export fn meshguard_destroy(ctx: ?*MeshguardContext) void {
         s.close();
     }
 
-    var alloc = c.allocator;
-    alloc.allocator().destroy(c);
-    _ = alloc.deinit();
+    c.alloc.destroy(c);
 }
 
 /// Get our Ed25519 public key (32 bytes).
@@ -209,6 +279,7 @@ export fn meshguard_join(
         .onPeerDead = &onPeerDeadCallback,
         .onPeerPunched = null,
         .onAppMessage = &onAppMessageCallback,
+        .onWgPacket = &onWgPacketCallback,
     };
 
     // Initialize SWIM protocol — use OUR port, not the seed's port
@@ -270,6 +341,7 @@ export fn meshguard_join_lan(
         .onPeerDead = &onPeerDeadCallback,
         .onPeerPunched = null,
         .onAppMessage = &onAppMessageCallback,
+        .onWgPacket = &onWgPacketCallback,
     };
 
     // Initialize SWIM protocol
@@ -433,13 +505,13 @@ export fn meshguard_recv(
 
     const slot = read_idx % 64;
     const msg = &c.inbox[slot];
-    if (!msg.valid) return 1;
+    if (!@atomicLoad(bool, &msg.valid, .acquire)) return 1;
 
     @memcpy(out_data[0..msg.len], msg.data[0..msg.len]);
     out_len.* = msg.len;
     @memcpy(out_sender[0..32], &msg.sender_pubkey);
 
-    msg.valid = false;
+    @atomicStore(bool, &msg.valid, false, .release);
     _ = c.inbox_read.fetchAdd(1, .release);
 
     return 0;
@@ -744,16 +816,16 @@ pub fn handleAppMessage(ctx: *MeshguardContext, data: []const u8) void {
         enc_key,
     ) catch return; // Auth failed — silently drop
 
-    // Enqueue to inbox
+    // Enqueue to inbox (Finding #8: capacity check + atomic valid)
+    const read_idx = ctx.inbox_read.load(.acquire);
     const write_idx = ctx.inbox_write.load(.acquire);
+    if (write_idx -% read_idx >= 64) return; // Full — drop message
+
     const slot = write_idx % 64;
-    ctx.inbox[slot] = .{
-        .sender_pubkey = peer_key,
-        .data = undefined,
-        .len = @intCast(payload_len),
-        .valid = true,
-    };
+    ctx.inbox[slot].sender_pubkey = peer_key;
+    ctx.inbox[slot].len = @intCast(payload_len);
     @memcpy(ctx.inbox[slot].data[0..payload_len], plaintext[0..payload_len]);
+    @atomicStore(bool, &ctx.inbox[slot].valid, true, .release);
     _ = ctx.inbox_write.fetchAdd(1, .release);
 
     // Fire callback if set
@@ -766,4 +838,375 @@ pub fn handleAppMessage(ctx: *MeshguardContext, data: []const u8) void {
 fn onAppMessageCallback(raw_ctx: *anyopaque, data: []const u8) void {
     const ctx: *MeshguardContext = @ptrCast(@alignCast(raw_ctx));
     handleAppMessage(ctx, data);
+}
+
+// ─── Internal: WireGuard tunnel packet handling ───
+
+/// Callback adapter: SWIM → FFI WG packet dispatch
+fn onWgPacketCallback(raw_ctx: *anyopaque, data: []const u8, sender_addr: [4]u8, sender_port: u16) void {
+    const ctx: *MeshguardContext = @ptrCast(@alignCast(raw_ctx));
+    handleWgPacket(ctx, data, sender_addr, sender_port);
+}
+
+/// Process incoming WireGuard packets (Type 1/2/4) for tunnel support.
+fn handleWgPacket(ctx: *MeshguardContext, data: []const u8, sender_addr: [4]u8, sender_port: u16) void {
+    if (data.len < 4) return;
+    if (ctx.wg_device == null) return;
+
+    const pkt_type = Device.PacketType.classify(data);
+    switch (pkt_type) {
+        .wg_handshake_init => {
+            // Incoming handshake initiation — we are the responder
+            // Need exclusive lock: modifies peer state, index tables
+            ctx.wg_lock.lock();
+            defer ctx.wg_lock.unlock();
+
+            var dev = &ctx.wg_device.?;
+            if (data.len < @sizeOf(noise.HandshakeInitiation)) return;
+            const msg: *const noise.HandshakeInitiation = @ptrCast(@alignCast(data.ptr));
+
+            // Finding #7 (v2): Attempt handleInitiation first.
+            // Only auto-register if it fails with UnknownPeer.
+            // This avoids the double X25519 multiplication on every packet.
+            const result = dev.handleInitiation(msg) catch |err| blk: {
+                if (err != error.UnknownPeer) return;
+
+                // Auto-register responder peer from membership table
+                if (noise.verifyMac1(dev.static_public, msg)) {
+                    if (noise.decryptInitiatorStatic(
+                        dev.static_private,
+                        dev.static_public,
+                        msg,
+                    )) |preamble| {
+                        // Look up in membership by X25519 key
+                        var iter = ctx.membership.peers.iterator();
+                        while (iter.next()) |entry| {
+                            const m_peer = entry.value_ptr;
+                            if (m_peer.wg_pubkey) |wg_pk| {
+                                if (std.mem.eql(u8, &wg_pk, &preamble.initiator_static)) {
+                                    if (m_peer.gossip_endpoint) |ep| {
+                                        _ = dev.addPeerWithMeshIp(
+                                            m_peer.pubkey,
+                                            wg_pk,
+                                            ep.addr,
+                                            ep.port,
+                                            m_peer.mesh_ip,
+                                        ) catch {};
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    } else |_| {}
+                }
+
+                // Retry after auto-registration
+                break :blk dev.handleInitiation(msg) catch return;
+            };
+
+            // Send handshake response back to the initiator
+            const resp_bytes: [*]const u8 = @ptrCast(&result.response);
+            const socket = ctx.socket orelse return;
+            _ = socket.sendTo(resp_bytes[0..@sizeOf(noise.HandshakeResponse)], sender_addr, sender_port) catch return;
+
+            // Update the peer's endpoint to the sender's address
+            if (dev.peers[result.slot]) |*peer| {
+                peer.endpoint_addr = sender_addr;
+                peer.endpoint_port = sender_port;
+            }
+
+            std.debug.print("  🔑 WG handshake init handled (slot {d}), response sent\n", .{result.slot});
+        },
+        .wg_handshake_resp => {
+            // Incoming handshake response — we were the initiator
+            // Need exclusive lock: modifies tunnel keys
+            ctx.wg_lock.lock();
+            defer ctx.wg_lock.unlock();
+
+            var dev = &ctx.wg_device.?;
+            if (data.len < @sizeOf(noise.HandshakeResponse)) return;
+            const msg: *const noise.HandshakeResponse = @ptrCast(@alignCast(data.ptr));
+
+            const slot = dev.handleResponse(msg) catch return;
+
+            // Update the peer's endpoint
+            if (dev.peers[slot]) |*peer| {
+                peer.endpoint_addr = sender_addr;
+                peer.endpoint_port = sender_port;
+            }
+
+            std.debug.print("  🔑 WG handshake complete (slot {d}), tunnel ready\n", .{slot});
+        },
+        .wg_transport => {
+            // Incoming transport data — decrypt and enqueue to tunnel inbox
+            // Shared lock: decrypt only reads keys, counter is atomic
+            ctx.wg_lock.lockShared();
+            defer ctx.wg_lock.unlockShared();
+
+            var dev = &ctx.wg_device.?;
+            var plaintext: [1500]u8 = undefined;
+            const result = dev.decryptTransport(data, &plaintext) catch return;
+
+            // Look up the peer's identity key for the sender field
+            var sender_identity: [32]u8 = .{0} ** 32;
+            if (dev.peers[result.slot]) |*peer| {
+                sender_identity = peer.identity_key;
+                // Finding #5 (v2): Only update endpoint if changed.
+                // Under shared lock, only safe for same-value writes.
+                if (!std.mem.eql(u8, &peer.endpoint_addr, &sender_addr) or
+                    peer.endpoint_port != sender_port)
+                {
+                    // Endpoint changed — defer update to avoid torn read.
+                    // The next handshake (exclusive lock) will pick up the new address
+                    // from the UDP source. For now, just use sender_identity.
+                }
+            }
+
+            // Strip the 4-byte length framing header.
+            // Wire format: [2B reserved=0] [2B LE length] [payload]
+            if (result.len < 4) return;
+            if (plaintext[0] != 0 or plaintext[1] != 0) return; // Not our framing
+            const payload_len = std.mem.readInt(u16, plaintext[2..4], .little);
+            if (payload_len + 4 > result.len) return; // Corrupt frame
+            enqueueTunnelMessage(ctx, sender_identity, plaintext[4..][0..payload_len]);
+        },
+        else => {}, // Cookie (Type 3) not implemented yet
+    }
+}
+
+/// Enqueue a decrypted tunnel message to the tunnel inbox.
+/// Finding #3: Capacity check + atomic valid flag to prevent torn reads.
+fn enqueueTunnelMessage(ctx: *MeshguardContext, sender_identity: [32]u8, data: []const u8) void {
+    if (data.len > 1500) return;
+
+    const read_idx = ctx.tunnel_inbox_read.load(.acquire);
+    const write_idx = ctx.tunnel_inbox_write.load(.acquire);
+    if (write_idx -% read_idx >= 256) return; // Full — drop packet
+
+    const slot = write_idx % 256;
+    ctx.tunnel_inbox[slot].sender_identity = sender_identity;
+    ctx.tunnel_inbox[slot].len = @intCast(data.len);
+    @memcpy(ctx.tunnel_inbox[slot].data[0..data.len], data);
+
+    // Set valid AFTER data is fully written (release barrier)
+    @atomicStore(bool, &ctx.tunnel_inbox[slot].valid, true, .release);
+    _ = ctx.tunnel_inbox_write.fetchAdd(1, .release);
+}
+
+// ─── Tunnel FFI exports ───
+
+/// Open a WireGuard tunnel to a peer.
+///
+/// Looks up the peer by Ed25519 pubkey in the membership table,
+/// registers them in the WgDevice, and sends a handshake initiation.
+///
+/// `peer_pubkey`: 32-byte Ed25519 public key of the peer.
+///
+/// Returns 0 on success, negative on error:
+///   -1: null context
+///   -2: not running
+///   -3: peer not found in membership
+///   -4: peer has no WG pubkey
+///   -5: peer has no endpoint
+///   -6: failed to add peer to WG device
+///   -7: handshake initiation failed
+///   -8: failed to send handshake packet
+export fn meshguard_tunnel_open(
+    ctx: ?*MeshguardContext,
+    peer_pubkey: [*]const u8,
+) i32 {
+    const c = ctx orelse return -1;
+    if (!c.running.load(.acquire)) return -2;
+    if (c.wg_device == null) return -1;
+
+    var target_key: [32]u8 = undefined;
+    @memcpy(&target_key, peer_pubkey[0..32]);
+
+    // Look up peer in membership table for endpoint and WG pubkey
+    const peer = c.membership.peers.get(target_key) orelse return -3;
+    const peer_x25519 = peer.wg_pubkey orelse return -4;
+    const ep = peer.gossip_endpoint orelse return -5;
+
+    // Derive mesh IP for the peer
+    const ip_mod = @import("wireguard/ip.zig");
+    const pk = Ed25519.PublicKey.fromBytes(target_key) catch return -3;
+    const mesh_ip = ip_mod.deriveFromPubkey(pk);
+
+    // Exclusive lock: adding peer + initiating handshake modifies device state
+    c.wg_lock.lock();
+    defer c.wg_lock.unlock();
+
+    var dev = &c.wg_device.?;
+    const slot = dev.addPeerWithMeshIp(target_key, peer_x25519, ep.addr, ep.port, mesh_ip) catch return -6;
+
+    // Initiate WG Noise IK handshake
+    const init_msg = dev.initiateHandshake(slot) catch return -7;
+
+    // Send handshake initiation packet to peer
+    const init_bytes: [*]const u8 = @ptrCast(&init_msg);
+    const socket = c.socket orelse return -8;
+    _ = socket.sendTo(init_bytes[0..@sizeOf(noise.HandshakeInitiation)], ep.addr, ep.port) catch return -8;
+
+    std.debug.print("  \xf0\x9f\x94\x91 Tunnel handshake sent to {x:0>2}{x:0>2}...\n", .{ target_key[0], target_key[1] });
+    return 0;
+}
+
+/// Send data through a WireGuard tunnel to a peer.
+///
+/// Encrypts the data with the peer's tunnel and sends it as a
+/// WG Type 4 transport packet over UDP.
+///
+/// `peer_pubkey`: 32-byte Ed25519 public key of the peer.
+/// `data`:        payload to send.
+/// `len`:         payload length (max 1400 bytes, MTU limit).
+///
+/// Returns 0 on success, negative on error.
+export fn meshguard_tunnel_send(
+    ctx: ?*MeshguardContext,
+    peer_pubkey: [*]const u8,
+    data: [*]const u8,
+    len: u32,
+) i32 {
+    const c = ctx orelse return -1;
+    if (!c.running.load(.acquire)) return -2;
+    if (len > 1396) return -3; // MTU limit (1400 - 4 byte framing header)
+    if (c.wg_device == null) return -1;
+
+    var target_key: [32]u8 = undefined;
+    @memcpy(&target_key, peer_pubkey[0..32]);
+
+    // Shared lock for encrypt (keys are read-only, nonce is atomic)
+    // NOTE: Do NOT defer unlock — we manually unlock before I/O for rekey lock upgrade
+    c.wg_lock.lockShared();
+
+    var dev = &c.wg_device.?;
+
+    // Find peer by identity key
+    const slot = dev.findByIdentity(target_key) orelse {
+        c.wg_lock.unlockShared();
+        return -4;
+    };
+    const peer = if (dev.peers[slot]) |*p| p else {
+        c.wg_lock.unlockShared();
+        return -4;
+    };
+
+    // Finding #4 (v2): Framing header with leading zeros.
+    // [2B reserved=0] [2B LE payload_length] [payload]
+    // Leading 0x00 ensures tunnel.zig sees version==0, bypassing IPv4/IPv6.
+    const data_len: usize = @intCast(len);
+    var framed_buf: [1400]u8 = undefined;
+    framed_buf[0] = 0;
+    framed_buf[1] = 0;
+    std.mem.writeInt(u16, framed_buf[2..4], @intCast(data_len), .little);
+    @memcpy(framed_buf[4..][0..data_len], data[0..data_len]);
+    const framed_len = data_len + 4;
+
+    // Encrypt the framed data
+    var out_buf: [1500]u8 = undefined;
+    const encrypted_len = dev.encryptForPeer(slot, framed_buf[0..framed_len], &out_buf) catch {
+        c.wg_lock.unlockShared();
+        return -5;
+    };
+
+    // Finding #2 (v2): Check rekey flag, but DON'T initiate under shared lock.
+    // Save the flag, we'll upgrade to exclusive lock after releasing shared.
+    var requires_rekey = false;
+    if (peer.active_tunnel) |*tun| {
+        if (tun.needs_rekey) {
+            tun.needs_rekey = false;
+            requires_rekey = true;
+        }
+    }
+
+    // Read endpoint while we have the lock
+    const ep_addr = peer.endpoint_addr;
+    const ep_port = peer.endpoint_port;
+
+    // Release shared lock before I/O
+    c.wg_lock.unlockShared();
+
+    // Send via UDP to peer's endpoint
+    const socket = c.socket orelse return -6;
+    _ = socket.sendTo(out_buf[0..encrypted_len], ep_addr, ep_port) catch return -7;
+
+    // Rekeying requires exclusive lock (modifies index_map)
+    if (requires_rekey) {
+        c.wg_lock.lock();
+        defer c.wg_lock.unlock();
+        if (c.wg_device) |*wd| {
+            var rekey_dev = wd;
+            if (rekey_dev.initiateHandshake(slot)) |rekey_msg| {
+                const rekey_bytes: [*]const u8 = @ptrCast(&rekey_msg);
+                _ = socket.sendTo(rekey_bytes[0..@sizeOf(noise.HandshakeInitiation)], ep_addr, ep_port) catch {};
+            } else |_| {}
+        }
+    }
+
+    return 0;
+}
+
+/// Receive the next decrypted tunnel message.
+///
+/// `out_data`:   buffer for decrypted payload (must be >= 1500 bytes).
+/// `out_len`:    receives the actual payload length.
+/// `out_sender`: receives the 32-byte Ed25519 pubkey of the sender.
+///
+/// Returns 0 if a message was received, 1 if inbox empty, -1 on error.
+export fn meshguard_tunnel_recv(
+    ctx: ?*MeshguardContext,
+    out_data: [*]u8,
+    out_len: *u32,
+    out_sender: [*]u8,
+) i32 {
+    const c = ctx orelse return -1;
+
+    const read_idx = c.tunnel_inbox_read.load(.acquire);
+    const write_idx = c.tunnel_inbox_write.load(.acquire);
+    if (read_idx == write_idx) return 1; // empty
+
+    const slot = read_idx % 256;
+    const msg = &c.tunnel_inbox[slot];
+
+    // Atomic load of valid flag (acquire barrier matches producer's release)
+    if (!@atomicLoad(bool, &msg.valid, .acquire)) return 1;
+
+    @memcpy(out_data[0..msg.len], msg.data[0..msg.len]);
+    out_len.* = msg.len;
+    @memcpy(out_sender[0..32], &msg.sender_identity);
+
+    @atomicStore(bool, &msg.valid, false, .release);
+    _ = c.tunnel_inbox_read.fetchAdd(1, .release);
+
+    return 0;
+}
+
+/// Close a WireGuard tunnel to a peer.
+///
+/// Removes the peer from the WgDevice, clearing all tunnel state.
+///
+/// `peer_pubkey`: 32-byte Ed25519 public key of the peer.
+export fn meshguard_tunnel_close(
+    ctx: ?*MeshguardContext,
+    peer_pubkey: [*]const u8,
+) void {
+    const c = ctx orelse return;
+    if (c.wg_device == null) return;
+
+    var target_key: [32]u8 = undefined;
+    @memcpy(&target_key, peer_pubkey[0..32]);
+
+    // Exclusive lock: removing peer modifies device state
+    c.wg_lock.lock();
+    defer c.wg_lock.unlock();
+
+    var dev = &c.wg_device.?;
+
+    // Find peer by identity key to get their WG pubkey
+    if (dev.findByIdentity(target_key)) |slot| {
+        if (dev.peers[slot]) |peer| {
+            dev.removePeer(peer.wg_pubkey);
+            std.debug.print("  \xf0\x9f\x94\x91 Tunnel closed with {x:0>2}{x:0>2}...\n", .{ target_key[0], target_key[1] });
+        }
+    }
 }

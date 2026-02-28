@@ -23,7 +23,7 @@ const BEACON_MAGIC = "MGLAN";
 const BEACON_SIZE: usize = 5 + 2 + 32 + 2; // 41 bytes
 
 /// Well-known app IDs.
-pub const APP_ID_PEER_CIRCLE: u16 = 0x5043; // "PC"
+pub const APP_ID_PEER_CIRCLE: u16 = 0x5043; // "PC" (Peer Circle)
 
 /// Callback when a LAN peer is discovered.
 pub const OnLanPeerFn = *const fn (ctx: *anyopaque, pubkey: [32]u8, addr: [4]u8, gossip_port: u16) void;

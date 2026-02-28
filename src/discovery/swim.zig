@@ -31,6 +31,7 @@ pub const EventHandler = struct {
     onPeerDead: *const fn (ctx: *anyopaque, pubkey: [32]u8) void,
     onPeerPunched: ?*const fn (ctx: *anyopaque, peer: *const Membership.Peer, endpoint: messages.Endpoint) void = null,
     onAppMessage: ?*const fn (ctx: *anyopaque, data: []const u8) void = null,
+    onWgPacket: ?*const fn (ctx: *anyopaque, data: []const u8, addr: [4]u8, port: u16) void = null,
 };
 
 /// Gossip entry with broadcast remaining counter.
@@ -395,6 +396,20 @@ pub const SwimProtocol = struct {
         if (data.len > 0 and data[0] == 0x50) {
             self.handleAppMessage(data, sender_addr, sender_port);
             return;
+        }
+
+        // Check for WireGuard packets (Type 1-4: LE32 header)
+        // These are handled by the tunnel FFI layer via onWgPacket callback.
+        if (data.len >= 4) {
+            const msg_type = std.mem.readInt(u32, data[0..4], .little);
+            if (msg_type >= 1 and msg_type <= 4) {
+                if (self.handler) |h| {
+                    if (h.onWgPacket) |cb| {
+                        cb(h.ctx, data, sender_addr, sender_port);
+                    }
+                }
+                return;
+            }
         }
 
         const decoded = codec.decode(data) catch return;
