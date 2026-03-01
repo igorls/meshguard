@@ -24,16 +24,18 @@ pub const PacketType = enum {
     stun, // STUN binding response
     unknown,
 
-    pub fn classify(data: []const u8) PacketType {
+    pub inline fn classify(data: []const u8) PacketType {
         if (data.len < 4) return .unknown;
 
-        // WireGuard messages: first byte is type, next 3 are zeros
+        // Optimization: WireGuard messages are little-endian, type is in byte 0, bytes 1-3 are zero.
+        // Reading as a u32 and checking `== 4` avoids branching for the most common data-plane case.
         const msg_type = std.mem.readInt(u32, data[0..4], .little);
+        if (msg_type == 4) return .wg_transport;
+
         return switch (msg_type) {
             1 => .wg_handshake_init,
             2 => .wg_handshake_resp,
             3 => .wg_cookie,
-            4 => .wg_transport,
             else => blk: {
                 // STUN: check for magic cookie at bytes 4-7
                 if (data.len >= 8) {
