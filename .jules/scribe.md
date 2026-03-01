@@ -12,3 +12,8 @@
 **Gap:** The documentation stated the SWIM protocol period was 1000ms (1s), but the implementation uses 5000ms (5s) in both `src/config.zig` and `src/discovery/swim.zig`.
 **Learning:** The documentation likely reflected an early design decision or standard SWIM defaults, but the implementation settled on a more conservative 5s interval for WAN stability, and docs were not updated.
 **Prevention:** Add a CI check that grep's `docs/guide/configuration.md` for values that match constants exported in `src/config.zig`.
+
+## 2024-05-23 - Suspicion Timeout and NAT Relay Drift
+**Gap:** The documentation stated the `suspicion_timeout_ms` was `5000 ms`, but the implementation in `src/config.zig` is `30000 ms`. Additionally, `relay_enabled` and `relay_max_peers` from the NAT configuration were missing from the documentation.
+**Learning:** These configuration fields likely changed in `src/config.zig` over time, and the corresponding updates to `docs/guide/configuration.md` were overlooked.
+**Prevention:** Consider implementing an automated check that ensures all configuration fields in `src/config.zig` are documented in `docs/guide/configuration.md`.

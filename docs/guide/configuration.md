@@ -65,15 +65,22 @@ $MESHGUARD_CONFIG_DIR/
 | Interface name    | `mg0`          | `wg_config.zig`    |
 | MTU               | `1420`         | `tun.zig`          |
 | Max peers         | `64`           | `device.zig`       |
-| Suspicion timeout | `5000 ms`      | `config.zig`       |
+| Suspicion timeout | `30000 ms`     | `config.zig`       |
 
 ## SWIM Protocol Defaults
 
 | Parameter          | Value     | Description                            |
 | ------------------ | --------- | -------------------------------------- |
 | Protocol period    | `5000 ms` | Interval between SWIM probe rounds     |
-| Suspicion timeout  | `5000 ms` | Time before suspected → dead           |
+| Suspicion timeout  | `30000 ms`| Time before suspected → dead           |
 | Max gossip entries | `8`       | Gossip entries piggybacked per message |
+
+## NAT & Relay Defaults
+
+| Parameter         | Value     | Description                            |
+| ----------------- | --------- | -------------------------------------- |
+| Relay enabled     | `true`    | Enable relaying traffic for peers      |
+| Relay max peers   | `10`      | Maximum peers this node will relay for |
 
 ## WireGuard Transport Defaults
 
