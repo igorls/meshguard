@@ -85,7 +85,7 @@ pub const ControlSocket = struct {
         try std.posix.listen(sock, 4);
 
         // Make socket accessible to non-root users
-        std.fs.cwd().chmod(self.socket_path, 0o666) catch {};
+        std.posix.fchmodat(std.fs.cwd().fd, self.socket_path, 0o666, 0) catch {};
 
         self.server = sock;
     }
@@ -141,8 +141,8 @@ pub const ControlSocket = struct {
             first = false;
 
             // Format: {"pubkey":"hex...","mesh_ip":"10.99.X.Y","state":"alive"}
-            const written = std.fmt.bufPrint(buf[pos..], "{{\"pubkey\":\"{}\",\"mesh_ip\":\"{d}.{d}.{d}.{d}\",\"state\":\"alive\"}}", .{
-                std.fmt.fmtSliceHexLower(&peer.pubkey),
+            const written = std.fmt.bufPrint(buf[pos..], "{{\"pubkey\":\"{s}\",\"mesh_ip\":\"{d}.{d}.{d}.{d}\",\"state\":\"alive\"}}", .{
+                std.fmt.bytesToHex(peer.pubkey, .lower),
                 peer.mesh_ip[0],
                 peer.mesh_ip[1],
                 peer.mesh_ip[2],
@@ -178,8 +178,8 @@ pub const ControlSocket = struct {
         }
 
         var buf: [512]u8 = undefined;
-        const written = std.fmt.bufPrint(&buf, "{{\"running\":true,\"pubkey\":\"{}\",\"mesh_ip\":\"{d}.{d}.{d}.{d}\",\"peers\":{{\"alive\":{d},\"suspected\":{d},\"dead\":{d}}}}}\n", .{
-            std.fmt.fmtSliceHexLower(&self.our_pubkey),
+        const written = std.fmt.bufPrint(&buf, "{{\"running\":true,\"pubkey\":\"{s}\",\"mesh_ip\":\"{d}.{d}.{d}.{d}\",\"peers\":{{\"alive\":{d},\"suspected\":{d},\"dead\":{d}}}}}\n", .{
+            std.fmt.bytesToHex(self.our_pubkey, .lower),
             self.our_mesh_ip[0],
             self.our_mesh_ip[1],
             self.our_mesh_ip[2],
