@@ -43,6 +43,12 @@ pub fn build(b: *std.Build) void {
         .linkage = .dynamic,
     });
 
+    // Link libsodium on desktop targets for AVX2-accelerated crypto.
+    // On Android, the Zig std.crypto software fallback is used.
+    if (!is_android) {
+        ffi_lib.linkSystemLibrary("sodium");
+    }
+
     b.installArtifact(ffi_lib);
 
     // ─── Targets below only build for native (not Android) ───

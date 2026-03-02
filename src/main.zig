@@ -777,6 +777,16 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     var membership = lib.discovery.Membership.MembershipTable.init(allocator, 5000);
     defer membership.deinit();
 
+    // Initialize control socket (Unix domain socket API)
+    var control = lib.services.Control.ControlSocket.init(
+        allocator,
+        &membership,
+        kp.public_key.toBytes(),
+        mesh_ip,
+        null, // use default path
+    );
+    defer control.deinit(allocator);
+
     // Create WG event handler context
     var wg_handler_ctx = WgHandlerCtx{ .stdout = stdout, .membership = &membership, .socket = &gossip_socket };
 
@@ -911,6 +921,14 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
         }
     }
 
+    // Start control socket
+    control.listen() catch |err| {
+        try writeFormatted(stdout, "  control socket: failed ({s})\n", .{@errorName(err)});
+    };
+    if (control.server != null) {
+        try writeFormatted(stdout, "  control socket: {s}\n", .{control.socket_path});
+    }
+
     // Seed initial peers
     if (seed_count > 0) {
         try writeFormatted(stdout, "  seeds: {d} peer(s)\n", .{seed_count});
@@ -977,7 +995,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
         }
 
         // Run multiplexed event loop
-        userspaceEventLoop(&swim, &wg_device, &gossip_socket, tun_dev, stdout, encrypt_workers, &service_filter) catch |err| {
+        userspaceEventLoop(&swim, &wg_device, &gossip_socket, tun_dev, stdout, encrypt_workers, &service_filter, &control) catch |err| {
             try writeFormatted(stderr, "error: event loop failed: {s}\n", .{@errorName(err)});
         };
     }
@@ -2448,6 +2466,7 @@ fn userspaceEventLoop(
     stdout: std.fs.File,
     encrypt_workers_arg: usize,
     service_filter: *const lib.services.Policy.ServiceFilter,
+    control_socket: *lib.services.Control.ControlSocket,
 ) !void {
     const BatchUdp = lib.net.BatchUdp;
 
@@ -2680,6 +2699,9 @@ fn userspaceEventLoop(
         }
 
         swim.tickTimersOnly();
+
+        // Poll control socket for external queries (non-blocking)
+        _ = control_socket.poll();
     }
 
     // Send leave announcement safely from the main thread
