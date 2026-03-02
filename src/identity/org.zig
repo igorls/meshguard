@@ -151,7 +151,9 @@ pub fn saveOrgKeyPair(allocator: std.mem.Allocator, config_dir: []const u8, kp: 
 
     const sk_file = try std.fs.createFileAbsolute(sk_path, .{ .mode = 0o600 });
     defer sk_file.close();
-    try sk_file.chmod(0o600);
+    if (comptime @import("builtin").os.tag != .windows) {
+        try sk_file.chmod(0o600);
+    }
     try sk_file.writeAll(sk_b64);
     try sk_file.writeAll("\n");
 

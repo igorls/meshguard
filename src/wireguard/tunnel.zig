@@ -12,9 +12,12 @@ const std = @import("std");
 const noise = @import("noise.zig");
 
 // Compile-time AEAD backend selection:
-// - Linux/native: libsodium (AVX2 assembly, ~2× faster)
-// - Android/FFI: std.crypto (no libsodium dependency)
-const is_android = @import("builtin").target.abi == .android;
+// - Linux/native (non-Android): libsodium (AVX2 assembly, ~2× faster)
+// - Android/Windows/other: std.crypto (no libsodium dependency)
+const builtin = @import("builtin");
+const use_libsodium = (builtin.os.tag == .linux and builtin.target.abi != .android);
+
+
 
 const aead = struct {
     const StdAead = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
@@ -27,7 +30,7 @@ const aead = struct {
         npub: [12]u8,
         k: [32]u8,
     ) void {
-        if (comptime !is_android) {
+        if (comptime use_libsodium) {
             const sodium = @import("../crypto/sodium.zig");
             sodium.encrypt(c, tag, m, ad, npub, k);
         } else {
@@ -43,7 +46,7 @@ const aead = struct {
         npub: [12]u8,
         k: [32]u8,
     ) !void {
-        if (comptime !is_android) {
+        if (comptime use_libsodium) {
             const sodium = @import("../crypto/sodium.zig");
             return sodium.decrypt(m, c, tag, ad, npub, k);
         } else {

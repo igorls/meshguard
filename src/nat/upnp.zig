@@ -11,7 +11,11 @@
 
 const std = @import("std");
 const posix = std.posix;
-const linux = std.os.linux;
+const builtin = @import("builtin");
+const is_linux = builtin.os.tag == .linux;
+const is_windows = builtin.os.tag == .windows;
+const linux = if (is_linux) std.os.linux else struct {};
+
 
 // ─── Constants ───
 
@@ -130,7 +134,13 @@ pub fn deletePortMapping(external_port: u16) void {
 
 fn ssdpDiscover(gateway_ip: *[4]u8, location_buf: *[512]u8) ?[]const u8 {
     // Create UDP socket for multicast
-    const fd = posix.socket(linux.AF.INET, @intCast(linux.SOCK.DGRAM | linux.SOCK.CLOEXEC), 0) catch return null;
+    const fd = blk: {
+        if (comptime is_linux) {
+            break :blk posix.socket(linux.AF.INET, @intCast(linux.SOCK.DGRAM | linux.SOCK.CLOEXEC), 0) catch return null;
+        } else {
+            break :blk posix.socket(posix.AF.INET, posix.SOCK.DGRAM, 0) catch return null;
+        }
+    };
     defer posix.close(fd);
 
     // Allow reuse
@@ -143,7 +153,9 @@ fn ssdpDiscover(gateway_ip: *[4]u8, location_buf: *[512]u8) ?[]const u8 {
 
     // Set TTL for multicast (4 hops is enough for most LANs)
     const ttl: u32 = 4;
-    posix.setsockopt(fd, posix.IPPROTO.IP, linux.IP.MULTICAST_TTL, std.mem.asBytes(&ttl)) catch {};
+    if (comptime is_linux) {
+        posix.setsockopt(fd, posix.IPPROTO.IP, linux.IP.MULTICAST_TTL, std.mem.asBytes(&ttl)) catch {};
+    }
 
     const dest_addr = std.net.Address.initIp4(SSDP_ADDR, SSDP_PORT);
 
@@ -156,15 +168,30 @@ fn ssdpDiscover(gateway_ip: *[4]u8, location_buf: *[512]u8) ?[]const u8 {
     // poll timeouts (no data available) toward the give-up threshold.
     var timeouts: u32 = 0;
     while (timeouts < 10) { // 10 timeouts × 500ms = 5s of silence gives up
-        var fds = [1]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
-        const rc = linux.poll(&fds, 1, 500);
-        if (rc <= 0) {
-            timeouts += 1;
-            continue;
-        }
-        if ((fds[0].revents & linux.POLL.IN) == 0) {
-            timeouts += 1;
-            continue;
+        if (comptime is_linux) {
+            const c = @cImport(@cInclude("poll.h"));
+            var fds = [1]c.struct_pollfd{.{ .fd = fd, .events = c.POLLIN, .revents = 0 }};
+            const rc = c.poll(&fds, 1, 500);
+            if (rc <= 0) {
+                timeouts += 1;
+                continue;
+            }
+            if ((fds[0].revents & c.POLLIN) == 0) {
+                timeouts += 1;
+                continue;
+            }
+        } else if (comptime is_windows) {
+            const ws2 = std.os.windows.ws2_32;
+            var fds = [1]ws2.pollfd{.{ .fd = fd, .events = ws2.POLL.IN, .revents = 0 }};
+            const rc = ws2.WSAPoll(&fds, 1, 500);
+            if (rc <= 0) {
+                timeouts += 1;
+                continue;
+            }
+            if ((fds[0].revents & ws2.POLL.IN) == 0) {
+                timeouts += 1;
+                continue;
+            }
         }
 
         // Reset timeout counter — we're still getting responses
@@ -243,7 +270,13 @@ fn httpRequest(
     out: *[4096]u8,
 ) ?[]const u8 {
     // Connect TCP
-    const fd = posix.socket(linux.AF.INET, @intCast(linux.SOCK.STREAM | linux.SOCK.CLOEXEC), 0) catch return null;
+    const fd = blk: {
+        if (comptime is_linux) {
+            break :blk posix.socket(linux.AF.INET, @intCast(linux.SOCK.STREAM | linux.SOCK.CLOEXEC), 0) catch return null;
+        } else {
+            break :blk posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch return null;
+        }
+    };
     defer posix.close(fd);
 
     const addr = std.net.Address.initIp4(ip, port);
@@ -286,10 +319,19 @@ fn httpRequest(
     var total: usize = 0;
     var attempts: u32 = 0;
     while (total < out.len and attempts < 20) : (attempts += 1) {
-        var fds = [1]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
-        const rc = linux.poll(&fds, 1, 2000);
-        if (rc <= 0) break;
-        if ((fds[0].revents & linux.POLL.IN) == 0) break;
+        if (comptime is_linux) {
+            const c = @cImport(@cInclude("poll.h"));
+            var fds = [1]c.struct_pollfd{.{ .fd = fd, .events = c.POLLIN, .revents = 0 }};
+            const rc = c.poll(&fds, 1, 2000);
+            if (rc <= 0) break;
+            if ((fds[0].revents & c.POLLIN) == 0) break;
+        } else if (comptime is_windows) {
+            const ws2 = std.os.windows.ws2_32;
+            var fds = [1]ws2.pollfd{.{ .fd = fd, .events = ws2.POLL.IN, .revents = 0 }};
+            const rc = ws2.WSAPoll(&fds, 1, 2000);
+            if (rc <= 0) break;
+            if ((fds[0].revents & ws2.POLL.IN) == 0) break;
+        }
 
         const n = posix.read(fd, out[total..]) catch break;
         if (n == 0) break;
@@ -341,7 +383,13 @@ fn findControlUrl(xml: []const u8, out: *[256]u8) ?[]const u8 {
 
 fn getLocalIp(gateway_ip: [4]u8) [4]u8 {
     // Create a UDP socket and "connect" to the gateway to determine our local IP
-    const fd = posix.socket(linux.AF.INET, @intCast(linux.SOCK.DGRAM | linux.SOCK.CLOEXEC), 0) catch return .{ 0, 0, 0, 0 };
+    const fd = blk: {
+        if (comptime is_linux) {
+            break :blk posix.socket(linux.AF.INET, @intCast(linux.SOCK.DGRAM | linux.SOCK.CLOEXEC), 0) catch return .{ 0, 0, 0, 0 };
+        } else {
+            break :blk posix.socket(posix.AF.INET, posix.SOCK.DGRAM, 0) catch return .{ 0, 0, 0, 0 };
+        }
+    };
     defer posix.close(fd);
 
     const addr = std.net.Address.initIp4(gateway_ip, 80);

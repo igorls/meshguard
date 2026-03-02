@@ -513,26 +513,39 @@ fn aead_decrypt_empty(key: *const [32]u8, hash: *const [32]u8, ciphertext: *cons
 
 fn tai64nNow() [TIMESTAMP_LEN]u8 {
     var output: [TIMESTAMP_LEN]u8 = undefined;
-    // Use CLOCK_REALTIME (wall clock) — monotonic clock resets on reboot
-    // which would cause anti-replay rejection by the remote peer
-    const ts = std.posix.clock_gettime(.REALTIME) catch {
-        // Fallback to nanoTimestamp if clock_gettime fails
+
+    const builtin = @import("builtin");
+    if (comptime builtin.os.tag == .linux) {
+        // Use CLOCK_REALTIME (wall clock) — monotonic clock resets on reboot
+        // which would cause anti-replay rejection by the remote peer
+        const ts = std.posix.clock_gettime(.REALTIME) catch {
+            // Fallback to nanoTimestamp if clock_gettime fails
+            const now_ns_total = std.time.nanoTimestamp();
+            const now_s: i64 = @intCast(@divFloor(now_ns_total, std.time.ns_per_s));
+            const now_ns: u32 = @intCast(@mod(now_ns_total, std.time.ns_per_s));
+            const tai_seconds: u64 = @intCast(now_s + 0x400000000000000A);
+            std.mem.writeInt(u64, output[0..8], tai_seconds, .big);
+            std.mem.writeInt(u32, output[8..12], now_ns, .big);
+            return output;
+        };
+
+        // TAI64N: big-endian u64 seconds + big-endian u32 nanoseconds
+        // TAI epoch offset: 2^62 + 10 = 0x400000000000000A
+        const tai_seconds: u64 = @intCast(@as(isize, ts.sec) + 0x400000000000000A);
+        std.mem.writeInt(u64, output[0..8], tai_seconds, .big);
+        std.mem.writeInt(u32, output[8..12], @intCast(ts.nsec), .big);
+    } else {
+        // Windows/other: use nanoTimestamp (wall clock via QueryPerformanceCounter)
         const now_ns_total = std.time.nanoTimestamp();
         const now_s: i64 = @intCast(@divFloor(now_ns_total, std.time.ns_per_s));
         const now_ns: u32 = @intCast(@mod(now_ns_total, std.time.ns_per_s));
         const tai_seconds: u64 = @intCast(now_s + 0x400000000000000A);
         std.mem.writeInt(u64, output[0..8], tai_seconds, .big);
         std.mem.writeInt(u32, output[8..12], now_ns, .big);
-        return output;
-    };
-
-    // TAI64N: big-endian u64 seconds + big-endian u32 nanoseconds
-    // TAI epoch offset: 2^62 + 10 = 0x400000000000000A
-    const tai_seconds: u64 = @intCast(@as(isize, ts.sec) + 0x400000000000000A);
-    std.mem.writeInt(u64, output[0..8], tai_seconds, .big);
-    std.mem.writeInt(u32, output[8..12], @intCast(ts.nsec), .big);
+    }
     return output;
 }
+
 
 /// Generate a random 32-byte secret (clamped for X25519).
 fn generateSecret() [32]u8 {

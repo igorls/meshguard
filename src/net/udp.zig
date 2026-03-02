@@ -1,8 +1,13 @@
 //! UDP socket abstraction for meshguard gossip.
+//! Cross-platform: Linux (POSIX), Windows (Winsock2).
 
 const std = @import("std");
-const linux = std.os.linux;
+const builtin = @import("builtin");
+const is_windows = builtin.os.tag == .windows;
+const is_linux = builtin.os.tag == .linux;
 const posix = std.posix;
+
+const linux = if (is_linux) std.os.linux else struct {};
 
 /// Received datagram with sender info.
 pub const RecvResult = struct {
@@ -13,7 +18,7 @@ pub const RecvResult = struct {
 
 /// A non-blocking UDP socket bound to a port.
 pub const UdpSocket = struct {
-    fd: posix.fd_t,
+    fd: posix.socket_t,
     port: u16,
 
     /// Bind a UDP socket to the given port on all interfaces (or a specific address).
@@ -23,17 +28,30 @@ pub const UdpSocket = struct {
 
     /// Bind a UDP socket to a specific address and port.
     pub fn bindAddr(addr: [4]u8, port: u16) !UdpSocket {
-        const fd = try posix.socket(
-            linux.AF.INET,
-            @intCast(linux.SOCK.DGRAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC),
-            0,
-        );
-        errdefer posix.close(fd);
+        const fd = blk: {
+            if (comptime is_linux) {
+                break :blk try posix.socket(
+                    linux.AF.INET,
+                    @intCast(linux.SOCK.DGRAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC),
+                    0,
+                );
+            } else {
+                break :blk try posix.socket(
+                    posix.AF.INET,
+                    posix.SOCK.DGRAM,
+                    0,
+                );
+            }
+        };
+        errdefer closeSocket(fd);
 
-        // Enable SO_REUSEADDR + SO_REUSEPORT
+        // Enable SO_REUSEADDR
         const one: u32 = 1;
         try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one));
-        try posix.setsockopt(fd, posix.SOL.SOCKET, linux.SO.REUSEPORT, std.mem.asBytes(&one));
+        if (comptime is_linux) {
+            // SO_REUSEPORT is Linux-only
+            posix.setsockopt(fd, posix.SOL.SOCKET, linux.SO.REUSEPORT, std.mem.asBytes(&one)) catch {};
+        }
 
         var bind_addr = std.net.Address.initIp4(addr, port);
         try posix.bind(fd, &bind_addr.any, bind_addr.getOsSockLen());
@@ -49,57 +67,61 @@ pub const UdpSocket = struct {
     }
 
     /// Create a UDP socket for GSO data-plane sends (send-only, no bind).
-    /// Sets IP_PMTUDISC_PROBE (required for >MTU GSO sendmsg)
-    /// and increases SO_SNDBUF for large GSO batches.
+    /// Linux-only: Sets IP_PMTUDISC_PROBE and increases SO_SNDBUF.
+    /// On Windows, creates a basic unbound UDP socket.
     pub fn createGSOSender() !UdpSocket {
-        const fd = try posix.socket(
-            linux.AF.INET,
-            @intCast(linux.SOCK.DGRAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC),
-            0,
-        );
-        errdefer posix.close(fd);
+        const fd = blk: {
+            if (comptime is_linux) {
+                break :blk try posix.socket(
+                    linux.AF.INET,
+                    @intCast(linux.SOCK.DGRAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC),
+                    0,
+                );
+            } else {
+                break :blk try posix.socket(
+                    posix.AF.INET,
+                    posix.SOCK.DGRAM,
+                    0,
+                );
+            }
+        };
+        errdefer closeSocket(fd);
 
-        // IP_MTU_DISCOVER = IP_PMTUDISC_PROBE (3) — prevents EMSGSIZE on GSO
-        const IP_MTU_DISCOVER = 10;
-        const IP_PMTUDISC_PROBE: u32 = 3;
-        posix.setsockopt(fd, posix.IPPROTO.IP, IP_MTU_DISCOVER, std.mem.asBytes(&IP_PMTUDISC_PROBE)) catch {};
+        if (comptime is_linux) {
+            // IP_MTU_DISCOVER = IP_PMTUDISC_PROBE (3) — prevents EMSGSIZE on GSO
+            const IP_MTU_DISCOVER = 10;
+            const IP_PMTUDISC_PROBE: u32 = 3;
+            posix.setsockopt(fd, posix.IPPROTO.IP, IP_MTU_DISCOVER, std.mem.asBytes(&IP_PMTUDISC_PROBE)) catch {};
 
-        // SO_SNDBUF = 256KB for large GSO super-packets
-        const sndbuf: u32 = 262144;
-        posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&sndbuf)) catch {};
+            // SO_SNDBUF = 256KB for large GSO super-packets
+            const sndbuf: u32 = 262144;
+            posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&sndbuf)) catch {};
+        }
 
         return .{ .fd = fd, .port = 0 };
     }
 
-    /// Enable UDP GRO (Generic Receive Offload) on this socket.
-    /// When enabled, the kernel coalesces incoming UDP packets into a single
-    /// 64KB buffer, reducing recvmsg syscalls by ~44x.
+    /// Enable UDP GRO (Generic Receive Offload) on this socket. Linux-only.
     pub fn enableGRO(self: UdpSocket) void {
+        if (comptime !is_linux) return;
         const IPPROTO_UDP = 17;
         const UDP_GRO = 104;
         const one: u32 = 1;
         posix.setsockopt(self.fd, IPPROTO_UDP, UDP_GRO, std.mem.asBytes(&one)) catch {};
     }
 
-    /// Enable UDP GSO (Generic Segmentation Offload) on this socket.
-    /// Sets IP_PMTUDISC_PROBE to prevent EMSGSIZE on oversized sendmsg,
-    /// and increases SO_SNDBUF for large GSO batches.
-    /// When enabled, sendmsg can pass a 64KB buffer with a cmsg indicating
-    /// segment size — the kernel/NIC splits it into individual UDP packets.
+    /// Enable UDP GSO (Generic Segmentation Offload) on this socket. Linux-only.
     pub fn enableGSO(self: UdpSocket) void {
+        if (comptime !is_linux) return;
         const IPPROTO_UDP = 17;
         const UDP_SEGMENT = 103;
         const one: u32 = 1;
         posix.setsockopt(self.fd, IPPROTO_UDP, UDP_SEGMENT, std.mem.asBytes(&one)) catch {};
 
-        // Set IP_MTU_DISCOVER = IP_PMTUDISC_PROBE (3)
-        // This prevents EMSGSIZE when sending > MTU via GSO.
-        // wireguard-go does this in conn_linux.go.
         const IP_MTU_DISCOVER = 10;
         const IP_PMTUDISC_PROBE: u32 = 3;
         posix.setsockopt(self.fd, posix.IPPROTO.IP, IP_MTU_DISCOVER, std.mem.asBytes(&IP_PMTUDISC_PROBE)) catch {};
 
-        // Increase send buffer for GSO super-packets (256KB)
         const sndbuf: u32 = 262144;
         posix.setsockopt(self.fd, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&sndbuf)) catch {};
     }
@@ -134,23 +156,47 @@ pub const UdpSocket = struct {
     /// Poll the socket for readability with a timeout (milliseconds).
     /// Returns true if data is available.
     pub fn pollRead(self: UdpSocket, timeout_ms: i32) !bool {
-        // Use libc poll() instead of raw linux syscall.
-        // Android's seccomp blocks the old poll syscall (7) on modern Android.
-        const c = @cImport(@cInclude("poll.h"));
-        var fds = [1]c.struct_pollfd{.{
-            .fd = self.fd,
-            .events = c.POLLIN,
-            .revents = 0,
-        }};
+        if (comptime is_linux) {
+            // Use libc poll() instead of raw linux syscall.
+            // Android's seccomp blocks the old poll syscall (7) on modern Android.
+            const c = @cImport(@cInclude("poll.h"));
+            var fds = [1]c.struct_pollfd{.{
+                .fd = self.fd,
+                .events = c.POLLIN,
+                .revents = 0,
+            }};
 
-        const rc = c.poll(&fds, 1, timeout_ms);
-        if (rc < 0) return error.PollFailed;
-        return (fds[0].revents & c.POLLIN) != 0;
+            const rc = c.poll(&fds, 1, timeout_ms);
+            if (rc < 0) return error.PollFailed;
+            return (fds[0].revents & c.POLLIN) != 0;
+        } else if (comptime is_windows) {
+            // Use WSAPoll directly from ws2_32 (mingw doesn't export poll)
+            const ws2 = std.os.windows.ws2_32;
+            var fds = [1]ws2.pollfd{.{
+                .fd = self.fd,
+                .events = ws2.POLL.IN,
+                .revents = 0,
+            }};
+            const rc = ws2.WSAPoll(&fds, 1, timeout_ms);
+            if (rc < 0) return error.PollFailed;
+            return rc > 0 and (fds[0].revents & ws2.POLL.IN) != 0;
+        } else {
+            @compileError("Unsupported OS for pollRead");
+        }
     }
 
     /// Close the socket.
     pub fn close(self: *UdpSocket) void {
-        posix.close(self.fd);
-        self.fd = -1;
+        closeSocket(self.fd);
     }
 };
+
+/// Cross-platform socket close.
+fn closeSocket(fd: posix.socket_t) void {
+    if (comptime is_windows) {
+        // Windows sockets must be closed with closesocket, not CloseHandle
+        _ = std.os.windows.ws2_32.closesocket(fd);
+    } else {
+        posix.close(fd);
+    }
+}

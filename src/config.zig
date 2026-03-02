@@ -33,11 +33,28 @@ pub const Config = struct {
 
     /// Get the default config directory path.
     /// - If MESHGUARD_CONFIG_DIR is set, use that.
-    /// - If running as root (uid 0): /etc/meshguard/  (system-wide, for systemd)
-    /// - Otherwise: ~/.config/meshguard/  (per-user)
+    /// - Windows: %APPDATA%\meshguard
+    /// - Linux as root (uid 0): /etc/meshguard/  (system-wide, for systemd)
+    /// - Linux otherwise: ~/.config/meshguard/  (per-user)
     pub fn defaultConfigDir(allocator: std.mem.Allocator) ![]const u8 {
-        if (std.posix.getenv("MESHGUARD_CONFIG_DIR")) |dir| {
-            return allocator.dupe(u8, dir);
+        // Check for override env var (cross-platform)
+        if (std.process.getEnvVarOwned(allocator, "MESHGUARD_CONFIG_DIR")) |dir| {
+            return dir;
+        } else |_| {}
+
+        const builtin = @import("builtin");
+        if (comptime builtin.os.tag == .windows) {
+            // Windows: %APPDATA%\meshguard (e.g. C:\Users\user\AppData\Roaming\meshguard)
+            if (std.process.getEnvVarOwned(allocator, "APPDATA")) |appdata| {
+                defer allocator.free(appdata);
+                return std.fs.path.join(allocator, &.{ appdata, "meshguard" });
+            } else |_| {}
+            // Fallback to USERPROFILE
+            if (std.process.getEnvVarOwned(allocator, "USERPROFILE")) |home| {
+                defer allocator.free(home);
+                return std.fs.path.join(allocator, &.{ home, ".meshguard" });
+            } else |_| {}
+            return error.HomeNotFound;
         }
 
         // System-wide config when running as root (systemd, sudo)
@@ -56,6 +73,7 @@ pub const Config = struct {
 
         return error.HomeNotFound;
     }
+
 
     /// Ensure the config directory exists and return its path.
     pub fn ensureConfigDir(allocator: std.mem.Allocator) ![]const u8 {

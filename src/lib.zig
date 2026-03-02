@@ -3,6 +3,9 @@
 //! This is the library root. All modules are re-exported from here
 //! so they can be used both by the CLI binary and by embedders.
 
+const builtin = @import("builtin");
+const is_linux = builtin.os.tag == .linux;
+
 pub const identity = struct {
     pub const Keys = @import("identity/keys.zig");
     pub const Trust = @import("identity/trust.zig");
@@ -25,10 +28,11 @@ pub const nat = struct {
 };
 
 pub const wireguard = struct {
-    pub const NlSocket = @import("wireguard/nlsocket.zig");
-    pub const RtNetlink = @import("wireguard/rtnetlink.zig");
-    pub const Netlink = @import("wireguard/netlink.zig");
-    pub const Config = @import("wireguard/wg_config.zig");
+    // Linux-only: kernel WireGuard via netlink
+    pub const NlSocket = if (is_linux) @import("wireguard/nlsocket.zig") else struct {};
+    pub const RtNetlink = if (is_linux) @import("wireguard/rtnetlink.zig") else struct {};
+    pub const Netlink = if (is_linux) @import("wireguard/netlink.zig") else struct {};
+    pub const Config = if (is_linux) @import("wireguard/wg_config.zig") else struct {};
     pub const Ip = @import("wireguard/ip.zig");
     pub const Crypto = @import("wireguard/crypto.zig");
     pub const Noise = @import("wireguard/noise.zig");
@@ -43,13 +47,14 @@ pub const protocol = struct {
 
 pub const net = struct {
     pub const Udp = @import("net/udp.zig");
-    pub const BatchUdp = @import("net/batch_udp.zig");
-    pub const Offload = @import("net/offload.zig");
+    // Linux-only: batch I/O and offload optimizations
+    pub const BatchUdp = if (is_linux) @import("net/batch_udp.zig") else struct {};
+    pub const Offload = if (is_linux) @import("net/offload.zig") else struct {};
     pub const Io = @import("net/io.zig");
-    pub const Tun = @import("net/tun.zig");
+    pub const Tun = if (is_linux) @import("net/tun.zig") else struct {};
     pub const Dns = @import("net/dns.zig");
     pub const Pipeline = @import("net/pipeline.zig");
-    pub const IoUring = @import("net/io_uring.zig");
+    pub const IoUring = if (is_linux) @import("net/io_uring.zig") else struct {};
 };
 
 pub const config = @import("config.zig");
@@ -66,9 +71,12 @@ test {
     _ = wireguard.Noise;
     _ = wireguard.Crypto;
     _ = wireguard.Ip;
-    _ = wireguard.Config;
-    _ = wireguard.Netlink;
-    _ = wireguard.RtNetlink;
-    _ = wireguard.NlSocket;
+    if (is_linux) {
+        _ = wireguard.Config;
+        _ = wireguard.Netlink;
+        _ = wireguard.RtNetlink;
+        _ = wireguard.NlSocket;
+    }
     _ = services.Policy;
 }
+

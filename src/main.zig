@@ -44,20 +44,25 @@ const usage =
 ;
 
 fn getStdOut() std.fs.File {
-    return .{ .handle = std.posix.STDOUT_FILENO };
+    return std.fs.File.stdout();
 }
 
 fn getStdErr() std.fs.File {
-    return .{ .handle = std.posix.STDERR_FILENO };
+    return std.fs.File.stderr();
 }
+
+
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Initialize libsodium (AVX2 ChaCha20-Poly1305 assembly)
-    @import("crypto/sodium.zig").init();
+    // Initialize libsodium (AVX2 ChaCha20-Poly1305 assembly) — Linux only
+    if (comptime @import("builtin").os.tag == .linux) {
+        @import("crypto/sodium.zig").init();
+    }
+
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
@@ -331,7 +336,7 @@ fn cmdTrust(allocator: std.mem.Allocator, key_or_path: []const u8, extra_args: [
         try stderr.writeAll("Overwrite? [y/N] ");
 
         // Read user input
-        const stdin_file: std.fs.File = .{ .handle = std.posix.STDIN_FILENO };
+        const stdin_file = std.fs.File.stdin();
         var input_buf: [16]u8 = undefined;
         const read = stdin_file.readAll(&input_buf) catch 0;
         const answer = std.mem.trimRight(u8, input_buf[0..read], "\n\r ");
@@ -705,7 +710,8 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
 
     try stdout.writeAll("meshguard starting...\n");
     try writeFormatted(stdout, "  mesh IP: {s}\n", .{ip_str});
-    try writeFormatted(stdout, "  interface: {s}\n", .{lib.wireguard.Config.DEFAULT_IFNAME});
+    try writeFormatted(stdout, "  interface: {s}\n", .{if (comptime @import("builtin").os.tag == .linux) lib.wireguard.Config.DEFAULT_IFNAME else "wintun"});
+
     try writeFormatted(stdout, "  mode: {s}\n", .{if (use_kernel_wg) "kernel" else "userspace"});
 
     // Derive a WireGuard X25519 private key from the Ed25519 seed
@@ -728,26 +734,32 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
 
     // Setup WireGuard interface (kernel or TUN)
     if (use_kernel_wg) {
-        // Kernel mode: configure via netlink
-        const cfg = lib.wireguard.Config.MeshConfig{
-            .private_key = wg_private_key,
-            .listen_port = 51830,
-            .mesh_ip = mesh_ip,
-        };
-
-        lib.wireguard.Config.setup(cfg) catch |err| {
-            switch (err) {
-                error.PermissionDenied => try stderr.writeAll("error: permission denied. Run with sudo.\n"),
-                error.InterfaceAlreadyExists => try stderr.writeAll("error: interface mg0 already exists. Run 'meshguard down' first.\n"),
-                error.WireGuardModuleNotLoaded => try stderr.writeAll("error: WireGuard kernel module not loaded. Run 'modprobe wireguard'.\n"),
-                else => try writeFormatted(stderr, "error: failed to create interface: {s}\n", .{@errorName(err)}),
-            }
+        if (comptime @import("builtin").os.tag != .linux) {
+            try stderr.writeAll("error: kernel WireGuard mode is only available on Linux\n");
             std.process.exit(1);
-        };
+        } else {
+            // Kernel mode: configure via netlink
+            const cfg = lib.wireguard.Config.MeshConfig{
+                .private_key = wg_private_key,
+                .listen_port = 51830,
+                .mesh_ip = mesh_ip,
+            };
+
+            lib.wireguard.Config.setup(cfg) catch |err| {
+                switch (err) {
+                    error.PermissionDenied => try stderr.writeAll("error: permission denied. Run with sudo.\n"),
+                    error.InterfaceAlreadyExists => try stderr.writeAll("error: interface mg0 already exists. Run 'meshguard down' first.\n"),
+                    error.WireGuardModuleNotLoaded => try stderr.writeAll("error: WireGuard kernel module not loaded. Run 'modprobe wireguard'.\n"),
+                    else => try writeFormatted(stderr, "error: failed to create interface: {s}\n", .{@errorName(err)}),
+                }
+                std.process.exit(1);
+            };
+        }
     } else {
         // Userspace mode: create TUN interface and configure IP via rtnetlink
         // TUN creation happens later in the event loop setup
     }
+
 
     try stdout.writeAll("  interface mg0 created and configured\n");
 
@@ -758,15 +770,20 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
             // Bind to announced IP for correct source-based routing on multi-homed servers
             break :blk lib.net.Udp.UdpSocket.bindAddr(addr, gossip_port) catch {
                 try stderr.writeAll("error: failed to bind gossip port to announced address\n");
-                lib.wireguard.Config.teardown(lib.wireguard.Config.DEFAULT_IFNAME) catch {};
+                if (comptime @import("builtin").os.tag == .linux) {
+                    lib.wireguard.Config.teardown(lib.wireguard.Config.DEFAULT_IFNAME) catch {};
+                }
                 std.process.exit(1);
             };
         } else {
             break :blk lib.net.Udp.UdpSocket.bind(gossip_port) catch {
                 try stderr.writeAll("error: failed to bind gossip port 51821\n");
-                lib.wireguard.Config.teardown(lib.wireguard.Config.DEFAULT_IFNAME) catch {};
+                if (comptime @import("builtin").os.tag == .linux) {
+                    lib.wireguard.Config.teardown(lib.wireguard.Config.DEFAULT_IFNAME) catch {};
+                }
                 std.process.exit(1);
             };
+
         }
     };
     defer gossip_socket.close();
@@ -932,6 +949,12 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
         // Userspace mode: multiplexed event loop with TUN
         try stdout.writeAll("meshguard is running (userspace WG mode). Press Ctrl+C to stop.\n");
 
+        if (comptime @import("builtin").os.tag != .linux) {
+            try stderr.writeAll("error: userspace WireGuard mode requires Linux (TUN device + rtnetlink)\n");
+            try stderr.writeAll("  hint: Windows support via Wintun is not yet implemented\n");
+            std.process.exit(1);
+        }
+
         var wg_device = lib.wireguard.Device.WgDevice.init(wg_private_key, wg_public_key);
         wg_handler_ctx.wg_device = &wg_device;
         wg_handler_ctx.use_kernel = false;
@@ -980,6 +1003,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
         userspaceEventLoop(&swim, &wg_device, &gossip_socket, tun_dev, stdout, encrypt_workers, &service_filter) catch |err| {
             try writeFormatted(stderr, "error: event loop failed: {s}\n", .{@errorName(err)});
         };
+
     }
 
     // Send leave announcement safely from the main thread (covers kernel mode)
@@ -988,7 +1012,9 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     // Cleanup
     try stdout.writeAll("\nmeshguard stopping...\n");
     if (use_kernel_wg) {
-        lib.wireguard.Config.teardown(lib.wireguard.Config.DEFAULT_IFNAME) catch {};
+        if (comptime @import("builtin").os.tag == .linux) {
+            lib.wireguard.Config.teardown(lib.wireguard.Config.DEFAULT_IFNAME) catch {};
+        }
     }
     try stdout.writeAll("meshguard stopped.\n");
 }
@@ -1176,7 +1202,7 @@ fn cmdConnect(allocator: std.mem.Allocator, extra_args: []const []const u8) !voi
             try stdout.writeAll("Paste peer's response token: ");
 
             // Read peer's response token from stdin
-            const stdin: std.fs.File = .{ .handle = std.posix.STDIN_FILENO };
+            const stdin = std.fs.File.stdin();
             var input_buf: [256]u8 = undefined;
             const input_len = stdin.read(&input_buf) catch {
                 try stderr.writeAll("\nerror: failed to read stdin\n");
@@ -1350,7 +1376,7 @@ fn finalizePunch(
     if (service_exists) {
         try stdout.writeAll("  systemd service detected. Restart now? [Y/n] ");
 
-        const stdin: std.fs.File = .{ .handle = std.posix.STDIN_FILENO };
+        const stdin = std.fs.File.stdin();
         var input_buf: [16]u8 = undefined;
         const input_len = stdin.read(&input_buf) catch 0;
         const answer = std.mem.trimRight(u8, input_buf[0..input_len], "\n\r \t");
@@ -1392,14 +1418,19 @@ fn signalHandler(sig: i32) callconv(.c) void {
 fn installSignalHandler(swim_ref: *lib.discovery.Swim.SwimProtocol) void {
     g_swim_stop = swim_ref;
 
-    const sa: posix.Sigaction = .{
-        .handler = .{ .handler = &signalHandler },
-        .mask = .{0} ** @typeInfo(@TypeOf(@as(posix.Sigaction, undefined).mask)).array.len,
-        .flags = 0,
-    };
-    posix.sigaction(posix.SIG.INT, &sa, null);
-    posix.sigaction(posix.SIG.TERM, &sa, null);
+    if (comptime @import("builtin").os.tag == .linux) {
+        const sa: posix.Sigaction = .{
+            .handler = .{ .handler = &signalHandler },
+            .mask = .{0} ** @typeInfo(@TypeOf(@as(posix.Sigaction, undefined).mask)).array.len,
+            .flags = 0,
+        };
+        posix.sigaction(posix.SIG.INT, &sa, null);
+        posix.sigaction(posix.SIG.TERM, &sa, null);
+    }
+    // On Windows, signal handling via SetConsoleCtrlHandler will be implemented
+    // when full Windows runtime support is added.
 }
+
 
 const WgHandlerCtx = struct {
     stdout: std.fs.File,
@@ -1427,16 +1458,18 @@ fn wgOnPeerJoin(ctx: *anyopaque, peer: *const lib.discovery.Membership.Peer) voi
                     null;
             } else null;
 
-            lib.wireguard.Config.addPeer(lib.wireguard.Config.DEFAULT_IFNAME, .{
-                .public_key = wg_key,
-                .endpoint_addr = endpoint_addr,
-                .endpoint_port = if (endpoint_addr != null) peer.wg_port else 0,
-                .allowed_ips = &.{.{ .addr = peer.mesh_ip, .cidr = 32 }},
-                .persistent_keepalive = 25,
-            }) catch {
-                writeFormatted(handler.stdout, "  warning: failed to add WG peer {s}\n", .{ip_str}) catch {};
-                return;
-            };
+            if (comptime @import("builtin").os.tag == .linux) {
+                lib.wireguard.Config.addPeer(lib.wireguard.Config.DEFAULT_IFNAME, .{
+                    .public_key = wg_key,
+                    .endpoint_addr = endpoint_addr,
+                    .endpoint_port = if (endpoint_addr != null) peer.wg_port else 0,
+                    .allowed_ips = &.{.{ .addr = peer.mesh_ip, .cidr = 32 }},
+                    .persistent_keepalive = 25,
+                }) catch {
+                    writeFormatted(handler.stdout, "  warning: failed to add WG peer {s}\n", .{ip_str}) catch {};
+                    return;
+                };
+            }
         } else if (handler.wg_device) |dev| {
             // Userspace mode: register peer in WgDevice
             const peer_addr = if (peer.gossip_endpoint) |ep| ep.addr else if (peer.public_endpoint) |pub_ep| pub_ep.addr else [4]u8{ 0, 0, 0, 0 };
@@ -1475,7 +1508,9 @@ fn wgOnPeerDead(ctx: *anyopaque, pubkey: [32]u8) void {
     if (handler.use_kernel) {
         if (handler.membership.peers.get(pubkey)) |peer| {
             if (peer.wg_pubkey) |wg_key| {
-                lib.wireguard.Config.removePeer(lib.wireguard.Config.DEFAULT_IFNAME, wg_key) catch {};
+                if (comptime @import("builtin").os.tag == .linux) {
+                    lib.wireguard.Config.removePeer(lib.wireguard.Config.DEFAULT_IFNAME, wg_key) catch {};
+                }
             }
         }
     } else if (handler.wg_device) |dev| {
@@ -1497,17 +1532,20 @@ fn wgOnPeerPunched(ctx: *anyopaque, peer: *const lib.discovery.Membership.Peer, 
         const ip_str = lib.wireguard.Ip.formatIp(peer.mesh_ip, &ip_buf);
 
         if (handler.use_kernel) {
-            lib.wireguard.Config.addPeer(lib.wireguard.Config.DEFAULT_IFNAME, .{
-                .public_key = wg_key,
-                .endpoint_addr = endpoint.addr,
-                .endpoint_port = peer.wg_port,
-                .allowed_ips = &.{.{ .addr = peer.mesh_ip, .cidr = 32 }},
-                .persistent_keepalive = 25,
-            }) catch {
-                writeFormatted(handler.stdout, "  warning: failed to update WG peer after punch\n", .{}) catch {};
-                return;
-            };
+            if (comptime @import("builtin").os.tag == .linux) {
+                lib.wireguard.Config.addPeer(lib.wireguard.Config.DEFAULT_IFNAME, .{
+                    .public_key = wg_key,
+                    .endpoint_addr = endpoint.addr,
+                    .endpoint_port = peer.wg_port,
+                    .allowed_ips = &.{.{ .addr = peer.mesh_ip, .cidr = 32 }},
+                    .persistent_keepalive = 25,
+                }) catch {
+                    writeFormatted(handler.stdout, "  warning: failed to update WG peer after punch\n", .{}) catch {};
+                    return;
+                };
+            }
         } else if (handler.wg_device) |dev| {
+
             // Userspace mode: update peer endpoint
             if (dev.findByWgPubkey(wg_key)) |slot| {
                 if (dev.peers[slot]) |*p| {
@@ -2747,14 +2785,19 @@ fn cmdDown(allocator: std.mem.Allocator) !void {
     const stdout = getStdOut();
     const stderr = getStdErr();
 
-    lib.wireguard.Config.teardown(lib.wireguard.Config.DEFAULT_IFNAME) catch |err| {
-        switch (err) {
-            error.SocketCreateFailed => try stderr.writeAll("error: permission denied. Run with sudo.\n"),
-            error.NetlinkError => try stderr.writeAll("error: interface mg0 not found.\n"),
-            else => try writeFormatted(stderr, "error: {s}\n", .{@errorName(err)}),
-        }
+    if (comptime @import("builtin").os.tag != .linux) {
+        try stderr.writeAll("error: 'meshguard down' is only supported on Linux (requires netlink)\n");
         std.process.exit(1);
-    };
+    } else {
+        lib.wireguard.Config.teardown(lib.wireguard.Config.DEFAULT_IFNAME) catch |err| {
+            switch (err) {
+                error.SocketCreateFailed => try stderr.writeAll("error: permission denied. Run with sudo.\n"),
+                error.NetlinkError => try stderr.writeAll("error: interface mg0 not found.\n"),
+                else => try writeFormatted(stderr, "error: {s}\n", .{@errorName(err)}),
+            }
+            std.process.exit(1);
+        };
+    }
 
     try stdout.writeAll("meshguard stopped. Interface mg0 removed.\n");
 }
@@ -2762,6 +2805,12 @@ fn cmdDown(allocator: std.mem.Allocator) !void {
 fn cmdStatus(allocator: std.mem.Allocator) !void {
     const stdout = getStdOut();
     const stderr = getStdErr();
+
+    if (comptime @import("builtin").os.tag != .linux) {
+        try stderr.writeAll("error: 'meshguard status' is only supported on Linux (requires netlink)\n");
+        std.process.exit(1);
+    }
+
 
     const Netlink = lib.wireguard.Netlink;
 
