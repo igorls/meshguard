@@ -95,6 +95,82 @@ meshguard up [options]
 
 ---
 
+## `meshguard connect`
+
+Direct peer connection via token exchange (no seed node needed). Performs a coordinated UDP hole punch.
+
+```bash
+meshguard connect --generate [--in <minutes>]
+meshguard connect --join <mg://token>
+```
+
+| Flag | Description |
+| ---- | ----------- |
+| `--generate` | Run as initiator. Generates a token to share with the peer. |
+| `--in <minutes>` | Wait time before coordinated punch (default: 1). |
+| `--join` | Run as joiner. Accepts an `mg://` token. |
+
+---
+
+## `meshguard org-keygen`
+
+Generate a new Ed25519 organization keypair.
+
+```bash
+meshguard org-keygen
+```
+
+**Output files** (in `$MESHGUARD_CONFIG_DIR`, default `~/.config/meshguard/org/`):
+
+- `org.key` — secret key
+- `org.pub` — public key
+
+Generates an org keypair and derives the deterministic mesh domain (e.g., `a1b2c3.mesh`).
+
+---
+
+## `meshguard org-sign`
+
+Sign a node's public key with the org private key, producing a `NodeCertificate`.
+
+```bash
+meshguard org-sign <node.pub> --name <label> [--expires <unix-timestamp>]
+```
+
+| Argument | Description |
+| -------- | ----------- |
+| `<node.pub>` | Path to the node's `.pub` file or base64 key |
+| `--name` | Required human-readable label for the node |
+| `--expires` | Optional unix timestamp for certificate expiration |
+
+---
+
+## `meshguard org-vouch`
+
+Vouch for an external node without making it a full org member. The vouch propagates to all org members via gossip.
+
+```bash
+meshguard org-vouch <node.pub>
+```
+
+| Argument | Description |
+| -------- | ----------- |
+| `<node.pub>` | Path to the external node's `.pub` file or base64 key |
+
+---
+
+## `meshguard upgrade`
+
+Upgrade meshguard to the latest release from GitHub.
+
+```bash
+meshguard upgrade
+```
+
+Queries the GitHub API, downloads the latest `meshguard-linux-amd64` binary, replaces the current executable, and restarts the systemd service if running.
+
+---
+
 ## `meshguard down`
 
 Stop the daemon and remove the `mg0` interface.
