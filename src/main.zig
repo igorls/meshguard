@@ -967,60 +967,90 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
         // Userspace mode: multiplexed event loop with TUN
         try stdout.writeAll("meshguard is running (userspace WG mode). Press Ctrl+C to stop.\n");
 
-        if (comptime @import("builtin").os.tag != .linux) {
-            try stderr.writeAll("error: userspace WireGuard mode requires Linux (TUN device + rtnetlink)\n");
-            try stderr.writeAll("  hint: Windows support via Wintun is not yet implemented\n");
-            std.process.exit(1);
-        }
-
         var wg_device = lib.wireguard.Device.WgDevice.init(wg_private_key, wg_public_key);
         wg_handler_ctx.wg_device = &wg_device;
         wg_handler_ctx.use_kernel = false;
 
-        // Open TUN device
-        var tun_dev = lib.net.Tun.TunDevice.open("mg0") catch |err| {
-            try writeFormatted(stderr, "error: failed to open TUN device: {s}\n", .{@errorName(err)});
-            try stderr.writeAll("  hint: run with sudo or set CAP_NET_ADMIN\n");
-            std.process.exit(1);
-        };
-        defer tun_dev.close();
+        if (comptime @import("builtin").os.tag == .linux) {
+            // ─── Linux: TUN device + rtnetlink + multiplexed event loop ───
+            var tun_dev = lib.net.Tun.TunDevice.open("mg0") catch |err| {
+                try writeFormatted(stderr, "error: failed to open TUN device: {s}\n", .{@errorName(err)});
+                try stderr.writeAll("  hint: run with sudo or set CAP_NET_ADMIN\n");
+                std.process.exit(1);
+            };
+            defer tun_dev.close();
 
-        // Configure TUN IP via rtnetlink
-        const ifindex = lib.wireguard.RtNetlink.getInterfaceIndex("mg0") catch |err| {
-            try writeFormatted(stderr, "error: failed to get TUN ifindex: {s}\n", .{@errorName(err)});
-            std.process.exit(1);
-        };
-        lib.wireguard.RtNetlink.addAddress(ifindex, mesh_ip, 16) catch |err| {
-            try writeFormatted(stderr, "error: failed to set TUN IP: {s}\n", .{@errorName(err)});
-        };
-        lib.wireguard.RtNetlink.setInterfaceUp(ifindex, true) catch |err| {
-            try writeFormatted(stderr, "error: failed to bring up TUN: {s}\n", .{@errorName(err)});
-        };
+            const ifindex = lib.wireguard.RtNetlink.getInterfaceIndex("mg0") catch |err| {
+                try writeFormatted(stderr, "error: failed to get TUN ifindex: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            lib.wireguard.RtNetlink.addAddress(ifindex, mesh_ip, 16) catch |err| {
+                try writeFormatted(stderr, "error: failed to set TUN IP: {s}\n", .{@errorName(err)});
+            };
+            lib.wireguard.RtNetlink.setInterfaceUp(ifindex, true) catch |err| {
+                try writeFormatted(stderr, "error: failed to bring up TUN: {s}\n", .{@errorName(err)});
+            };
+            tun_dev.setMtu(1420) catch |err| {
+                try writeFormatted(stderr, "warning: failed to set MTU: {s}\n", .{@errorName(err)});
+            };
+            lib.wireguard.RtNetlink.addRoute(ifindex, .{ 10, 99, 0, 0 }, 16) catch |err| {
+                try writeFormatted(stderr, "warning: failed to add mesh route: {s}\n", .{@errorName(err)});
+            };
 
-        // Set MTU to 1420 (1500 - 80 WG overhead) to prevent fragmentation
-        tun_dev.setMtu(1420) catch |err| {
-            try writeFormatted(stderr, "warning: failed to set MTU: {s}\n", .{@errorName(err)});
-        };
+            try writeFormatted(stdout, "  TUN device: {s} (fd={d}, mtu=1420)\n", .{ tun_dev.getName(), tun_dev.fd });
 
-        // Add mesh subnet route: 10.99.0.0/16 via mg0
-        lib.wireguard.RtNetlink.addRoute(ifindex, .{ 10, 99, 0, 0 }, 16) catch |err| {
-            try writeFormatted(stderr, "warning: failed to add mesh route: {s}\n", .{@errorName(err)});
-        };
+            tun_dev.enableOffload();
+            if (tun_dev.vnet_hdr) {
+                try stdout.writeAll("  GSO/GRO offloads: enabled (IFF_VNET_HDR)\n");
+            } else {
+                try stdout.writeAll("  GSO/GRO offloads: disabled (fallback to single-packet)\n");
+            }
 
-        try writeFormatted(stdout, "  TUN device: {s} (fd={d}, mtu=1420)\n", .{ tun_dev.getName(), tun_dev.fd });
+            userspaceEventLoop(&swim, &wg_device, &gossip_socket, tun_dev, stdout, encrypt_workers, &service_filter, &control) catch |err| {
+                try writeFormatted(stderr, "error: event loop failed: {s}\n", .{@errorName(err)});
+            };
+        } else if (comptime @import("builtin").os.tag == .windows) {
+            // ─── Windows: Wintun adapter + netsh config + simplified event loop ───
+            const WintunDev = lib.net.Wintun.WintunDevice;
+            const WinCfg = lib.net.WinCfg;
 
-        // Enable GSO/GRO offloads for large packet coalescing
-        tun_dev.enableOffload();
-        if (tun_dev.vnet_hdr) {
-            try stdout.writeAll("  GSO/GRO offloads: enabled (IFF_VNET_HDR)\n");
+            var tun_dev = WintunDev.open("meshguard") catch |err| {
+                try writeFormatted(stderr, "error: failed to open Wintun adapter: {s}\n", .{@errorName(err)});
+                try stderr.writeAll("  hint: ensure wintun.dll is in the same directory as meshguard.exe\n");
+                try stderr.writeAll("  hint: run as Administrator\n");
+                std.process.exit(1);
+            };
+            defer tun_dev.close();
+
+            try writeFormatted(stdout, "  Wintun adapter: {s}\n", .{tun_dev.getName()});
+
+            // Configure IP address via netsh
+            WinCfg.setAdapterIp(allocator, tun_dev.getName(), mesh_ip, 16) catch |err| {
+                try writeFormatted(stderr, "warning: failed to set adapter IP: {s}\n", .{@errorName(err)});
+            };
+
+            // Set MTU
+            WinCfg.setMtu(allocator, tun_dev.getName(), 1420) catch |err| {
+                try writeFormatted(stderr, "warning: failed to set MTU: {s}\n", .{@errorName(err)});
+            };
+
+            // Add mesh subnet route
+            WinCfg.addRoute(allocator, tun_dev.getName(), .{ 10, 99, 0, 0 }, 16) catch |err| {
+                try writeFormatted(stderr, "warning: failed to add mesh route: {s}\n", .{@errorName(err)});
+            };
+
+            try writeFormatted(stdout, "  mesh IP: {d}.{d}.{d}.{d}/16 (mtu=1420)\n", .{
+                mesh_ip[0], mesh_ip[1], mesh_ip[2], mesh_ip[3],
+            });
+
+            // Simplified event loop: alternate between TUN reads and UDP gossip
+            windowsEventLoop(&swim, &wg_device, &gossip_socket, &tun_dev, stdout, &service_filter, &control) catch |err| {
+                try writeFormatted(stderr, "error: event loop failed: {s}\n", .{@errorName(err)});
+            };
         } else {
-            try stdout.writeAll("  GSO/GRO offloads: disabled (fallback to single-packet)\n");
+            try stderr.writeAll("error: unsupported platform for userspace WireGuard mode\n");
+            std.process.exit(1);
         }
-
-        // Run multiplexed event loop
-        userspaceEventLoop(&swim, &wg_device, &gossip_socket, tun_dev, stdout, encrypt_workers, &service_filter, &control) catch |err| {
-            try writeFormatted(stderr, "error: event loop failed: {s}\n", .{@errorName(err)});
-        };
 
     }
 
@@ -1444,10 +1474,27 @@ fn installSignalHandler(swim_ref: *lib.discovery.Swim.SwimProtocol) void {
         };
         posix.sigaction(posix.SIG.INT, &sa, null);
         posix.sigaction(posix.SIG.TERM, &sa, null);
+    } else if (comptime @import("builtin").os.tag == .windows) {
+        // SetConsoleCtrlHandler for Ctrl+C / console close
+        const k32 = struct {
+            extern "kernel32" fn SetConsoleCtrlHandler(
+                handler: ?*const fn (u32) callconv(.winapi) std.os.windows.BOOL,
+                add: std.os.windows.BOOL,
+            ) callconv(.winapi) std.os.windows.BOOL;
+        };
+        _ = k32.SetConsoleCtrlHandler(&windowsCtrlHandler, 1);
     }
-    // On Windows, signal handling via SetConsoleCtrlHandler will be implemented
-    // when full Windows runtime support is added.
 }
+
+fn windowsCtrlHandler(ctrl_type: u32) callconv(.winapi) std.os.windows.BOOL {
+    // CTRL_C_EVENT = 0, CTRL_CLOSE_EVENT = 2
+    if (ctrl_type == 0 or ctrl_type == 2) {
+        if (g_swim_stop) |swim| swim.stop();
+        return 1; // Handled
+    }
+    return 0; // Not handled
+}
+
 
 
 const WgHandlerCtx = struct {
@@ -2490,6 +2537,49 @@ fn processIncomingPacket(
 ///
 /// Architecture (parallel mode, encrypt_workers > 0):
 /// - N TUN reader threads: read from TUN queues, split GSO, push to EncryptQueue.
+/// Windows event loop — simplified single-threaded processing.
+///
+/// Uses swim.tick() which handles its own UDP polling, combined with
+/// TUN reads between ticks. The SWIM protocol handles gossip, failure
+/// detection, and incoming packet dispatching.
+fn windowsEventLoop(
+    swim: *lib.discovery.Swim.SwimProtocol,
+    wg_dev: *lib.wireguard.Device.WgDevice,
+    udp_sock: *lib.net.Udp.UdpSocket,
+    tun_dev: *lib.net.Wintun.WintunDevice,
+    stdout: std.fs.File,
+    service_filter: *const lib.services.Policy.ServiceFilter,
+    control_socket: *lib.services.Control.ControlSocket,
+) !void {
+    _ = wg_dev;
+    _ = udp_sock;
+    _ = service_filter;
+    _ = stdout;
+
+    var tun_buf: [65536]u8 = undefined;
+
+    while (swim.running.load(.acquire)) {
+        // 1. SWIM protocol tick (handles UDP poll + gossip + failure detection)
+        swim.tick() catch {};
+
+        // 2. Read TUN packets (outbound traffic from local apps)
+        // Short poll — don't block long or SWIM gossip will stall
+        if (tun_dev.pollRead(5) catch false) {
+            // Drain TUN packets — full WG encryption integration will be
+            // added when the data plane is wired up for Windows
+            _ = tun_dev.read(&tun_buf) catch 0;
+        }
+
+        // 3. Poll control socket for status queries
+        _ = control_socket.poll();
+    }
+}
+
+/// Linux userspace event loop — multi-threaded with BatchUdp and io_uring.
+///
+/// Architecture (pipeline mode, encrypt_workers > 0):
+/// - N data-plane workers: each reads from TUN (multi-queue fd), pushes
+///   {packet, peer} into a lockfree ring.
 /// - M encrypt workers: pop from queue, encrypt via UDP GSO (single sendmsg per peer).
 /// - Control-plane (this function): receives all UDP (GRO coalesced or batch),
 ///   dispatches handshakes, SWIM gossip, and decrypts transport → TUN.
@@ -2506,6 +2596,7 @@ fn userspaceEventLoop(
     service_filter: *const lib.services.Policy.ServiceFilter,
     control_socket: *lib.services.Control.ControlSocket,
 ) !void {
+
     const BatchUdp = lib.net.BatchUdp;
 
     // Determine TUN reader count: min(cpus, MAX_WORKERS), at least 1

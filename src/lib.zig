@@ -5,6 +5,7 @@
 
 const builtin = @import("builtin");
 const is_linux = builtin.os.tag == .linux;
+const is_windows = builtin.os.tag == .windows;
 
 pub const identity = struct {
     pub const Keys = @import("identity/keys.zig");
@@ -52,6 +53,8 @@ pub const net = struct {
     pub const Offload = if (is_linux) @import("net/offload.zig") else struct {};
     pub const Io = @import("net/io.zig");
     pub const Tun = if (is_linux) @import("net/tun.zig") else struct {};
+    pub const Wintun = if (is_windows) @import("net/wintun.zig") else struct {};
+    pub const WinCfg = if (is_windows) @import("net/wincfg.zig") else struct {};
     pub const Dns = @import("net/dns.zig");
     pub const Pipeline = @import("net/pipeline.zig");
     pub const IoUring = if (is_linux) @import("net/io_uring.zig") else struct {};
