@@ -247,7 +247,7 @@ pub const Handshake = struct {
         crypto.mixHash(&hash, &msg.encrypted_static);
 
         // Verify the decrypted static matches what we expect
-        if (!std.mem.eql(u8, &initiator_static, &self.remote_static)) {
+        if (!std.crypto.timing_safe.eql([32]u8, initiator_static, self.remote_static)) {
             return error.UnknownPeer;
         }
 
@@ -282,7 +282,7 @@ pub const Handshake = struct {
         var hash = preamble.hash;
 
         // Verify the decrypted static matches what we expect
-        if (!std.mem.eql(u8, &preamble.initiator_static, &self.remote_static)) {
+        if (!std.crypto.timing_safe.eql([32]u8, preamble.initiator_static, self.remote_static)) {
             return error.UnknownPeer;
         }
 
