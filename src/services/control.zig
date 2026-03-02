@@ -85,7 +85,7 @@ pub const ControlSocket = struct {
         try std.posix.listen(sock, 4);
 
         // Make socket accessible to non-root users
-        std.fs.cwd().chmod(self.socket_path, 0o666) catch {};
+        std.posix.fchmodat(std.fs.cwd().fd, self.socket_path, 0o666, 0) catch {};
 
         self.server = sock;
     }
