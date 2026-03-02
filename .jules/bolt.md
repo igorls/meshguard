@@ -1,0 +1,3 @@
+## 2024-03-02 - Optimize packet classification hot-path
+**Learning:** In Zig, standard `switch` statements on integers compile to jump tables. Extracting the dominant case (e.g., data-plane packets) into an explicit `if` branch before a `switch` improves branch prediction and avoids jump table overhead. Marking small, frequently called utility functions on the hot path (like packet classification) with the `inline` keyword ensures the compiler eliminates function call overhead across module boundaries.
+**Action:** When classifying packets or handling enums where one case occurs >99% of the time, check for the dominant case explicitly before using a `switch` statement, and use `inline fn` for short, hot-path classification functions to avoid cross-module call overhead.
