@@ -120,6 +120,9 @@ pub const SwimProtocol = struct {
     raw_recv: u32 = 0,
     tick_count: u32 = 0,
 
+    // Liveness tracking: timestamp of last received packet (epoch nanoseconds, i64)
+    last_recv_ns: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+
     pub fn init(
         membership: *Membership.MembershipTable,
         socket: Udp.UdpSocket,
@@ -377,6 +380,46 @@ pub const SwimProtocol = struct {
         }
     }
 
+    /// Receive-only tick for suspended/background mode.
+    /// Processes incoming packets (ACKs, messages, SOS, WireGuard handshakes)
+    /// but does NOT send PINGs, beacons, or escalate suspicion. This keeps the
+    /// node reachable while minimizing battery and network usage.
+    pub fn tickReceiveOnly(self: *SwimProtocol) !void {
+        self.tick_count += 1;
+
+        // Poll socket for incoming packets (200ms timeout)
+        const poll_ms: i32 = 200;
+        if (try self.socket.pollRead(poll_ms)) {
+            while (true) {
+                var recv_buf: [1500]u8 = undefined;
+                const result = try self.socket.recvFrom(&recv_buf);
+                if (result == null) break;
+                const recv = result.?;
+                self.raw_recv += 1;
+                self.handleMessage(recv.data, recv.sender_addr, recv.sender_port);
+            }
+        }
+
+        // Still clear timed-out pending pings (prevents accumulation)
+        // but don't escalate to PING-REQ since we're in low-power mode.
+        self.checkTimeouts();
+    }
+
+    /// Re-ping all alive peers to refresh state after resuming from suspend.
+    /// Call this immediately after exiting suspended mode to catch up on
+    /// peer liveness and exchange gossip.
+    pub fn pingAllAlive(self: *SwimProtocol) void {
+        var iter = self.membership.peers.iterator();
+        while (iter.next()) |entry| {
+            const peer = entry.value_ptr;
+            if (peer.state == .alive or peer.state == .suspected) {
+                if (peer.gossip_endpoint) |ep| {
+                    self.sendPing(ep.addr, ep.port, peer.pubkey);
+                }
+            }
+        }
+    }
+
     /// Feed a received packet to SWIM from an external event loop.
     pub fn feedPacket(self: *SwimProtocol, data: []const u8, sender_addr: [4]u8, sender_port: u16) void {
         self.handleMessage(data, sender_addr, sender_port);
@@ -414,6 +457,7 @@ pub const SwimProtocol = struct {
 
         const decoded = codec.decode(data) catch return;
         self.pkts_recv += 1;
+        self.last_recv_ns.store(@intCast(std.time.nanoTimestamp()), .release);
 
         // Trust enforcement: check sender's pubkey against authorized set
         const sender_pubkey: [32]u8 = switch (decoded) {

@@ -61,6 +61,7 @@ pub const config = @import("config.zig");
 
 pub const services = struct {
     pub const Policy = @import("services/policy.zig");
+    pub const Control = @import("services/control.zig");
 };
 
 test {

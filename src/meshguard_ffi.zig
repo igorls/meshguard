@@ -86,6 +86,7 @@ pub const MeshguardContext = struct {
     lan_discovery: ?LanDiscovery,
     event_loop_thread: ?std.Thread,
     running: std.atomic.Value(bool),
+    suspended: std.atomic.Value(bool), // low-power mode: recv only, no send
 
     // Callbacks (set by host app)
     on_message_cb: ?*const fn ([*]const u8, usize, [*]const u8) callconv(.c) void,
@@ -158,6 +159,7 @@ export fn meshguard_init(
         .lan_discovery = null,
         .event_loop_thread = null,
         .running = std.atomic.Value(bool).init(false),
+        .suspended = std.atomic.Value(bool).init(false),
         .on_message_cb = null,
         .on_peer_event_cb = null,
         .inbox = std.mem.zeroes([64]AppMessage),
@@ -563,6 +565,58 @@ export fn meshguard_is_running(ctx: ?*MeshguardContext) bool {
     return c.running.load(.acquire);
 }
 
+// ─── Background lifecycle ───
+
+/// Enter low-power suspended mode.
+/// The event loop continues to receive incoming packets (messages, SOS,
+/// WireGuard handshakes) but stops sending PINGs and LAN beacons to
+/// conserve battery. Call meshguard_resume() to restore full operation.
+export fn meshguard_suspend(ctx: ?*MeshguardContext) void {
+    const c = ctx orelse return;
+    c.suspended.store(true, .release);
+    std.debug.print("  ⏸️  meshguard suspended (receive-only mode)\n", .{});
+}
+
+/// Resume full mesh operation from suspended mode.
+/// Immediately re-announces to all known peers and restores normal
+/// gossip intervals to refresh peer states.
+export fn meshguard_resume(ctx: ?*MeshguardContext) void {
+    const c = ctx orelse return;
+    const was_suspended = c.suspended.load(.acquire);
+    c.suspended.store(false, .release);
+
+    if (was_suspended) {
+        std.debug.print("  ▶️  meshguard resumed — re-pinging all peers\n", .{});
+        // Force immediate ping to all alive peers to refresh state
+        if (c.swim) |*swim| {
+            swim.pingAllAlive();
+        }
+        // Fire a LAN beacon immediately to re-discover nearby peers
+        if (c.lan_discovery) |*lan| {
+            lan.sendBeacon();
+        }
+    }
+}
+
+/// Check if the mesh is currently in suspended (low-power) mode.
+export fn meshguard_is_suspended(ctx: ?*MeshguardContext) bool {
+    const c = ctx orelse return false;
+    return c.suspended.load(.acquire);
+}
+
+/// Get the timestamp (epoch ms) of the last received SWIM packet.
+/// Returns 0 if no packets have been received.
+/// Used by the host app for heartbeat/liveness detection.
+export fn meshguard_last_recv_time(ctx: ?*MeshguardContext) u64 {
+    const c = ctx orelse return 0;
+    if (c.swim) |*swim| {
+        const ns = swim.last_recv_ns.load(.acquire);
+        if (ns <= 0) return 0;
+        return @intCast(@divTrunc(ns, 1_000_000));
+    }
+    return 0;
+}
+
 /// Get our actual bound UDP port.
 export fn meshguard_get_bound_port(ctx: ?*MeshguardContext) u16 {
     const c = ctx orelse return 0;
@@ -733,16 +787,31 @@ export fn meshguard_get_peer_info(
 fn eventLoop(ctx: *MeshguardContext) void {
     var lan_beacon_counter: u32 = 0;
     while (ctx.running.load(.acquire)) {
-        if (ctx.swim) |*swim| {
-            swim.tick() catch {};
+        const is_suspended = ctx.suspended.load(.acquire);
 
-            // LAN discovery: send beacons every ~3 seconds (every 10 ticks at ~300ms/tick)
-            if (ctx.lan_discovery) |*lan| {
-                _ = lan.recvBeacons();
-                lan_beacon_counter += 1;
-                if (lan_beacon_counter >= 10) {
-                    lan.sendBeacon();
-                    lan_beacon_counter = 0;
+        if (ctx.swim) |*swim| {
+            if (is_suspended) {
+                // SUSPENDED: receive-only mode
+                // - Poll socket for incoming packets (messages, SOS, handshakes)
+                // - Process pending ping timeouts (prevent accumulation)
+                // - Do NOT send PINGs or LAN beacons (saves battery)
+                // - Sleep longer between ticks (1s vs ~200ms)
+                swim.tickReceiveOnly() catch {};
+                std.Thread.sleep(800_000_000); // 800ms extra sleep (1s total w/ poll)
+            } else {
+                // ACTIVE: full gossip + discovery
+                swim.tick() catch {};
+            }
+
+            // LAN discovery: only in active mode
+            if (!is_suspended) {
+                if (ctx.lan_discovery) |*lan| {
+                    _ = lan.recvBeacons();
+                    lan_beacon_counter += 1;
+                    if (lan_beacon_counter >= 10) {
+                        lan.sendBeacon();
+                        lan_beacon_counter = 0;
+                    }
                 }
             }
         } else {
