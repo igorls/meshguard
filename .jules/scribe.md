@@ -12,3 +12,7 @@
 **Gap:** The documentation stated the SWIM protocol period was 1000ms (1s), but the implementation uses 5000ms (5s) in both `src/config.zig` and `src/discovery/swim.zig`.
 **Learning:** The documentation likely reflected an early design decision or standard SWIM defaults, but the implementation settled on a more conservative 5s interval for WAN stability, and docs were not updated.
 **Prevention:** Add a CI check that grep's `docs/guide/configuration.md` for values that match constants exported in `src/config.zig`.
+## 2024-03-22 - AppMessage Documentation Gap
+**Gap:** The documentation (docs/concepts/wire-protocol.md) described an AppMessage protocol for end-to-end encrypted application-level messages, while the implementation (src/protocol/messages.zig) does not define it.
+**Learning:** Documentation drifted because the initial design likely included an AppMessage protocol which was either not implemented or removed, but docs were not updated.
+**Prevention:** Regularly audit messages.zig against documentation to ensure all documented message types are actually defined.
