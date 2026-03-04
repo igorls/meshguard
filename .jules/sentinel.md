@@ -16,3 +16,8 @@
 **Vulnerability:** Intermediate key material (`secret` extracted from chaining key, and expanded `t*_plus` buffers) in `src/wireguard/crypto.zig`'s HKDF implementation (`kdf1`, `kdf2`, `kdf3`) was left on the stack without being zeroed. These buffers contain sensitive pseudorandom keys derived from the handshake chaining key.
 **Learning:** Helper functions often create temporary buffers on the stack which persist until overwritten. Unlike the main handshake state struct, these are ephemeral but critical. Zig does not automatically zero stack variables on return.
 **Prevention:** Always use `defer std.crypto.secureZero(u8, &var);` immediately after declaring any variable that will hold sensitive key material, especially in crypto primitives.
+
+## 2023-10-27 - [CRITICAL] Timing Attack on Remote Static Key Verification
+**Vulnerability:** The functions `consumeInitiation` and `consumeInitiationFast` in `src/wireguard/noise.zig` used `std.mem.eql` to compare the decrypted `initiator_static` key against `self.remote_static`. `std.mem.eql` terminates early on the first mismatch, creating a timing oracle. This could allow an attacker to perform a timing attack to determine the expected remote static key during the handshake processing.
+**Learning:** It is easy to accidentally use `std.mem.eql` for comparing public keys or decrypted public keys when validating expected peers, especially when the key itself is public but the expected value is part of the secret handshake state.
+**Prevention:** Always use `std.crypto.timing_safe.eql` for any comparison involving cryptographic keys, even public keys, when the comparison occurs within a cryptographic protocol or handshake where timing could leak information about the internal state or expected peer.
