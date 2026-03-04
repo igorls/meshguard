@@ -24,16 +24,20 @@ pub const PacketType = enum {
     stun, // STUN binding response
     unknown,
 
-    pub fn classify(data: []const u8) PacketType {
+    pub inline fn classify(data: []const u8) PacketType {
         if (data.len < 4) return .unknown;
 
         // WireGuard messages: first byte is type, next 3 are zeros
         const msg_type = std.mem.readInt(u32, data[0..4], .little);
+
+        // Optimization: Extract dominant case (data-plane packets) to avoid
+        // jump table overhead and improve branch prediction.
+        if (msg_type == 4) return .wg_transport;
+
         return switch (msg_type) {
             1 => .wg_handshake_init,
             2 => .wg_handshake_resp,
             3 => .wg_cookie,
-            4 => .wg_transport,
             else => blk: {
                 // STUN: check for magic cookie at bytes 4-7
                 if (data.len >= 8) {
@@ -89,7 +93,8 @@ const IndexTable = struct {
     keys: [INDEX_TABLE_SIZE]u32 = .{EMPTY} ** INDEX_TABLE_SIZE,
     values: [INDEX_TABLE_SIZE]usize = .{0} ** INDEX_TABLE_SIZE,
 
-    fn hash(index: u32) usize {
+    // Optimization: inline to avoid function call overhead on fast path
+    inline fn hash(index: u32) usize {
         // Fibonacci hashing: multiply by golden ratio, extract TOP bits.
         // Using % extracts bottom bits which defeats the multiplication.
         return @as(usize, (index *% 0x9E3779B9) >> 24);
@@ -200,7 +205,8 @@ const StaticKeyTable = struct {
 
 /// Extract the host ID (u16) from a mesh IP address.
 /// Mesh prefix is 10.99.0.0/16, so octets [2] and [3] form the host key.
-fn meshIpHostId(ip: [4]u8) u16 {
+/// Optimization: inline to avoid function call overhead on packet routing hot path.
+inline fn meshIpHostId(ip: [4]u8) u16 {
     return (@as(u16, ip[2]) << 8) | @as(u16, ip[3]);
 }
 
@@ -448,7 +454,8 @@ pub const WgDevice = struct {
 
     /// O(1) mesh IP routing lookup for data plane.
     /// Extracts host ID from destination IP and does flat-array lookup.
-    pub fn lookupByMeshIp(self: *const WgDevice, dst_ip: [4]u8) ?usize {
+    /// Optimization: inline for data plane fast path.
+    pub inline fn lookupByMeshIp(self: *const WgDevice, dst_ip: [4]u8) ?usize {
         const slot = self.ip_to_slot[meshIpHostId(dst_ip)];
         if (slot == 0xFF) return null;
         return @as(usize, slot);
