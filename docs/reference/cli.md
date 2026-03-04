@@ -95,6 +95,24 @@ meshguard up [options]
 
 ---
 
+## `meshguard connect`
+
+Direct peer connection via token exchange (bypasses seed nodes).
+
+```bash
+meshguard connect --generate [--in <minutes>]
+meshguard connect --join <mg://token>
+```
+
+**Flow**:
+
+1. Initiator runs `--generate`, shares `mg://` token with peer
+2. Peer runs `--join <token>`, shares response token back
+3. Initiator pastes response token
+4. Both sides punch simultaneously (NTP-synced)
+
+---
+
 ## `meshguard down`
 
 Stop the daemon and remove the `mg0` interface.
