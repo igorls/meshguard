@@ -53,6 +53,30 @@ meshguard trust <key-or-path> [--name <name>]
 
 ---
 
+## `meshguard connect`
+
+Direct peer connection via token exchange (no seed needed).
+
+```bash
+meshguard connect --generate [--in <minutes>]
+meshguard connect --join <mg://token>
+```
+
+| Flag         | Description                                     |
+| ------------ | ----------------------------------------------- |
+| `--generate` | Initiator flag, generates an `mg://` token      |
+| `--join`     | Joiner flag, accepts an `mg://` token           |
+| `--in`       | Punch delay in minutes (default: 1 minute)      |
+
+**Flow**:
+
+1. Initiator runs `--generate`, shares `mg://` token with peer
+2. Peer runs `--join <token>`, shares response token back
+3. Initiator pastes response token
+4. Both sides punch simultaneously (NTP-synced)
+
+---
+
 ## `meshguard revoke`
 
 Remove a peer from your authorized keys.
