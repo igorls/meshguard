@@ -1,0 +1,3 @@
+## 2024-05-14 - Packet Classification Fast Path
+**Learning:** Optimizing the packet classification function `PacketType.classify` is beneficial because it's called on every single incoming UDP packet (the hottest path in the system). Standard `switch` statements compile to jump tables. Extracting the dominant case (`msg_type == 4` for `.wg_transport` data-plane packets) into an explicit `if` branch before the `switch` statement improves branch prediction and avoids jump table overhead.
+**Action:** Always consider the dominant branch in high-throughput hot paths and hoist it outside of standard switch/jump table constructs when possible. Documented the fast path optimization.
