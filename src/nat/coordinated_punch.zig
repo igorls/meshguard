@@ -14,7 +14,6 @@
 
 const std = @import("std");
 const posix = std.posix;
-const linux = std.os.linux;
 const Udp = @import("../net/udp.zig");
 const Stun = @import("stun.zig");
 const messages = @import("../protocol/messages.zig");
@@ -387,13 +386,9 @@ pub fn probeMatchesNonce(data: []const u8, expected_nonce: [8]u8) bool {
     return std.mem.eql(u8, data[4..12], &expected_nonce);
 }
 
-/// Sleep for the given number of milliseconds using POSIX nanosleep.
+/// Sleep for the given number of milliseconds (cross-platform).
 fn sleepMs(ms: u32) void {
-    const ts = linux.timespec{
-        .sec = @intCast(ms / 1000),
-        .nsec = @intCast(@as(u64, ms % 1000) * 1_000_000),
-    };
-    _ = linux.nanosleep(&ts, null);
+    std.Thread.sleep(@as(u64, ms) * std.time.ns_per_ms);
 }
 
 /// Run the coordinated punch loop.

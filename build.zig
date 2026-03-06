@@ -4,10 +4,13 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Detect cross-compilation targets
-    const is_android = if (target.query.os_tag) |os| os == .linux and
-        (target.query.abi == .android) else false;
-    const is_windows = if (target.query.os_tag) |os| os == .windows else false;
+    // Detect target OS — works for both native and cross-compilation.
+    // target.query.os_tag is null for native builds, so fall back to the
+    // resolved target's os.tag.
+    const resolved_os = if (target.query.os_tag) |os| os else target.result.os.tag;
+    const resolved_abi = if (target.query.abi) |abi| abi else target.result.abi;
+    const is_android = resolved_os == .linux and resolved_abi == .android;
+    const is_windows = resolved_os == .windows;
 
     // ─── FFI module (for mobile embedding — not built on Windows) ───
     if (!is_windows) {

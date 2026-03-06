@@ -12,15 +12,26 @@
 //!
 //! The app_id field allows different meshguard applications to coexist
 //! on the same multicast group without interfering with each other.
+//!
+//! Cross-platform: supports both Linux and Windows.
 
 const std = @import("std");
 const posix = std.posix;
+const builtin = @import("builtin");
+const is_linux = builtin.os.tag == .linux;
+const is_windows = builtin.os.tag == .windows;
 
 /// Multicast group for meshguard LAN discovery.
 pub const MULTICAST_GROUP = [4]u8{ 239, 99, 99, 1 };
 pub const MULTICAST_PORT: u16 = 51820;
 const BEACON_MAGIC = "MGLAN";
 const BEACON_SIZE: usize = 5 + 2 + 32 + 2; // 41 bytes
+
+/// Cross-platform IP-level socket option constants for multicast.
+/// Linux and Windows use different values for these options.
+const IP_ADD_MEMBERSHIP: u32 = if (is_linux) 35 else if (is_windows) 12 else 35;
+const IP_MULTICAST_TTL: u32 = if (is_linux) 33 else if (is_windows) 10 else 33;
+const IP_MULTICAST_LOOP: u32 = if (is_linux) 34 else if (is_windows) 11 else 34;
 
 /// Well-known app IDs.
 pub const APP_ID_PEER_CIRCLE: u16 = 0x5043; // "PC" (Peer Circle)
@@ -39,8 +50,28 @@ pub const LanDiscovery = struct {
 
     /// Initialize LAN discovery: create multicast socket, join group.
     pub fn init(our_pubkey: [32]u8, gossip_port: u16, app_id: u16, on_peer: OnLanPeerFn, ctx: *anyopaque) !LanDiscovery {
-        const sock_fd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
-        errdefer posix.close(sock_fd);
+        // On Linux, set SOCK_NONBLOCK at creation. On Windows, we'll use ioctlsocket.
+        const sock_fd = blk: {
+            if (comptime is_linux) {
+                break :blk try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+            } else {
+                break :blk try posix.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
+            }
+        };
+        errdefer {
+            if (comptime is_windows) {
+                _ = std.os.windows.ws2_32.closesocket(sock_fd);
+            } else {
+                posix.close(sock_fd);
+            }
+        }
+
+        // On Windows, set non-blocking via ioctlsocket
+        if (comptime is_windows) {
+            const ws2 = std.os.windows.ws2_32;
+            var mode: u32 = 1; // non-blocking
+            _ = ws2.ioctlsocket(sock_fd, @bitCast(@as(i32, 0x4004667e)), &mode); // FIONBIO
+        }
 
         // Allow address reuse
         const one: c_int = 1;
@@ -63,16 +94,15 @@ pub const LanDiscovery = struct {
             .multiaddr = MULTICAST_GROUP,
             .interface = .{ 0, 0, 0, 0 }, // INADDR_ANY
         };
-        // IP_ADD_MEMBERSHIP = 35 on Linux
-        try posix.setsockopt(sock_fd, posix.IPPROTO.IP, 35, std.mem.asBytes(&mreq));
+        try posix.setsockopt(sock_fd, posix.IPPROTO.IP, IP_ADD_MEMBERSHIP, std.mem.asBytes(&mreq));
 
         // Set multicast TTL to 1 (LAN only)
         const ttl: c_int = 1;
-        try posix.setsockopt(sock_fd, posix.IPPROTO.IP, 33, std.mem.asBytes(&ttl)); // IP_MULTICAST_TTL
+        try posix.setsockopt(sock_fd, posix.IPPROTO.IP, IP_MULTICAST_TTL, std.mem.asBytes(&ttl));
 
         // Disable loopback (don't receive our own beacons)
         const loopback: c_int = 0;
-        try posix.setsockopt(sock_fd, posix.IPPROTO.IP, 34, std.mem.asBytes(&loopback)); // IP_MULTICAST_LOOP
+        try posix.setsockopt(sock_fd, posix.IPPROTO.IP, IP_MULTICAST_LOOP, std.mem.asBytes(&loopback));
 
         return .{
             .sock_fd = sock_fd,
@@ -151,6 +181,10 @@ pub const LanDiscovery = struct {
 
     pub fn deinit(self: *LanDiscovery) void {
         self.running.store(false, .release);
-        posix.close(self.sock_fd);
+        if (comptime is_windows) {
+            _ = std.os.windows.ws2_32.closesocket(self.sock_fd);
+        } else {
+            posix.close(self.sock_fd);
+        }
     }
 };

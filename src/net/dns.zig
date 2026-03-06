@@ -5,10 +5,13 @@
 //!   - TXT records (service discovery via `_meshguard._udp.domain`)
 //!   - mDNS queries (multicast to 224.0.0.251:5353)
 //!
-//! Zero dependencies beyond std and the project's UdpSocket.
+//! Cross-platform: supports both Linux and Windows.
 
 const std = @import("std");
 const posix = std.posix;
+const builtin = @import("builtin");
+const is_linux = builtin.os.tag == .linux;
+const is_windows = builtin.os.tag == .windows;
 
 // ─── DNS Wire Format Constants ───
 
@@ -36,8 +39,18 @@ const DnsHeader = struct {
 
 // ─── Public API ───
 
-/// Parse /etc/resolv.conf and return up to 3 nameserver IPv4 addresses.
+/// Get nameserver IPv4 addresses. On Linux, parses /etc/resolv.conf.
+/// On Windows, uses well-known public DNS servers as fallback.
 pub fn getNameservers(buf: *[3][4]u8) usize {
+    if (comptime is_linux) {
+        return getNameserversLinux(buf);
+    } else if (comptime is_windows) {
+        return getNameserversWindows(buf);
+    }
+    return 0;
+}
+
+fn getNameserversLinux(buf: *[3][4]u8) usize {
     const file = std.fs.openFileAbsolute("/etc/resolv.conf", .{}) catch return 0;
     defer file.close();
 
@@ -61,6 +74,17 @@ pub fn getNameservers(buf: *[3][4]u8) usize {
         }
     }
     return count;
+}
+
+fn getNameserversWindows(buf: *[3][4]u8) usize {
+    // Use well-known public DNS servers.
+    // A more advanced implementation could query the registry at
+    // HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\*\NameServer
+    // or use GetNetworkParams from iphlpapi.dll.
+    buf[0] = .{ 8, 8, 8, 8 }; // Google DNS
+    buf[1] = .{ 1, 1, 1, 1 }; // Cloudflare DNS
+    buf[2] = .{ 9, 9, 9, 9 }; // Quad9 DNS
+    return 3;
 }
 
 /// Resolve a hostname to an IPv4 address via DNS A record query.
@@ -117,7 +141,7 @@ pub fn queryMDNS(allocator: std.mem.Allocator, service_name: []const u8) ![][]co
 
     // Create UDP socket for mDNS
     const sock_fd = posix.socket(posix.AF.INET, posix.SOCK.DGRAM, 0) catch return &.{};
-    defer posix.close(sock_fd);
+    defer closeFd(sock_fd);
 
     // Set SO_REUSEADDR
     const one: i32 = 1;
@@ -135,30 +159,24 @@ pub fn queryMDNS(allocator: std.mem.Allocator, service_name: []const u8) ![][]co
     // Collect responses with a short timeout (500ms)
     var results: std.ArrayList([]const u8) = .empty;
 
-    var fds = [_]posix.pollfd{
-        .{ .fd = sock_fd, .events = posix.POLL.IN, .revents = 0 },
-    };
-
     // Poll for up to 1 second, collecting multiple responses
     var deadline: i32 = 1000;
     while (deadline > 0) {
         const poll_start = std.time.milliTimestamp();
-        const n = posix.poll(&fds, deadline) catch break;
+        const n = pollReadFd(sock_fd, deadline);
         const elapsed: i32 = @intCast(@min(std.time.milliTimestamp() - poll_start, deadline));
         deadline -= elapsed;
 
-        if (n == 0) break; // timeout
+        if (n <= 0) break; // timeout or error
 
-        if (fds[0].revents & posix.POLL.IN != 0) {
-            var resp_buf: [MAX_RESPONSE]u8 = undefined;
-            const resp_n = posix.recvfrom(sock_fd, &resp_buf, 0, null, null) catch break;
-            if (resp_n > HEADER_LEN) {
-                const parsed = parseTXTResponse(allocator, &resp_buf, resp_n) catch continue;
-                for (parsed) |txt| {
-                    results.append(allocator, txt) catch {};
-                }
-                if (parsed.len > 0) allocator.free(parsed);
+        var resp_buf: [MAX_RESPONSE]u8 = undefined;
+        const resp_n = posix.recvfrom(sock_fd, &resp_buf, 0, null, null) catch break;
+        if (resp_n > HEADER_LEN) {
+            const parsed = parseTXTResponse(allocator, &resp_buf, resp_n) catch continue;
+            for (parsed) |txt| {
+                results.append(allocator, txt) catch {};
             }
+            if (parsed.len > 0) allocator.free(parsed);
         }
     }
 
@@ -324,17 +342,45 @@ fn skipDomainName(data: []const u8, start: usize, len: usize) ?usize {
     return null;
 }
 
-// ─── Network I/O ───
+// ─── Network I/O (cross-platform) ───
 
 const QueryResponse = struct {
     data: [MAX_RESPONSE]u8,
     len: usize,
 };
 
+/// Cross-platform poll: check if a socket is readable within timeout_ms.
+/// Returns > 0 if readable, 0 on timeout, < 0 on error.
+fn pollReadFd(fd: posix.socket_t, timeout_ms: i32) i32 {
+    if (comptime is_windows) {
+        const ws2 = std.os.windows.ws2_32;
+        var fds = [1]ws2.pollfd{.{ .fd = fd, .events = ws2.POLL.IN, .revents = 0 }};
+        return ws2.WSAPoll(&fds, 1, timeout_ms);
+    } else {
+        var fds = [_]posix.pollfd{
+            .{ .fd = fd, .events = posix.POLL.IN, .revents = 0 },
+        };
+        const rc = posix.poll(&fds, timeout_ms) catch return -1;
+        if (rc == 0) return 0;
+        if (fds[0].revents & posix.POLL.IN != 0) return 1;
+        return 0;
+    }
+}
+
+/// Cross-platform socket close.
+fn closeFd(fd: posix.socket_t) void {
+    if (comptime is_windows) {
+        const ws2 = std.os.windows.ws2_32;
+        _ = ws2.closesocket(fd);
+    } else {
+        posix.close(fd);
+    }
+}
+
 /// Send a DNS query to a nameserver and wait for a response (2s timeout).
 fn sendQuery(nameserver: [4]u8, port: u16, query: []const u8) ?QueryResponse {
     const sock_fd = posix.socket(posix.AF.INET, posix.SOCK.DGRAM, 0) catch return null;
-    defer posix.close(sock_fd);
+    defer closeFd(sock_fd);
 
     const addr = posix.sockaddr.in{
         .family = posix.AF.INET,
@@ -345,12 +391,9 @@ fn sendQuery(nameserver: [4]u8, port: u16, query: []const u8) ?QueryResponse {
 
     _ = posix.sendto(sock_fd, query, 0, @ptrCast(&addr), @sizeOf(posix.sockaddr.in)) catch return null;
 
-    // Wait for response with 2s timeout
-    var fds = [_]posix.pollfd{
-        .{ .fd = sock_fd, .events = posix.POLL.IN, .revents = 0 },
-    };
-    const ready = posix.poll(&fds, 2000) catch return null;
-    if (ready == 0) return null;
+    // Wait for response with 2s timeout (cross-platform)
+    const ready = pollReadFd(sock_fd, 2000);
+    if (ready <= 0) return null;
 
     var result: QueryResponse = undefined;
     const n = posix.recvfrom(sock_fd, &result.data, 0, null, null) catch return null;

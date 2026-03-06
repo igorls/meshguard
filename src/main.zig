@@ -5,7 +5,7 @@ const Config = lib.config.Config;
 const Identity = lib.identity.Keys;
 const posix = std.posix;
 
-const version = "0.7.0";
+const version = "0.8.0";
 
 const usage =
     \\meshguard — decentralized WireGuard mesh VPN daemon
@@ -1148,26 +1148,28 @@ fn cmdConnect(allocator: std.mem.Allocator, extra_args: []const []const u8) !voi
     const gossip_port: u16 = 51821;
 
     // Stop running service first (otherwise we can't bind the port)
-    const was_running = blk: {
-        const stat = std.fs.openFileAbsolute("/etc/systemd/system/meshguard.service", .{}) catch break :blk false;
-        stat.close();
-        // Check if service is active
-        var child = std.process.Child.init(&.{ "systemctl", "is-active", "--quiet", "meshguard" }, allocator);
-        child.stderr_behavior = .Ignore;
-        child.stdout_behavior = .Ignore;
-        const term = child.spawnAndWait() catch break :blk false;
-        break :blk (term.Exited == 0);
-    };
+    // Only relevant on Linux where systemd may be managing the service.
+    if (comptime @import("builtin").os.tag == .linux) {
+        const was_running = blk: {
+            const stat = std.fs.openFileAbsolute("/etc/systemd/system/meshguard.service", .{}) catch break :blk false;
+            stat.close();
+            // Check if service is active
+            var child = std.process.Child.init(&.{ "systemctl", "is-active", "--quiet", "meshguard" }, allocator);
+            child.stderr_behavior = .Ignore;
+            child.stdout_behavior = .Ignore;
+            const term = child.spawnAndWait() catch break :blk false;
+            break :blk (term.Exited == 0);
+        };
 
-    if (was_running) {
-        try stdout.writeAll("  stopping meshguard service (need gossip port)...\n");
-        var stop = std.process.Child.init(&.{ "systemctl", "stop", "meshguard" }, allocator);
-        stop.stderr_behavior = .Ignore;
-        stop.stdout_behavior = .Ignore;
-        _ = stop.spawnAndWait() catch {};
-        // Brief pause for port to be released
-        const ts = std.os.linux.timespec{ .sec = 1, .nsec = 0 };
-        _ = std.os.linux.nanosleep(&ts, null);
+        if (was_running) {
+            try stdout.writeAll("  stopping meshguard service (need gossip port)...\n");
+            var stop = std.process.Child.init(&.{ "systemctl", "stop", "meshguard" }, allocator);
+            stop.stderr_behavior = .Ignore;
+            stop.stdout_behavior = .Ignore;
+            _ = stop.spawnAndWait() catch {};
+            // Brief pause for port to be released
+            std.Thread.sleep(1 * std.time.ns_per_s);
+        }
     }
 
     // Bind to the gossip port (same port meshguard up will use)
@@ -1414,40 +1416,42 @@ fn finalizePunch(
     try stdout.writeAll("  To start the mesh:\n");
     try writeFormatted(stdout, "    meshguard up --seed {s}\n\n", .{peer_ep});
 
-    // Check if systemd service exists and offer auto-restart
-    const service_exists = blk: {
-        const stat = std.fs.openFileAbsolute("/etc/systemd/system/meshguard.service", .{}) catch break :blk false;
-        stat.close();
-        break :blk true;
-    };
+    // Check if systemd service exists and offer auto-restart (Linux only)
+    if (comptime @import("builtin").os.tag == .linux) {
+        const service_exists = blk: {
+            const stat = std.fs.openFileAbsolute("/etc/systemd/system/meshguard.service", .{}) catch break :blk false;
+            stat.close();
+            break :blk true;
+        };
 
-    if (service_exists) {
-        try stdout.writeAll("  systemd service detected. Restart now? [Y/n] ");
+        if (service_exists) {
+            try stdout.writeAll("  systemd service detected. Restart now? [Y/n] ");
 
-        const stdin = std.fs.File.stdin();
-        var input_buf: [16]u8 = undefined;
-        const input_len = stdin.read(&input_buf) catch 0;
-        const answer = std.mem.trimRight(u8, input_buf[0..input_len], "\n\r \t");
+            const stdin = std.fs.File.stdin();
+            var input_buf: [16]u8 = undefined;
+            const input_len = stdin.read(&input_buf) catch 0;
+            const answer = std.mem.trimRight(u8, input_buf[0..input_len], "\n\r \t");
 
-        if (answer.len == 0 or answer[0] == 'Y' or answer[0] == 'y') {
-            try stdout.writeAll("  restarting meshguard service...\n");
-            var child = std.process.Child.init(&.{ "systemctl", "restart", "meshguard" }, allocator);
-            child.stderr_behavior = .Ignore;
-            child.stdout_behavior = .Ignore;
-            const term = child.spawnAndWait() catch {
-                try stderr.writeAll("  warning: failed to restart service. Run manually:\n");
-                try stderr.writeAll("    sudo systemctl restart meshguard\n");
-                return;
-            };
-            if (term.Exited == 0) {
-                try stdout.writeAll("  ✓ meshguard service restarted\n");
+            if (answer.len == 0 or answer[0] == 'Y' or answer[0] == 'y') {
+                try stdout.writeAll("  restarting meshguard service...\n");
+                var child = std.process.Child.init(&.{ "systemctl", "restart", "meshguard" }, allocator);
+                child.stderr_behavior = .Ignore;
+                child.stdout_behavior = .Ignore;
+                const term = child.spawnAndWait() catch {
+                    try stderr.writeAll("  warning: failed to restart service. Run manually:\n");
+                    try stderr.writeAll("    sudo systemctl restart meshguard\n");
+                    return;
+                };
+                if (term.Exited == 0) {
+                    try stdout.writeAll("  ✓ meshguard service restarted\n");
+                } else {
+                    try stderr.writeAll("  warning: systemctl returned non-zero. Run manually:\n");
+                    try stderr.writeAll("    sudo systemctl restart meshguard\n");
+                }
             } else {
-                try stderr.writeAll("  warning: systemctl returned non-zero. Run manually:\n");
-                try stderr.writeAll("    sudo systemctl restart meshguard\n");
+                try stdout.writeAll("  Remember to restart the service soon (NAT mapping expires):\n");
+                try stdout.writeAll("    sudo systemctl restart meshguard\n");
             }
-        } else {
-            try stdout.writeAll("  Remember to restart the service soon (NAT mapping expires):\n");
-            try stdout.writeAll("    sudo systemctl restart meshguard\n");
         }
     }
 }
@@ -2533,15 +2537,15 @@ fn processIncomingPacket(
     }
 }
 
-/// Userspace multiplexed event loop with multi-threaded data plane.
+/// Windows event loop — single-threaded WG data plane + SWIM gossip.
 ///
-/// Architecture (parallel mode, encrypt_workers > 0):
-/// - N TUN reader threads: read from TUN queues, split GSO, push to EncryptQueue.
-/// Windows event loop — simplified single-threaded processing.
-///
-/// Uses swim.tick() which handles its own UDP polling, combined with
-/// TUN reads between ticks. The SWIM protocol handles gossip, failure
-/// detection, and incoming packet dispatching.
+/// Architecture:
+///   1. Poll UDP socket → classify incoming packets (WG handshake/transport, SWIM, STUN)
+///   2. Decrypt WG transport → service filter → write plaintext to Wintun
+///   3. Poll Wintun → read outbound IP packets → route by mesh IP → encrypt → UDP send
+///   4. SWIM tick for gossip, failure detection, and NAT traversal
+///   5. Periodic handshake initiation for peers without active tunnels
+///   6. Control socket polling for status queries
 fn windowsEventLoop(
     swim: *lib.discovery.Swim.SwimProtocol,
     wg_dev: *lib.wireguard.Device.WgDevice,
@@ -2551,26 +2555,117 @@ fn windowsEventLoop(
     service_filter: *const lib.services.Policy.ServiceFilter,
     control_socket: *lib.services.Control.ControlSocket,
 ) !void {
-    _ = wg_dev;
-    _ = udp_sock;
-    _ = service_filter;
-    _ = stdout;
+    const Device = lib.wireguard.Device;
+    const Noise = lib.wireguard.Noise;
 
     var tun_buf: [65536]u8 = undefined;
+    var udp_recv_buf: [2048]u8 = undefined;
+    var decrypt_buf: [1500]u8 = undefined;
+    var encrypt_buf: [2048]u8 = undefined; // 16B header + 1500B payload + 16B poly1305 tag
+    var last_handshake_check_ns: i128 = 0;
 
     while (swim.running.load(.acquire)) {
-        // 1. SWIM protocol tick (handles UDP poll + gossip + failure detection)
+        // ─── 1. SWIM protocol tick (gossip, failure detection, NAT) ───
         swim.tick() catch {};
 
-        // 2. Read TUN packets (outbound traffic from local apps)
-        // Short poll — don't block long or SWIM gossip will stall
-        if (tun_dev.pollRead(5) catch false) {
-            // Drain TUN packets — full WG encryption integration will be
-            // added when the data plane is wired up for Windows
-            _ = tun_dev.read(&tun_buf) catch 0;
+        // ─── 2. Process incoming UDP packets (WG + SWIM multiplexed) ───
+        // Drain up to 64 packets per iteration to stay responsive
+        var udp_count: u32 = 0;
+        while (udp_count < 64) : (udp_count += 1) {
+            const recv = (udp_sock.recvFrom(&udp_recv_buf) catch break) orelse break;
+            const pkt = recv.data;
+
+            switch (Device.PacketType.classify(pkt)) {
+                .wg_handshake_init => {
+                    if (pkt.len >= @sizeOf(Noise.HandshakeInitiation)) {
+                        const msg: *const Noise.HandshakeInitiation = @ptrCast(@alignCast(pkt.ptr));
+                        if (wg_dev.handleInitiation(msg)) |hs_result| {
+                            const resp_bytes = std.mem.asBytes(&hs_result.response);
+                            _ = udp_sock.sendTo(resp_bytes, recv.sender_addr, recv.sender_port) catch 0;
+                            writeFormatted(stdout, "  WG handshake: responded to initiation\n", .{}) catch {};
+                        } else |_| {}
+                    }
+                },
+                .wg_handshake_resp => {
+                    if (pkt.len >= @sizeOf(Noise.HandshakeResponse)) {
+                        const msg: *const Noise.HandshakeResponse = @ptrCast(@alignCast(pkt.ptr));
+                        if (wg_dev.handleResponse(msg)) |slot| {
+                            if (wg_dev.peers[slot]) |*p| {
+                                p.endpoint_addr = recv.sender_addr;
+                                p.endpoint_port = recv.sender_port;
+                            }
+                            writeFormatted(stdout, "  WG handshake: completed with peer\n", .{}) catch {};
+                        } else |_| {}
+                    }
+                },
+                .wg_transport => {
+                    // Decrypt WG transport → write plaintext to Wintun
+                    if (wg_dev.decryptTransport(pkt, &decrypt_buf)) |result| {
+                        // Apply service filter before writing to TUN
+                        const PolicyMod = lib.services.Policy;
+                        if (PolicyMod.parseTransportHeader(decrypt_buf[0..result.len])) |ti| {
+                            if (wg_dev.peers[result.slot]) |peer| {
+                                const org_pk = if (swim.membership.peers.getPtr(peer.identity_key)) |mp| mp.org_pubkey else null;
+                                if (!service_filter.check(peer.identity_key, org_pk, ti.proto, ti.dst_port)) continue;
+                            }
+                        }
+                        tun_dev.write(decrypt_buf[0..result.len]) catch {};
+                    } else |_| {}
+                },
+                .wg_cookie => {},
+                .stun => swim.feedPacket(pkt, recv.sender_addr, recv.sender_port),
+                .swim => swim.feedPacket(pkt, recv.sender_addr, recv.sender_port),
+                .unknown => {},
+            }
         }
 
-        // 3. Poll control socket for status queries
+        // ─── 3. Read Wintun → encrypt → send via UDP ───
+        // Drain outbound TUN packets (up to 64 per iteration)
+        var tun_count: u32 = 0;
+        while (tun_count < 64) : (tun_count += 1) {
+            const tun_n = tun_dev.read(&tun_buf) catch break;
+            if (tun_n == 0) break;
+
+            const ip_pkt = tun_buf[0..tun_n];
+
+            // Route by destination mesh IP (IPv4 only, dst at offset 16)
+            if (tun_n < 20) continue;
+            const dst_ip: [4]u8 = .{ ip_pkt[16], ip_pkt[17], ip_pkt[18], ip_pkt[19] };
+
+            if (wg_dev.lookupByMeshIp(dst_ip)) |slot| {
+                const peer = wg_dev.peers[slot] orelse continue;
+                if (peer.endpoint_port == 0) continue; // No endpoint yet
+
+                // Encrypt and send
+                if (wg_dev.encryptForPeer(slot, ip_pkt, &encrypt_buf)) |enc_len| {
+                    _ = udp_sock.sendTo(encrypt_buf[0..enc_len], peer.endpoint_addr, peer.endpoint_port) catch {};
+                } else |_| {
+                    // No tunnel — attempt handshake if due
+                    if (wg_dev.initiateHandshake(slot)) |init_msg| {
+                        const init_bytes = std.mem.asBytes(&init_msg);
+                        _ = udp_sock.sendTo(init_bytes, peer.endpoint_addr, peer.endpoint_port) catch {};
+                    } else |_| {} // rate-limited or other error
+                }
+            }
+        }
+
+        // ─── 4. Periodic handshake initiation for peers without tunnels ───
+        const now_ns = std.time.nanoTimestamp();
+        if (now_ns - last_handshake_check_ns >= 10 * std.time.ns_per_s) {
+            last_handshake_check_ns = now_ns;
+            for (&wg_dev.peers, 0..) |*slot, i| {
+                if (slot.*) |peer| {
+                    if (peer.active_tunnel == null and peer.endpoint_port != 0) {
+                        if (wg_dev.initiateHandshake(i)) |init_msg| {
+                            const init_bytes = std.mem.asBytes(&init_msg);
+                            _ = udp_sock.sendTo(init_bytes, peer.endpoint_addr, peer.endpoint_port) catch {};
+                        } else |_| {}
+                    }
+                }
+            }
+        }
+
+        // ─── 5. Poll control socket for status queries ───
         _ = control_socket.poll();
     }
 }
