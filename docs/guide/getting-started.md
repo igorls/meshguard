@@ -2,6 +2,8 @@
 
 ## Install
 
+### Linux
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/igorls/meshguard/main/install.sh | bash
 ```
@@ -13,6 +15,18 @@ This will:
 - Download the latest release from [GitHub Releases](https://github.com/igorls/meshguard/releases/latest)
 - Install to `/usr/local/bin/meshguard`
 
+### Windows
+
+```powershell
+irm https://raw.githubusercontent.com/igorls/meshguard/main/install.ps1 | iex
+```
+
+This will:
+
+- Download `meshguard.exe` and `wintun.dll` from the latest release
+- Install to `%LOCALAPPDATA%\meshguard\`
+- Add to your user PATH
+
 ::: tip Manual download
 You can also download binaries directly from the [releases page](https://github.com/igorls/meshguard/releases/latest).
 :::
@@ -21,12 +35,12 @@ You can also download binaries directly from the [releases page](https://github.
 
 Alternatively, build from source with [Zig](https://ziglang.org/download/) 0.15+:
 
-| Requirement     | Details                                          |
-| --------------- | ------------------------------------------------ |
-| **Zig**         | 0.15 or later                                    |
-| **libsodium**   | `libsodium-dev` for building                     |
-| **OS**          | Linux (kernel WireGuard module _or_ TUN support) |
-| **Permissions** | `sudo` or `CAP_NET_ADMIN` for interface creation |
+| Requirement     | Linux                                            | Windows                            |
+| --------------- | ------------------------------------------------ | ---------------------------------- |
+| **Zig**         | 0.15 or later                                    | 0.15 or later                      |
+| **libsodium**   | `libsodium-dev` for building                     | Not required                       |
+| **OS**          | Kernel WireGuard module _or_ TUN support         | Windows 10+ with Wintun            |
+| **Permissions** | `sudo` or `CAP_NET_ADMIN` for interface creation | Administrator for `meshguard up`   |
 
 ```bash
 # Debug build
@@ -54,7 +68,10 @@ Every meshguard node needs an Ed25519 keypair. Generate one:
 meshguard keygen
 ```
 
-This creates two files in `~/.config/meshguard/`:
+This creates two files in your config directory:
+
+- **Linux**: `~/.config/meshguard/` (or `/etc/meshguard/` as root)
+- **Windows**: `%APPDATA%\meshguard\`
 
 | File           | Contents                                 |
 | -------------- | ---------------------------------------- |

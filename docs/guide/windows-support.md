@@ -1,36 +1,60 @@
-# Windows Support — Developer Guide
+# Windows Support
 
-> **Status**: Phase 1 complete (compilation + CLI commands). Daemon runtime not yet functional.
+> **Status**: Full support — daemon, CLI, WireGuard data plane, and control socket all functional.
 
-## What Works on Windows Today
+## Install
 
-The codebase compiles for `x86_64-windows` and the following commands work:
-
-| Command                 | Status   | Notes                                                       |
-| ----------------------- | -------- | ----------------------------------------------------------- |
-| `meshguard keygen`      | ✅       | chmod skipped via comptime guard                            |
-| `meshguard export`      | ✅       |                                                             |
-| `meshguard trust`       | ✅       |                                                             |
-| `meshguard revoke`      | ✅       |                                                             |
-| `meshguard version`     | ✅       |                                                             |
-| `meshguard config show` | ✅       |                                                             |
-| `meshguard up`          | ❌ exits | "userspace WG mode requires Linux (TUN device + rtnetlink)" |
-| `meshguard down`        | ❌ exits | "only supported on Linux (requires netlink)"                |
-| `meshguard status`      | ❌ exits | "only supported on Linux (requires netlink)"                |
-
-## Cross-compilation
-
-```bash
-# Windows x86_64
-zig build -Dtarget=x86_64-windows -Doptimize=ReleaseFast
-
-# The build system already handles:
-#   - Excludes libsodium linking (uses std.crypto)
-#   - Links ws2_32 for Winsock
-#   - Skips TUN-related modules
+```powershell
+irm https://raw.githubusercontent.com/igorls/meshguard/main/install.ps1 | iex
 ```
 
-## Architecture Overview
+This will:
+
+- Download `meshguard.exe` and `wintun.dll` from the latest release
+- Install to `%LOCALAPPDATA%\meshguard\`
+- Add to your user PATH
+
+::: tip Manual download
+Download `meshguard-windows-amd64.exe` and `wintun.dll` from the [releases page](https://github.com/igorls/meshguard/releases/latest). Place both files in the same directory.
+:::
+
+## Quick Start
+
+```powershell
+# Generate identity (stored in %APPDATA%\meshguard\)
+meshguard keygen
+
+# Export your public key
+meshguard export > my-node.pub
+
+# Trust a peer
+meshguard trust peer.pub --name my-peer
+
+# Join the mesh (must run as Administrator)
+meshguard up --seed 1.2.3.4:51821
+
+# If the machine has a public IP, announce it
+meshguard up --announce 203.0.113.42
+```
+
+::: warning Administrator Required
+`meshguard up` creates a Wintun network adapter, which requires Administrator privileges. Right-click your terminal → **Run as Administrator**.
+:::
+
+## What Works
+
+| Command | Status | Notes |
+|---|---|---|
+| `meshguard keygen` | ✅ | Keys stored in `%APPDATA%\meshguard\` |
+| `meshguard export` | ✅ | |
+| `meshguard trust` | ✅ | |
+| `meshguard revoke` | ✅ | |
+| `meshguard version` | ✅ | |
+| `meshguard config show` | ✅ | |
+| `meshguard up` | ✅ | Requires Admin + wintun.dll |
+| `meshguard status` | ✅ | Via named pipe `\\.\pipe\meshguard` |
+
+## Architecture
 
 ```
 ┌──────────────────────────────────────────────────────┐
@@ -46,172 +70,49 @@ zig build -Dtarget=x86_64-windows -Doptimize=ReleaseFast
 │  ┌──────────┐  ┌──────────────┐  ┌────────────────┐  │
 │  │  Network │  │  TUN Device  │  │  Event Loop    │  │
 │  │  (UDP)   │  │              │  │                │  │
-│  │ ✅ DONE  │  │ ❌ WINTUN    │  │ ❌ IOCP/poll   │  │
+│  │ ✅ DONE  │  │ ✅ Wintun    │  │ ✅ Single-thrd │  │
 │  └──────────┘  └──────────────┘  └────────────────┘  │
 │  ┌──────────┐  ┌──────────────┐  ┌────────────────┐  │
 │  │ Control  │  │   Signals    │  │  Interface     │  │
 │  │ Socket   │  │              │  │  Mgmt          │  │
-│  │ ❌ Pipes │  │ ❌ CtrlHandler│ │ ❌ No netlink  │  │
+│  │ ✅ Pipes │  │ ✅ CtrlHandler│ │ ✅ netsh       │  │
 │  └──────────┘  └──────────────┘  └────────────────┘  │
 └──────────────────────────────────────────────────────┘
 ```
 
-## What Needs to Be Done
+## Platform Differences
 
-### Phase 2: TUN Device (Wintun)
+| Feature | Linux | Windows |
+|---|---|---|
+| TUN driver | `/dev/net/tun` | Wintun (`wintun.dll`) |
+| WG mode | Kernel or userspace | Userspace only |
+| Crypto | libsodium (AVX2) | `std.crypto` |
+| Control socket | Unix domain socket | Named pipe (`\\.\pipe\meshguard`) |
+| Signal handling | `signalfd` | `SetConsoleCtrlHandler` |
+| Interface config | Netlink / `ip` | `netsh` |
+| Config directory | `/etc/meshguard/` or `~/.config/meshguard/` | `%APPDATA%\meshguard\` |
+| Event loop | Multi-threaded (io_uring planned) | Single-threaded |
 
-**Priority: HIGHEST** — This is the main blocker for the daemon.
-
-**Location**: Create `src/net/wintun.zig`
-
-Wintun is a lightweight TUN driver for Windows (used by the official WireGuard Windows client). It provides a userspace API via a DLL.
-
-**Steps**:
-
-1. Download `wintun.dll` from https://www.wintun.net and include in the repo or document download
-2. Implement `WintunDevice` struct matching the `TunDevice` API surface:
-   - `init() → WintunDevice` — call `WintunCreateAdapter`, `WintunStartSession`
-   - `read(buf) → []u8` — call `WintunReceivePacket`, copy, `WintunReleaseReceivePacket`
-   - `write(data)` — call `WintunAllocateSendPacket`, copy, `WintunSendPacket`
-   - `close()` — call `WintunEndSession`, `WintunCloseAdapter`
-3. Use `@import("builtin").os.tag == .windows` to switch between `TunDevice` and `WintunDevice`
-4. Assign mesh IP on the Wintun adapter via `netsh` or Windows API
-
-**Wintun API** (loaded dynamically from `wintun.dll`):
-
-```
-WintunCreateAdapter(name, tunnel_type) → ADAPTER
-WintunCloseAdapter(adapter)
-WintunStartSession(adapter, capacity) → SESSION
-WintunEndSession(session)
-WintunReceivePacket(session, *size) → *packet
-WintunReleaseReceivePacket(session, packet)
-WintunAllocateSendPacket(session, size) → *packet
-WintunSendPacket(session, packet)
-```
-
-**Reference**: [wintun.h](https://git.zx2c4.com/wintun/tree/api/wintun.h)
-
-### Phase 3: Event Loop
-
-**Location**: `src/main.zig` — `userspaceEventLoop` function (line ~2466)
-
-The current event loop uses `poll()` on three file descriptors (gossip UDP, TUN, signal pipe). Windows alternatives:
-
-| Linux                | Windows                                       | Notes                            |
-| -------------------- | --------------------------------------------- | -------------------------------- |
-| `poll()` on TUN fd   | `WintunReceivePacket` (blocking with timeout) | Or use a reader thread           |
-| `poll()` on UDP fd   | `WSAPoll()`                                   | Already implemented in `udp.zig` |
-| Signal pipe          | `SetConsoleCtrlHandler` callback              | Set a global atomic flag         |
-| `fcntl` non-blocking | `ioctlsocket(FIONBIO)`                        | Already in `udp.zig`             |
-
-**Recommended approach**: Dual-thread architecture
-
-- **Thread 1**: Wintun read loop → feed packets to WgDevice
-- **Thread 2**: UDP poll loop (gossip + WG handshakes) — reuse existing `userspaceEventLoop` structure with `WSAPoll`
-
-### Phase 4: Interface Management
-
-**Location**: `src/wireguard/wg_config.zig` (currently Linux netlink only)
-
-Replace netlink calls with Windows equivalents:
-
-| Operation        | Linux          | Windows                                                           |
-| ---------------- | -------------- | ----------------------------------------------------------------- |
-| Create interface | `RTM_NEWLINK`  | Wintun creates the adapter                                        |
-| Assign IP        | `RTM_NEWADDR`  | `netsh interface ip set address` or `CreateUnicastIpAddressEntry` |
-| Set MTU          | `RTM_NEWLINK`  | `netsh interface ipv4 set subinterface`                           |
-| Delete interface | `RTM_DELLINK`  | `WintunCloseAdapter`                                              |
-| Add route        | `RTM_NEWROUTE` | `CreateIpForwardEntry2`                                           |
-
-### Phase 5: Signal Handling
-
-**Location**: `src/main.zig` — `installSignalHandler` (line ~1436)
-
-```zig
-if (comptime builtin.os.tag == .windows) {
-    // Use SetConsoleCtrlHandler for Ctrl+C / service stop
-    const kernel32 = std.os.windows.kernel32;
-    _ = kernel32.SetConsoleCtrlHandler(&windowsCtrlHandler, 1);
-}
-
-fn windowsCtrlHandler(ctrl_type: u32) callconv(.C) c_int {
-    if (ctrl_type == 0 or ctrl_type == 2) { // CTRL_C or CTRL_CLOSE
-        if (g_swim_stop) |swim| swim.stop();
-        return 1; // Handled
-    }
-    return 0;
-}
-```
-
-### Phase 6: Control Socket
-
-**Location**: `src/services/control.zig`
-
-Unix domain sockets → Windows Named Pipes:
-
-| Linux                 | Windows                                  |
-| --------------------- | ---------------------------------------- |
-| `AF_UNIX` socket      | `CreateNamedPipe` (`\\.\pipe\meshguard`) |
-| `accept()` + `read()` | `ConnectNamedPipe` + `ReadFile`          |
-| `write()`             | `WriteFile`                              |
-
-The control socket already has `comptime` guard — listen() is a no-op on Windows.
-
-## Comptime Guards Reference
-
-All POSIX-only code is already guarded. Search for these patterns:
-
-```zig
-// Guard pattern (blocks on non-Linux):
-if (comptime @import("builtin").os.tag != .linux) {
-    try stderr.writeAll("error: ...\n");
-    std.process.exit(1);
-}
-
-// Guard pattern (skips on Windows):
-if (comptime @import("builtin").os.tag == .linux) {
-    // Linux-only code
-}
-
-// Guard pattern (skips chmod on Windows):
-if (comptime @import("builtin").os.tag != .windows) {
-    try sk_file.chmod(0o600);
-}
-```
-
-## Files to Create / Modify
-
-| File                          | Action  | Purpose                                                   |
-| ----------------------------- | ------- | --------------------------------------------------------- |
-| `src/net/wintun.zig`          | **NEW** | Wintun adapter wrapper                                    |
-| `src/main.zig`                | MODIFY  | Windows event loop branch, signal handler, interface name |
-| `src/wireguard/wg_config.zig` | MODIFY  | Windows IP/route configuration                            |
-| `src/services/control.zig`    | MODIFY  | Named pipe implementation                                 |
-| `build.zig`                   | MODIFY  | Bundle `wintun.dll`, add Windows-specific link flags      |
-
-## Testing on Windows
+## Building from Source
 
 ```powershell
-# Build on Linux, copy to Windows:
+# Native Windows build
+zig build -Doptimize=ReleaseFast
+# → zig-out/bin/meshguard.exe + wintun.dll
+
+# Cross-compile from Linux
 zig build -Dtarget=x86_64-windows -Doptimize=ReleaseFast
-# → zig-out/bin/meshguard.exe
 
-# Test CLI commands (should work today):
-.\meshguard.exe keygen
-.\meshguard.exe export
-.\meshguard.exe trust <key>
-
-# Test daemon (blocked on wintun):
-.\meshguard.exe up --seed 1.2.3.4:51821
-# → "error: userspace WireGuard mode requires Linux"
+# Run tests
+zig build test
 ```
+
+The build system automatically copies `wintun.dll` from `deps/wintun/` alongside the binary.
 
 ## Dependencies
 
-| Dependency | Linux                 | Windows                       |
-| ---------- | --------------------- | ----------------------------- |
-| libsodium  | Required (AVX2 accel) | Not used (`std.crypto`)       |
-| Wintun     | N/A                   | Required for TUN              |
-| ws2_32     | N/A                   | Already linked in `build.zig` |
-| kernel32   | N/A                   | For `SetConsoleCtrlHandler`   |
+| Dependency | Purpose | Source |
+|---|---|---|
+| `wintun.dll` | TUN adapter driver | Bundled from [wintun.net](https://www.wintun.net/) |
+| `ws2_32` | Winsock2 sockets | Linked by `build.zig` |
+| `kernel32` | Named pipes, signals | System |

@@ -22,35 +22,51 @@ jobs:
         with:
           version: 0.15.0
 
-      - name: Build
+      # ─── Linux amd64 ───
+      - name: Build Linux amd64
         run: zig build -Doptimize=ReleaseFast
 
-      - name: Rename binary
+      - name: Rename Linux binary
         run: mv zig-out/bin/meshguard meshguard-linux-amd64
 
-      - name: Generate checksum
-        run: sha256sum meshguard-linux-amd64 > checksums.txt
+      # ─── Windows amd64 (cross-compile) ───
+      - name: Build Windows amd64
+        run: zig build -Dtarget=x86_64-windows -Doptimize=ReleaseFast
 
+      - name: Rename Windows binary
+        run: mv zig-out/bin/meshguard.exe meshguard-windows-amd64.exe
+
+      - name: Copy wintun.dll
+        run: cp deps/wintun/wintun.dll wintun.dll
+
+      # ─── Checksums ───
+      - name: Generate checksums
+        run: sha256sum meshguard-linux-amd64 meshguard-windows-amd64.exe wintun.dll > checksums.txt
+
+      # ─── Release ───
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           files: |
             meshguard-linux-amd64
+            meshguard-windows-amd64.exe
+            wintun.dll
             checksums.txt
           body: |
             ## Install
 
+            **Linux:**
             ```bash
             curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | bash
             ```
 
-            Or download manually and install:
-
-            ```bash
-            curl -fSLo meshguard https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/meshguard-linux-amd64
-            chmod +x meshguard
-            sudo mv meshguard /usr/local/bin/
+            **Windows (PowerShell as Admin):**
+            ```powershell
+            irm https://raw.githubusercontent.com/${{ github.repository }}/main/install.ps1 | iex
             ```
 
-            **Runtime dependency:** `libsodium` — the install script handles this automatically.
+            Or download manually from the assets below.
+
+            **Linux runtime dependency:** `libsodium` — the install script handles this automatically.
+            **Windows runtime dependency:** `wintun.dll` — bundled in the release and install script.

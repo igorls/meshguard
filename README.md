@@ -68,10 +68,21 @@ Building a secure mesh network between N nodes (blockchain validators, edge serv
 
 ## Quick Start
 
-```bash
-# Build
-zig build
+### Install
 
+**Linux:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/igorls/meshguard/main/install.sh | bash
+```
+
+**Windows (PowerShell as Admin):**
+```powershell
+irm https://raw.githubusercontent.com/igorls/meshguard/main/install.ps1 | iex
+```
+
+### Usage
+
+```bash
 # Generate identity
 meshguard keygen
 
@@ -84,7 +95,7 @@ meshguard trust /path/to/peer.pub --name validator-3
 # Join the mesh (userspace WireGuard — default)
 meshguard up --seed 1.2.3.4:51821
 
-# Join the mesh (kernel WireGuard)
+# Join the mesh (kernel WireGuard — Linux only)
 meshguard up --seed 1.2.3.4:51821 --kernel
 
 # Check status
@@ -261,6 +272,13 @@ docker compose -f docker-compose.bench.yml up
 - **libsodium** (`libsodium-dev` for building, `libsodium23` at runtime)
 - `sudo` or `CAP_NET_ADMIN` for interface creation
 
+### Windows
+
+- **Zig 0.15+** (for building from source)
+- **Administrator privileges** for TUN interface creation
+- **wintun.dll** — bundled automatically by the build system and install script
+- No libsodium needed — uses `std.crypto` on Windows
+
 ### Android (FFI)
 
 - **Zig 0.15+** (cross-compiles to Android targets)
@@ -270,10 +288,10 @@ docker compose -f docker-compose.bench.yml up
 ## Building
 
 ```bash
-# Debug build (Linux server — exe + static lib + FFI shared lib)
+# Debug build (Linux — exe + static lib + FFI shared lib)
 zig build
 
-# Release (optimized, static binary)
+# Release (optimized)
 zig build -Doptimize=ReleaseFast
 
 # Run tests
@@ -282,14 +300,16 @@ zig build test
 # Cross-compile for aarch64 Linux
 zig build -Dtarget=aarch64-linux-gnu -Doptimize=ReleaseFast
 
+# Windows (native or cross-compile)
+zig build -Dtarget=x86_64-windows -Doptimize=ReleaseFast
+# → zig-out/bin/meshguard.exe + wintun.dll
+
 # Android aarch64 (produces libmeshguard-ffi.so only)
 zig build -Dtarget=aarch64-linux-android -Doptimize=ReleaseFast
-
-# Android x86_64 (for emulators)
-zig build -Dtarget=x86_64-linux-android -Doptimize=ReleaseFast
 ```
 
-Android builds produce only `libmeshguard-ffi.so` — the CLI binary, static library, and unit tests are excluded (they require kernel APIs not available on Android).
+Windows builds automatically bundle `wintun.dll` alongside `meshguard.exe`.
+Android builds produce only `libmeshguard-ffi.so` — the CLI binary, static library, and unit tests are excluded.
 
 ## Status
 
@@ -333,7 +353,7 @@ Core functionality is implemented and under active benchmarking:
 - [x] DNS / mDNS seed discovery
 - [ ] macOS support (utun)
 - [ ] FreeBSD support
-- [ ] Windows support (wintun)
+- [x] Windows support (Wintun + named pipe IPC)
 
 ## Mobile / Embedded
 

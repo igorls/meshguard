@@ -68,6 +68,11 @@ pub fn build(b: *std.Build) void {
         }
         b.installArtifact(exe);
 
+        // On Windows, bundle wintun.dll alongside meshguard.exe
+        if (is_windows) {
+            b.installBinFile("deps/wintun/wintun.dll", "wintun.dll");
+        }
+
         // ─── WG interop test binary (Linux only — requires kernel WG) ───
         if (!is_windows) {
             const interop_mod = b.createModule(.{
