@@ -12,3 +12,8 @@
 **Gap:** The documentation stated the SWIM protocol period was 1000ms (1s), but the implementation uses 5000ms (5s) in both `src/config.zig` and `src/discovery/swim.zig`.
 **Learning:** The documentation likely reflected an early design decision or standard SWIM defaults, but the implementation settled on a more conservative 5s interval for WAN stability, and docs were not updated.
 **Prevention:** Add a CI check that grep's `docs/guide/configuration.md` for values that match constants exported in `src/config.zig`.
+
+## 2026-03-06 - CLI reference missing command
+**Gap:** `meshguard connect` command was missing from `docs/reference/cli.md` despite being implemented in `src/main.zig`.
+**Learning:** Adding new commands in `src/main.zig` does not automatically update the CLI reference documentation since CLI parsing is manual. This creates a high risk of documentation drift.
+**Prevention:** Check for undocumented commands by comparing `fn cmd...` implementations in `src/main.zig` against documented commands in `docs/reference/cli.md`.

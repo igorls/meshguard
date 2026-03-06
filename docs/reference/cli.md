@@ -137,6 +137,29 @@ meshguard config show
 
 ---
 
+## `meshguard connect`
+
+Direct peer connection via token exchange (no seed node needed). Performs a coordinated UDP hole punch.
+
+```bash
+meshguard connect --generate [--in <minutes>]
+meshguard connect --join <mg://token>
+```
+
+| Flag           | Description                                    |
+| -------------- | ---------------------------------------------- |
+| `--generate`   | Generate an initial token to share with a peer |
+| `--join`       | Accept a token and generate a response token   |
+| `--in <mins>`  | Delay until punch time (default: 1 minute)     |
+
+**Flow:**
+1. Initiator runs `--generate` and shares the `mg://` token with the peer.
+2. Peer runs `--join <token>` and shares the generated response token back.
+3. Initiator pastes the response token.
+4. Both sides punch simultaneously (NTP-synced).
+
+---
+
 ## `meshguard service`
 
 Manage service access control policies (port-level allow/deny rules).
