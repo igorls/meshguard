@@ -1,0 +1,3 @@
+## 2024-05-24 - Branch Misprediction Optimization for Packet Classification
+**Learning:** In Zig, standard `switch` statements on integers compile to jump tables. Extracting the dominant case (like data-plane packets `wg_transport` which is 99.9% of traffic) into an explicit `if` branch before a `switch` improves branch prediction and avoids jump table overhead.
+**Action:** When classifying packets on the hot path, explicitly use an `if` statement for the most common case, falling back to a `switch` for the less common ones. Also, use the `inline` keyword on small, frequently called classification functions to eliminate function call overhead.

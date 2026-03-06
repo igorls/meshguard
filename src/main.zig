@@ -2486,7 +2486,29 @@ fn processIncomingPacket(
 ) void {
     const Device = lib.wireguard.Device;
 
-    switch (Device.PacketType.classify(pkt)) {
+    const pkt_type = Device.PacketType.classify(pkt);
+
+    // Optimization: Fast path for data plane transport to avoid jump table overhead
+    if (pkt_type == .wg_transport) {
+        if (n_decrypted.* < 64) {
+            if (wg_dev.decryptTransport(pkt, &decrypt_storage[n_decrypted.*])) |result| {
+                // Check service filter before buffering
+                const PolicyMod = lib.services.Policy;
+                if (PolicyMod.parseTransportHeader(decrypt_storage[n_decrypted.*][0..result.len])) |ti| {
+                    if (wg_dev.peers[result.slot]) |peer| {
+                        const org_pk = if (swim.membership.peers.getPtr(peer.identity_key)) |mp| mp.org_pubkey else null;
+                        if (!service_filter.check(peer.identity_key, org_pk, ti.proto, ti.dst_port)) return;
+                    }
+                }
+                decrypt_lens[n_decrypted.*] = result.len;
+                decrypt_slots[n_decrypted.*] = result.slot;
+                n_decrypted.* += 1;
+            } else |_| {}
+        }
+        return;
+    }
+
+    switch (pkt_type) {
         .wg_handshake_init => {
             if (pkt.len >= @sizeOf(lib.wireguard.Noise.HandshakeInitiation)) {
                 const msg: *const lib.wireguard.Noise.HandshakeInitiation = @ptrCast(@alignCast(pkt.ptr));
@@ -2509,27 +2531,10 @@ fn processIncomingPacket(
                 } else |_| {}
             }
         },
-        .wg_transport => {
-            if (n_decrypted.* < 64) {
-                if (wg_dev.decryptTransport(pkt, &decrypt_storage[n_decrypted.*])) |result| {
-                    // Check service filter before buffering
-                    const PolicyMod = lib.services.Policy;
-                    if (PolicyMod.parseTransportHeader(decrypt_storage[n_decrypted.*][0..result.len])) |ti| {
-                        if (wg_dev.peers[result.slot]) |peer| {
-                            const org_pk = if (swim.membership.peers.getPtr(peer.identity_key)) |mp| mp.org_pubkey else null;
-                            if (!service_filter.check(peer.identity_key, org_pk, ti.proto, ti.dst_port)) return;
-                        }
-                    }
-                    decrypt_lens[n_decrypted.*] = result.len;
-                    decrypt_slots[n_decrypted.*] = result.slot;
-                    n_decrypted.* += 1;
-                } else |_| {}
-            }
-        },
         .wg_cookie => {},
         .stun => swim.feedPacket(pkt, sender_addr, sender_port),
         .swim => swim.feedPacket(pkt, sender_addr, sender_port),
-        .unknown => {},
+        .wg_transport, .unknown => {},
     }
 }
 
