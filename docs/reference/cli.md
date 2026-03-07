@@ -95,6 +95,23 @@ meshguard up [options]
 
 ---
 
+## `meshguard connect`
+
+Direct peer connection via token exchange (bypassing seed nodes). Enables coordinated UDP hole punching for peers behind NAT.
+
+```bash
+meshguard connect --generate [--in <minutes>]
+meshguard connect --join <mg://token>
+```
+
+| Flag         | Description                                        |
+| ------------ | -------------------------------------------------- |
+| `--generate` | Generate a connection token (initiator)            |
+| `--in`       | Delay in minutes before punching (default: 1)      |
+| `--join`     | Join a connection using the peer's `mg://` token   |
+
+---
+
 ## `meshguard down`
 
 Stop the daemon and remove the `mg0` interface.
