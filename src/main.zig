@@ -59,6 +59,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     // Initialize libsodium (AVX2 ChaCha20-Poly1305 assembly) — Linux only
+    // macOS and Windows use std.crypto (no libsodium dependency)
     if (comptime @import("builtin").os.tag == .linux) {
         @import("crypto/sodium.zig").init();
     }
@@ -710,7 +711,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
 
     try stdout.writeAll("meshguard starting...\n");
     try writeFormatted(stdout, "  mesh IP: {s}\n", .{ip_str});
-    try writeFormatted(stdout, "  interface: {s}\n", .{if (comptime @import("builtin").os.tag == .linux) lib.wireguard.Config.DEFAULT_IFNAME else "wintun"});
+    try writeFormatted(stdout, "  interface: {s}\n", .{if (comptime @import("builtin").os.tag == .linux) lib.wireguard.Config.DEFAULT_IFNAME else if (comptime @import("builtin").os.tag == .macos) "utun" else "wintun"});
 
     try writeFormatted(stdout, "  mode: {s}\n", .{if (use_kernel_wg) "kernel" else "userspace"});
 
@@ -1045,6 +1046,48 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
 
             // Simplified event loop: alternate between TUN reads and UDP gossip
             windowsEventLoop(&swim, &wg_device, &gossip_socket, &tun_dev, stdout, &service_filter, &control) catch |err| {
+                try writeFormatted(stderr, "error: event loop failed: {s}\n", .{@errorName(err)});
+            };
+        } else if (comptime @import("builtin").os.tag == .macos) {
+            // ─── macOS: utun device + ifconfig/route config + simplified event loop ───
+            const DarwinCfg = lib.net.DarwinCfg;
+
+            var tun_dev = lib.net.Tun.TunDevice.open("utun") catch |err| {
+                try writeFormatted(stderr, "error: failed to open utun device: {s}\n", .{@errorName(err)});
+                try stderr.writeAll("  hint: run with sudo\n");
+                std.process.exit(1);
+            };
+            defer tun_dev.close();
+
+            try writeFormatted(stdout, "  TUN device: {s} (fd={d})\n", .{ tun_dev.getName(), tun_dev.fd });
+
+            // Configure IP address and routing
+            DarwinCfg.setInterfaceIp(allocator, tun_dev.getName(), mesh_ip, 16) catch |err| {
+                try writeFormatted(stderr, "warning: failed to set interface IP: {s}\n", .{@errorName(err)});
+            };
+            DarwinCfg.setInterfaceUp(allocator, tun_dev.getName()) catch |err| {
+                try writeFormatted(stderr, "warning: failed to bring up interface: {s}\n", .{@errorName(err)});
+            };
+            tun_dev.setMtu(1420) catch |err| {
+                try writeFormatted(stderr, "warning: failed to set MTU: {s}\n", .{@errorName(err)});
+            };
+            DarwinCfg.addRoute(allocator, tun_dev.getName(), .{ 10, 99, 0, 0 }, 16) catch |err| {
+                try writeFormatted(stderr, "warning: failed to add mesh route: {s}\n", .{@errorName(err)});
+            };
+
+            try writeFormatted(stdout, "  mesh IP: {d}.{d}.{d}.{d}/16 (mtu=1420)\n", .{
+                mesh_ip[0], mesh_ip[1], mesh_ip[2], mesh_ip[3],
+            });
+
+            // Set TUN fd to non-blocking for the event loop
+            tun_dev.setNonBlocking() catch |err| {
+                try writeFormatted(stderr, "warning: failed to set TUN non-blocking: {s}\n", .{@errorName(err)});
+            };
+
+            try stdout.writeAll("  GSO/GRO offloads: not available (macOS)\n");
+
+            // Run the macOS event loop (simplified, similar to Windows)
+            macosEventLoop(&swim, &wg_device, &gossip_socket, &tun_dev, stdout, &service_filter, &control) catch |err| {
                 try writeFormatted(stderr, "error: event loop failed: {s}\n", .{@errorName(err)});
             };
         } else {
@@ -1470,10 +1513,10 @@ fn signalHandler(sig: i32) callconv(.c) void {
 fn installSignalHandler(swim_ref: *lib.discovery.Swim.SwimProtocol) void {
     g_swim_stop = swim_ref;
 
-    if (comptime @import("builtin").os.tag == .linux) {
+    if (comptime @import("builtin").os.tag == .linux or @import("builtin").os.tag == .macos) {
         const sa: posix.Sigaction = .{
             .handler = .{ .handler = &signalHandler },
-            .mask = .{0} ** @typeInfo(@TypeOf(@as(posix.Sigaction, undefined).mask)).array.len,
+            .mask = std.mem.zeroes(@TypeOf(@as(posix.Sigaction, undefined).mask)),
             .flags = 0,
         };
         posix.sigaction(posix.SIG.INT, &sa, null);
@@ -2672,6 +2715,132 @@ fn windowsEventLoop(
 
         // ─── 6. Short sleep to avoid CPU spin (10ms) ───
         std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+}
+
+/// macOS userspace event loop — simplified single-threaded poll loop.
+///
+/// Similar to windowsEventLoop: alternates between TUN reads and UDP gossip.
+/// No batch I/O or GSO/GRO (not available on macOS utun).
+fn macosEventLoop(
+    swim: *lib.discovery.Swim.SwimProtocol,
+    wg_dev: *lib.wireguard.Device.WgDevice,
+    udp_sock: *lib.net.Udp.UdpSocket,
+    tun_dev: *lib.net.Tun.TunDevice,
+    stdout: std.fs.File,
+    service_filter: *const lib.services.Policy.ServiceFilter,
+    control_socket: *lib.services.Control.ControlSocket,
+) !void {
+    const Device = lib.wireguard.Device;
+    const Noise = lib.wireguard.Noise;
+
+    var tun_buf: [65536]u8 = undefined;
+    var udp_recv_buf: [2048]u8 = undefined;
+    var decrypt_buf: [1500]u8 = undefined;
+    var encrypt_buf: [2048]u8 = undefined; // 16B header + 1500B payload + 16B poly1305 tag
+    var last_handshake_check_ns: i128 = 0;
+
+    while (swim.running.load(.acquire)) {
+        // ─── 1. SWIM protocol tick (gossip, failure detection, NAT) ───
+        swim.tick() catch {};
+
+        // ─── 2. Process incoming UDP packets (WG + SWIM multiplexed) ───
+        var udp_count: u32 = 0;
+        while (udp_count < 64) : (udp_count += 1) {
+            const recv = (udp_sock.recvFrom(&udp_recv_buf) catch break) orelse break;
+            const pkt = recv.data;
+
+            switch (Device.PacketType.classify(pkt)) {
+                .wg_handshake_init => {
+                    if (pkt.len >= @sizeOf(Noise.HandshakeInitiation)) {
+                        const msg: *const Noise.HandshakeInitiation = @ptrCast(@alignCast(pkt.ptr));
+                        if (wg_dev.handleInitiation(msg)) |hs_result| {
+                            const resp_bytes = std.mem.asBytes(&hs_result.response);
+                            _ = udp_sock.sendTo(resp_bytes, recv.sender_addr, recv.sender_port) catch 0;
+                            writeFormatted(stdout, "  WG handshake: responded to initiation\n", .{}) catch {};
+                        } else |_| {}
+                    }
+                },
+                .wg_handshake_resp => {
+                    if (pkt.len >= @sizeOf(Noise.HandshakeResponse)) {
+                        const msg: *const Noise.HandshakeResponse = @ptrCast(@alignCast(pkt.ptr));
+                        if (wg_dev.handleResponse(msg)) |slot| {
+                            if (wg_dev.peers[slot]) |*p| {
+                                p.endpoint_addr = recv.sender_addr;
+                                p.endpoint_port = recv.sender_port;
+                            }
+                            writeFormatted(stdout, "  WG handshake: completed with peer\n", .{}) catch {};
+                        } else |_| {}
+                    }
+                },
+                .wg_transport => {
+                    // Decrypt WG transport → write plaintext to utun
+                    if (wg_dev.decryptTransport(pkt, &decrypt_buf)) |result| {
+                        // Apply service filter before writing to TUN
+                        const PolicyMod = lib.services.Policy;
+                        if (PolicyMod.parseTransportHeader(decrypt_buf[0..result.len])) |ti| {
+                            if (wg_dev.peers[result.slot]) |peer| {
+                                const org_pk = if (swim.membership.peers.getPtr(peer.identity_key)) |mp| mp.org_pubkey else null;
+                                if (!service_filter.check(peer.identity_key, org_pk, ti.proto, ti.dst_port)) continue;
+                            }
+                        }
+                        tun_dev.write(decrypt_buf[0..result.len]) catch {};
+                    } else |_| {}
+                },
+                .wg_cookie => {},
+                .stun => swim.feedPacket(pkt, recv.sender_addr, recv.sender_port),
+                .swim => swim.feedPacket(pkt, recv.sender_addr, recv.sender_port),
+                .unknown => {},
+            }
+        }
+
+        // ─── 3. Read utun → encrypt → send via UDP ───
+        var tun_count: u32 = 0;
+        while (tun_count < 64) : (tun_count += 1) {
+            const tun_n = tun_dev.read(&tun_buf) catch break;
+            if (tun_n == 0) break;
+
+            const ip_pkt = tun_buf[0..tun_n];
+
+            // Route by destination mesh IP (IPv4 only, dst at offset 16)
+            if (tun_n < 20) continue;
+            const dst_ip: [4]u8 = .{ ip_pkt[16], ip_pkt[17], ip_pkt[18], ip_pkt[19] };
+
+            if (wg_dev.lookupByMeshIp(dst_ip)) |slot| {
+                const peer = wg_dev.peers[slot] orelse continue;
+                if (peer.endpoint_port == 0) continue; // No endpoint yet
+
+                // Encrypt and send
+                if (wg_dev.encryptForPeer(slot, ip_pkt, &encrypt_buf)) |enc_len| {
+                    _ = udp_sock.sendTo(encrypt_buf[0..enc_len], peer.endpoint_addr, peer.endpoint_port) catch {};
+                } else |_| {
+                    // No tunnel — attempt handshake if due
+                    if (wg_dev.initiateHandshake(slot)) |init_msg| {
+                        const init_bytes = std.mem.asBytes(&init_msg);
+                        _ = udp_sock.sendTo(init_bytes, peer.endpoint_addr, peer.endpoint_port) catch {};
+                    } else |_| {}
+                }
+            }
+        }
+
+        // ─── 4. Periodic handshake initiation for peers without tunnels ───
+        const now_ns = std.time.nanoTimestamp();
+        if (now_ns - last_handshake_check_ns >= 10 * std.time.ns_per_s) {
+            last_handshake_check_ns = now_ns;
+            for (&wg_dev.peers, 0..) |*slot, i| {
+                if (slot.*) |peer| {
+                    if (peer.active_tunnel == null and peer.endpoint_port != 0) {
+                        if (wg_dev.initiateHandshake(i)) |init_msg| {
+                            const init_bytes = std.mem.asBytes(&init_msg);
+                            _ = udp_sock.sendTo(init_bytes, peer.endpoint_addr, peer.endpoint_port) catch {};
+                        } else |_| {}
+                    }
+                }
+            }
+        }
+
+        // ─── 5. Poll control socket for status queries ───
+        _ = control_socket.poll();
     }
 }
 

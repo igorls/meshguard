@@ -11,6 +11,7 @@ pub fn build(b: *std.Build) void {
     const resolved_abi = if (target.query.abi) |abi| abi else target.result.abi;
     const is_android = resolved_os == .linux and resolved_abi == .android;
     const is_windows = resolved_os == .windows;
+    const is_macos = resolved_os == .macos;
 
     // ─── FFI module (for mobile embedding — not built on Windows) ───
     if (!is_windows) {
@@ -28,9 +29,9 @@ pub fn build(b: *std.Build) void {
             .linkage = .dynamic,
         });
 
-        // Link libsodium on desktop targets for AVX2-accelerated crypto.
-        // On Android, the Zig std.crypto software fallback is used.
-        if (!is_android) {
+        // Link libsodium on Linux desktop targets for AVX2-accelerated crypto.
+        // On Android, macOS, and Windows, the Zig std.crypto software fallback is used.
+        if (!is_android and !is_macos) {
             ffi_lib.linkSystemLibrary("sodium");
         }
 
@@ -59,8 +60,10 @@ pub fn build(b: *std.Build) void {
             .name = "meshguard",
             .root_module = exe_mod,
         });
-        if (!is_windows) {
-            exe.linkSystemLibrary("sodium"); // AVX2 ChaCha20-Poly1305 assembly
+        // Link libsodium on Linux desktop only (AVX2 ChaCha20-Poly1305 assembly)
+        // macOS and Windows use std.crypto
+        if (!is_windows and !is_macos) {
+            exe.linkSystemLibrary("sodium");
         }
         // On Windows, link ws2_32 for Winsock2 sockets
         if (is_windows) {
@@ -74,7 +77,7 @@ pub fn build(b: *std.Build) void {
         }
 
         // ─── WG interop test binary (Linux only — requires kernel WG) ───
-        if (!is_windows) {
+        if (!is_windows and !is_macos) {
             const interop_mod = b.createModule(.{
                 .root_source_file = b.path("src/wg_interop.zig"),
                 .target = target,
@@ -118,7 +121,7 @@ pub fn build(b: *std.Build) void {
         const unit_tests = b.addTest(.{
             .root_module = test_mod,
         });
-        if (!is_windows) {
+        if (!is_windows and !is_macos) {
             unit_tests.linkSystemLibrary("sodium");
         }
         if (is_windows) {

@@ -57,8 +57,9 @@ pub const Config = struct {
             return error.HomeNotFound;
         }
 
-        // System-wide config when running as root (systemd, sudo)
-        const uid = std.os.linux.getuid();
+        // System-wide config when running as root (systemd, sudo, launchd)
+        // Use POSIX getuid() — works on Linux, macOS, and other POSIX systems
+        const uid = std.posix.system.getuid();
         if (uid == 0) {
             return allocator.dupe(u8, "/etc/meshguard");
         }

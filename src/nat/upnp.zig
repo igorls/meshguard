@@ -14,6 +14,7 @@ const posix = std.posix;
 const builtin = @import("builtin");
 const is_linux = builtin.os.tag == .linux;
 const is_windows = builtin.os.tag == .windows;
+const is_macos = builtin.os.tag == .macos;
 const linux = if (is_linux) std.os.linux else struct {};
 
 
@@ -155,6 +156,9 @@ fn ssdpDiscover(gateway_ip: *[4]u8, location_buf: *[512]u8) ?[]const u8 {
     const ttl: u32 = 4;
     if (comptime is_linux) {
         posix.setsockopt(fd, posix.IPPROTO.IP, linux.IP.MULTICAST_TTL, std.mem.asBytes(&ttl)) catch {};
+    } else if (comptime is_macos) {
+        // macOS IP_MULTICAST_TTL = 10
+        posix.setsockopt(fd, posix.IPPROTO.IP, 10, std.mem.asBytes(&ttl)) catch {};
     }
 
     const dest_addr = std.net.Address.initIp4(SSDP_ADDR, SSDP_PORT);
@@ -168,7 +172,7 @@ fn ssdpDiscover(gateway_ip: *[4]u8, location_buf: *[512]u8) ?[]const u8 {
     // poll timeouts (no data available) toward the give-up threshold.
     var timeouts: u32 = 0;
     while (timeouts < 10) { // 10 timeouts × 500ms = 5s of silence gives up
-        if (comptime is_linux) {
+        if (comptime is_linux or is_macos) {
             const c = @cImport(@cInclude("poll.h"));
             var fds = [1]c.struct_pollfd{.{ .fd = fd, .events = c.POLLIN, .revents = 0 }};
             const rc = c.poll(&fds, 1, 500);
@@ -319,7 +323,7 @@ fn httpRequest(
     var total: usize = 0;
     var attempts: u32 = 0;
     while (total < out.len and attempts < 20) : (attempts += 1) {
-        if (comptime is_linux) {
+        if (comptime is_linux or is_macos) {
             const c = @cImport(@cInclude("poll.h"));
             var fds = [1]c.struct_pollfd{.{ .fd = fd, .events = c.POLLIN, .revents = 0 }};
             const rc = c.poll(&fds, 1, 2000);

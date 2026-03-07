@@ -5,6 +5,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const is_windows = builtin.os.tag == .windows;
 const is_linux = builtin.os.tag == .linux;
+const is_macos = builtin.os.tag == .macos;
 const posix = std.posix;
 
 const linux = if (is_linux) std.os.linux else struct {};
@@ -36,6 +37,7 @@ pub const UdpSocket = struct {
                     0,
                 );
             } else {
+                // Windows and macOS: create socket without SOCK_NONBLOCK
                 break :blk try posix.socket(
                     posix.AF.INET,
                     posix.SOCK.DGRAM,
@@ -49,8 +51,12 @@ pub const UdpSocket = struct {
         const one: u32 = 1;
         try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one));
         if (comptime is_linux) {
-            // SO_REUSEPORT is Linux-only
+            // SO_REUSEPORT is Linux and macOS
             posix.setsockopt(fd, posix.SOL.SOCKET, linux.SO.REUSEPORT, std.mem.asBytes(&one)) catch {};
+        } else if (comptime is_macos) {
+            // macOS SO_REUSEPORT = 0x0200
+            const SO_REUSEPORT: u32 = 0x0200;
+            posix.setsockopt(fd, posix.SOL.SOCKET, SO_REUSEPORT, std.mem.asBytes(&one)) catch {};
         }
 
         var bind_addr = std.net.Address.initIp4(addr, port);
@@ -156,8 +162,8 @@ pub const UdpSocket = struct {
     /// Poll the socket for readability with a timeout (milliseconds).
     /// Returns true if data is available.
     pub fn pollRead(self: UdpSocket, timeout_ms: i32) !bool {
-        if (comptime is_linux) {
-            // Use libc poll() instead of raw linux syscall.
+        if (comptime is_linux or is_macos) {
+            // Use libc poll() — works on Linux, macOS, and Android.
             // Android's seccomp blocks the old poll syscall (7) on modern Android.
             const c = @cImport(@cInclude("poll.h"));
             var fds = [1]c.struct_pollfd{.{
