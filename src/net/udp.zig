@@ -6,6 +6,8 @@ const builtin = @import("builtin");
 const is_windows = builtin.os.tag == .windows;
 const is_linux = builtin.os.tag == .linux;
 const is_macos = builtin.os.tag == .macos;
+const is_ios = builtin.os.tag == .ios;
+const is_darwin = is_macos or is_ios;
 const posix = std.posix;
 
 const linux = if (is_linux) std.os.linux else struct {};
@@ -53,8 +55,8 @@ pub const UdpSocket = struct {
         if (comptime is_linux) {
             // SO_REUSEPORT is Linux and macOS
             posix.setsockopt(fd, posix.SOL.SOCKET, linux.SO.REUSEPORT, std.mem.asBytes(&one)) catch {};
-        } else if (comptime is_macos) {
-            // macOS SO_REUSEPORT = 0x0200
+        } else if (comptime is_darwin) {
+            // Darwin (macOS/iOS) SO_REUSEPORT = 0x0200
             const SO_REUSEPORT: u32 = 0x0200;
             posix.setsockopt(fd, posix.SOL.SOCKET, SO_REUSEPORT, std.mem.asBytes(&one)) catch {};
         }
@@ -162,19 +164,18 @@ pub const UdpSocket = struct {
     /// Poll the socket for readability with a timeout (milliseconds).
     /// Returns true if data is available.
     pub fn pollRead(self: UdpSocket, timeout_ms: i32) !bool {
-        if (comptime is_linux or is_macos) {
-            // Use libc poll() — works on Linux, macOS, and Android.
-            // Android's seccomp blocks the old poll syscall (7) on modern Android.
-            const c = @cImport(@cInclude("poll.h"));
-            var fds = [1]c.struct_pollfd{.{
+        if (comptime is_linux or is_darwin) {
+            // Use std.posix.poll — works on Linux, macOS, iOS, and Android
+            // without requiring C headers (critical for iOS cross-compilation).
+            const POLLIN: i16 = 0x0001;
+            var fds = [1]std.posix.pollfd{.{
                 .fd = self.fd,
-                .events = c.POLLIN,
+                .events = POLLIN,
                 .revents = 0,
             }};
 
-            const rc = c.poll(&fds, 1, timeout_ms);
-            if (rc < 0) return error.PollFailed;
-            return (fds[0].revents & c.POLLIN) != 0;
+            _ = try std.posix.poll(&fds, timeout_ms);
+            return (fds[0].revents & POLLIN) != 0;
         } else if (comptime is_windows) {
             // Use WSAPoll directly from ws2_32 (mingw doesn't export poll)
             const ws2 = std.os.windows.ws2_32;

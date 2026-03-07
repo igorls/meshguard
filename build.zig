@@ -10,6 +10,7 @@ pub fn build(b: *std.Build) void {
     const resolved_os = if (target.query.os_tag) |os| os else target.result.os.tag;
     const resolved_abi = if (target.query.abi) |abi| abi else target.result.abi;
     const is_android = resolved_os == .linux and resolved_abi == .android;
+    const is_ios = resolved_os == .ios;
     const is_windows = resolved_os == .windows;
     const is_macos = resolved_os == .macos;
 
@@ -26,20 +27,21 @@ pub fn build(b: *std.Build) void {
         const ffi_lib = b.addLibrary(.{
             .name = "meshguard-ffi",
             .root_module = ffi_mod,
-            .linkage = .dynamic,
+            // iOS requires static linking — apps cannot dlopen user dylibs.
+            .linkage = if (is_ios) .static else .dynamic,
         });
 
         // Link libsodium on Linux desktop targets for AVX2-accelerated crypto.
-        // On Android, macOS, and Windows, the Zig std.crypto software fallback is used.
-        if (!is_android and !is_macos) {
+        // On Android, macOS, iOS, and Windows, the Zig std.crypto software fallback is used.
+        if (!is_android and !is_macos and !is_ios) {
             ffi_lib.linkSystemLibrary("sodium");
         }
 
         b.installArtifact(ffi_lib);
     }
 
-    // ─── Targets below only build for native (not Android) ───
-    if (!is_android) {
+    // ─── Targets below only build for native (not Android/iOS) ───
+    if (!is_android and !is_ios) {
         // ─── Root modules ───
         const exe_mod = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),

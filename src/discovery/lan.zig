@@ -21,6 +21,8 @@ const builtin = @import("builtin");
 const is_linux = builtin.os.tag == .linux;
 const is_windows = builtin.os.tag == .windows;
 const is_macos = builtin.os.tag == .macos;
+const is_ios = builtin.os.tag == .ios;
+const is_darwin = is_macos or is_ios;
 
 /// Multicast group for meshguard LAN discovery.
 pub const MULTICAST_GROUP = [4]u8{ 239, 99, 99, 1 };
@@ -30,9 +32,9 @@ const BEACON_SIZE: usize = 5 + 2 + 32 + 2; // 41 bytes
 
 /// Cross-platform IP-level socket option constants for multicast.
 /// Linux, macOS (BSD), and Windows use different values for these options.
-const IP_ADD_MEMBERSHIP: u32 = if (is_linux) 35 else if (is_windows) 12 else if (is_macos) 12 else 35;
-const IP_MULTICAST_TTL: u32 = if (is_linux) 33 else if (is_windows) 10 else if (is_macos) 10 else 33;
-const IP_MULTICAST_LOOP: u32 = if (is_linux) 34 else if (is_windows) 11 else if (is_macos) 11 else 34;
+const IP_ADD_MEMBERSHIP: u32 = if (is_linux) 35 else if (is_windows) 12 else if (is_darwin) 12 else 35;
+const IP_MULTICAST_TTL: u32 = if (is_linux) 33 else if (is_windows) 10 else if (is_darwin) 10 else 33;
+const IP_MULTICAST_LOOP: u32 = if (is_linux) 34 else if (is_windows) 11 else if (is_darwin) 11 else 34;
 
 /// Well-known app IDs.
 pub const APP_ID_PEER_CIRCLE: u16 = 0x5043; // "PC" (Peer Circle)
@@ -72,8 +74,8 @@ pub const LanDiscovery = struct {
             const ws2 = std.os.windows.ws2_32;
             var mode: u32 = 1; // non-blocking
             _ = ws2.ioctlsocket(sock_fd, @bitCast(@as(i32, 0x4004667e)), &mode); // FIONBIO
-        } else if (comptime is_macos) {
-            // On macOS, set non-blocking via fcntl (no SOCK_NONBLOCK at creation)
+        } else if (comptime is_darwin) {
+            // On Darwin (macOS/iOS), set non-blocking via fcntl (no SOCK_NONBLOCK at creation)
             const flags = try posix.fcntl(sock_fd, posix.F.GETFL, 0);
             _ = try posix.fcntl(sock_fd, posix.F.SETFL, flags | @as(usize, 0x0004)); // O_NONBLOCK
         }

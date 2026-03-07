@@ -15,6 +15,8 @@ const builtin = @import("builtin");
 const is_linux = builtin.os.tag == .linux;
 const is_windows = builtin.os.tag == .windows;
 const is_macos = builtin.os.tag == .macos;
+const is_ios = builtin.os.tag == .ios;
+const is_darwin = is_macos or is_ios;
 const linux = if (is_linux) std.os.linux else struct {};
 
 
@@ -156,8 +158,8 @@ fn ssdpDiscover(gateway_ip: *[4]u8, location_buf: *[512]u8) ?[]const u8 {
     const ttl: u32 = 4;
     if (comptime is_linux) {
         posix.setsockopt(fd, posix.IPPROTO.IP, linux.IP.MULTICAST_TTL, std.mem.asBytes(&ttl)) catch {};
-    } else if (comptime is_macos) {
-        // macOS IP_MULTICAST_TTL = 10
+    } else if (comptime is_darwin) {
+        // Darwin IP_MULTICAST_TTL = 10
         posix.setsockopt(fd, posix.IPPROTO.IP, 10, std.mem.asBytes(&ttl)) catch {};
     }
 
@@ -172,15 +174,11 @@ fn ssdpDiscover(gateway_ip: *[4]u8, location_buf: *[512]u8) ?[]const u8 {
     // poll timeouts (no data available) toward the give-up threshold.
     var timeouts: u32 = 0;
     while (timeouts < 10) { // 10 timeouts × 500ms = 5s of silence gives up
-        if (comptime is_linux or is_macos) {
-            const c = @cImport(@cInclude("poll.h"));
-            var fds = [1]c.struct_pollfd{.{ .fd = fd, .events = c.POLLIN, .revents = 0 }};
-            const rc = c.poll(&fds, 1, 500);
-            if (rc <= 0) {
-                timeouts += 1;
-                continue;
-            }
-            if ((fds[0].revents & c.POLLIN) == 0) {
+        if (comptime is_linux or is_darwin) {
+            const POLLIN: i16 = 0x0001;
+            var fds = [1]posix.pollfd{.{ .fd = fd, .events = POLLIN, .revents = 0 }};
+            _ = posix.poll(&fds, 500) catch 0;
+            if ((fds[0].revents & POLLIN) == 0) {
                 timeouts += 1;
                 continue;
             }
@@ -323,12 +321,11 @@ fn httpRequest(
     var total: usize = 0;
     var attempts: u32 = 0;
     while (total < out.len and attempts < 20) : (attempts += 1) {
-        if (comptime is_linux or is_macos) {
-            const c = @cImport(@cInclude("poll.h"));
-            var fds = [1]c.struct_pollfd{.{ .fd = fd, .events = c.POLLIN, .revents = 0 }};
-            const rc = c.poll(&fds, 1, 2000);
-            if (rc <= 0) break;
-            if ((fds[0].revents & c.POLLIN) == 0) break;
+        if (comptime is_linux or is_darwin) {
+            const POLLIN: i16 = 0x0001;
+            var fds = [1]posix.pollfd{.{ .fd = fd, .events = POLLIN, .revents = 0 }};
+            _ = posix.poll(&fds, 2000) catch break;
+            if ((fds[0].revents & POLLIN) == 0) break;
         } else if (comptime is_windows) {
             const ws2 = std.os.windows.ws2_32;
             var fds = [1]ws2.pollfd{.{ .fd = fd, .events = ws2.POLL.IN, .revents = 0 }};
