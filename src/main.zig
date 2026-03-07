@@ -2565,11 +2565,8 @@ fn windowsEventLoop(
     var last_handshake_check_ns: i128 = 0;
 
     while (swim.running.load(.acquire)) {
-        // ─── 1. SWIM protocol tick (gossip, failure detection, NAT) ───
-        swim.tick() catch {};
-
-        // ─── 2. Process incoming UDP packets (WG + SWIM multiplexed) ───
-        // Drain up to 64 packets per iteration to stay responsive
+        // ─── 1. Process incoming UDP packets (WG + SWIM multiplexed) ───
+        // Drain up to 64 packets per iteration — fully non-blocking
         var udp_count: u32 = 0;
         while (udp_count < 64) : (udp_count += 1) {
             const recv = (udp_sock.recvFrom(&udp_recv_buf) catch break) orelse break;
@@ -2613,11 +2610,16 @@ fn windowsEventLoop(
                     } else |_| {}
                 },
                 .wg_cookie => {},
+                // SWIM and STUN packets: feed to SWIM via feedPacket (non-blocking)
                 .stun => swim.feedPacket(pkt, recv.sender_addr, recv.sender_port),
                 .swim => swim.feedPacket(pkt, recv.sender_addr, recv.sender_port),
                 .unknown => {},
             }
         }
+
+        // ─── 2. SWIM timers-only tick (gossip, failure detection, NAT) ───
+        // Does NOT poll or read the socket — uses feedPacket above instead
+        swim.tickTimersOnly();
 
         // ─── 3. Read Wintun → encrypt → send via UDP ───
         // Drain outbound TUN packets (up to 64 per iteration)
@@ -2667,6 +2669,9 @@ fn windowsEventLoop(
 
         // ─── 5. Poll control socket for status queries ───
         _ = control_socket.poll();
+
+        // ─── 6. Short sleep to avoid CPU spin (10ms) ───
+        std.Thread.sleep(10 * std.time.ns_per_ms);
     }
 }
 
