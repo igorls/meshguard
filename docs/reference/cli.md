@@ -107,6 +107,23 @@ Uses `RTM_DELLINK` via RTNETLINK to remove the interface.
 
 ---
 
+## `meshguard connect`
+
+Direct peer connection via token exchange (bypassing seed nodes) and performs a coordinated UDP hole punch.
+
+```bash
+meshguard connect --generate [--in <minutes>]
+meshguard connect --join <mg://token>
+```
+
+| Flag         | Description                                     |
+| ------------ | ----------------------------------------------- |
+| `--generate` | Generate a connection token as the initiator    |
+| `--join`     | Join a connection using the peer's token        |
+| `--in`       | Delay before punching in minutes (default: 1)   |
+
+---
+
 ## `meshguard status`
 
 Display the current mesh state.
