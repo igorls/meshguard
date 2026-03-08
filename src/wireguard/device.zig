@@ -24,16 +24,22 @@ pub const PacketType = enum {
     stun, // STUN binding response
     unknown,
 
-    pub fn classify(data: []const u8) PacketType {
+    /// Optimization: Inlining small packet classification function and extracting
+    /// the dominant data-plane path (.wg_transport) outside the switch.
+    /// This avoids jump table overhead and improves branch prediction for 99%+ of packets.
+    pub inline fn classify(data: []const u8) PacketType {
         if (data.len < 4) return .unknown;
 
         // WireGuard messages: first byte is type, next 3 are zeros
         const msg_type = std.mem.readInt(u32, data[0..4], .little);
+
+        // Fast path: Type 4 (Transport Data) is overwhelmingly the most common
+        if (msg_type == 4) return .wg_transport;
+
         return switch (msg_type) {
             1 => .wg_handshake_init,
             2 => .wg_handshake_resp,
             3 => .wg_cookie,
-            4 => .wg_transport,
             else => blk: {
                 // STUN: check for magic cookie at bytes 4-7
                 if (data.len >= 8) {

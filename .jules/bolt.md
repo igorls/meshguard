@@ -1,0 +1,3 @@
+## 2024-03-08 - Fast Path Packet Classification
+**Learning:** In Zig, standard `switch` statements on integers compile to jump tables. For network packet classification where one type (data plane packets) vastly outnumbers others, the jump table overhead and potential branch mispredictions can be a bottleneck. Furthermore, small utility functions on the hot path may incur call overhead across module boundaries if not explicitly inlined.
+**Action:** Extract the dominant case (`msg_type == 4` for `.wg_transport`) into an explicit `if` branch before the `switch` statement to improve branch prediction and avoid jump table overhead for the most common packets. Also mark the function with the `inline` keyword.
