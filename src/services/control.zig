@@ -141,8 +141,8 @@ pub const ControlSocket = struct {
             first = false;
 
             // Format: {"pubkey":"hex...","mesh_ip":"10.99.X.Y","state":"alive"}
-            const written = std.fmt.bufPrint(buf[pos..], "{{\"pubkey\":\"{}\",\"mesh_ip\":\"{d}.{d}.{d}.{d}\",\"state\":\"alive\"}}", .{
-                std.fmt.fmtSliceHexLower(&peer.pubkey),
+            const written = std.fmt.bufPrint(buf[pos..], "{{\"pubkey\":\"{x}\",\"mesh_ip\":\"{d}.{d}.{d}.{d}\",\"state\":\"alive\"}}", .{
+                peer.pubkey,
                 peer.mesh_ip[0],
                 peer.mesh_ip[1],
                 peer.mesh_ip[2],
@@ -178,8 +178,8 @@ pub const ControlSocket = struct {
         }
 
         var buf: [512]u8 = undefined;
-        const written = std.fmt.bufPrint(&buf, "{{\"running\":true,\"pubkey\":\"{}\",\"mesh_ip\":\"{d}.{d}.{d}.{d}\",\"peers\":{{\"alive\":{d},\"suspected\":{d},\"dead\":{d}}}}}\n", .{
-            std.fmt.fmtSliceHexLower(&self.our_pubkey),
+        const written = std.fmt.bufPrint(&buf, "{{\"running\":true,\"pubkey\":\"{x}\",\"mesh_ip\":\"{d}.{d}.{d}.{d}\",\"peers\":{{\"alive\":{d},\"suspected\":{d},\"dead\":{d}}}}}\n", .{
+            self.our_pubkey,
             self.our_mesh_ip[0],
             self.our_mesh_ip[1],
             self.our_mesh_ip[2],
