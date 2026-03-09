@@ -17,6 +17,9 @@ const GOSSIP_ENTRY_SIZE = 32 + 1 + 8 + 1 + 4 + 2 + 1 + 32 + 1 + 4 + 2 + 1; // 89
 
 /// Encode a Ping message into a buffer. Returns bytes written.
 pub fn encodePing(buf: []u8, ping: messages.Ping) !usize {
+    const required = 1 + 32 + 8 + 1 + ping.gossip.len * GOSSIP_ENTRY_SIZE;
+    if (buf.len < required) return error.BufferTooShort;
+
     var pos: usize = 0;
 
     // Type tag
@@ -45,6 +48,9 @@ pub fn encodePing(buf: []u8, ping: messages.Ping) !usize {
 
 /// Encode an Ack message into a buffer. Returns bytes written.
 pub fn encodeAck(buf: []u8, ack: messages.Ack) !usize {
+    const required = 1 + 32 + 8 + 1 + ack.gossip.len * GOSSIP_ENTRY_SIZE;
+    if (buf.len < required) return error.BufferTooShort;
+
     var pos: usize = 0;
 
     buf[pos] = @intFromEnum(messages.MessageType.ack);
@@ -69,6 +75,9 @@ pub fn encodeAck(buf: []u8, ack: messages.Ack) !usize {
 
 /// Encode a PingReq message.
 pub fn encodePingReq(buf: []u8, req: messages.PingReq) !usize {
+    const required = 1 + 32 + 32 + 8;
+    if (buf.len < required) return error.BufferTooShort;
+
     var pos: usize = 0;
 
     buf[pos] = @intFromEnum(messages.MessageType.ping_req);
