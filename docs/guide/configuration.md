@@ -35,13 +35,15 @@ $MESHGUARD_CONFIG_DIR/
 
 ### `meshguard up`
 
-| Flag         | Default  | Description                                      |
-| ------------ | -------- | ------------------------------------------------ |
-| `--seed`     | _(none)_ | Seed peer address (`ip:port`). Can be repeated.  |
-| `--dns`      | _(none)_ | Discover seeds via DNS TXT records               |
-| `--mdns`     | `false`  | Discover seeds via mDNS on LAN                   |
-| `--announce` | _(auto)_ | Manually announce this IP to peers               |
-| `--kernel`   | `false`  | Use kernel WireGuard module instead of userspace |
+| Flag                | Default  | Description                                      |
+| ------------------- | -------- | ------------------------------------------------ |
+| `--seed`            | _(none)_ | Seed peer address (`ip:port`). Can be repeated.  |
+| `--dns`             | _(none)_ | Discover seeds via DNS TXT records               |
+| `--mdns`            | `false`  | Discover seeds via mDNS on LAN                   |
+| `--announce`        | _(auto)_ | Manually announce this IP to peers               |
+| `--kernel`          | `false`  | Use kernel WireGuard module instead of userspace |
+| `--encrypt-workers` | `0`      | Number of encryption threads (0 = serial)        |
+| `--open`            | `false`  | Accept all peers (skip trust enforcement)        |
 
 ### `meshguard keygen`
 
@@ -65,14 +67,14 @@ $MESHGUARD_CONFIG_DIR/
 | Interface name    | `mg0`          | `wg_config.zig`    |
 | MTU               | `1420`         | `tun.zig`          |
 | Max peers         | `64`           | `device.zig`       |
-| Suspicion timeout | `5000 ms`      | `config.zig`       |
+| Suspicion timeout | `30000 ms`     | `config.zig`       |
 
 ## SWIM Protocol Defaults
 
 | Parameter          | Value     | Description                            |
 | ------------------ | --------- | -------------------------------------- |
 | Protocol period    | `5000 ms` | Interval between SWIM probe rounds     |
-| Suspicion timeout  | `5000 ms` | Time before suspected → dead           |
+| Suspicion timeout  | `30000 ms`| Time before suspected → dead           |
 | Max gossip entries | `8`       | Gossip entries piggybacked per message |
 
 ## WireGuard Transport Defaults

@@ -88,10 +88,10 @@ meshguard up --announce 203.0.113.42
 | WG mode | Kernel or userspace | Userspace only |
 | Crypto | libsodium (AVX2) | `std.crypto` |
 | Control socket | Unix domain socket | Named pipe (`\\.\pipe\meshguard`) |
-| Signal handling | `signalfd` | `SetConsoleCtrlHandler` |
+| Signal handling | `sigaction` | `SetConsoleCtrlHandler` |
 | Interface config | Netlink / `ip` | `netsh` |
 | Config directory | `/etc/meshguard/` or `~/.config/meshguard/` | `%APPDATA%\meshguard\` |
-| Event loop | Multi-threaded (io_uring planned) | Single-threaded |
+| Event loop | Multi-threaded (`--encrypt-workers`) | Single-threaded |
 
 ## Building from Source
 

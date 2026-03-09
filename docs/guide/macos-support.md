@@ -1,6 +1,6 @@
 # macOS Support — Developer Guide
 
-> **Status**: Not yet started. Estimated effort: **moderate** — macOS is POSIX-compatible, but uses `utun` instead of `/dev/net/tun` and `route`/`ifconfig` instead of netlink.
+> **Status**: Core implementation complete (utun device + interface config). The `utun.zig` and `darwincfg.zig` modules are implemented and `main.zig` includes a macOS daemon branch. Remaining: testing on macOS hardware, installer, CI integration.
 
 ## Compatibility Assessment
 

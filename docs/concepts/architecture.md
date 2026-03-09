@@ -75,7 +75,9 @@ meshguard is organized into six top-level modules, each with a focused responsib
 
 - **`udp.zig`** — Non-blocking UDP socket with `sendTo`, `recvFrom`, `pollRead`
 - **`tun.zig`** — Linux TUN device: open, read/write IP packets, `setMtu`, `setNonBlocking`
-- **`io.zig`** — Event loop placeholder (Phase 2: epoll/io_uring)
+- **`io.zig`** — Event loop abstraction layer
+- **`io_uring.zig`** — Linux io_uring integration for async I/O
+- **`pipeline.zig`** — Packet processing pipeline with batched encrypt/decrypt
 
 ## Packet Flow
 

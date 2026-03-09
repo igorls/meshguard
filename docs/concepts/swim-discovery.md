@@ -42,7 +42,7 @@ The membership table tracks each peer in one of three states:
 | ------------- | ----------------------------------------------- | ------------------------- |
 | **Alive**     | Node is responding normally                     | Initial state on join     |
 | **Suspected** | Node failed to respond, may be temporarily down | Ack received → Alive      |
-| **Dead**      | Node confirmed unreachable                      | Suspicion timeout expired |
+| **Dead**      | Node confirmed unreachable                      | Suspicion timeout expired (30s) |
 
 ## Lamport Timestamps
 

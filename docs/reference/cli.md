@@ -207,6 +207,37 @@ Rules are evaluated in this order (first match wins):
 
 ---
 
+## `meshguard connect`
+
+Direct peer connection via token exchange — no seed server needed. Uses STUN-based coordinated hole punching.
+
+```bash
+# Generate a connection token (share with your peer)
+meshguard connect --generate
+
+# Generate a token that expires in 30 minutes
+meshguard connect --generate --in 30
+
+# Join using a token from another peer
+meshguard connect --join mg://...
+```
+
+| Flag         | Description                                         |
+| ------------ | --------------------------------------------------- |
+| `--generate` | Generate a connection token for a peer to join with |
+| `--join`     | Join using a `mg://` token from another peer        |
+| `--in`       | Token expiry in minutes (used with `--generate`)    |
+
+**Flow**:
+
+1. Peer A runs `meshguard connect --generate` → prints an `mg://` token
+2. Peer A shares the token with Peer B
+3. Peer B runs `meshguard connect --join mg://...`
+4. Both peers perform STUN discovery, exchange endpoints, and establish a direct WireGuard tunnel
+5. Seeds are saved to config for future `meshguard up` reconnection
+
+---
+
 ## Environment Variables
 
 | Variable               | Description                                                |

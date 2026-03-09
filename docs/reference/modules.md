@@ -10,6 +10,7 @@ Reference map of all source modules and their responsibilities.
 | `lib.zig`           | Library root — re-exports all modules for embedders              |
 | `config.zig`        | Configuration struct with network, discovery, and trust defaults |
 | `meshguard_ffi.zig` | C-ABI FFI surface for mobile embedding (Android JNI)             |
+| `wg_interop.zig`    | WireGuard interop layer for cross-platform tunnel management     |
 
 ## `identity/`
 
@@ -17,6 +18,7 @@ Reference map of all source modules and their responsibilities.
 | ----------- | ------------------------------------------------------------ |
 | `keys.zig`  | Ed25519 keypair generation, save/load, sign/verify           |
 | `trust.zig` | `authorized_keys/` management, key validation, authorization |
+| `org.zig`   | Org keypair generation, NodeCertificate signing/verification  |
 
 ## `discovery/`
 
@@ -58,13 +60,35 @@ Reference map of all source modules and their responsibilities.
 | `messages.zig` | Wire message type definitions: `Ping`, `Ack`, `PingReq`, `HandshakeInit/Resp`, `GossipEntry`, `HolepunchRequest/Response`, `NatType`, `Endpoint` |
 | `codec.zig`    | Binary codec: encode/decode for all message types, gossip entry serialization (89 bytes each)                                                    |
 
+## `services/`
+
+| File          | Purpose                                                                              |
+| ------------- | ------------------------------------------------------------------------------------ |
+| `control.zig` | Control socket server (Unix domain socket / Windows named pipe) for `meshguard status`, `down` |
+| `policy.zig`  | Service access control engine: policy file parsing, rule evaluation, packet filtering |
+
+## `crypto/`
+
+| File         | Purpose                                      |
+| ------------ | -------------------------------------------- |
+| `sodium.zig` | libsodium FFI bindings for AEAD acceleration |
+
 ## `net/`
 
-| File      | Purpose                                                                            |
-| --------- | ---------------------------------------------------------------------------------- |
-| `udp.zig` | Non-blocking UDP socket: bind, `sendTo`, `recvFrom`, `pollRead`                    |
-| `tun.zig` | Linux TUN device: open, read/write packets, `setMtu`, `setNonBlocking`, `pollRead` |
-| `io.zig`  | Event loop placeholder (Phase 2: epoll/io_uring)                                   |
+| File             | Purpose                                                                                    |
+| ---------------- | ------------------------------------------------------------------------------------------ |
+| `udp.zig`        | Non-blocking UDP socket: bind, `sendTo`, `recvFrom`, `pollRead`                            |
+| `batch_udp.zig`  | Batched UDP I/O: `sendmmsg`/`recvmmsg` for high-throughput packet processing               |
+| `tun.zig`        | Linux TUN device: open, read/write packets, `setMtu`, `setNonBlocking`, multi-queue        |
+| `utun.zig`       | macOS utun device: `PF_SYSTEM` socket creation, 4-byte AF header handling                  |
+| `wintun.zig`     | Windows Wintun adapter: DLL loading, ring buffer read/write                                |
+| `darwincfg.zig`  | macOS interface configuration: `ifconfig`/`route` for IP assignment, MTU, routes            |
+| `wincfg.zig`     | Windows interface configuration: `netsh` for IP assignment, routes                          |
+| `dns.zig`        | DNS resolver: seed peer discovery via DNS TXT records                                      |
+| `offload.zig`    | GSO/GRO offload: `IFF_VNET_HDR`, segmentation offload for high-throughput paths            |
+| `pipeline.zig`   | Packet processing pipeline: batched encrypt/decrypt with multi-queue TUN support           |
+| `io.zig`         | Event loop abstraction layer                                                               |
+| `io_uring.zig`   | Linux io_uring integration for async I/O                                                   |
 
 ## `docker/`
 

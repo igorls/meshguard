@@ -210,7 +210,7 @@ Messages are encrypted end-to-end using X25519 key agreement + ChaCha20-Poly1305
 ## Design Notes
 
 - **No root required** — the FFI library only needs UDP sockets, no TUN/netlink
-- **Battery-friendly** — gossip interval is 3s (vs 1s on server), ping timeout 5s
+- **Battery-friendly** — gossip interval is 3s (vs 5s on server), ping timeout 5s
 - **Ephemeral ports** — pass port `0` to `meshguard_init` for OS-assigned port (recommended on mobile)
 - **Identity persistence** — use `meshguard_get_seed` to export the 32-byte seed, store in Android Keystore, and pass back to `meshguard_init` on restart
 - **Tunnel ring buffer** — the tunnel inbox holds 256 messages (1500 bytes each). At 50 fps audio (20ms frames), this gives ~5 seconds of buffer before dropping. Poll `meshguard_tunnel_recv` from a dedicated thread.

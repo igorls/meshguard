@@ -117,17 +117,6 @@ meshguard trust <org-pubkey> --org --name eosrio
 meshguard org-vouch <solo-node-pubkey>
 ```
 
-### Authorization Flow
-
-When a new peer connects, trust is evaluated in order:
-
-1. **Individual key check** — is the peer's pubkey in `authorized_keys/`?
-2. **Org certificate check** — does the peer present a valid `NodeCertificate`?
-   - Verify Ed25519 signature
-   - Check certificate expiry
-   - Confirm issuing org is in `trusted_orgs/`
-3. **Revocation check** — has the cert been revoked via gossip?
-
 ### Revocation
 
 Org admins can revoke certificates, which are propagated via gossip:
