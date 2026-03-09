@@ -36,13 +36,14 @@ meshguard export > my-node.pub
 Add a peer's public key to your authorized keys.
 
 ```bash
-meshguard trust <key-or-path> [--name <name>]
+meshguard trust <key-or-path> [--name <name>] [--org]
 ```
 
 | Argument        | Description                                            |
 | --------------- | ------------------------------------------------------ |
 | `<key-or-path>` | Base64 public key string _or_ path to a `.pub` file    |
 | `--name`        | Human-readable name (default: auto-generated from key) |
+| `--org`         | Trust an organization's public key                     |
 
 **Validation**:
 
@@ -113,6 +114,77 @@ Display the current mesh state.
 
 ```bash
 meshguard status
+```
+
+---
+
+## `meshguard connect`
+
+Direct peer connection via token exchange (bypassing seed nodes) and performs a coordinated UDP hole punch.
+
+```bash
+meshguard connect --generate [--in <minutes>]
+meshguard connect --join <mg://token>
+```
+
+| Flag         | Description                                     |
+| ------------ | ----------------------------------------------- |
+| `--generate` | Generate a token to share with the peer         |
+| `--join`     | Join a connection using the peer's token        |
+| `--in`       | Punch delay in minutes (default: 1 minute)      |
+
+---
+
+## `meshguard org-keygen`
+
+Generate a new organization keypair.
+
+```bash
+meshguard org-keygen
+```
+
+**Output files** (in `$MESHGUARD_CONFIG_DIR/org/`):
+- `org.key` — secret key
+- `org.pub` — public key
+
+---
+
+## `meshguard org-sign`
+
+Sign a node's public key with the organization's private key, producing a NodeCertificate.
+
+```bash
+meshguard org-sign <node.pub> [--name <label>] [--expires <unix-timestamp>]
+```
+
+| Argument     | Description                                     |
+| ------------ | ----------------------------------------------- |
+| `<node.pub>` | Node's public key file                          |
+| `--name`     | Node name label                                 |
+| `--expires`  | Expiration as a Unix timestamp (default: never) |
+
+---
+
+## `meshguard org-vouch`
+
+Vouch for an external node (auto-propagates to org members).
+
+```bash
+meshguard org-vouch <node.pub>
+```
+
+| Argument     | Description                                     |
+| ------------ | ----------------------------------------------- |
+| `<node.pub>` | Node's public key file                          |
+
+---
+
+## `meshguard upgrade`
+
+Upgrade meshguard to the latest release from GitHub.
+
+```bash
+meshguard upgrade
 ```
 
 ---
