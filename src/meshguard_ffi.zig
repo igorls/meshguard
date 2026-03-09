@@ -91,6 +91,9 @@ pub const MeshguardContext = struct {
     // Callbacks (set by host app)
     on_message_cb: ?*const fn ([*]const u8, usize, [*]const u8) callconv(.c) void,
     on_peer_event_cb: ?*const fn (u8, [*]const u8) callconv(.c) void,
+    // Called when meshguard_send() fails to deliver (peer unknown/dead/no endpoint).
+    // Signature: void callback(dest_pubkey_ptr, data_ptr, data_len, error_code)
+    on_undeliverable_cb: ?*const fn ([*]const u8, [*]const u8, u32, i32) callconv(.c) void,
 
     // App-level message inbox (ring buffer)
     inbox: [64]AppMessage,
@@ -162,6 +165,7 @@ export fn meshguard_init(
         .suspended = std.atomic.Value(bool).init(false),
         .on_message_cb = null,
         .on_peer_event_cb = null,
+        .on_undeliverable_cb = null,
         .inbox = std.mem.zeroes([64]AppMessage),
         .inbox_write = std.atomic.Value(u32).init(0),
         .inbox_read = std.atomic.Value(u32).init(0),
@@ -445,8 +449,23 @@ export fn meshguard_send(
     var target_key: [32]u8 = undefined;
     @memcpy(&target_key, peer_pubkey[0..32]);
 
-    const peer = c.membership.peers.get(target_key) orelse return -4; // unknown peer
-    const ep = peer.gossip_endpoint orelse return -5; // no endpoint
+    const peer_entry = c.membership.peers.get(target_key);
+    if (peer_entry == null) {
+        // Peer unknown — notify host app so it can queue for offline delivery
+        if (c.on_undeliverable_cb) |cb| cb(peer_pubkey, data, len, -4);
+        return -4;
+    }
+    const peer = peer_entry.?;
+    const ep = peer.gossip_endpoint orelse {
+        if (c.on_undeliverable_cb) |cb| cb(peer_pubkey, data, len, -5);
+        return -5;
+    };
+
+    // Check if peer is actually reachable
+    if (peer.state != .alive and peer.state != .suspected) {
+        if (c.on_undeliverable_cb) |cb| cb(peer_pubkey, data, len, -10);
+        return -10; // peer is dead or left
+    }
 
     // Build encrypted message:
     //   [1B type=0x50] [32B dest_pubkey] [32B sender_pubkey] [12B nonce] [N ciphertext] [16B tag]
@@ -461,7 +480,10 @@ export fn meshguard_send(
     @memcpy(msg_buf[65..77], &nonce);
 
     // Derive shared key via X25519 + HKDF
-    const peer_x25519 = peer.wg_pubkey orelse return -6; // no WG pubkey
+    const peer_x25519 = peer.wg_pubkey orelse {
+        if (c.on_undeliverable_cb) |cb| cb(peer_pubkey, data, len, -6);
+        return -6;
+    };
     const shared = X25519.scalarmult(c.x25519_private, peer_x25519) catch return -7;
     const key_result = crypto.kdf2(shared, "meshguard-app-v1");
     const enc_key = key_result.key;
@@ -544,6 +566,20 @@ export fn meshguard_set_on_peer_event(
 ) void {
     const c = ctx orelse return;
     c.on_peer_event_cb = cb;
+}
+
+/// Set the callback for undeliverable messages.
+/// Called synchronously from meshguard_send() when the message cannot be delivered
+/// (peer unknown, dead, no endpoint, or no WG pubkey).
+///
+/// Signature: void callback(dest_pubkey_ptr, data_ptr, data_len, error_code)
+///   error_code: -4 = unknown peer, -5 = no endpoint, -6 = no WG pubkey, -10 = peer dead/left
+export fn meshguard_set_on_undeliverable(
+    ctx: ?*MeshguardContext,
+    cb: ?*const fn ([*]const u8, [*]const u8, u32, i32) callconv(.c) void,
+) void {
+    const c = ctx orelse return;
+    c.on_undeliverable_cb = cb;
 }
 
 // ─── Query ───
@@ -729,13 +765,16 @@ export fn meshguard_get_peers(
 /// Get info about a specific peer by pubkey.
 ///
 /// `peer_pubkey`: 32-byte Ed25519 public key.
-/// `out_info`:    72-byte buffer for peer info:
+/// `out_info`:    48-byte buffer for peer info:
 ///   [0..4]   = IPv4 address (gossip endpoint)
 ///   [4..6]   = gossip port (big-endian)
 ///   [6..10]  = mesh IP
 ///   [10..11] = state (0=alive, 1=suspected, 2=dead, 3=left)
 ///   [11..12] = has_wg_pubkey (0/1)
 ///   [12..44] = wg_pubkey (if has_wg_pubkey)
+///   [44..45] = connection_type (0=direct, 1=relayed, 2=unknown)
+///   [45..46] = nat_type (0=unknown, 1=public, 2=cone, 3=symmetric)
+///   [46..47] = is_relay_capable (0/1)
 ///
 /// Returns 0 on success, -1 if peer not found.
 export fn meshguard_get_peer_info(
@@ -779,7 +818,66 @@ export fn meshguard_get_peer_info(
         @memset(out_info[12..44], 0);
     }
 
+    // Connection type: check if gossip endpoint matches a known relay peer
+    // For now, use NAT type as a heuristic:
+    //   - public NAT = direct connection likely
+    //   - cone/symmetric = may be relayed
+    //   - if peer's endpoint matches our seed servers = relayed
+    out_info[44] = switch (peer.nat_type) {
+        .public => 0, // direct
+        .cone => 0, // hole-punched direct
+        .symmetric => 1, // likely relayed
+        .unknown => 2, // unknown
+    };
+
+    // NAT type
+    out_info[45] = switch (peer.nat_type) {
+        .unknown => 0,
+        .public => 1,
+        .cone => 2,
+        .symmetric => 3,
+    };
+
+    // Relay capability
+    out_info[46] = if (peer.is_relay_capable) 1 else 0;
+
     return 0;
+}
+
+// ─── Hostname-based join ───
+
+/// Join the mesh by connecting to a seed peer specified by hostname:port string.
+///
+/// `host_str`:  Null-terminated hostname:port string (e.g., "s1.peercircle.live:51821").
+///
+/// Resolves the hostname via DNS A record, then delegates to meshguard_join().
+/// Returns 0 on success, -1 on failure, -11 on DNS resolution failure.
+export fn meshguard_join_host(
+    ctx: ?*MeshguardContext,
+    host_str: [*:0]const u8,
+) i32 {
+    if (ctx == null) return -1;
+
+    // Find the string length (null-terminated)
+    var str_len: usize = 0;
+    while (host_str[str_len] != 0) : (str_len += 1) {
+        if (str_len > 255) return -11; // hostname too long
+    }
+    const host_slice = host_str[0..str_len];
+
+    // Split hostname:port
+    const colon_idx = std.mem.lastIndexOfScalar(u8, host_slice, ':') orelse return -11;
+    const hostname = host_slice[0..colon_idx];
+    const port_str = host_slice[colon_idx + 1 ..];
+
+    const port = std.fmt.parseInt(u16, port_str, 10) catch return -11;
+
+    // Resolve hostname via DNS A record
+    const dns = lib.net.Dns;
+    const addr = dns.resolveA(hostname) orelse return -11;
+
+    // Delegate to meshguard_join
+    return meshguard_join(ctx, &addr, port);
 }
 
 // ─── Internal: Event loop ───
