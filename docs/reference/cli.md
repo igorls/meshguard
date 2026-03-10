@@ -243,3 +243,58 @@ meshguard connect --join mg://...
 | Variable               | Description                                                |
 | ---------------------- | ---------------------------------------------------------- |
 | `MESHGUARD_CONFIG_DIR` | Override config directory (default: `~/.config/meshguard`) |
+
+---
+
+## `meshguard org-keygen`
+
+Generate a new Ed25519 organization keypair.
+
+```bash
+meshguard org-keygen
+```
+
+**Output files** (in `$MESHGUARD_CONFIG_DIR`):
+
+- `org.key` — secret key (permissions `0600`)
+- `org.pub` — public key
+
+---
+
+## `meshguard org-sign`
+
+Sign a node's public key with the organization key.
+
+```bash
+meshguard org-sign <node-key-or-path> [--name <label>] [--expires <unix-timestamp>]
+```
+
+| Argument | Description |
+| -------- | ----------- |
+| `<node-key-or-path>` | Base64 public key string _or_ path to a `.pub` file |
+| `--name` | Human-readable name for the node |
+| `--expires` | Unix timestamp when the signature expires (default: 0, never expires) |
+
+---
+
+## `meshguard org-vouch`
+
+Vouch for an external node. This action auto-propagates to organization members.
+
+```bash
+meshguard org-vouch <node-key-or-path>
+```
+
+| Argument | Description |
+| -------- | ----------- |
+| `<node-key-or-path>` | Base64 public key string _or_ path to a `.pub` file |
+
+---
+
+## `meshguard upgrade`
+
+Upgrade meshguard to the latest release from GitHub.
+
+```bash
+meshguard upgrade
+```
