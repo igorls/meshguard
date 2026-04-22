@@ -9,6 +9,14 @@
 const std = @import("std");
 const posix = std.posix;
 
+fn linuxSocket(domain: u32, sock_type: u32, protocol: u32) !std.posix.socket_t {
+    const fd = std.c.socket(@intCast(domain), @intCast(sock_type), @intCast(protocol));
+    switch (std.posix.errno(fd)) {
+        .SUCCESS => return fd,
+        else => |err| return std.posix.unexpectedErrno(err),
+    }
+}
+
 pub const TunDevice = struct {
     fd: posix.fd_t,
     name: [16]u8,
@@ -62,7 +70,7 @@ pub const TunDevice = struct {
             if (result < 0) return error.TunSetupFailed;
             break :blk @as(posix.fd_t, @intCast(result));
         };
-        errdefer posix.close(fd);
+        errdefer _ = std.c.close(fd);
 
         // Get the control ID for utun
         var ctl_info = CtlInfo{};
@@ -189,8 +197,8 @@ pub const TunDevice = struct {
         @memcpy(ifr.ifr_name[0..self.name_len], self.name[0..self.name_len]);
         ifr.ifr_mtu = @intCast(mtu);
 
-        const sock = std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0) catch return error.SocketFailed;
-        defer std.posix.close(sock);
+        const sock = linuxSocket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0) catch return error.SocketFailed;
+        defer _ = std.c.close(sock);
 
         const rc = std.c.ioctl(sock, @as(c_int, @bitCast(@as(c_uint, c.SIOCSIFMTU))), &ifr);
         if (rc < 0) return error.SetMtuFailed;
@@ -198,7 +206,7 @@ pub const TunDevice = struct {
 
     /// Close the utun device. This also destroys the utun interface.
     pub fn close(self: *TunDevice) void {
-        posix.close(self.fd);
+        _ = std.c.close(self.fd);
     }
 
     /// Poll for readable data with timeout.

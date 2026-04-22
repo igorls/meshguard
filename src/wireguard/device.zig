@@ -7,6 +7,14 @@ const std = @import("std");
 const noise = @import("noise.zig");
 const tunnel = @import("tunnel.zig");
 
+fn zio() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+fn nowNs() i128 {
+    return @intCast(std.Io.Timestamp.now(zio(), .awake).toNanoseconds());
+}
+
 pub const MAX_PEERS: usize = 64;
 
 /// Hash table bucket count for index → peer mapping.
@@ -233,7 +241,7 @@ pub const WgDevice = struct {
     pub fn init(static_private: [32]u8, static_public: [32]u8) WgDevice {
         // Start with a random sender index for unpredictability
         var seed: [4]u8 = undefined;
-        std.crypto.random.bytes(&seed);
+        zio().random(&seed);
         const start_index = std.mem.readInt(u32, &seed, .little) | 1; // ensure non-zero
 
         return .{
@@ -329,7 +337,7 @@ pub const WgDevice = struct {
     /// Initiate a handshake with a peer.
     pub fn initiateHandshake(self: *WgDevice, slot: usize) !noise.HandshakeInitiation {
         const peer = if (self.peers[slot]) |*p| p else return error.PeerNotFound;
-        const now = std.time.nanoTimestamp();
+        const now = nowNs();
 
         // Rate limit: 1 handshake per 5 seconds
         if (now - peer.last_handshake_ns < 5 * std.time.ns_per_s) {
@@ -371,10 +379,16 @@ pub const WgDevice = struct {
         // Step 3: Continue from preamble state (no redundant X25519)
         try peer.handshake.consumeInitiationFast(msg, preamble);
 
-        // Allocate our sender index for this handshake
-        self.index_map.remove(peer.sender_index);
-        peer.sender_index = self.allocIndex();
-        self.index_map.put(peer.sender_index, slot);
+        // If we already have an outstanding locally-initiated handshake, keep
+        // its sender index mapped so the matching response can still complete.
+        // Otherwise, a simultaneous initiation race causes both peers to drop
+        // the other's handshake response as UnknownIndex and data traffic never
+        // establishes despite both sides having responded.
+        if (peer.handshake.state != .created_initiation) {
+            self.index_map.remove(peer.sender_index);
+            peer.sender_index = self.allocIndex();
+            self.index_map.put(peer.sender_index, slot);
+        }
 
         const response = try peer.handshake.createResponse(peer.sender_index);
 
@@ -460,13 +474,13 @@ pub const WgDevice = struct {
 test "WgDevice add/remove peer" {
     const X25519 = std.crypto.dh.X25519;
     var secret: [32]u8 = undefined;
-    std.crypto.random.bytes(&secret);
+    zio().random(&secret);
     const pubkey = try X25519.recoverPublicKey(secret);
 
     var dev = WgDevice.init(secret, pubkey);
 
     var peer_secret: [32]u8 = undefined;
-    std.crypto.random.bytes(&peer_secret);
+    zio().random(&peer_secret);
     const peer_pub = try X25519.recoverPublicKey(peer_secret);
 
     const slot = try dev.addPeer(.{0} ** 32, peer_pub, .{ 10, 0, 0, 1 }, 51821);

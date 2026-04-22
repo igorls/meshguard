@@ -36,6 +36,22 @@ const IP_ADD_MEMBERSHIP: u32 = if (is_linux) 35 else if (is_windows) 12 else if 
 const IP_MULTICAST_TTL: u32 = if (is_linux) 33 else if (is_windows) 10 else if (is_darwin) 10 else 33;
 const IP_MULTICAST_LOOP: u32 = if (is_linux) 34 else if (is_windows) 11 else if (is_darwin) 11 else 34;
 
+fn linuxSocket(domain: u32, sock_type: u32, protocol: u32) !std.posix.socket_t {
+    const fd = std.c.socket(@intCast(domain), @intCast(sock_type), @intCast(protocol));
+    switch (std.posix.errno(fd)) {
+        .SUCCESS => return fd,
+        else => |err| return std.posix.unexpectedErrno(err),
+    }
+}
+
+fn closeSocket(fd: posix.socket_t) void {
+    if (comptime is_windows) {
+        _ = std.os.windows.ws2_32.closesocket(fd);
+    } else {
+        _ = std.c.close(fd);
+    }
+}
+
 /// Well-known app IDs.
 pub const APP_ID_PEER_CIRCLE: u16 = 0x5043; // "PC" (Peer Circle)
 
@@ -56,17 +72,13 @@ pub const LanDiscovery = struct {
         // On Linux, set SOCK_NONBLOCK at creation. On Windows, we'll use ioctlsocket.
         const sock_fd = blk: {
             if (comptime is_linux) {
-                break :blk try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+                break :blk try linuxSocket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
             } else {
-                break :blk try posix.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
+                break :blk try linuxSocket(posix.AF.INET, posix.SOCK.DGRAM, 0);
             }
         };
         errdefer {
-            if (comptime is_windows) {
-                _ = std.os.windows.ws2_32.closesocket(sock_fd);
-            } else {
-                posix.close(sock_fd);
-            }
+            closeSocket(sock_fd);
         }
 
         // On Windows, set non-blocking via ioctlsocket
@@ -91,7 +103,16 @@ pub const LanDiscovery = struct {
             .addr = 0, // INADDR_ANY
             .zero = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
         };
-        try posix.bind(sock_fd, @ptrCast(&bind_addr), @sizeOf(posix.sockaddr.in));
+        if (comptime is_windows) {
+            const ws2 = std.os.windows.ws2_32;
+            if (ws2.bind(sock_fd, @ptrCast(&bind_addr), @sizeOf(posix.sockaddr.in)) != 0) {
+                return error.AddressInUse;
+            }
+        } else {
+            if (std.c.bind(sock_fd, @ptrCast(&bind_addr), @sizeOf(posix.sockaddr.in)) != 0) {
+                return error.AddressInUse;
+            }
+        }
 
         // Join multicast group
         const mreq = extern struct {
@@ -140,7 +161,12 @@ pub const LanDiscovery = struct {
             .zero = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
         };
 
-        _ = posix.sendto(self.sock_fd, &buf, 0, @ptrCast(&dest), @sizeOf(posix.sockaddr.in)) catch {};
+        if (comptime is_windows) {
+            const ws2 = std.os.windows.ws2_32;
+            _ = ws2.sendto(self.sock_fd, buf[0..].ptr, @intCast(buf.len), 0, @ptrCast(&dest), @sizeOf(posix.sockaddr.in));
+        } else {
+            _ = std.c.sendto(self.sock_fd, buf[0..].ptr, buf.len, 0, @ptrCast(&dest), @sizeOf(posix.sockaddr.in));
+        }
     }
 
     /// Check for incoming beacons (non-blocking). Returns number of peers discovered.
@@ -151,7 +177,16 @@ pub const LanDiscovery = struct {
         var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
 
         while (count < 16) { // Max 16 beacons per tick
-            const n = posix.recvfrom(self.sock_fd, &buf, 0, @ptrCast(&src_addr), &addr_len) catch break;
+            const n = if (comptime is_windows) blk: {
+                const ws2 = std.os.windows.ws2_32;
+                const rc = ws2.recvfrom(self.sock_fd, buf[0..].ptr, @intCast(buf.len), 0, @ptrCast(&src_addr), @ptrCast(&addr_len));
+                if (rc < 0) break;
+                break :blk @as(usize, @intCast(rc));
+            } else blk: {
+                const rc = std.c.recvfrom(self.sock_fd, buf[0..].ptr, buf.len, 0, @ptrCast(&src_addr), &addr_len);
+                if (rc < 0) break;
+                break :blk @as(usize, @intCast(rc));
+            };
             if (n != BEACON_SIZE) continue;
             if (!std.mem.eql(u8, buf[0..5], BEACON_MAGIC)) continue;
 
@@ -188,10 +223,6 @@ pub const LanDiscovery = struct {
 
     pub fn deinit(self: *LanDiscovery) void {
         self.running.store(false, .release);
-        if (comptime is_windows) {
-            _ = std.os.windows.ws2_32.closesocket(self.sock_fd);
-        } else {
-            posix.close(self.sock_fd);
-        }
+        closeSocket(self.sock_fd);
     }
 };

@@ -15,6 +15,14 @@ const Udp = @import("../net/udp.zig");
 const Holepuncher = @import("../nat/holepunch.zig").Holepuncher;
 const log = std.log.scoped(.swim);
 
+fn zio() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+fn nowNs() i128 {
+    return @intCast(std.Io.Timestamp.now(zio(), .awake).toNanoseconds());
+}
+
 pub const SwimConfig = struct {
     gossip_port: u16 = 51821,
     gossip_interval_ms: u32 = 5000, // 5s — reasonable for WAN
@@ -302,7 +310,7 @@ pub const SwimProtocol = struct {
         }
 
         // 4. Pick a random alive peer and send PING (rate-limited)
-        const now_ns = std.time.nanoTimestamp();
+        const now_ns = nowNs();
         const interval_ns: i128 = @as(i128, self.config.gossip_interval_ms) * 1_000_000;
         if (now_ns - self.last_ping_sent_ns >= interval_ns) {
             if (self.membership.randomAlivePeer()) |peer| {
@@ -340,7 +348,7 @@ pub const SwimProtocol = struct {
         // 1. Check pending pings for timeouts
         self.checkTimeouts();
 
-        const now_ns = std.time.nanoTimestamp();
+        const now_ns = nowNs();
 
         // 2. Expire suspected peers
         const expired = self.membership.expireSuspected();
@@ -457,7 +465,7 @@ pub const SwimProtocol = struct {
 
         const decoded = codec.decode(data) catch return;
         self.pkts_recv += 1;
-        self.last_recv_ns.store(@intCast(std.time.nanoTimestamp()), .release);
+        self.last_recv_ns.store(@intCast(nowNs()), .release);
 
         // Trust enforcement: check sender's pubkey against authorized set
         const sender_pubkey: [32]u8 = switch (decoded) {
@@ -530,11 +538,11 @@ pub const SwimProtocol = struct {
 
     /// Handle an OrgAliasAnnounce: register or update org alias, with Lamport conflict resolution.
     fn handleOrgAlias(self: *SwimProtocol, ann: messages.OrgAliasAnnounce) void {
-        const alias_name = std.mem.trimRight(u8, &ann.alias, "\x00");
+        const alias_name = std.mem.trimEnd(u8, &ann.alias, "\x00");
 
         // Check for existing alias with same name from a different org (conflict)
         for (0..self.alias_count) |i| {
-            const existing_name = std.mem.trimRight(u8, &self.alias_names[i], "\x00");
+            const existing_name = std.mem.trimEnd(u8, &self.alias_names[i], "\x00");
             if (std.mem.eql(u8, existing_name, alias_name)) {
                 if (std.mem.eql(u8, &self.alias_org_pubkeys[i], &ann.org_pubkey)) {
                     // Same org, update lamport if newer
@@ -843,7 +851,7 @@ pub const SwimProtocol = struct {
                 .mesh_ip = mesh_ip,
                 .wg_port = 51830,
                 .lamport = self.membership.lamport,
-                .last_seen_ns = std.time.nanoTimestamp(),
+                .last_seen_ns = nowNs(),
                 .suspected_at_ns = null,
                 .last_rtt_ns = null,
                 .handshake_complete = false,
@@ -901,7 +909,7 @@ pub const SwimProtocol = struct {
                 .target_addr = addr,
                 .target_port = port,
                 .seq = self.seq,
-                .sent_at_ns = std.time.nanoTimestamp(),
+                .sent_at_ns = nowNs(),
                 .escalated = false,
             };
             self.pending_count += 1;
@@ -922,7 +930,7 @@ pub const SwimProtocol = struct {
     }
 
     fn checkTimeouts(self: *SwimProtocol) void {
-        const now = std.time.nanoTimestamp();
+        const now = nowNs();
         const timeout_ns: i128 = @as(i128, self.config.ping_timeout_ms) * 1_000_000;
 
         var i: usize = 0;

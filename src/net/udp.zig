@@ -1,5 +1,5 @@
 //! UDP socket abstraction for meshguard gossip.
-//! Cross-platform: Linux (POSIX), Windows (Winsock2).
+//! Cross-platform: Linux (syscalls), Windows (Winsock2).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -33,43 +33,66 @@ pub const UdpSocket = struct {
     pub fn bindAddr(addr: [4]u8, port: u16) !UdpSocket {
         const fd = blk: {
             if (comptime is_linux) {
-                break :blk try posix.socket(
-                    linux.AF.INET,
-                    @intCast(linux.SOCK.DGRAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC),
-                    0,
-                );
+                const rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0);
+                switch (posix.errno(rc)) {
+                    .SUCCESS => {},
+                    else => |err| return posix.unexpectedErrno(err),
+                }
+                break :blk @as(posix.socket_t, @intCast(@as(i32, @bitCast(@as(u32, @truncate(rc))))));
+            } else if (comptime is_windows) {
+                const ws2 = std.os.windows.ws2_32;
+                const sock = ws2.socket(ws2.AF.INET, ws2.SOCK.DGRAM, 0);
+                if (sock == ws2.INVALID_SOCKET) return error.SocketCreateFailed;
+                break :blk sock;
             } else {
-                // Windows and macOS: create socket without SOCK_NONBLOCK
-                break :blk try posix.socket(
-                    posix.AF.INET,
-                    posix.SOCK.DGRAM,
-                    0,
-                );
+                // macOS/iOS: use std.c
+                const sock = std.c.socket(std.c.AF.INET, std.c.SOCK.DGRAM, 0);
+                if (sock < 0) return error.SocketCreateFailed;
+                break :blk sock;
             }
         };
         errdefer closeSocket(fd);
 
         // Enable SO_REUSEADDR
         const one: u32 = 1;
-        try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one));
         if (comptime is_linux) {
-            // SO_REUSEPORT is Linux and macOS
-            posix.setsockopt(fd, posix.SOL.SOCKET, linux.SO.REUSEPORT, std.mem.asBytes(&one)) catch {};
-        } else if (comptime is_darwin) {
-            // Darwin (macOS/iOS) SO_REUSEPORT = 0x0200
-            const SO_REUSEPORT: u32 = 0x0200;
-            posix.setsockopt(fd, posix.SOL.SOCKET, SO_REUSEPORT, std.mem.asBytes(&one)) catch {};
+            _ = linux.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one), @sizeOf(u32));
+            _ = linux.setsockopt(fd, posix.SOL.SOCKET, linux.SO.REUSEPORT, std.mem.asBytes(&one), @sizeOf(u32));
+        } else {
+            try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one));
+            if (comptime is_darwin) {
+                const SO_REUSEPORT: u32 = 0x0200;
+                posix.setsockopt(fd, posix.SOL.SOCKET, SO_REUSEPORT, std.mem.asBytes(&one)) catch {};
+            }
         }
 
-        var bind_addr = std.net.Address.initIp4(addr, port);
-        try posix.bind(fd, &bind_addr.any, bind_addr.getOsSockLen());
+        // Bind
+        var bind_addr = makeSockaddrIn(addr, port);
+        if (comptime is_linux) {
+            const bind_rc = linux.bind(fd, @ptrCast(&bind_addr), @sizeOf(@TypeOf(bind_addr)));
+            switch (posix.errno(bind_rc)) {
+                .SUCCESS => {},
+                else => |err| return posix.unexpectedErrno(err),
+            }
+        } else if (comptime is_windows) {
+            const ws2 = std.os.windows.ws2_32;
+            if (ws2.bind(fd, @ptrCast(&bind_addr), @sizeOf(@TypeOf(bind_addr))) != 0) return error.BindFailed;
+        } else {
+            if (std.c.bind(fd, @ptrCast(&bind_addr), @sizeOf(@TypeOf(bind_addr))) != 0) return error.BindFailed;
+        }
 
         // Resolve actual port (important when binding to ephemeral port 0)
         var actual_port = port;
         var bound_addr = bind_addr;
-        var bound_len = bind_addr.getOsSockLen();
-        posix.getsockname(fd, &bound_addr.any, &bound_len) catch {};
-        actual_port = bound_addr.getPort();
+        var bound_len: u32 = @sizeOf(@TypeOf(bind_addr));
+        if (comptime is_linux) {
+            _ = linux.getsockname(fd, @ptrCast(&bound_addr), &bound_len);
+        } else if (comptime is_windows) {
+            _ = std.os.windows.ws2_32.getsockname(fd, @ptrCast(&bound_addr), @ptrCast(&bound_len));
+        } else {
+            _ = std.c.getsockname(fd, @ptrCast(&bound_addr), @ptrCast(&bound_len));
+        }
+        actual_port = std.mem.bigToNative(u16, bound_addr.port);
 
         return .{ .fd = fd, .port = actual_port };
     }
@@ -80,17 +103,21 @@ pub const UdpSocket = struct {
     pub fn createGSOSender() !UdpSocket {
         const fd = blk: {
             if (comptime is_linux) {
-                break :blk try posix.socket(
-                    linux.AF.INET,
-                    @intCast(linux.SOCK.DGRAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC),
-                    0,
-                );
+                const rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0);
+                switch (posix.errno(rc)) {
+                    .SUCCESS => {},
+                    else => |err| return posix.unexpectedErrno(err),
+                }
+                break :blk @as(posix.socket_t, @intCast(@as(i32, @bitCast(@as(u32, @truncate(rc))))));
+            } else if (comptime is_windows) {
+                const ws2 = std.os.windows.ws2_32;
+                const sock = ws2.socket(ws2.AF.INET, ws2.SOCK.DGRAM, 0);
+                if (sock == ws2.INVALID_SOCKET) return error.SocketCreateFailed;
+                break :blk sock;
             } else {
-                break :blk try posix.socket(
-                    posix.AF.INET,
-                    posix.SOCK.DGRAM,
-                    0,
-                );
+                const sock = std.c.socket(std.c.AF.INET, std.c.SOCK.DGRAM, 0);
+                if (sock < 0) return error.SocketCreateFailed;
+                break :blk sock;
             }
         };
         errdefer closeSocket(fd);
@@ -99,11 +126,11 @@ pub const UdpSocket = struct {
             // IP_MTU_DISCOVER = IP_PMTUDISC_PROBE (3) — prevents EMSGSIZE on GSO
             const IP_MTU_DISCOVER = 10;
             const IP_PMTUDISC_PROBE: u32 = 3;
-            posix.setsockopt(fd, posix.IPPROTO.IP, IP_MTU_DISCOVER, std.mem.asBytes(&IP_PMTUDISC_PROBE)) catch {};
+            _ = linux.setsockopt(fd, posix.IPPROTO.IP, IP_MTU_DISCOVER, std.mem.asBytes(&IP_PMTUDISC_PROBE), @sizeOf(u32));
 
             // SO_SNDBUF = 256KB for large GSO super-packets
             const sndbuf: u32 = 262144;
-            posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&sndbuf)) catch {};
+            _ = linux.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&sndbuf), @sizeOf(u32));
         }
 
         return .{ .fd = fd, .port = 0 };
@@ -115,7 +142,7 @@ pub const UdpSocket = struct {
         const IPPROTO_UDP = 17;
         const UDP_GRO = 104;
         const one: u32 = 1;
-        posix.setsockopt(self.fd, IPPROTO_UDP, UDP_GRO, std.mem.asBytes(&one)) catch {};
+        _ = linux.setsockopt(self.fd, IPPROTO_UDP, UDP_GRO, std.mem.asBytes(&one), @sizeOf(u32));
     }
 
     /// Enable UDP GSO (Generic Segmentation Offload) on this socket. Linux-only.
@@ -124,41 +151,64 @@ pub const UdpSocket = struct {
         const IPPROTO_UDP = 17;
         const UDP_SEGMENT = 103;
         const one: u32 = 1;
-        posix.setsockopt(self.fd, IPPROTO_UDP, UDP_SEGMENT, std.mem.asBytes(&one)) catch {};
+        _ = linux.setsockopt(self.fd, IPPROTO_UDP, UDP_SEGMENT, std.mem.asBytes(&one), @sizeOf(u32));
 
         const IP_MTU_DISCOVER = 10;
         const IP_PMTUDISC_PROBE: u32 = 3;
-        posix.setsockopt(self.fd, posix.IPPROTO.IP, IP_MTU_DISCOVER, std.mem.asBytes(&IP_PMTUDISC_PROBE)) catch {};
+        _ = linux.setsockopt(self.fd, posix.IPPROTO.IP, IP_MTU_DISCOVER, std.mem.asBytes(&IP_PMTUDISC_PROBE), @sizeOf(u32));
 
         const sndbuf: u32 = 262144;
-        posix.setsockopt(self.fd, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&sndbuf)) catch {};
+        _ = linux.setsockopt(self.fd, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&sndbuf), @sizeOf(u32));
     }
 
     /// Send data to a specific address.
     pub fn sendTo(self: UdpSocket, data: []const u8, dest_addr: [4]u8, dest_port: u16) !usize {
-        const addr = std.net.Address.initIp4(dest_addr, dest_port);
-        return posix.sendto(self.fd, data, 0, &addr.any, addr.getOsSockLen());
+        const addr = makeSockaddrIn(dest_addr, dest_port);
+        if (comptime is_linux) {
+            const rc = linux.sendto(self.fd, data.ptr, data.len, 0, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
+            switch (posix.errno(rc)) {
+                .SUCCESS => {},
+                else => |err| return posix.unexpectedErrno(err),
+            }
+            return @intCast(rc);
+        } else if (comptime is_windows) {
+            const ws2 = std.os.windows.ws2_32;
+            const n = ws2.sendto(self.fd, data.ptr, @intCast(data.len), 0, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
+            if (n < 0) return error.SendFailed;
+            return @intCast(n);
+        } else {
+            const n = std.c.sendto(self.fd, data.ptr, data.len, 0, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
+            if (n < 0) return error.SendFailed;
+            return @intCast(n);
+        }
     }
 
     /// Receive a datagram (non-blocking). Returns null if no data available.
     pub fn recvFrom(self: UdpSocket, buf: []u8) !?RecvResult {
-        var src_addr: posix.sockaddr.in = undefined;
-        var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
+        var src_addr: linux.sockaddr.in = undefined;
+        var addr_len: u32 = @sizeOf(linux.sockaddr.in);
 
-        const n = posix.recvfrom(self.fd, buf, 0, @ptrCast(&src_addr), &addr_len) catch |err| {
-            if (err == error.WouldBlock) return null;
-            return err;
-        };
+        if (comptime is_linux) {
+            const rc = linux.recvfrom(self.fd, buf.ptr, buf.len, 0, @ptrCast(&src_addr), &addr_len);
+            switch (posix.errno(rc)) {
+                .SUCCESS => {},
+                .AGAIN => return null,
+                else => |err| return posix.unexpectedErrno(err),
+            }
+            const n: usize = @intCast(rc);
 
-        // Extract sender IP and port
-        const ip_bytes: [4]u8 = @bitCast(src_addr.addr);
-        const port = std.mem.bigToNative(u16, src_addr.port);
+            // Extract sender IP and port
+            const ip_bytes: [4]u8 = @bitCast(src_addr.addr);
+            const port_val = std.mem.bigToNative(u16, src_addr.port);
 
-        return RecvResult{
-            .data = buf[0..n],
-            .sender_addr = ip_bytes,
-            .sender_port = port,
-        };
+            return RecvResult{
+                .data = buf[0..n],
+                .sender_addr = ip_bytes,
+                .sender_port = port_val,
+            };
+        } else {
+            @compileError("recvFrom not yet ported for non-Linux in 0.16");
+        }
     }
 
     /// Poll the socket for readability with a timeout (milliseconds).
@@ -203,7 +253,19 @@ fn closeSocket(fd: posix.socket_t) void {
     if (comptime is_windows) {
         // Windows sockets must be closed with closesocket, not CloseHandle
         _ = std.os.windows.ws2_32.closesocket(fd);
+    } else if (comptime is_linux) {
+        _ = linux.close(fd);
     } else {
-        posix.close(fd);
+        _ = std.c.close(fd);
     }
+}
+
+/// Build a Linux sockaddr.in from IP bytes and port.
+fn makeSockaddrIn(addr: [4]u8, port: u16) linux.sockaddr.in {
+    return .{
+        .family = linux.AF.INET,
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = @bitCast(addr),
+        .zero = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+    };
 }

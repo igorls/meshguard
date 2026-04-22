@@ -12,6 +12,29 @@
 
 const std = @import("std");
 
+
+/// Read all available bytes from an Io.File into buf. Returns bytes read.
+fn readFileBytes(f: std.Io.File, buf: []u8) !usize {
+    var reader = f.reader(zio(), &.{});
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = reader.interface.readSliceShort(buf[total..]) catch break;
+        if (n == 0) break;
+        total += n;
+    }
+    return total;
+}
+
+/// Returns a blocking Io instance for synchronous operations.
+fn zio() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+fn openDirAbsolute(path: []const u8) !std.Io.Dir {
+    return std.Io.Dir.openDirAbsolute(zio(), path, .{ .iterate = true });
+}
+
+
 // ─── Rule types ───
 
 pub const Action = enum(u1) { allow = 0, deny = 1 };
@@ -243,7 +266,7 @@ pub const ServiceFilter = struct {
         const services_path = std.fmt.bufPrint(&services_path_buf, "{s}/services", .{config_dir}) catch return filter;
 
         // Check if services/ directory exists
-        std.fs.accessAbsolute(services_path, .{}) catch return filter; // no dir = allow-all
+        std.Io.Dir.accessAbsolute(zio(), services_path, .{}) catch return filter; // no dir = allow-all
 
         // Load default action
         var default_path_buf: [512]u8 = undefined;
@@ -276,12 +299,11 @@ pub const ServiceFilter = struct {
     }
 
     fn loadPeerPolicies(self: *ServiceFilter, dir_path: []const u8) void {
-        var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch return;
-        defer dir.close();
+        const dir = openDirAbsolute(dir_path) catch return;
+        defer dir.close(zio());
 
         var iter = dir.iterate();
-        while (iter.next() catch null) |entry| {
-            if (entry.kind != .file) continue;
+        while (iter.next(zio()) catch null) |entry| {
             if (!std.mem.endsWith(u8, entry.name, ".policy")) continue;
             if (self.peer_count >= MAX_PEER_POLICIES) break;
 
@@ -319,12 +341,11 @@ pub const ServiceFilter = struct {
     }
 
     fn loadOrgPolicies(self: *ServiceFilter, dir_path: []const u8) void {
-        var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch return;
-        defer dir.close();
+        const dir = openDirAbsolute(dir_path) catch return;
+        defer dir.close(zio());
 
         var iter = dir.iterate();
-        while (iter.next() catch null) |entry| {
-            if (entry.kind != .file) continue;
+        while (iter.next(zio()) catch null) |entry| {
             if (!std.mem.endsWith(u8, entry.name, ".policy")) continue;
             if (self.org_count >= MAX_ORG_POLICIES) break;
 
@@ -362,12 +383,11 @@ pub const ServiceFilter = struct {
         var peer_dir_buf: [512]u8 = undefined;
         const peer_dir_path = std.fmt.bufPrint(&peer_dir_buf, "{s}/services/peer", .{config_dir}) catch return;
 
-        var dir = std.fs.openDirAbsolute(peer_dir_path, .{ .iterate = true }) catch return;
-        defer dir.close();
+        const dir = openDirAbsolute(peer_dir_path) catch return;
+        defer dir.close(zio());
 
         var iter = dir.iterate();
-        while (iter.next() catch null) |entry| {
-            if (entry.kind != .file) continue;
+        while (iter.next(zio()) catch null) |entry| {
             if (!std.mem.endsWith(u8, entry.name, ".policy")) continue;
             if (self.peer_count >= MAX_PEER_POLICIES) break;
 
@@ -407,12 +427,11 @@ pub const ServiceFilter = struct {
         var org_dir_buf: [512]u8 = undefined;
         const org_policy_dir = std.fmt.bufPrint(&org_dir_buf, "{s}/services/org", .{config_dir}) catch return;
 
-        var dir = std.fs.openDirAbsolute(org_policy_dir, .{ .iterate = true }) catch return;
-        defer dir.close();
+        const dir = openDirAbsolute(org_policy_dir) catch return;
+        defer dir.close(zio());
 
         var iter = dir.iterate();
-        while (iter.next() catch null) |entry| {
-            if (entry.kind != .file) continue;
+        while (iter.next(zio()) catch null) |entry| {
             if (!std.mem.endsWith(u8, entry.name, ".policy")) continue;
             if (self.org_count >= MAX_ORG_POLICIES) break;
 
@@ -489,10 +508,10 @@ const SmallFile = struct {
 };
 
 fn readSmallFile(path: []const u8) ?SmallFile {
-    const file = std.fs.openFileAbsolute(path, .{}) catch return null;
-    defer file.close();
+    const file = std.Io.Dir.openFileAbsolute(zio(), path, .{}) catch return null;
+    defer file.close(zio());
     var result = SmallFile{ .buf = undefined, .len = 0 };
-    result.len = file.readAll(&result.buf) catch return null;
+    result.len = readFileBytes(file, &result.buf) catch return null;
     return result;
 }
 

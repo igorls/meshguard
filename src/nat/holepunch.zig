@@ -13,6 +13,14 @@ const std = @import("std");
 const messages = @import("../protocol/messages.zig");
 const Udp = @import("../net/udp.zig");
 
+fn zio() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+fn nowNs() i128 {
+    return @intCast(std.Io.Timestamp.now(zio(), .awake).toNanoseconds());
+}
+
 /// Result of a hole punching attempt.
 pub const HolepunchResult = enum {
     /// Hole punch succeeded — direct UDP path established
@@ -81,7 +89,7 @@ pub const Holepuncher = struct {
         } else return null; // all slots busy
 
         var token: [16]u8 = undefined;
-        std.crypto.random.bytes(&token);
+        zio().random(&token);
 
         self.active[slot] = .{
             .initiator_pubkey = our_pubkey,
@@ -89,7 +97,7 @@ pub const Holepuncher = struct {
             .our_public_endpoint = our_public_endpoint,
             .target_public_endpoint = null,
             .token = token,
-            .started_at_ns = std.time.nanoTimestamp(),
+            .started_at_ns = nowNs(),
             .probes_sent = 0,
             .response_received = false,
         };
@@ -139,7 +147,7 @@ pub const Holepuncher = struct {
         self: *Holepuncher,
         socket: *Udp.UdpSocket,
     ) [MAX_CONCURRENT_PUNCHES]?[32]u8 {
-        const now = std.time.nanoTimestamp();
+        const now = nowNs();
         const successes: [MAX_CONCURRENT_PUNCHES]?[32]u8 = .{ null, null, null, null };
 
         for (&self.active, 0..) |*slot, i| {
@@ -198,7 +206,7 @@ pub const Holepuncher = struct {
 
     /// Clean up timed-out attempts.
     pub fn expireTimeouts(self: *Holepuncher) void {
-        const now = std.time.nanoTimestamp();
+        const now = nowNs();
         for (&self.active) |*slot| {
             if (slot.*) |state| {
                 if (now - state.started_at_ns > PUNCH_TIMEOUT_NS) {

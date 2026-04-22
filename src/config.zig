@@ -3,6 +3,28 @@
 const std = @import("std");
 
 pub const Config = struct {
+
+/// Returns a blocking Io instance for synchronous operations.
+fn zio() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+fn getEnvVarOwned(allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
+    const builtin = @import("builtin");
+    if (comptime builtin.os.tag == .windows) {
+        return std.process.Environ.getAlloc(.{ .block = .global }, allocator, key) catch |err| switch (err) {
+            error.EnvironmentVariableMissing => null,
+            else => |other| return other,
+        };
+    }
+
+    const key_z = try allocator.dupeZ(u8, key);
+    defer allocator.free(key_z);
+
+    const value = std.c.getenv(key_z) orelse return null;
+    return try allocator.dupe(u8, std.mem.span(value));
+}
+
     // Identity
     name: []const u8 = "meshguard-node",
 
@@ -38,22 +60,22 @@ pub const Config = struct {
     /// - Linux otherwise: ~/.config/meshguard/  (per-user)
     pub fn defaultConfigDir(allocator: std.mem.Allocator) ![]const u8 {
         // Check for override env var (cross-platform)
-        if (std.process.getEnvVarOwned(allocator, "MESHGUARD_CONFIG_DIR")) |dir| {
+        if (try getEnvVarOwned(allocator, "MESHGUARD_CONFIG_DIR")) |dir| {
             return dir;
-        } else |_| {}
+        }
 
         const builtin = @import("builtin");
         if (comptime builtin.os.tag == .windows) {
             // Windows: %APPDATA%\meshguard (e.g. C:\Users\user\AppData\Roaming\meshguard)
-            if (std.process.getEnvVarOwned(allocator, "APPDATA")) |appdata| {
+            if (try getEnvVarOwned(allocator, "APPDATA")) |appdata| {
                 defer allocator.free(appdata);
                 return std.fs.path.join(allocator, &.{ appdata, "meshguard" });
-            } else |_| {}
+            }
             // Fallback to USERPROFILE
-            if (std.process.getEnvVarOwned(allocator, "USERPROFILE")) |home| {
+            if (try getEnvVarOwned(allocator, "USERPROFILE")) |home| {
                 defer allocator.free(home);
                 return std.fs.path.join(allocator, &.{ home, ".meshguard" });
-            } else |_| {}
+            }
             return error.HomeNotFound;
         }
 
@@ -64,11 +86,13 @@ pub const Config = struct {
             return allocator.dupe(u8, "/etc/meshguard");
         }
 
-        if (std.posix.getenv("XDG_CONFIG_HOME")) |xdg| {
+        if (try getEnvVarOwned(allocator, "XDG_CONFIG_HOME")) |xdg| {
+            defer allocator.free(xdg);
             return std.fs.path.join(allocator, &.{ xdg, "meshguard" });
         }
 
-        if (std.posix.getenv("HOME")) |home| {
+        if (try getEnvVarOwned(allocator, "HOME")) |home| {
+            defer allocator.free(home);
             return std.fs.path.join(allocator, &.{ home, ".config", "meshguard" });
         }
 
@@ -79,14 +103,14 @@ pub const Config = struct {
     /// Ensure the config directory exists and return its path.
     pub fn ensureConfigDir(allocator: std.mem.Allocator) ![]const u8 {
         const dir = try defaultConfigDir(allocator);
-        std.fs.makeDirAbsolute(dir) catch |err| {
+        std.Io.Dir.cwd().createDirPath(zio(), dir) catch |err| {
             if (err != error.PathAlreadyExists) {
                 // Try creating parent directories
                 const parent = std.fs.path.dirname(dir) orelse return err;
-                std.fs.makeDirAbsolute(parent) catch |e| {
+                std.Io.Dir.cwd().createDirPath(zio(), parent) catch |e| {
                     if (e != error.PathAlreadyExists) return e;
                 };
-                std.fs.makeDirAbsolute(dir) catch |e| {
+                std.Io.Dir.cwd().createDirPath(zio(), dir) catch |e| {
                     if (e != error.PathAlreadyExists) return e;
                 };
             }

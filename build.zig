@@ -34,7 +34,7 @@ pub fn build(b: *std.Build) void {
         // Link libsodium on Linux desktop targets for AVX2-accelerated crypto.
         // On Android, macOS, iOS, and Windows, the Zig std.crypto software fallback is used.
         if (!is_android and !is_macos and !is_ios) {
-            ffi_lib.linkSystemLibrary("sodium");
+            ffi_mod.linkSystemLibrary("sodium", .{});
         }
 
         b.installArtifact(ffi_lib);
@@ -65,11 +65,11 @@ pub fn build(b: *std.Build) void {
         // Link libsodium on Linux desktop only (AVX2 ChaCha20-Poly1305 assembly)
         // macOS and Windows use std.crypto
         if (!is_windows and !is_macos) {
-            exe.linkSystemLibrary("sodium");
+            exe_mod.linkSystemLibrary("sodium", .{});
         }
         // On Windows, link ws2_32 for Winsock2 sockets
         if (is_windows) {
-            exe.linkSystemLibrary("ws2_32");
+            exe_mod.linkSystemLibrary("ws2_32", .{});
         }
         b.installArtifact(exe);
 
@@ -90,7 +90,7 @@ pub fn build(b: *std.Build) void {
                 .name = "wg-interop-test",
                 .root_module = interop_mod,
             });
-            interop_exe.linkSystemLibrary("sodium");
+            interop_mod.linkSystemLibrary("sodium", .{});
             b.installArtifact(interop_exe);
         }
 
@@ -124,10 +124,10 @@ pub fn build(b: *std.Build) void {
             .root_module = test_mod,
         });
         if (!is_windows and !is_macos) {
-            unit_tests.linkSystemLibrary("sodium");
+            test_mod.linkSystemLibrary("sodium", .{});
         }
         if (is_windows) {
-            unit_tests.linkSystemLibrary("ws2_32");
+            test_mod.linkSystemLibrary("ws2_32", .{});
         }
         const run_unit_tests = b.addRunArtifact(unit_tests);
         const test_step = b.step("test", "Run unit tests");

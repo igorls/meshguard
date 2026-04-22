@@ -13,6 +13,14 @@ const Blake2s128 = std.crypto.hash.blake2.Blake2s128;
 const X25519 = std.crypto.dh.X25519;
 const ChaCha20Poly1305 = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
 
+fn zio() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+fn nowNs() i128 {
+    return @intCast(std.Io.Timestamp.now(zio(), .awake).toNanoseconds());
+}
+
 // ─── Constants ───
 
 pub const PUBLIC_KEY_LEN: usize = 32;
@@ -418,7 +426,7 @@ pub const Handshake = struct {
             .sending_index = self.sender_index,
             .receiving_index = self.remote_index,
             .is_initiator = is_initiator,
-            .birthdate_ns = std.time.nanoTimestamp(),
+            .birthdate_ns = nowNs(),
         };
     }
 };
@@ -514,35 +522,12 @@ fn aead_decrypt_empty(key: *const [32]u8, hash: *const [32]u8, ciphertext: *cons
 fn tai64nNow() [TIMESTAMP_LEN]u8 {
     var output: [TIMESTAMP_LEN]u8 = undefined;
 
-    const builtin = @import("builtin");
-    if (comptime builtin.os.tag == .linux) {
-        // Use CLOCK_REALTIME (wall clock) — monotonic clock resets on reboot
-        // which would cause anti-replay rejection by the remote peer
-        const ts = std.posix.clock_gettime(.REALTIME) catch {
-            // Fallback to nanoTimestamp if clock_gettime fails
-            const now_ns_total = std.time.nanoTimestamp();
-            const now_s: i64 = @intCast(@divFloor(now_ns_total, std.time.ns_per_s));
-            const now_ns: u32 = @intCast(@mod(now_ns_total, std.time.ns_per_s));
-            const tai_seconds: u64 = @intCast(now_s + 0x400000000000000A);
-            std.mem.writeInt(u64, output[0..8], tai_seconds, .big);
-            std.mem.writeInt(u32, output[8..12], now_ns, .big);
-            return output;
-        };
-
-        // TAI64N: big-endian u64 seconds + big-endian u32 nanoseconds
-        // TAI epoch offset: 2^62 + 10 = 0x400000000000000A
-        const tai_seconds: u64 = @intCast(@as(isize, ts.sec) + 0x400000000000000A);
-        std.mem.writeInt(u64, output[0..8], tai_seconds, .big);
-        std.mem.writeInt(u32, output[8..12], @intCast(ts.nsec), .big);
-    } else {
-        // Windows/other: use nanoTimestamp (wall clock via QueryPerformanceCounter)
-        const now_ns_total = std.time.nanoTimestamp();
-        const now_s: i64 = @intCast(@divFloor(now_ns_total, std.time.ns_per_s));
-        const now_ns: u32 = @intCast(@mod(now_ns_total, std.time.ns_per_s));
-        const tai_seconds: u64 = @intCast(now_s + 0x400000000000000A);
-        std.mem.writeInt(u64, output[0..8], tai_seconds, .big);
-        std.mem.writeInt(u32, output[8..12], now_ns, .big);
-    }
+    const now_ns_total = std.Io.Timestamp.now(zio(), .real).toNanoseconds();
+    const now_s: i64 = @intCast(@divFloor(now_ns_total, std.time.ns_per_s));
+    const now_ns: u32 = @intCast(@mod(now_ns_total, std.time.ns_per_s));
+    const tai_seconds: u64 = @intCast(now_s + 0x400000000000000A);
+    std.mem.writeInt(u64, output[0..8], tai_seconds, .big);
+    std.mem.writeInt(u32, output[8..12], now_ns, .big);
     return output;
 }
 
@@ -550,7 +535,7 @@ fn tai64nNow() [TIMESTAMP_LEN]u8 {
 /// Generate a random 32-byte secret (clamped for X25519).
 fn generateSecret() [32]u8 {
     var secret: [32]u8 = undefined;
-    std.crypto.random.bytes(&secret);
+    zio().random(&secret);
     // Clamp for Curve25519
     secret[0] &= 248;
     secret[31] &= 127;

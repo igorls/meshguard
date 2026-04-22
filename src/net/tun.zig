@@ -9,6 +9,14 @@
 const std = @import("std");
 const posix = std.posix;
 
+fn linuxSocket(domain: u32, sock_type: u32, protocol: u32) !std.posix.socket_t {
+    const fd = std.c.socket(@intCast(domain), @intCast(sock_type), @intCast(protocol));
+    switch (std.posix.errno(fd)) {
+        .SUCCESS => return fd,
+        else => |err| return std.posix.unexpectedErrno(err),
+    }
+}
+
 pub const TunDevice = struct {
     fd: posix.fd_t,
     name: [16]u8,
@@ -43,8 +51,12 @@ pub const TunDevice = struct {
     /// Requires CAP_NET_ADMIN. Uses IFF_MULTI_QUEUE to allow parallel I/O.
     pub fn open(name: []const u8) !TunDevice {
         // Open /dev/net/tun
-        const fd = try posix.open("/dev/net/tun", .{ .ACCMODE = .RDWR }, 0);
-        errdefer posix.close(fd);
+        const fd = std.c.open("/dev/net/tun", .{ .ACCMODE = .RDWR });
+        switch (std.posix.errno(fd)) {
+            .SUCCESS => {},
+            else => |err| return std.posix.unexpectedErrno(err),
+        }
+        errdefer _ = std.c.close(fd);
 
         // Set up ifreq with MULTI_QUEUE
         var ifr = Ifreq{};
@@ -59,7 +71,7 @@ pub const TunDevice = struct {
             @intFromPtr(&ifr),
         );
         if (rc != 0) {
-            posix.close(fd);
+            _ = std.c.close(fd);
             return error.TunSetupFailed;
         }
 
@@ -103,8 +115,12 @@ pub const TunDevice = struct {
     /// Open an additional queue fd above an existing multi-queue TUN device.
     /// The kernel distributes packets across queues by flow hash.
     pub fn openQueue(self: *const TunDevice) !TunDevice {
-        const fd = try posix.open("/dev/net/tun", .{ .ACCMODE = .RDWR }, 0);
-        errdefer posix.close(fd);
+        const fd = std.c.open("/dev/net/tun", .{ .ACCMODE = .RDWR });
+        switch (std.posix.errno(fd)) {
+            .SUCCESS => {},
+            else => |err| return std.posix.unexpectedErrno(err),
+        }
+        errdefer _ = std.c.close(fd);
 
         var ifr = Ifreq{};
         ifr.ifr_flags = IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE | IFF_VNET_HDR;
@@ -116,7 +132,7 @@ pub const TunDevice = struct {
             @intFromPtr(&ifr),
         );
         if (rc != 0) {
-            posix.close(fd);
+            _ = std.c.close(fd);
             return error.TunSetupFailed;
         }
 
@@ -147,9 +163,17 @@ pub const TunDevice = struct {
                 .{ .base = &vhdr_bytes, .len = Offload.VNET_HDR_LEN },
                 .{ .base = data.ptr, .len = data.len },
             };
-            _ = try posix.writev(self.fd, &iov);
+            const rc = std.c.writev(self.fd, iov[0..].ptr, @intCast(iov.len));
+            switch (posix.errno(rc)) {
+                .SUCCESS => {},
+                else => |err| return posix.unexpectedErrno(err),
+            }
         } else {
-            _ = try posix.write(self.fd, data);
+            const rc = std.c.write(self.fd, data.ptr, data.len);
+            switch (posix.errno(rc)) {
+                .SUCCESS => {},
+                else => |err| return posix.unexpectedErrno(err),
+            }
         }
     }
 
@@ -162,17 +186,30 @@ pub const TunDevice = struct {
             .{ .base = &hdr_bytes, .len = Offload.VNET_HDR_LEN },
             .{ .base = data.ptr, .len = data.len },
         };
-        _ = try posix.writev(self.fd, &iov);
+        const rc = std.c.writev(self.fd, iov[0..].ptr, @intCast(iov.len));
+        switch (posix.errno(rc)) {
+            .SUCCESS => {},
+            else => |err| return posix.unexpectedErrno(err),
+        }
     }
 
     /// Set the TUN fd to non-blocking mode.
     pub fn setNonBlocking(self: *TunDevice) !void {
-        const flags = try posix.fcntl(self.fd, posix.F.GETFL, 0);
-        _ = try posix.fcntl(
+        const flags = posix.system.fcntl(self.fd, posix.F.GETFL, @as(usize, 0));
+        switch (posix.errno(flags)) {
+            .SUCCESS => {},
+            else => |err| return posix.unexpectedErrno(err),
+        }
+
+        const rc = posix.system.fcntl(
             self.fd,
             posix.F.SETFL,
-            flags | @as(usize, 0x800), // O_NONBLOCK = 0x800 on Linux
+            @as(usize, @intCast(flags)) | @as(usize, 1 << @bitOffsetOf(posix.O, "NONBLOCK")),
         );
+        switch (posix.errno(rc)) {
+            .SUCCESS => {},
+            else => |err| return posix.unexpectedErrno(err),
+        }
     }
 
     /// Get the interface name as a slice.
@@ -195,8 +232,8 @@ pub const TunDevice = struct {
         ifr.ifr_mtu = mtu;
 
         // Need a socket for the ioctl
-        const sock = std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0) catch return error.SocketFailed;
-        defer std.posix.close(sock);
+        const sock = linuxSocket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0) catch return error.SocketFailed;
+        defer _ = std.c.close(sock);
 
         const rc = std.os.linux.ioctl(
             @intCast(sock),
@@ -208,7 +245,7 @@ pub const TunDevice = struct {
 
     /// Close the TUN device.
     pub fn close(self: *TunDevice) void {
-        posix.close(self.fd);
+        _ = std.c.close(self.fd);
     }
 
     /// Poll for readable data with timeout.

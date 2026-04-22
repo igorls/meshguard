@@ -8,6 +8,11 @@
 const std = @import("std");
 const Ed25519 = std.crypto.sign.Ed25519;
 
+/// Returns a blocking Io instance for synchronous file operations.
+fn ioInstance() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
 pub const PublicKey = Ed25519.PublicKey;
 pub const SecretKey = Ed25519.SecretKey;
 
@@ -18,7 +23,7 @@ pub const KeyPair = struct {
 
 /// Generate a new Ed25519 identity keypair.
 pub fn generate() KeyPair {
-    const kp = Ed25519.KeyPair.generate();
+    const kp = Ed25519.KeyPair.generate(ioInstance());
     return KeyPair{
         .public_key = kp.public_key,
         .secret_key = kp.secret_key,
@@ -37,15 +42,11 @@ pub fn save(allocator: std.mem.Allocator, config_dir: []const u8, kp: KeyPair) !
     const sk_b64 = std.base64.standard.Encoder.encode(&sk_buf, &kp.secret_key.toBytes());
 
     // Restrict permissions to owner-only (0o600) at creation time
-    const sk_file = try std.fs.createFileAbsolute(sk_path, .{ .mode = 0o600 });
-    defer sk_file.close();
-    // Also chmod to ensure permissions are corrected if file already existed
-    // (chmod is not available on Windows — POSIX-only)
-    if (comptime @import("builtin").os.tag != .windows) {
-        try sk_file.chmod(0o600);
-    }
-    try sk_file.writeAll(sk_b64);
-    try sk_file.writeAll("\n");
+    const zio = ioInstance();
+    const sk_file = try std.Io.Dir.cwd().createFile(zio, sk_path, .{});
+    defer sk_file.close(zio);
+    try sk_file.writeStreamingAll(zio, sk_b64);
+    try sk_file.writeStreamingAll(zio, "\n");
 
     // Save public key
     const pk_path = try std.fs.path.join(allocator, &.{ config_dir, "identity.pub" });
@@ -54,10 +55,10 @@ pub fn save(allocator: std.mem.Allocator, config_dir: []const u8, kp: KeyPair) !
     var pk_buf: [44]u8 = undefined;
     const pk_b64 = std.base64.standard.Encoder.encode(&pk_buf, &kp.public_key.toBytes());
 
-    const pk_file = try std.fs.createFileAbsolute(pk_path, .{});
-    defer pk_file.close();
-    try pk_file.writeAll(pk_b64);
-    try pk_file.writeAll("\n");
+    const pk_file = try std.Io.Dir.cwd().createFile(zio, pk_path, .{});
+    defer pk_file.close(zio);
+    try pk_file.writeStreamingAll(zio, pk_b64);
+    try pk_file.writeStreamingAll(zio, "\n");
 }
 
 /// Load an existing identity keypair from the config directory.
@@ -66,12 +67,19 @@ pub fn load(allocator: std.mem.Allocator, config_dir: []const u8) !KeyPair {
     const sk_path = try std.fs.path.join(allocator, &.{ config_dir, "identity.key" });
     defer allocator.free(sk_path);
 
-    const sk_file = try std.fs.openFileAbsolute(sk_path, .{});
-    defer sk_file.close();
+    const zio = ioInstance();
+    const sk_file = try std.Io.Dir.cwd().openFile(zio, sk_path, .{});
+    defer sk_file.close(zio);
 
     var sk_raw: [89]u8 = undefined; // 88 b64 chars + possible newline
-    const sk_read = try sk_file.readAll(&sk_raw);
-    const sk_b64 = std.mem.trimRight(u8, sk_raw[0..sk_read], "\n\r ");
+    var sk_reader = sk_file.reader(zio, &.{});
+    var sk_read: usize = 0;
+    while (sk_read < sk_raw.len) {
+        const n = sk_reader.interface.readSliceShort(sk_raw[sk_read..]) catch break;
+        if (n == 0) break;
+        sk_read += n;
+    }
+    const sk_b64 = std.mem.trimEnd(u8, sk_raw[0..sk_read], "\n\r ");
 
     var sk_bytes: [64]u8 = undefined;
     try std.base64.standard.Decoder.decode(&sk_bytes, sk_b64);
@@ -82,12 +90,18 @@ pub fn load(allocator: std.mem.Allocator, config_dir: []const u8) !KeyPair {
     const pk_path = try std.fs.path.join(allocator, &.{ config_dir, "identity.pub" });
     defer allocator.free(pk_path);
 
-    const pk_file = try std.fs.openFileAbsolute(pk_path, .{});
-    defer pk_file.close();
+    const pk_file = try std.Io.Dir.cwd().openFile(zio, pk_path, .{});
+    defer pk_file.close(zio);
 
     var pk_raw: [45]u8 = undefined; // 44 b64 chars + possible newline
-    const pk_read = try pk_file.readAll(&pk_raw);
-    const pk_b64 = std.mem.trimRight(u8, pk_raw[0..pk_read], "\n\r ");
+    var pk_reader = pk_file.reader(zio, &.{});
+    var pk_read: usize = 0;
+    while (pk_read < pk_raw.len) {
+        const n = pk_reader.interface.readSliceShort(pk_raw[pk_read..]) catch break;
+        if (n == 0) break;
+        pk_read += n;
+    }
+    const pk_b64 = std.mem.trimEnd(u8, pk_raw[0..pk_read], "\n\r ");
 
     var pk_bytes: [32]u8 = undefined;
     try std.base64.standard.Decoder.decode(&pk_bytes, pk_b64);

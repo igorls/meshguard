@@ -14,8 +14,52 @@ const builtin = @import("builtin");
 const is_windows = builtin.os.tag == .windows;
 const is_linux = builtin.os.tag == .linux;
 const posix = std.posix;
+const Config = @import("../config.zig").Config;
 const Membership = @import("../discovery/membership.zig");
 const Ip = @import("../wireguard/ip.zig");
+
+fn linuxSocket(domain: u32, sock_type: u32, protocol: u32) !std.posix.socket_t {
+    const fd = std.c.socket(@intCast(domain), @intCast(sock_type), @intCast(protocol));
+    switch (std.posix.errno(fd)) {
+        .SUCCESS => return fd,
+        else => |err| return std.posix.unexpectedErrno(err),
+    }
+}
+
+fn closeSocket(fd: posix.socket_t) void {
+    _ = std.c.close(fd);
+}
+
+fn zio() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+fn deleteFileAbsolute(path: []const u8) void {
+    std.Io.Dir.cwd().deleteFile(zio(), path) catch {};
+}
+
+const UnixSocketAddress = struct {
+    addr: posix.sockaddr.un,
+    len: posix.socklen_t,
+};
+
+fn initUnixSocketAddress(path: []const u8) !UnixSocketAddress {
+    var addr = std.mem.zeroes(posix.sockaddr.un);
+    if (path.len >= addr.path.len) return error.NameTooLong;
+
+    addr.family = posix.AF.UNIX;
+    @memcpy(addr.path[0..path.len], path);
+    addr.path[path.len] = 0;
+
+    return .{
+        .addr = addr,
+        .len = @intCast(@offsetOf(posix.sockaddr.un, "path") + path.len + 1),
+    };
+}
+
+fn writeSocket(fd: posix.socket_t, data: []const u8) void {
+    _ = std.c.write(fd, data.ptr, data.len);
+}
 
 // ─── Windows-only imports ───
 const win = if (is_windows) struct {
@@ -56,17 +100,17 @@ pub const ControlSocket = struct {
                 break :blk DEFAULT_SOCKET_PATH;
             } else {
                 // Try /run/meshguard first (systemd convention), fall back to XDG config
-                if (std.fs.makeDirAbsolute("/run/meshguard")) |_| {
+                if (std.Io.Dir.cwd().createDirPath(zio(), "/run/meshguard")) |_| {
                     break :blk DEFAULT_SOCKET_PATH;
                 } else |_| {
                     // Fallback: ~/.config/meshguard/meshguard.sock
-                    const config_dir = std.fs.getAppDataDir(allocator, "meshguard") catch
+                    const config_dir = Config.defaultConfigDir(allocator) catch
                         break :blk DEFAULT_SOCKET_PATH;
                     defer allocator.free(config_dir);
                     const sock_path = std.fs.path.join(allocator, &.{ config_dir, "meshguard.sock" }) catch
                         break :blk DEFAULT_SOCKET_PATH;
                     // Ensure parent dir exists
-                    std.fs.makeDirAbsolute(config_dir) catch {};
+                    std.Io.Dir.cwd().createDirPath(zio(), config_dir) catch {};
                     return .{
                         .server = null,
                         .socket_path = sock_path,
@@ -99,17 +143,25 @@ pub const ControlSocket = struct {
 
     fn listenUnix(self: *ControlSocket) !void {
         // Remove stale socket file
-        std.fs.deleteFileAbsolute(self.socket_path) catch {};
+        deleteFileAbsolute(self.socket_path);
 
-        const addr = try std.net.Address.initUnix(self.socket_path);
-        const sock = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
-        errdefer posix.close(sock);
+        const addr = try initUnixSocketAddress(self.socket_path);
+        const sock = try linuxSocket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
+        errdefer closeSocket(sock);
 
-        try posix.bind(sock, &addr.any, addr.getOsSockLen());
-        try posix.listen(sock, 4);
+        if (std.c.bind(sock, @ptrCast(&addr.addr), addr.len) != 0) {
+            return error.BindFailed;
+        }
+        if (std.c.listen(sock, 4) != 0) {
+            return error.ListenFailed;
+        }
 
         // Make socket accessible to non-root users
-        posix.fchmodat(posix.AT.FDCWD, self.socket_path, 0o666, 0) catch {};
+        if (self.socket_path.len < 256) {
+            var path_buf = std.mem.zeroes([256:0]u8);
+            @memcpy(path_buf[0..self.socket_path.len], self.socket_path);
+            _ = std.c.fchmodat(posix.AT.FDCWD, &path_buf, 0o666, 0);
+        }
 
         self.server = sock;
     }
@@ -150,8 +202,12 @@ pub const ControlSocket = struct {
 
     fn pollUnix(self: *ControlSocket) bool {
         const sock = self.server orelse return false;
-        const client = posix.accept(sock, null, null, posix.SOCK.NONBLOCK) catch return false;
-        defer posix.close(client);
+        const client = if (comptime is_linux)
+            std.c.accept4(sock, null, null, @intCast(posix.SOCK.NONBLOCK))
+        else
+            std.c.accept(sock, null, null);
+        if (client < 0) return false;
+        defer closeSocket(client);
         self.handleClientUnix(client);
         return true;
     }
@@ -182,7 +238,7 @@ pub const ControlSocket = struct {
             return false;
         }
 
-        const cmd = std.mem.trimRight(u8, buf[0..bytes_read], "\r\n \t");
+        const cmd = std.mem.trimEnd(u8, buf[0..bytes_read], "\r\n \t");
 
         // Generate response
         var resp_buf: [8192]u8 = undefined;
@@ -217,22 +273,22 @@ pub const ControlSocket = struct {
         const n = posix.read(client, &buf) catch return;
         if (n == 0) return;
 
-        const cmd = std.mem.trimRight(u8, buf[0..n], "\r\n \t");
+        const cmd = std.mem.trimEnd(u8, buf[0..n], "\r\n \t");
 
         if (std.mem.eql(u8, cmd, "PEERS")) {
             var resp_buf: [8192]u8 = undefined;
             const resp_len = self.formatPeers(&resp_buf);
             if (resp_len > 0) {
-                _ = posix.write(client, resp_buf[0..resp_len]) catch {};
+                writeSocket(client, resp_buf[0..resp_len]);
             }
         } else if (std.mem.eql(u8, cmd, "STATUS")) {
             var resp_buf: [512]u8 = undefined;
             const resp_len = self.formatStatus(&resp_buf);
             if (resp_len > 0) {
-                _ = posix.write(client, resp_buf[0..resp_len]) catch {};
+                writeSocket(client, resp_buf[0..resp_len]);
             }
         } else {
-            _ = posix.write(client, "{\"error\":\"unknown command\"}\n") catch {};
+            writeSocket(client, "{\"error\":\"unknown command\"}\n");
         }
     }
 
@@ -313,11 +369,11 @@ pub const ControlSocket = struct {
             }
         } else {
             if (self.server) |sock| {
-                posix.close(sock);
+                closeSocket(sock);
                 self.server = null;
             }
             // Clean up socket file
-            std.fs.deleteFileAbsolute(self.socket_path) catch {};
+            deleteFileAbsolute(self.socket_path);
         }
         if (self.socket_path_owned) {
             allocator.free(self.socket_path);

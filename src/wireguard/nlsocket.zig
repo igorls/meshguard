@@ -7,6 +7,18 @@ const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
 
+fn linuxSocket(domain: u32, sock_type: u32, protocol: u32) !std.posix.socket_t {
+    const fd = std.c.socket(@intCast(domain), @intCast(sock_type), @intCast(protocol));
+    switch (std.posix.errno(fd)) {
+        .SUCCESS => return fd,
+        else => |err| return std.posix.unexpectedErrno(err),
+    }
+}
+
+fn closeSocket(fd: posix.socket_t) void {
+    _ = std.c.close(fd);
+}
+
 /// Netlink Attribute header (mirrors struct nlattr from linux/netlink.h)
 pub const nlattr = extern struct {
     len: u16,
@@ -279,7 +291,7 @@ pub const NetlinkSocket = struct {
 
     /// Open a netlink socket for the given protocol (e.g. NETLINK.ROUTE, NETLINK.GENERIC).
     pub fn open(protocol: u32) !NetlinkSocket {
-        const fd = posix.socket(
+        const fd = linuxSocket(
             linux.AF.NETLINK,
             @intCast(linux.SOCK.RAW | linux.SOCK.CLOEXEC),
             protocol,
@@ -291,14 +303,16 @@ pub const NetlinkSocket = struct {
             .groups = 0,
         };
 
-        posix.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.nl)) catch return error.BindFailed;
+        if (std.c.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.nl)) != 0) {
+            return error.BindFailed;
+        }
 
         return NetlinkSocket{ .fd = fd };
     }
 
     /// Close the socket.
     pub fn close(self: *NetlinkSocket) void {
-        posix.close(self.fd);
+        closeSocket(self.fd);
     }
 
     /// Get next sequence number.
@@ -310,10 +324,16 @@ pub const NetlinkSocket = struct {
 
     /// Send a message and wait for ACK. Returns error on NLMSG_ERROR with non-zero error.
     pub fn sendAndAck(self: *NetlinkSocket, msg: []const u8) !void {
-        _ = posix.send(self.fd, msg, 0) catch return error.SendFailed;
+        if (std.c.send(self.fd, msg.ptr, msg.len, 0) < 0) {
+            return error.SendFailed;
+        }
 
         var resp_buf: [8192]u8 align(4) = undefined;
-        const n = posix.recv(self.fd, &resp_buf, 0) catch return error.RecvFailed;
+        const rc = std.c.recv(self.fd, resp_buf[0..].ptr, resp_buf.len, 0);
+        if (rc < 0) {
+            return error.RecvFailed;
+        }
+        const n: usize = @intCast(rc);
 
         if (n < @sizeOf(linux.nlmsghdr)) return error.UnexpectedResponse;
 
@@ -335,8 +355,16 @@ pub const NetlinkSocket = struct {
 
     /// Send a message and return the raw response buffer + length.
     pub fn sendAndRecv(self: *NetlinkSocket, msg: []const u8, resp_buf: []u8) !usize {
-        _ = posix.send(self.fd, msg, 0) catch return error.SendFailed;
-        return posix.recv(self.fd, resp_buf, 0) catch return error.RecvFailed;
+        if (std.c.send(self.fd, msg.ptr, msg.len, 0) < 0) {
+            return error.SendFailed;
+        }
+
+        const rc = std.c.recv(self.fd, resp_buf.ptr, resp_buf.len, 0);
+        if (rc < 0) {
+            return error.RecvFailed;
+        }
+
+        return @intCast(rc);
     }
 };
 

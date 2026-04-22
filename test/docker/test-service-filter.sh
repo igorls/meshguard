@@ -195,26 +195,44 @@ sleep 2
 # ─── Test 3: Verify allowed port (22) ───
 if [ -n "$NODE_A_MESH" ]; then
     # First verify the listener works via Docker network (bypass mesh)
-    DIRECT_CHECK=$(docker exec meshguard-node-b timeout 3 nc -w 2 "$NODE_A_IP" 22 2>/dev/null || true)
-    if [ -z "$DIRECT_CHECK" ]; then
-        info "Warning: direct TCP 22 check failed (listener might not be ready)"
+    DIRECT_CHECK=""
+    for _ in $(seq 1 10); do
+        DIRECT_CHECK=$(docker exec meshguard-node-b timeout 3 nc -w 2 "$NODE_A_IP" 22 2>/dev/null || true)
+        if echo "$DIRECT_CHECK" | grep -q "SSH OK"; then
+            break
+        fi
+        sleep 1
+    done
+
+    if echo "$DIRECT_CHECK" | grep -q "SSH OK"; then
+        pass "Direct TCP 22 reachable on node-a service listener"
+    else
+        info "Node A services log:"
+        docker exec meshguard-node-a cat /var/log/services.log 2>/dev/null || true
+        info "Node A port listeners:"
+        docker exec meshguard-node-a ss -ltn 2>/dev/null || true
+        fail "Direct TCP 22 listener on node-a never became reachable"
     fi
 
     info "Testing TCP 22 via mesh (should be ALLOWED)..."
-    RESULT=$(docker exec meshguard-node-b timeout 5 nc -w 3 "$NODE_A_MESH" 22 2>/dev/null || true)
+    RESULT=""
+    for _ in $(seq 1 5); do
+        RESULT=$(docker exec meshguard-node-b timeout 5 nc -w 3 "$NODE_A_MESH" 22 2>/dev/null || true)
+        if echo "$RESULT" | grep -q "SSH OK"; then
+            break
+        fi
+        sleep 1
+    done
+
     if echo "$RESULT" | grep -q "SSH OK"; then
         pass "TCP 22 reachable through mesh (as allowed by policy)"
     else
-        # The connection may succeed but the response may be empty if timing is tight
-        # Try one more time
-        sleep 1
-        RESULT=$(docker exec meshguard-node-b timeout 5 nc -w 3 "$NODE_A_MESH" 22 2>/dev/null || true)
-        if echo "$RESULT" | grep -q "SSH OK"; then
-            pass "TCP 22 reachable through mesh (as allowed by policy, 2nd try)"
-        else
-            info "TCP 22 result: '$RESULT'"
-            fail "TCP 22 should be reachable (allowed by policy)"
-        fi
+        info "TCP 22 result: '$RESULT'"
+        info "Node A meshguard log:"
+        docker exec meshguard-node-a tail -20 /var/log/meshguard.log 2>/dev/null || true
+        info "Node B meshguard log:"
+        docker exec meshguard-node-b tail -20 /var/log/meshguard.log 2>/dev/null || true
+        fail "TCP 22 should be reachable (allowed by policy)"
     fi
 
     # ─── Test 4: Verify blocked port (8080) ───

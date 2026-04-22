@@ -11,6 +11,29 @@ const std = @import("std");
 const Ed25519 = std.crypto.sign.Ed25519;
 const Blake3 = std.crypto.hash.Blake3;
 
+
+/// Read all available bytes from an Io.File into buf. Returns bytes read.
+fn readFileBytes(f: std.Io.File, buf: []u8) !usize {
+    var reader = f.reader(zio(), &.{});
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = reader.interface.readSliceShort(buf[total..]) catch break;
+        if (n == 0) break;
+        total += n;
+    }
+    return total;
+}
+
+/// Returns a blocking Io instance for synchronous operations.
+fn zio() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+fn nowUnixSecs() i64 {
+    return @intCast(std.Io.Timestamp.now(zio(), .real).toSeconds());
+}
+
+
 // ─── Types ───
 
 pub const OrgKeyPair = struct {
@@ -114,12 +137,12 @@ pub const NodeCertificate = struct {
     pub fn isValid(self: *const NodeCertificate) bool {
         if (self.version != 1) return false;
         if (self.expires_at == 0) return true; // never expires
-        return std.time.timestamp() < self.expires_at;
+        return nowUnixSecs() < self.expires_at;
     }
 
     /// Get the node name as a trimmed string (strips null padding).
     pub fn getName(self: *const NodeCertificate) []const u8 {
-        return std.mem.trimRight(u8, &self.node_name, "\x00");
+        return std.mem.trimEnd(u8, &self.node_name, "\x00");
     }
 };
 
@@ -127,7 +150,7 @@ pub const NodeCertificate = struct {
 
 /// Generate a new org Ed25519 keypair.
 pub fn generateOrgKeyPair() OrgKeyPair {
-    const kp = Ed25519.KeyPair.generate();
+    const kp = Ed25519.KeyPair.generate(zio());
     return .{
         .public_key = kp.public_key,
         .secret_key = kp.secret_key,
@@ -138,7 +161,7 @@ pub fn generateOrgKeyPair() OrgKeyPair {
 pub fn saveOrgKeyPair(allocator: std.mem.Allocator, config_dir: []const u8, kp: OrgKeyPair) !void {
     const org_dir = try std.fs.path.join(allocator, &.{ config_dir, "org" });
     defer allocator.free(org_dir);
-    std.fs.makeDirAbsolute(org_dir) catch |err| {
+    std.Io.Dir.cwd().createDirPath(zio(), org_dir) catch |err| {
         if (err != error.PathAlreadyExists) return err;
     };
 
@@ -149,13 +172,13 @@ pub fn saveOrgKeyPair(allocator: std.mem.Allocator, config_dir: []const u8, kp: 
     var sk_buf: [88]u8 = undefined;
     const sk_b64 = std.base64.standard.Encoder.encode(&sk_buf, &kp.secret_key.toBytes());
 
-    const sk_file = try std.fs.createFileAbsolute(sk_path, .{ .mode = 0o600 });
-    defer sk_file.close();
+    const sk_file = try std.Io.Dir.createFileAbsolute(zio(), sk_path, .{});
+    defer sk_file.close(zio());
     if (comptime @import("builtin").os.tag != .windows) {
-        try sk_file.chmod(0o600);
+        try sk_file.setPermissions(zio(), .fromMode(0o600));
     }
-    try sk_file.writeAll(sk_b64);
-    try sk_file.writeAll("\n");
+    try sk_file.writeStreamingAll(zio(), sk_b64);
+    try sk_file.writeStreamingAll(zio(), "\n");
 
     // Save public key
     const pk_path = try std.fs.path.join(allocator, &.{ org_dir, "org.pub" });
@@ -164,10 +187,10 @@ pub fn saveOrgKeyPair(allocator: std.mem.Allocator, config_dir: []const u8, kp: 
     var pk_buf: [44]u8 = undefined;
     const pk_b64 = std.base64.standard.Encoder.encode(&pk_buf, &kp.public_key.toBytes());
 
-    const pk_file = try std.fs.createFileAbsolute(pk_path, .{});
-    defer pk_file.close();
-    try pk_file.writeAll(pk_b64);
-    try pk_file.writeAll("\n");
+    const pk_file = try std.Io.Dir.createFileAbsolute(zio(), pk_path, .{});
+    defer pk_file.close(zio());
+    try pk_file.writeStreamingAll(zio(), pk_b64);
+    try pk_file.writeStreamingAll(zio(), "\n");
 }
 
 /// Load an org keypair from config_dir/org/.
@@ -175,12 +198,12 @@ pub fn loadOrgKeyPair(allocator: std.mem.Allocator, config_dir: []const u8) !Org
     const sk_path = try std.fs.path.join(allocator, &.{ config_dir, "org", "org.key" });
     defer allocator.free(sk_path);
 
-    const sk_file = try std.fs.openFileAbsolute(sk_path, .{});
-    defer sk_file.close();
+    const sk_file = try std.Io.Dir.openFileAbsolute(zio(), sk_path, .{});
+    defer sk_file.close(zio());
 
     var sk_raw: [89]u8 = undefined;
-    const sk_read = try sk_file.readAll(&sk_raw);
-    const sk_b64 = std.mem.trimRight(u8, sk_raw[0..sk_read], "\n\r ");
+    const sk_read = try readFileBytes(sk_file, &sk_raw);
+    const sk_b64 = std.mem.trimEnd(u8, sk_raw[0..sk_read], "\n\r ");
 
     var sk_bytes: [64]u8 = undefined;
     try std.base64.standard.Decoder.decode(&sk_bytes, sk_b64);
@@ -188,12 +211,12 @@ pub fn loadOrgKeyPair(allocator: std.mem.Allocator, config_dir: []const u8) !Org
     const pk_path = try std.fs.path.join(allocator, &.{ config_dir, "org", "org.pub" });
     defer allocator.free(pk_path);
 
-    const pk_file = try std.fs.openFileAbsolute(pk_path, .{});
-    defer pk_file.close();
+    const pk_file = try std.Io.Dir.openFileAbsolute(zio(), pk_path, .{});
+    defer pk_file.close(zio());
 
     var pk_raw: [45]u8 = undefined;
-    const pk_read = try pk_file.readAll(&pk_raw);
-    const pk_b64 = std.mem.trimRight(u8, pk_raw[0..pk_read], "\n\r ");
+    const pk_read = try readFileBytes(pk_file, &pk_raw);
+    const pk_b64 = std.mem.trimEnd(u8, pk_raw[0..pk_read], "\n\r ");
 
     var pk_bytes: [32]u8 = undefined;
     try std.base64.standard.Decoder.decode(&pk_bytes, pk_b64);
@@ -238,7 +261,7 @@ pub fn issueCertificate(
         .org_pubkey = org_kp.public_key.toBytes(),
         .node_pubkey = node_pubkey,
         .node_name = node_name,
-        .issued_at = std.time.timestamp(),
+        .issued_at = nowUnixSecs(),
         .expires_at = expires_at,
     };
 
@@ -273,19 +296,19 @@ pub fn saveCertificate(allocator: std.mem.Allocator, path: []const u8, cert: *co
     _ = allocator;
     var wire: [NodeCertificate.WIRE_SIZE]u8 = undefined;
     cert.serialize(&wire);
-    const file = try std.fs.createFileAbsolute(path, .{});
-    defer file.close();
-    try file.writeAll(&wire);
+    const file = try std.Io.Dir.createFileAbsolute(zio(), path, .{});
+    defer file.close(zio());
+    try file.writeStreamingAll(zio(), &wire);
 }
 
 /// Load a certificate from a file.
 pub fn loadCertificate(allocator: std.mem.Allocator, path: []const u8) !NodeCertificate {
     _ = allocator;
-    const file = try std.fs.openFileAbsolute(path, .{});
-    defer file.close();
+    const file = try std.Io.Dir.openFileAbsolute(zio(), path, .{});
+    defer file.close(zio());
 
     var wire: [NodeCertificate.WIRE_SIZE]u8 = undefined;
-    const n = try file.readAll(&wire);
+    const n = try readFileBytes(file, &wire);
     if (n < NodeCertificate.WIRE_SIZE) return error.InvalidCertificate;
     return NodeCertificate.deserialize(&wire);
 }
@@ -294,7 +317,7 @@ pub fn loadCertificate(allocator: std.mem.Allocator, path: []const u8) !NodeCert
 
 test "org keygen and cert sign/verify" {
     const org_kp = generateOrgKeyPair();
-    const node_kp = Ed25519.KeyPair.generate();
+    const node_kp = Ed25519.KeyPair.generate(zio());
 
     var cert = try issueCertificate(
         org_kp,
@@ -315,7 +338,7 @@ test "org keygen and cert sign/verify" {
 
 test "cert serialize/deserialize round-trip" {
     const org_kp = generateOrgKeyPair();
-    const node_kp = Ed25519.KeyPair.generate();
+    const node_kp = Ed25519.KeyPair.generate(zio());
 
     const cert = try issueCertificate(
         org_kp,

@@ -19,6 +19,35 @@ const is_ios = builtin.os.tag == .ios;
 const is_darwin = is_macos or is_ios;
 const linux = if (is_linux) std.os.linux else struct {};
 
+fn linuxSocket(domain: u32, sock_type: u32, protocol: u32) !std.posix.socket_t {
+    const fd = std.c.socket(@intCast(domain), @intCast(sock_type), @intCast(protocol));
+    switch (std.posix.errno(fd)) {
+        .SUCCESS => return fd,
+        else => |err| return std.posix.unexpectedErrno(err),
+    }
+}
+
+fn closeSocket(fd: posix.socket_t) void {
+    _ = std.c.close(fd);
+}
+
+
+/// Create a socket via raw Linux syscall (replaces removed posix.socket).
+/// Returns a blocking Io instance for synchronous operations.
+fn zio() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+fn ipv4Sockaddr(ip: [4]u8, port: u16) posix.sockaddr.in {
+    return .{
+        .family = posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, @as(u32, @bitCast(ip))),
+        .zero = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+    };
+}
+
+
 
 // ─── Constants ───
 
@@ -139,20 +168,20 @@ fn ssdpDiscover(gateway_ip: *[4]u8, location_buf: *[512]u8) ?[]const u8 {
     // Create UDP socket for multicast
     const fd = blk: {
         if (comptime is_linux) {
-            break :blk posix.socket(linux.AF.INET, @intCast(linux.SOCK.DGRAM | linux.SOCK.CLOEXEC), 0) catch return null;
+            break :blk linuxSocket(linux.AF.INET, @intCast(linux.SOCK.DGRAM | linux.SOCK.CLOEXEC), 0) catch return null;
         } else {
-            break :blk posix.socket(posix.AF.INET, posix.SOCK.DGRAM, 0) catch return null;
+            break :blk linuxSocket(posix.AF.INET, posix.SOCK.DGRAM, 0) catch return null;
         }
     };
-    defer posix.close(fd);
+    defer closeSocket(fd);
 
     // Allow reuse
     const one: u32 = 1;
     posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one)) catch {};
 
     // Bind to any port (required for receiving multicast responses)
-    var bind_addr = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, 0);
-    posix.bind(fd, &bind_addr.any, bind_addr.getOsSockLen()) catch {};
+    var bind_addr = ipv4Sockaddr(.{ 0, 0, 0, 0 }, 0);
+    _ = std.c.bind(fd, @ptrCast(&bind_addr), @sizeOf(posix.sockaddr.in));
 
     // Set TTL for multicast (4 hops is enough for most LANs)
     const ttl: u32 = 4;
@@ -163,11 +192,13 @@ fn ssdpDiscover(gateway_ip: *[4]u8, location_buf: *[512]u8) ?[]const u8 {
         posix.setsockopt(fd, posix.IPPROTO.IP, 10, std.mem.asBytes(&ttl)) catch {};
     }
 
-    const dest_addr = std.net.Address.initIp4(SSDP_ADDR, SSDP_PORT);
+    const dest_addr = ipv4Sockaddr(SSDP_ADDR, SSDP_PORT);
 
     // Send M-SEARCH for IGD v1 (most common) and rootdevice (broader)
-    _ = posix.sendto(fd, SSDP_SEARCH, 0, &dest_addr.any, dest_addr.getOsSockLen()) catch return null;
-    _ = posix.sendto(fd, SSDP_SEARCH_V2, 0, &dest_addr.any, dest_addr.getOsSockLen()) catch {};
+    if (std.c.sendto(fd, SSDP_SEARCH.ptr, SSDP_SEARCH.len, 0, @ptrCast(&dest_addr), @sizeOf(posix.sockaddr.in)) < 0) {
+        return null;
+    }
+    _ = std.c.sendto(fd, SSDP_SEARCH_V2.ptr, SSDP_SEARCH_V2.len, 0, @ptrCast(&dest_addr), @sizeOf(posix.sockaddr.in));
 
     // Receive responses, filtering for an IGD device.
     // Many non-IGD devices (TVs, speakers) respond instantly — only count
@@ -202,7 +233,9 @@ fn ssdpDiscover(gateway_ip: *[4]u8, location_buf: *[512]u8) ?[]const u8 {
         var recv_buf: [2048]u8 = undefined;
         var src_addr: posix.sockaddr.in = undefined;
         var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
-        const n = posix.recvfrom(fd, &recv_buf, 0, @ptrCast(&src_addr), &addr_len) catch continue;
+        const rc = std.c.recvfrom(fd, recv_buf[0..].ptr, recv_buf.len, 0, @ptrCast(&src_addr), &addr_len);
+        if (rc < 0) continue;
+        const n: usize = @intCast(rc);
         if (n == 0) continue;
 
         const response = recv_buf[0..n];
@@ -274,15 +307,17 @@ fn httpRequest(
     // Connect TCP
     const fd = blk: {
         if (comptime is_linux) {
-            break :blk posix.socket(linux.AF.INET, @intCast(linux.SOCK.STREAM | linux.SOCK.CLOEXEC), 0) catch return null;
+            break :blk linuxSocket(linux.AF.INET, @intCast(linux.SOCK.STREAM | linux.SOCK.CLOEXEC), 0) catch return null;
         } else {
-            break :blk posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch return null;
+            break :blk linuxSocket(posix.AF.INET, posix.SOCK.STREAM, 0) catch return null;
         }
     };
-    defer posix.close(fd);
+    defer closeSocket(fd);
 
-    const addr = std.net.Address.initIp4(ip, port);
-    posix.connect(fd, &addr.any, addr.getOsSockLen()) catch return null;
+    const addr = ipv4Sockaddr(ip, port);
+    if (std.c.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in)) != 0) {
+        return null;
+    }
 
     // Build and send request
     var req_buf: [2048]u8 = undefined;
@@ -334,7 +369,9 @@ fn httpRequest(
             if ((fds[0].revents & ws2.POLL.IN) == 0) break;
         }
 
-        const n = posix.read(fd, out[total..]) catch break;
+        const rc = std.c.read(fd, out[total..].ptr, out.len - total);
+        if (rc < 0) break;
+        const n: usize = @intCast(rc);
         if (n == 0) break;
         total += n;
     }
@@ -346,7 +383,12 @@ fn httpRequest(
 fn writeAll(fd: posix.fd_t, data: []const u8) !void {
     var sent: usize = 0;
     while (sent < data.len) {
-        const n = try posix.write(fd, data[sent..]);
+        const rc = std.c.write(fd, data[sent..].ptr, data.len - sent);
+        switch (posix.errno(rc)) {
+            .SUCCESS => {},
+            else => |err| return posix.unexpectedErrno(err),
+        }
+        const n: usize = @intCast(rc);
         sent += n;
     }
 }
@@ -386,19 +428,23 @@ fn getLocalIp(gateway_ip: [4]u8) [4]u8 {
     // Create a UDP socket and "connect" to the gateway to determine our local IP
     const fd = blk: {
         if (comptime is_linux) {
-            break :blk posix.socket(linux.AF.INET, @intCast(linux.SOCK.DGRAM | linux.SOCK.CLOEXEC), 0) catch return .{ 0, 0, 0, 0 };
+            break :blk linuxSocket(linux.AF.INET, @intCast(linux.SOCK.DGRAM | linux.SOCK.CLOEXEC), 0) catch return .{ 0, 0, 0, 0 };
         } else {
-            break :blk posix.socket(posix.AF.INET, posix.SOCK.DGRAM, 0) catch return .{ 0, 0, 0, 0 };
+            break :blk linuxSocket(posix.AF.INET, posix.SOCK.DGRAM, 0) catch return .{ 0, 0, 0, 0 };
         }
     };
-    defer posix.close(fd);
+    defer closeSocket(fd);
 
-    const addr = std.net.Address.initIp4(gateway_ip, 80);
-    posix.connect(fd, &addr.any, addr.getOsSockLen()) catch return .{ 0, 0, 0, 0 };
+    const addr = ipv4Sockaddr(gateway_ip, 80);
+    if (std.c.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in)) != 0) {
+        return .{ 0, 0, 0, 0 };
+    }
 
     var local_addr: posix.sockaddr.in = undefined;
     var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
-    std.posix.getsockname(fd, @ptrCast(&local_addr), &addr_len) catch return .{ 0, 0, 0, 0 };
+    if (std.c.getsockname(fd, @ptrCast(&local_addr), &addr_len) != 0) {
+        return .{ 0, 0, 0, 0 };
+    }
 
     return @bitCast(local_addr.addr);
 }
@@ -521,7 +567,7 @@ fn parseHeader(data: []const u8, name: []const u8, out: *[512]u8) ?[]const u8 {
             while (pos < data.len and data[pos] == ' ') pos += 1;
             // Read until \r\n
             const end = std.mem.indexOfPos(u8, data, pos, "\r\n") orelse data.len;
-            const val = std.mem.trimRight(u8, data[pos..end], " \t");
+            const val = std.mem.trimEnd(u8, data[pos..end], " \t");
             if (val.len > out.len) return null;
             @memcpy(out[0..val.len], val);
             return out[0..val.len];

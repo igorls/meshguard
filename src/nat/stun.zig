@@ -14,6 +14,10 @@ const std = @import("std");
 const Udp = @import("../net/udp.zig");
 const messages = @import("../protocol/messages.zig");
 
+fn zio() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
 /// STUN magic cookie (RFC 5389 §6)
 const MAGIC_COOKIE: u32 = 0x2112A442;
 
@@ -66,7 +70,7 @@ pub fn encodBindingRequest(buf: *[20]u8) [12]u8 {
     std.mem.writeInt(u32, buf[4..8], MAGIC_COOKIE, .big);
     // Transaction ID: 12 random bytes
     var txn_id: [12]u8 = undefined;
-    std.crypto.random.bytes(&txn_id);
+    zio().random(&txn_id);
     @memcpy(buf[8..20], &txn_id);
     return txn_id;
 }

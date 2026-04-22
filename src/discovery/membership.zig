@@ -11,6 +11,14 @@
 const std = @import("std");
 const messages = @import("../protocol/messages.zig");
 
+fn zio() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+fn nowNs() i128 {
+    return @intCast(std.Io.Timestamp.now(zio(), .awake).toNanoseconds());
+}
+
 pub const PeerState = enum {
     alive,
     suspected,
@@ -101,7 +109,7 @@ pub const MembershipTable = struct {
             if (peer.state == .alive) {
                 self.lamport += 1;
                 peer.state = .suspected;
-                peer.suspected_at_ns = std.time.nanoTimestamp();
+                peer.suspected_at_ns = nowNs();
                 peer.lamport = self.lamport;
             }
         }
@@ -112,7 +120,7 @@ pub const MembershipTable = struct {
         if (self.peers.getPtr(pubkey)) |peer| {
             self.lamport += 1;
             peer.state = .alive;
-            peer.last_seen_ns = std.time.nanoTimestamp();
+            peer.last_seen_ns = nowNs();
             peer.suspected_at_ns = null;
             peer.last_rtt_ns = rtt_ns;
             peer.lamport = self.lamport;
@@ -162,7 +170,7 @@ pub const MembershipTable = struct {
         if (alive_count == 0) return null;
 
         // Use a simple PRNG seeded from timestamp
-        var prng = std.Random.DefaultPrng.init(@intCast(std.time.nanoTimestamp()));
+        var prng = std.Random.DefaultPrng.init(@intCast(nowNs()));
         const random = prng.random();
         const target = random.intRangeAtMost(usize, 0, alive_count - 1);
 
@@ -180,7 +188,7 @@ pub const MembershipTable = struct {
 
     /// Check suspected peers and promote to dead if timeout expired.
     pub fn expireSuspected(self: *MembershipTable) [][32]u8 {
-        const now = std.time.nanoTimestamp();
+        const now = nowNs();
         // Collect keys of peers to mark as dead (can't modify map while iterating)
         var to_kill_buf: [256][32]u8 = undefined;
         var to_kill_count: usize = 0;
@@ -239,7 +247,7 @@ test "basic membership lifecycle" {
         .mesh_ip = .{ 10, 99, 1, 2 },
         .wg_port = 51820,
         .lamport = 1,
-        .last_seen_ns = std.time.nanoTimestamp(),
+        .last_seen_ns = nowNs(),
         .suspected_at_ns = null,
         .last_rtt_ns = null,
         .handshake_complete = false,

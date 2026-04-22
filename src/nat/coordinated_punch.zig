@@ -18,6 +18,18 @@ const Udp = @import("../net/udp.zig");
 const Stun = @import("stun.zig");
 const messages = @import("../protocol/messages.zig");
 
+fn zio() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+fn nowNs() i128 {
+    return @intCast(std.Io.Timestamp.now(zio(), .awake).toNanoseconds());
+}
+
+fn nowUnixSecs() i64 {
+    return @intCast(std.Io.Timestamp.now(zio(), .real).toSeconds());
+}
+
 /// Protocol version for tokens.
 const TOKEN_VERSION: u8 = 0x01;
 
@@ -356,7 +368,7 @@ pub fn ntpQuery() ?u64 {
 pub fn currentTimeSecs() u64 {
     if (ntpQuery()) |ntp_time| return ntp_time;
     // Fallback to system clock
-    const ts = std.time.timestamp();
+    const ts = nowUnixSecs();
     return @intCast(@max(ts, 0));
 }
 
@@ -388,7 +400,7 @@ pub fn probeMatchesNonce(data: []const u8, expected_nonce: [8]u8) bool {
 
 /// Sleep for the given number of milliseconds (cross-platform).
 fn sleepMs(ms: u32) void {
-    std.Thread.sleep(@as(u64, ms) * std.time.ns_per_ms);
+    std.Io.sleep(zio(), std.Io.Duration.fromNanoseconds(@as(i96, ms) * std.time.ns_per_ms), .awake) catch {};
 }
 
 /// Run the coordinated punch loop.
@@ -406,7 +418,7 @@ pub fn runPunchLoop(
     peer_port: u16,
     punch_time: u64,
     stun_server: Stun.StunServer,
-    stdout: std.fs.File,
+    stdout: std.Io.File,
 ) ?PunchResult {
     const probe_pkt = buildProbe(our_nonce, our_pubkey);
 
@@ -420,7 +432,7 @@ pub fn runPunchLoop(
             const idle_ns: i128 = @as(i128, IDLE_BETWEEN_SECS) * 1_000_000_000;
 
             while (idle_elapsed < idle_ns) {
-                const now = std.time.nanoTimestamp();
+                const now = nowNs();
 
                 // STUN keepalive every 20s to maintain NAT mapping
                 if (now - last_keepalive > STUN_KEEPALIVE_INTERVAL_NS) {
@@ -444,7 +456,7 @@ pub fn runPunchLoop(
         const effective_target = target_ns + attempt_offset_ns;
 
         while (true) {
-            const now = std.time.nanoTimestamp();
+            const now = nowNs();
             if (now >= effective_target) break;
 
             const wait_secs = @divTrunc(effective_target - now, 1_000_000_000);
@@ -468,7 +480,7 @@ pub fn runPunchLoop(
         writeMsg(stdout, "  punching...\n", .{});
 
         const window_ns: i128 = @as(i128, PUNCH_WINDOW_SECS) * 1_000_000_000;
-        const start = std.time.nanoTimestamp();
+        const start = nowNs();
         var last_probe_sent: i128 = 0;
         var probes_sent: u32 = 0;
         var detected: bool = false;
@@ -478,7 +490,7 @@ pub fn runPunchLoop(
         const POST_DETECT_NS: i128 = 3_000_000_000; // keep probing 3s after detection
 
         while (true) {
-            const now = std.time.nanoTimestamp();
+            const now = nowNs();
             const elapsed = now - start;
 
             // Exit conditions
@@ -526,9 +538,9 @@ pub fn runPunchLoop(
     return null;
 }
 
-fn writeMsg(file: std.fs.File, comptime fmt: []const u8, args: anytype) void {
+fn writeMsg(file: std.Io.File, comptime fmt: []const u8, args: anytype) void {
     // Prefix with HH:MM:SS timestamp
-    const ts = std.time.timestamp();
+    const ts = nowUnixSecs();
     const secs_today: u64 = @intCast(@mod(@as(i64, @intCast(@max(ts, 0))), 86400));
     const hours: u32 = @intCast(secs_today / 3600);
     const minutes: u32 = @intCast((secs_today % 3600) / 60);
@@ -536,11 +548,11 @@ fn writeMsg(file: std.fs.File, comptime fmt: []const u8, args: anytype) void {
 
     var ts_buf: [12]u8 = undefined;
     const ts_str = std.fmt.bufPrint(&ts_buf, "[{d:0>2}:{d:0>2}:{d:0>2}] ", .{ hours, minutes, seconds }) catch "[??:??:??] ";
-    file.writeAll(ts_str) catch {};
+    file.writeStreamingAll(zio(), ts_str) catch {};
 
     var buf: [256]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
-    file.writeAll(msg) catch {};
+    file.writeStreamingAll(zio(), msg) catch {};
 }
 
 // ─── Peer persistence ───
@@ -565,20 +577,20 @@ pub fn savePunchedSeed(
     const entry = std.fmt.bufPrint(&entry_buf, "{s}:{d}\n", .{ ip_str, peer_port }) catch return error.FormatError;
 
     // Append to seeds file (create if not exists)
-    const file = std.fs.createFileAbsolute(seeds_path, .{
+    const file = std.Io.Dir.createFileAbsolute(zio(), seeds_path, .{
         .truncate = false,
     }) catch |err| {
         if (err == error.PathAlreadyExists) {
-            const existing = try std.fs.openFileAbsolute(seeds_path, .{ .mode = .write_only });
-            try existing.seekFromEnd(0);
-            try existing.writeAll(entry);
-            existing.close();
+            const existing = try std.Io.Dir.openFileAbsolute(zio(), seeds_path, .{ .mode = .write_only });
+            const end = (try existing.stat(zio())).size;
+            try existing.writePositionalAll(zio(), entry, end);
+            existing.close(zio());
             return;
         }
         return err;
     };
-    defer file.close();
-    try file.writeAll(entry);
+    defer file.close(zio());
+    try file.writeStreamingAll(zio(), entry);
 }
 
 // ─── Tests ───

@@ -17,6 +17,16 @@ const noise = @import("noise.zig");
 const builtin = @import("builtin");
 const use_libsodium = (builtin.os.tag == .linux and builtin.target.abi != .android);
 
+/// Returns a blocking Io instance for synchronous operations.
+fn zio() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+fn nowNs() i128 {
+    return @intCast(std.Io.Timestamp.now(zio(), .awake).toNanoseconds());
+}
+
+
 
 
 const aead = struct {
@@ -79,7 +89,7 @@ pub const Tunnel = struct {
 
     /// Anti-replay window for receiving (mutex-protected for multi-thread)
     replay_window: ReplayWindow = .{},
-    replay_lock: std.Thread.Mutex = .{},
+    replay_lock: std.Io.Mutex = .init,
 
     /// Last time we sent data (for keepalive scheduling)
     last_send_ns: i128 = 0,
@@ -103,7 +113,7 @@ pub const Tunnel = struct {
 
         if (counter >= REJECT_AFTER_MESSAGES) return error.KeyExpired;
 
-        const elapsed = std.time.nanoTimestamp() - self.keys.birthdate_ns;
+        const elapsed = nowNs() - self.keys.birthdate_ns;
         if (elapsed >= REJECT_AFTER_TIME_NS) return error.KeyExpired;
         if (elapsed >= REKEY_AFTER_TIME_NS or counter >= REKEY_AFTER_MESSAGES)
             self.needs_rekey = true;
@@ -140,7 +150,7 @@ pub const Tunnel = struct {
             self.keys.sending_key,
         );
 
-        self.last_send_ns = std.time.nanoTimestamp();
+        self.last_send_ns = nowNs();
 
         return total_len;
     }
@@ -155,7 +165,7 @@ pub const Tunnel = struct {
     pub fn encryptPreassigned(self: *Tunnel, buf: []u8, plaintext_len: usize, nonce_val: u64) ?usize {
         if (nonce_val >= REJECT_AFTER_MESSAGES) return null;
 
-        const elapsed = std.time.nanoTimestamp() - self.keys.birthdate_ns;
+        const elapsed = nowNs() - self.keys.birthdate_ns;
         if (elapsed >= REJECT_AFTER_TIME_NS) return null;
         if (elapsed >= REKEY_AFTER_TIME_NS or nonce_val >= REKEY_AFTER_MESSAGES)
             self.needs_rekey = true;
@@ -190,7 +200,7 @@ pub const Tunnel = struct {
             self.keys.sending_key,
         );
 
-        self.last_send_ns = std.time.nanoTimestamp();
+        self.last_send_ns = nowNs();
 
         return total_len;
     }
@@ -209,13 +219,13 @@ pub const Tunnel = struct {
 
         // Anti-replay check (mutex-protected for multi-thread)
         {
-            self.replay_lock.lock();
-            defer self.replay_lock.unlock();
+            self.replay_lock.lockUncancelable(zio());
+            defer self.replay_lock.unlock(zio());
             if (!self.replay_window.check(counter)) return error.ReplayedPacket;
         }
 
         // Check key expiration
-        const elapsed = std.time.nanoTimestamp() - self.keys.birthdate_ns;
+        const elapsed = nowNs() - self.keys.birthdate_ns;
         if (elapsed >= REJECT_AFTER_TIME_NS) return error.KeyExpired;
 
         // Build nonce: 4 zero bytes || 8-byte LE counter
@@ -238,7 +248,7 @@ pub const Tunnel = struct {
 
         // Update replay window
         self.replay_window.update(counter);
-        self.last_recv_ns = std.time.nanoTimestamp();
+        self.last_recv_ns = nowNs();
 
         // Strip padding: parse IP header to get real packet length
         // Without this, padded bytes written to TUN may be rejected by the kernel
@@ -260,7 +270,7 @@ pub const Tunnel = struct {
 
     /// Check if this tunnel's keys are still valid.
     pub fn isValid(self: *const Tunnel) bool {
-        const elapsed = std.time.nanoTimestamp() - self.keys.birthdate_ns;
+        const elapsed = nowNs() - self.keys.birthdate_ns;
         return elapsed < REJECT_AFTER_TIME_NS and
             self.send_counter < REJECT_AFTER_MESSAGES;
     }
@@ -268,7 +278,7 @@ pub const Tunnel = struct {
     /// Check if a keepalive should be sent.
     pub fn needsKeepalive(self: *const Tunnel) bool {
         if (self.last_send_ns == 0) return false;
-        const since_send = std.time.nanoTimestamp() - self.last_send_ns;
+        const since_send = nowNs() - self.last_send_ns;
         return since_send >= KEEPALIVE_TIMEOUT_NS;
     }
 };
@@ -369,7 +379,7 @@ test "transport encrypt/decrypt roundtrip" {
         .sending_index = 1,
         .receiving_index = 2,
         .is_initiator = true,
-        .birthdate_ns = std.time.nanoTimestamp(),
+        .birthdate_ns = nowNs(),
     };
 
     // Sender has keys as-is, receiver has them swapped
@@ -442,7 +452,7 @@ test "transport nonce counter increments" {
         .sending_index = 1,
         .receiving_index = 2,
         .is_initiator = true,
-        .birthdate_ns = std.time.nanoTimestamp(),
+        .birthdate_ns = nowNs(),
     };
     var tunnel = Tunnel{ .keys = keys };
     var buf: [256]u8 = undefined;
@@ -511,7 +521,7 @@ test "transport tunnel deinit zeros keys" {
         .sending_index = 1,
         .receiving_index = 2,
         .is_initiator = true,
-        .birthdate_ns = std.time.nanoTimestamp(),
+        .birthdate_ns = nowNs(),
     };
     var t = Tunnel{ .keys = keys };
 

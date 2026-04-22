@@ -11,6 +11,48 @@ const std = @import("std");
 const Keys = @import("keys.zig");
 const Org = @import("org.zig");
 
+/// Returns a blocking Io instance for synchronous operations.
+fn zio() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+/// Read all available bytes from an Io.File into buf. Returns bytes read.
+fn readFileBytes(f: std.Io.File, buf: []u8) !usize {
+    var reader = f.reader(zio(), &.{});
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = reader.interface.readSliceShort(buf[total..]) catch break;
+        if (n == 0) break;
+        total += n;
+    }
+    return total;
+}
+
+/// Open file by absolute path (replaces std.fs.openFileAbsolute).
+fn openFileAbsolute(path: []const u8) !std.Io.File {
+    return std.Io.Dir.cwd().openFile(zio(), path, .{});
+}
+
+/// Create file by absolute path (replaces std.fs.createFileAbsolute).
+fn createFileAbsolute(path: []const u8) !std.Io.File {
+    return std.Io.Dir.cwd().createFile(zio(), path, .{});
+}
+
+/// Delete file by absolute path (replaces std.fs.deleteFileAbsolute).
+fn deleteFileAbsolute(path: []const u8) !void {
+    return std.Io.Dir.cwd().deleteFile(zio(), path);
+}
+
+/// Open directory by absolute path (replaces std.fs.openDirAbsolute).
+fn openDirAbsolute(path: []const u8) !std.Io.Dir {
+    return std.Io.Dir.cwd().openDir(zio(), path, .{ .iterate = true });
+}
+
+/// Create directory path recursively (replaces std.fs.makeDirAbsolute).
+fn makeDirPath(path: []const u8) !void {
+    return std.Io.Dir.cwd().createDirPath(zio(), path);
+}
+
 pub const AuthorizedPeer = struct {
     name: []const u8,
     public_key: Keys.PublicKey,
@@ -43,14 +85,14 @@ pub fn validateKey(key_or_path: []const u8, key_b64_out: *[44]u8, pk_bytes_out: 
     var file_buf: [256]u8 = undefined; // Must outlive key_b64 slice
 
     if (std.fs.path.isAbsolute(key_or_path) or std.mem.endsWith(u8, key_or_path, ".pub")) {
-        const file = std.fs.cwd().openFile(key_or_path, .{}) catch {
+        const file = std.Io.Dir.cwd().openFile(zio(), key_or_path, .{}) catch {
             return "file not found or cannot be opened";
         };
-        defer file.close();
-        const read = file.readAll(&file_buf) catch {
+        defer file.close(zio());
+        const read = readFileBytes(file, &file_buf) catch {
             return "failed to read key file";
         };
-        key_b64 = std.mem.trimRight(u8, file_buf[0..read], "\n\r ");
+        key_b64 = std.mem.trimEnd(u8, file_buf[0..read], "\n\r ");
     } else {
         key_b64 = key_or_path;
     }
@@ -78,24 +120,25 @@ pub fn findExistingByKey(allocator: std.mem.Allocator, config_dir: []const u8, t
     const auth_dir = try ensureAuthorizedKeysDir(allocator, config_dir);
     defer allocator.free(auth_dir);
 
-    const dir = std.fs.openDirAbsolute(auth_dir, .{ .iterate = true }) catch |err| {
+    const dir = openDirAbsolute(auth_dir) catch |err| {
         if (err == error.FileNotFound) return null;
         return err;
     };
+    defer dir.close(zio());
 
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(zio())) |entry| {
         if (!std.mem.endsWith(u8, entry.name, ".pub")) continue;
 
         const file_path = try std.fs.path.join(allocator, &.{ auth_dir, entry.name });
         defer allocator.free(file_path);
 
-        const file = std.fs.openFileAbsolute(file_path, .{}) catch continue;
-        defer file.close();
+        const file = openFileAbsolute(file_path) catch continue;
+        defer file.close(zio());
 
         var buf: [256]u8 = undefined;
-        const read = file.readAll(&buf) catch continue;
-        const existing_b64 = std.mem.trimRight(u8, buf[0..read], "\n\r ");
+        const read = readFileBytes(file, &buf) catch continue;
+        const existing_b64 = std.mem.trimEnd(u8, buf[0..read], "\n\r ");
 
         if (std.mem.eql(u8, existing_b64, target_b64)) {
             return try allocator.dupe(u8, std.fs.path.stem(entry.name));
@@ -115,15 +158,15 @@ pub fn checkNameConflict(allocator: std.mem.Allocator, config_dir: []const u8, n
     const dest_path = try std.fs.path.join(allocator, &.{ auth_dir, dest_name });
     defer allocator.free(dest_path);
 
-    const file = std.fs.openFileAbsolute(dest_path, .{}) catch |err| {
+    const file = openFileAbsolute(dest_path) catch |err| {
         if (err == error.FileNotFound) return null;
         return err;
     };
-    defer file.close();
+    defer file.close(zio());
 
     var buf: [256]u8 = undefined;
-    const read = try file.readAll(&buf);
-    const existing_b64 = std.mem.trimRight(u8, buf[0..read], "\n\r ");
+    const read = try readFileBytes(file, &buf);
+    const existing_b64 = std.mem.trimEnd(u8, buf[0..read], "\n\r ");
 
     return ExistingKeyInfo{
         .name = name,
@@ -144,10 +187,10 @@ pub fn addAuthorizedKey(allocator: std.mem.Allocator, config_dir: []const u8, ke
     const dest_path = try std.fs.path.join(allocator, &.{ auth_dir, dest_name });
     defer allocator.free(dest_path);
 
-    const file = try std.fs.createFileAbsolute(dest_path, .{});
-    defer file.close();
-    try file.writeAll(key_b64);
-    try file.writeAll("\n");
+    const file = try createFileAbsolute(dest_path);
+    defer file.close(zio());
+    try file.writeStreamingAll(zio(), key_b64);
+    try file.writeStreamingAll(zio(), "\n");
 }
 
 /// Remove an old key file when renaming (dedup).
@@ -161,7 +204,7 @@ pub fn removeKeyFile(allocator: std.mem.Allocator, config_dir: []const u8, name:
     const del_path = try std.fs.path.join(allocator, &.{ auth_dir, del_name });
     defer allocator.free(del_path);
 
-    std.fs.deleteFileAbsolute(del_path) catch {};
+    deleteFileAbsolute(del_path) catch {};
 }
 
 /// Remove a public key from the authorized_keys directory.
@@ -177,7 +220,7 @@ pub fn removeAuthorizedKey(allocator: std.mem.Allocator, config_dir: []const u8,
     const del_path = try std.fs.path.join(allocator, &.{ auth_dir, pub_name });
     defer allocator.free(del_path);
 
-    std.fs.deleteFileAbsolute(del_path) catch |err| {
+    deleteFileAbsolute(del_path) catch |err| {
         if (err == error.FileNotFound) {
             // Try matching by key content
             try removeByKeyContent(allocator, auth_dir, key_or_name);
@@ -197,25 +240,26 @@ pub fn loadAuthorizedKeys(allocator: std.mem.Allocator, config_dir: []const u8) 
     var temp_names: [64][]const u8 = undefined;
     var count: usize = 0;
 
-    const dir = std.fs.openDirAbsolute(auth_dir, .{ .iterate = true }) catch |err| {
+    const dir = openDirAbsolute(auth_dir) catch |err| {
         if (err == error.FileNotFound) return try allocator.alloc(AuthorizedPeer, 0);
         return err;
     };
+    defer dir.close(zio());
 
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(zio())) |entry| {
         if (!std.mem.endsWith(u8, entry.name, ".pub")) continue;
         if (count >= 64) break;
 
         const file_path = try std.fs.path.join(allocator, &.{ auth_dir, entry.name });
         defer allocator.free(file_path);
 
-        const file = std.fs.openFileAbsolute(file_path, .{}) catch continue;
-        defer file.close();
+        const file = openFileAbsolute(file_path) catch continue;
+        defer file.close(zio());
 
         var buf: [256]u8 = undefined;
-        const read = file.readAll(&buf) catch continue;
-        const key_b64 = std.mem.trimRight(u8, buf[0..read], "\n\r ");
+        const read = readFileBytes(file, &buf) catch continue;
+        const key_b64 = std.mem.trimEnd(u8, buf[0..read], "\n\r ");
 
         var pk_bytes: [32]u8 = undefined;
         std.base64.standard.Decoder.decode(&pk_bytes, key_b64) catch continue;
@@ -293,25 +337,26 @@ pub fn loadTrustedOrgs(allocator: std.mem.Allocator, config_dir: []const u8) ![]
     var temp: [64]TrustedOrg = undefined;
     var count: usize = 0;
 
-    const dir = std.fs.openDirAbsolute(org_dir, .{ .iterate = true }) catch |err| {
+    const dir = openDirAbsolute(org_dir) catch |err| {
         if (err == error.FileNotFound) return try allocator.alloc(TrustedOrg, 0);
         return err;
     };
+    defer dir.close(zio());
 
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(zio())) |entry| {
         if (!std.mem.endsWith(u8, entry.name, ".org")) continue;
         if (count >= 64) break;
 
         const file_path = try std.fs.path.join(allocator, &.{ org_dir, entry.name });
         defer allocator.free(file_path);
 
-        const file = std.fs.openFileAbsolute(file_path, .{}) catch continue;
-        defer file.close();
+        const file = openFileAbsolute(file_path) catch continue;
+        defer file.close(zio());
 
         var buf: [256]u8 = undefined;
-        const read = file.readAll(&buf) catch continue;
-        const key_b64 = std.mem.trimRight(u8, buf[0..read], "\n\r ");
+        const read = readFileBytes(file, &buf) catch continue;
+        const key_b64 = std.mem.trimEnd(u8, buf[0..read], "\n\r ");
 
         var pk_bytes: [32]u8 = undefined;
         std.base64.standard.Decoder.decode(&pk_bytes, key_b64) catch continue;
@@ -330,7 +375,7 @@ pub fn loadTrustedOrgs(allocator: std.mem.Allocator, config_dir: []const u8) ![]
 pub fn addTrustedOrg(allocator: std.mem.Allocator, config_dir: []const u8, key_b64: []const u8, name: []const u8) !void {
     const org_dir = try std.fs.path.join(allocator, &.{ config_dir, "trusted_orgs" });
     defer allocator.free(org_dir);
-    std.fs.makeDirAbsolute(org_dir) catch |err| {
+    makeDirPath(org_dir) catch |err| {
         if (err != error.PathAlreadyExists) return err;
     };
 
@@ -340,10 +385,10 @@ pub fn addTrustedOrg(allocator: std.mem.Allocator, config_dir: []const u8, key_b
     const dest_path = try std.fs.path.join(allocator, &.{ org_dir, dest_name });
     defer allocator.free(dest_path);
 
-    const file = try std.fs.createFileAbsolute(dest_path, .{});
-    defer file.close();
-    try file.writeAll(key_b64);
-    try file.writeAll("\n");
+    const file = try createFileAbsolute(dest_path);
+    defer file.close(zio());
+    try file.writeStreamingAll(zio(), key_b64);
+    try file.writeStreamingAll(zio(), "\n");
 }
 
 /// Remove a trusted org from the trusted_orgs/ directory.
@@ -357,7 +402,7 @@ pub fn removeTrustedOrg(allocator: std.mem.Allocator, config_dir: []const u8, na
     const del_path = try std.fs.path.join(allocator, &.{ org_dir, del_name });
     defer allocator.free(del_path);
 
-    try std.fs.deleteFileAbsolute(del_path);
+    try deleteFileAbsolute(del_path);
 }
 
 /// Load this node's org certificate from config_dir/node.cert.
@@ -373,31 +418,32 @@ pub fn loadNodeCert(allocator: std.mem.Allocator, config_dir: []const u8) !?Org.
 
 fn ensureAuthorizedKeysDir(allocator: std.mem.Allocator, config_dir: []const u8) ![]const u8 {
     const auth_dir = try std.fs.path.join(allocator, &.{ config_dir, "authorized_keys" });
-    std.fs.makeDirAbsolute(auth_dir) catch |err| {
+    makeDirPath(auth_dir) catch |err| {
         if (err != error.PathAlreadyExists) return err;
     };
     return auth_dir;
 }
 
 fn removeByKeyContent(allocator: std.mem.Allocator, auth_dir: []const u8, target_b64: []const u8) !void {
-    const dir = try std.fs.openDirAbsolute(auth_dir, .{ .iterate = true });
+    const dir = try openDirAbsolute(auth_dir);
+    defer dir.close(zio());
 
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(zio())) |entry| {
         if (!std.mem.endsWith(u8, entry.name, ".pub")) continue;
 
         const file_path = try std.fs.path.join(allocator, &.{ auth_dir, entry.name });
         defer allocator.free(file_path);
 
-        const file = std.fs.openFileAbsolute(file_path, .{}) catch continue;
-        defer file.close();
+        const file = openFileAbsolute(file_path) catch continue;
+        defer file.close(zio());
 
         var buf: [256]u8 = undefined;
-        const read = file.readAll(&buf) catch continue;
-        const key_b64 = std.mem.trimRight(u8, buf[0..read], "\n\r ");
+        const read = readFileBytes(file, &buf) catch continue;
+        const key_b64 = std.mem.trimEnd(u8, buf[0..read], "\n\r ");
 
         if (std.mem.eql(u8, key_b64, target_b64)) {
-            try std.fs.deleteFileAbsolute(file_path);
+            try deleteFileAbsolute(file_path);
             return;
         }
     }

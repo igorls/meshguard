@@ -4,6 +4,14 @@ const lib = @import("lib.zig");
 const Config = lib.config.Config;
 const Identity = lib.identity.Keys;
 const posix = std.posix;
+const linux = std.os.linux;
+
+var runtime_io: ?std.Io = null;
+
+/// Returns the process Io instance initialized in main().
+fn zio() std.Io {
+    return runtime_io orelse @panic("meshguard Io not initialized");
+}
 
 const version = "0.8.0";
 
@@ -43,20 +51,61 @@ const usage =
     \\
 ;
 
-fn getStdOut() std.fs.File {
-    return std.fs.File.stdout();
+fn getStdOut() std.Io.File {
+    return std.Io.File.stdout();
 }
 
-fn getStdErr() std.fs.File {
-    return std.fs.File.stderr();
+fn getStdErr() std.Io.File {
+    return std.Io.File.stderr();
+}
+
+fn writeFdNoErr(fd: posix.fd_t, data: []const u8) void {
+    _ = std.c.write(fd, data.ptr, data.len);
+}
+
+fn writevFdNoErr(fd: posix.fd_t, iov: []const posix.iovec_const) void {
+    _ = std.c.writev(fd, iov.ptr, @intCast(iov.len));
+}
+
+fn deleteFileAbsoluteNoErr(path: []const u8) void {
+    std.Io.Dir.cwd().deleteFile(zio(), path) catch {};
+}
+
+fn sleepNs(ns: i96) void {
+    std.Io.sleep(zio(), std.Io.Duration.fromNanoseconds(ns), .awake) catch {};
+}
+
+fn nowUnixSecs() i64 {
+    return @intCast(std.Io.Timestamp.now(zio(), .real).toSeconds());
+}
+
+fn spawnChild(options: std.process.SpawnOptions) !std.process.Child {
+    return std.process.spawn(zio(), options);
+}
+
+fn spawnAndWaitChild(options: std.process.SpawnOptions) !std.process.Child.Term {
+    var child = try spawnChild(options);
+    defer child.kill(zio());
+    return child.wait(zio());
+}
+
+fn childExitCode(term: std.process.Child.Term) ?u8 {
+    return switch (term) {
+        .exited => |code| code,
+        else => null,
+    };
+}
+
+fn childExitedSuccessfully(term: std.process.Child.Term) bool {
+    return childExitCode(term) == 0;
 }
 
 
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    runtime_io = init.io;
+    const allocator = init.gpa;
+    const arena = init.arena.allocator();
 
     // Initialize libsodium (AVX2 ChaCha20-Poly1305 assembly) — Linux only
     // macOS and Windows use std.crypto (no libsodium dependency)
@@ -64,23 +113,22 @@ pub fn main() !void {
         @import("crypto/sodium.zig").init();
     }
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try init.minimal.args.toSlice(arena);
 
     if (args.len < 2) {
-        try getStdErr().writeAll(usage);
+        try getStdErr().writeStreamingAll(zio(), usage);
         std.process.exit(1);
     }
 
     const command = args[1];
 
     if (std.mem.eql(u8, command, "version") or std.mem.eql(u8, command, "--version")) {
-        try getStdOut().writeAll("meshguard " ++ version ++ "\n");
+        try getStdOut().writeStreamingAll(zio(), "meshguard " ++ version ++ "\n");
         return;
     }
 
     if (std.mem.eql(u8, command, "-h") or std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "help")) {
-        try getStdOut().writeAll(usage);
+        try getStdOut().writeStreamingAll(zio(), usage);
         return;
     }
 
@@ -96,7 +144,7 @@ pub fn main() !void {
 
     if (std.mem.eql(u8, command, "trust")) {
         if (args.len < 3) {
-            try getStdErr().writeAll("error: 'trust' requires a public key or path argument\n");
+            try getStdErr().writeStreamingAll(zio(), "error: 'trust' requires a public key or path argument\n");
             std.process.exit(1);
         }
         try cmdTrust(allocator, args[2], args[3..]);
@@ -105,7 +153,7 @@ pub fn main() !void {
 
     if (std.mem.eql(u8, command, "revoke")) {
         if (args.len < 3) {
-            try getStdErr().writeAll("error: 'revoke' requires a public key or name argument\n");
+            try getStdErr().writeStreamingAll(zio(), "error: 'revoke' requires a public key or name argument\n");
             std.process.exit(1);
         }
         try cmdRevoke(allocator, args[2]);
@@ -144,7 +192,7 @@ pub fn main() !void {
 
     if (std.mem.eql(u8, command, "org-sign")) {
         if (args.len < 3) {
-            try getStdErr().writeAll("error: 'org-sign' requires a node public key or .pub file\n");
+            try getStdErr().writeStreamingAll(zio(), "error: 'org-sign' requires a node public key or .pub file\n");
             std.process.exit(1);
         }
         try cmdOrgSign(allocator, args[2], args[3..]);
@@ -153,7 +201,7 @@ pub fn main() !void {
 
     if (std.mem.eql(u8, command, "org-vouch")) {
         if (args.len < 3) {
-            try getStdErr().writeAll("error: 'org-vouch' requires a node public key or .pub file\n");
+            try getStdErr().writeStreamingAll(zio(), "error: 'org-vouch' requires a node public key or .pub file\n");
             std.process.exit(1);
         }
         try cmdOrgVouch(allocator, args[2]);
@@ -162,7 +210,7 @@ pub fn main() !void {
 
     if (std.mem.eql(u8, command, "config")) {
         if (args.len < 3 or !std.mem.eql(u8, args[2], "show")) {
-            try getStdErr().writeAll("usage: meshguard config show\n");
+            try getStdErr().writeStreamingAll(zio(), "usage: meshguard config show\n");
             std.process.exit(1);
         }
         try cmdConfigShow(allocator);
@@ -174,17 +222,35 @@ pub fn main() !void {
         return;
     }
 
-    try getStdErr().writeAll("error: unknown command\n\n");
-    try getStdErr().writeAll(usage);
+    try getStdErr().writeStreamingAll(zio(), "error: unknown command\n\n");
+    try getStdErr().writeStreamingAll(zio(), usage);
     std.process.exit(1);
 }
 
 // ─── Command implementations ───
 
-fn writeFormatted(file: std.fs.File, comptime fmt: []const u8, args: anytype) !void {
+fn writeFormatted(file: std.Io.File, comptime fmt: []const u8, args: anytype) !void {
     var buf: [4096]u8 = undefined;
     const msg = try std.fmt.bufPrint(&buf, fmt, args);
-    try file.writeAll(msg);
+    try file.writeStreamingAll(zio(), msg);
+}
+
+/// Read all available bytes from an Io.File into buf. Returns number of bytes read.
+fn readAll(file: std.Io.File, buf: []u8) !usize {
+    var reader = file.reader(zio(), &.{});
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = reader.interface.readSliceShort(buf[total..]) catch break;
+        if (n == 0) break;
+        total += n;
+    }
+    return total;
+}
+
+/// Read a single chunk from an Io.File. Useful for interactive stdin prompts.
+fn readSome(file: std.Io.File, buf: []u8) !usize {
+    var reader = file.reader(zio(), &.{});
+    return try reader.interface.readSliceShort(buf);
 }
 
 fn cmdKeygen(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
@@ -204,16 +270,16 @@ fn cmdKeygen(allocator: std.mem.Allocator, extra_args: []const []const u8) !void
         if (Identity.load(allocator, config_dir)) |existing| {
             _ = existing;
             const stderr = getStdErr();
-            try stderr.writeAll("error: identity already exists. Use 'meshguard keygen --force' to overwrite.\n");
+            try stderr.writeStreamingAll(zio(), "error: identity already exists. Use 'meshguard keygen --force' to overwrite.\n");
 
             // Show existing public key for convenience
             const pk_path = try std.fs.path.join(allocator, &.{ config_dir, "identity.pub" });
             defer allocator.free(pk_path);
-            const pk_file = try std.fs.openFileAbsolute(pk_path, .{});
-            defer pk_file.close();
+            const pk_file = try std.Io.Dir.openFileAbsolute(zio(), pk_path, .{});
+            defer pk_file.close(zio());
             var pk_raw: [45]u8 = undefined;
-            const pk_read = try pk_file.readAll(&pk_raw);
-            const pk_b64 = std.mem.trimRight(u8, pk_raw[0..pk_read], "\n\r ");
+            const pk_read = try readAll(pk_file, &pk_raw);
+            const pk_b64 = std.mem.trimEnd(u8, pk_raw[0..pk_read], "\n\r ");
             try writeFormatted(stderr, "Existing public key: {s}\n", .{pk_b64});
 
             std.process.exit(1);
@@ -229,7 +295,7 @@ fn cmdKeygen(allocator: std.mem.Allocator, extra_args: []const []const u8) !void
     const pub_b64 = std.base64.standard.Encoder.encode(&b64_buf, &kp.public_key.toBytes());
 
     const stdout = getStdOut();
-    try stdout.writeAll("Identity keypair generated.\n");
+    try stdout.writeStreamingAll(zio(), "Identity keypair generated.\n");
     try writeFormatted(stdout, "Public key: {s}\n", .{pub_b64});
     try writeFormatted(stdout, "Saved to:   {s}/\n", .{config_dir});
 }
@@ -240,7 +306,7 @@ fn cmdExport(allocator: std.mem.Allocator) !void {
 
     const kp = Identity.load(allocator, config_dir) catch |err| {
         if (err == error.FileNotFound) {
-            try getStdErr().writeAll("error: no identity found. Run 'meshguard keygen' first.\n");
+            try getStdErr().writeStreamingAll(zio(), "error: no identity found. Run 'meshguard keygen' first.\n");
             std.process.exit(1);
         }
         return err;
@@ -250,8 +316,8 @@ fn cmdExport(allocator: std.mem.Allocator) !void {
     const pub_b64 = std.base64.standard.Encoder.encode(&buf, &kp.public_key.toBytes());
 
     const stdout = getStdOut();
-    try stdout.writeAll(pub_b64);
-    try stdout.writeAll("\n");
+    try stdout.writeStreamingAll(zio(), pub_b64);
+    try stdout.writeStreamingAll(zio(), "\n");
 }
 
 fn cmdTrust(allocator: std.mem.Allocator, key_or_path: []const u8, extra_args: []const []const u8) !void {
@@ -270,7 +336,7 @@ fn cmdTrust(allocator: std.mem.Allocator, key_or_path: []const u8, extra_args: [
                 peer_name = extra_args[i + 1];
                 i += 1;
             } else {
-                try getStdErr().writeAll("error: --name requires a value\n");
+                try getStdErr().writeStreamingAll(zio(), "error: --name requires a value\n");
                 std.process.exit(1);
             }
         }
@@ -334,19 +400,19 @@ fn cmdTrust(allocator: std.mem.Allocator, key_or_path: []const u8, extra_args: [
 
         // Different key, same name — prompt user
         try writeFormatted(stderr, "warning: peer '{s}' already exists with a different key.\n", .{name});
-        try stderr.writeAll("Overwrite? [y/N] ");
+        try stderr.writeStreamingAll(zio(), "Overwrite? [y/N] ");
 
         // Read user input
-        const stdin_file = std.fs.File.stdin();
+        const stdin_file = std.Io.File.stdin();
         var input_buf: [16]u8 = undefined;
-        const read = stdin_file.readAll(&input_buf) catch 0;
-        const answer = std.mem.trimRight(u8, input_buf[0..read], "\n\r ");
+        const read = readAll(stdin_file, &input_buf) catch 0;
+        const answer = std.mem.trimEnd(u8, input_buf[0..read], "\n\r ");
 
         if (answer.len > 0 and (answer[0] == 'y' or answer[0] == 'Y')) {
             try lib.identity.Trust.addAuthorizedKey(allocator, config_dir, key_b64, name);
             try writeFormatted(stdout, "Peer '{s}' updated with new key.\n", .{name});
         } else {
-            try stderr.writeAll("Aborted.\n");
+            try stderr.writeStreamingAll(zio(), "Aborted.\n");
             std.process.exit(1);
         }
         return;
@@ -400,8 +466,8 @@ fn cmdOrgKeygen(allocator: std.mem.Allocator) !void {
     const org_key_path = try std.fs.path.join(allocator, &.{ config_dir, "org", "org.key" });
     defer allocator.free(org_key_path);
 
-    if (std.fs.accessAbsolute(org_key_path, .{})) |_| {
-        try stderr.writeAll("error: org keypair already exists. Use --force to overwrite.\n");
+    if (std.Io.Dir.accessAbsolute(zio(), org_key_path, .{})) |_| {
+        try stderr.writeStreamingAll(zio(), "error: org keypair already exists. Use --force to overwrite.\n");
         std.process.exit(1);
     } else |_| {}
 
@@ -448,7 +514,7 @@ fn cmdOrgSign(allocator: std.mem.Allocator, node_key_path: []const u8, extra_arg
 
     // Load org keypair
     const org_kp = Org.loadOrgKeyPair(allocator, config_dir) catch {
-        try stderr.writeAll("error: no org keypair found. Run 'meshguard org-keygen' first.\n");
+        try stderr.writeStreamingAll(zio(), "error: no org keypair found. Run 'meshguard org-keygen' first.\n");
         std.process.exit(1);
     };
 
@@ -462,7 +528,7 @@ fn cmdOrgSign(allocator: std.mem.Allocator, node_key_path: []const u8, extra_arg
 
     // Issue certificate
     const cert = Org.issueCertificate(org_kp, node_pk_bytes, node_name, expires_at) catch {
-        try stderr.writeAll("error: failed to sign certificate\n");
+        try stderr.writeStreamingAll(zio(), "error: failed to sign certificate\n");
         std.process.exit(1);
     };
 
@@ -480,7 +546,7 @@ fn cmdOrgSign(allocator: std.mem.Allocator, node_key_path: []const u8, extra_arg
     try writeFormatted(stdout, "  mesh domain: {s}.{s}.mesh\n", .{ node_name, domain });
     try writeFormatted(stdout, "  saved to:    {s}\n", .{cert_path});
     if (expires_at == 0) {
-        try stdout.writeAll("  expires:     never\n");
+        try stdout.writeStreamingAll(zio(), "  expires:     never\n");
     } else {
         try writeFormatted(stdout, "  expires:     {d}\n", .{expires_at});
     }
@@ -497,7 +563,7 @@ fn cmdOrgVouch(allocator: std.mem.Allocator, node_key_arg: []const u8) !void {
 
     // Load org keypair
     const org_kp = Org.loadOrgKeyPair(allocator, config_dir) catch {
-        try stderr.writeAll("error: no org keypair found. Run 'meshguard org-keygen' first.\n");
+        try stderr.writeStreamingAll(zio(), "error: no org keypair found. Run 'meshguard org-keygen' first.\n");
         std.process.exit(1);
     };
 
@@ -510,7 +576,7 @@ fn cmdOrgVouch(allocator: std.mem.Allocator, node_key_arg: []const u8) !void {
     }
 
     // Create lamport timestamp (unix seconds — good enough for vouch ordering)
-    const lamport: u64 = @intCast(@divTrunc(std.time.timestamp(), 1));
+    const lamport: u64 = @intCast(@max(nowUnixSecs(), 0));
 
     // Sign the vouch: Ed25519(vouched_pubkey ‖ lamport)
     var sign_buf: [40]u8 = undefined;
@@ -519,18 +585,18 @@ fn cmdOrgVouch(allocator: std.mem.Allocator, node_key_arg: []const u8) !void {
 
     const Ed25519 = std.crypto.sign.Ed25519;
     const kp = Ed25519.KeyPair.fromSecretKey(org_kp.secret_key) catch {
-        try stderr.writeAll("error: failed to derive signing key\n");
+        try stderr.writeStreamingAll(zio(), "error: failed to derive signing key\n");
         std.process.exit(1);
     };
     const signature = kp.sign(&sign_buf, null) catch {
-        try stderr.writeAll("error: failed to sign vouch\n");
+        try stderr.writeStreamingAll(zio(), "error: failed to sign vouch\n");
         std.process.exit(1);
     };
 
     // Save vouch to config dir for gossip broadcast
     const vouch_dir = try std.fs.path.join(allocator, &.{ config_dir, "vouched" });
     defer allocator.free(vouch_dir);
-    std.fs.makeDirAbsolute(vouch_dir) catch {};
+    std.Io.Dir.cwd().createDirPath(zio(), vouch_dir) catch {};
 
     // Use first 8 hex chars of node pubkey as filename
     var hex_buf: [16]u8 = undefined;
@@ -553,9 +619,9 @@ fn cmdOrgVouch(allocator: std.mem.Allocator, node_key_arg: []const u8) !void {
     std.mem.writeInt(u64, vouch_data[64..72], lamport, .little);
     @memcpy(vouch_data[72..136], &signature.toBytes());
 
-    const file = try std.fs.createFileAbsolute(vouch_path, .{});
-    defer file.close();
-    try file.writeAll(&vouch_data);
+    const file = try std.Io.Dir.createFileAbsolute(zio(), vouch_path, .{});
+    defer file.close(zio());
+    try file.writeStreamingAll(zio(), &vouch_data);
 
     const b64 = std.base64.standard.Encoder;
     var node_b64: [44]u8 = undefined;
@@ -564,8 +630,8 @@ fn cmdOrgVouch(allocator: std.mem.Allocator, node_key_arg: []const u8) !void {
     try writeFormatted(stdout, "Vouch signed for external node.\n", .{});
     try writeFormatted(stdout, "  node pubkey: {s}\n", .{node_b64});
     try writeFormatted(stdout, "  saved to:    {s}\n", .{vouch_path});
-    try stdout.writeAll("\nThis vouch will be gossiped to all org members on next 'meshguard up'.\n");
-    try stdout.writeAll("All nodes trusting this org will auto-accept the vouched node.\n");
+    try stdout.writeStreamingAll(zio(), "\nThis vouch will be gossiped to all org members on next 'meshguard up'.\n");
+    try stdout.writeStreamingAll(zio(), "All nodes trusting this org will auto-accept the vouched node.\n");
 }
 
 fn cmdRevoke(allocator: std.mem.Allocator, key_or_name: []const u8) !void {
@@ -574,7 +640,7 @@ fn cmdRevoke(allocator: std.mem.Allocator, key_or_name: []const u8) !void {
 
     try lib.identity.Trust.removeAuthorizedKey(allocator, config_dir, key_or_name);
 
-    try getStdOut().writeAll("Peer revoked.\n");
+    try getStdOut().writeStreamingAll(zio(), "Peer revoked.\n");
 }
 
 fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
@@ -601,7 +667,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
         var i: usize = 0;
         while (i < extra_args.len) : (i += 1) {
             if (std.mem.eql(u8, extra_args[i], "--help") or std.mem.eql(u8, extra_args[i], "-h")) {
-                try getStdOut().writeAll(usage);
+                try getStdOut().writeStreamingAll(zio(), usage);
                 return;
             } else if (std.mem.eql(u8, extra_args[i], "--seed") and i + 1 < extra_args.len) {
                 i += 1;
@@ -670,11 +736,11 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
         defer if (seeds_path) |p| allocator.free(p);
 
         if (seeds_path) |path| {
-            const file = std.fs.openFileAbsolute(path, .{}) catch null;
+            const file = std.Io.Dir.openFileAbsolute(zio(), path, .{}) catch null;
             if (file) |f| {
-                defer f.close();
+                defer f.close(zio());
                 var file_buf: [1024]u8 = undefined;
-                const read = f.readAll(&file_buf) catch 0;
+                const read = readAll(f, &file_buf) catch 0;
                 if (read > 0) {
                     // Parse line by line: "host:port\n"
                     var rest: []const u8 = file_buf[0..read];
@@ -682,7 +748,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
                         const nl = std.mem.indexOfScalar(u8, rest, '\n');
                         const line = if (nl) |n| rest[0..n] else rest;
                         rest = if (nl) |n| rest[n + 1 ..] else rest[rest.len..];
-                        const trimmed = std.mem.trimRight(u8, line, "\r \t");
+                        const trimmed = std.mem.trimEnd(u8, line, "\r \t");
                         if (trimmed.len == 0) continue;
                         if (lib.discovery.Seed.parseEndpoint(trimmed)) |ep| {
                             if (seed_count < seed_buf.len) {
@@ -697,7 +763,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     }
     const kp = Identity.load(allocator, config_dir) catch |err| {
         if (err == error.FileNotFound) {
-            try stderr.writeAll("error: no identity found. Run 'meshguard keygen' first.\n");
+            try stderr.writeStreamingAll(zio(), "error: no identity found. Run 'meshguard keygen' first.\n");
             std.process.exit(1);
         }
         return err;
@@ -709,7 +775,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     var ip_str_buf: [15]u8 = undefined;
     const ip_str = lib.wireguard.Ip.formatIp(mesh_ip, &ip_str_buf);
 
-    try stdout.writeAll("meshguard starting...\n");
+    try stdout.writeStreamingAll(zio(), "meshguard starting...\n");
     try writeFormatted(stdout, "  mesh IP: {s}\n", .{ip_str});
     try writeFormatted(stdout, "  interface: {s}\n", .{if (comptime @import("builtin").os.tag == .linux) lib.wireguard.Config.DEFAULT_IFNAME else if (comptime @import("builtin").os.tag == .macos) "utun" else "wintun"});
 
@@ -729,14 +795,14 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
 
     // Derive WG public key from clamped private key (X25519 base point mult)
     const wg_public_key = std.crypto.dh.X25519.recoverPublicKey(wg_private_key) catch {
-        try stderr.writeAll("error: failed to derive WG public key\n");
+        try stderr.writeStreamingAll(zio(), "error: failed to derive WG public key\n");
         std.process.exit(1);
     };
 
     // Setup WireGuard interface (kernel or TUN)
     if (use_kernel_wg) {
         if (comptime @import("builtin").os.tag != .linux) {
-            try stderr.writeAll("error: kernel WireGuard mode is only available on Linux\n");
+            try stderr.writeStreamingAll(zio(), "error: kernel WireGuard mode is only available on Linux\n");
             std.process.exit(1);
         } else {
             // Kernel mode: configure via netlink
@@ -748,9 +814,9 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
 
             lib.wireguard.Config.setup(cfg) catch |err| {
                 switch (err) {
-                    error.PermissionDenied => try stderr.writeAll("error: permission denied. Run with sudo.\n"),
-                    error.InterfaceAlreadyExists => try stderr.writeAll("error: interface mg0 already exists. Run 'meshguard down' first.\n"),
-                    error.WireGuardModuleNotLoaded => try stderr.writeAll("error: WireGuard kernel module not loaded. Run 'modprobe wireguard'.\n"),
+                    error.PermissionDenied => try stderr.writeStreamingAll(zio(), "error: permission denied. Run with sudo.\n"),
+                    error.InterfaceAlreadyExists => try stderr.writeStreamingAll(zio(), "error: interface mg0 already exists. Run 'meshguard down' first.\n"),
+                    error.WireGuardModuleNotLoaded => try stderr.writeStreamingAll(zio(), "error: WireGuard kernel module not loaded. Run 'modprobe wireguard'.\n"),
                     else => try writeFormatted(stderr, "error: failed to create interface: {s}\n", .{@errorName(err)}),
                 }
                 std.process.exit(1);
@@ -762,7 +828,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     }
 
 
-    try stdout.writeAll("  interface mg0 created and configured\n");
+    try stdout.writeStreamingAll(zio(), "  interface mg0 created and configured\n");
 
     // Bind gossip UDP socket
     const gossip_port: u16 = 51821;
@@ -770,7 +836,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
         if (announce_addr) |addr| {
             // Bind to announced IP for correct source-based routing on multi-homed servers
             break :blk lib.net.Udp.UdpSocket.bindAddr(addr, gossip_port) catch {
-                try stderr.writeAll("error: failed to bind gossip port to announced address\n");
+                try stderr.writeStreamingAll(zio(), "error: failed to bind gossip port to announced address\n");
                 if (comptime @import("builtin").os.tag == .linux) {
                     lib.wireguard.Config.teardown(lib.wireguard.Config.DEFAULT_IFNAME) catch {};
                 }
@@ -778,7 +844,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
             };
         } else {
             break :blk lib.net.Udp.UdpSocket.bind(gossip_port) catch {
-                try stderr.writeAll("error: failed to bind gossip port 51821\n");
+                try stderr.writeStreamingAll(zio(), "error: failed to bind gossip port 51821\n");
                 if (comptime @import("builtin").os.tag == .linux) {
                     lib.wireguard.Config.teardown(lib.wireguard.Config.DEFAULT_IFNAME) catch {};
                 }
@@ -859,7 +925,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
             try writeFormatted(stdout, "  org trust: {d} trusted org(s)\n", .{trusted_orgs.len});
         }
     } else {
-        try stdout.writeAll("  trust: OPEN (accepting all peers)\n");
+        try stdout.writeStreamingAll(zio(), "  trust: OPEN (accepting all peers)\n");
     }
 
     // Load service access policies
@@ -896,7 +962,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     } else {
         // Run STUN to discover our public endpoint and NAT type
         const Stun = lib.nat.Stun;
-        try stdout.writeAll("  discovering public endpoint (STUN)...\n");
+        try stdout.writeStreamingAll(zio(), "  discovering public endpoint (STUN)...\n");
         const stun_result = Stun.discover(&gossip_socket, gossip_port, &Stun.DEFAULT_STUN_SERVERS);
         swim.setPublicEndpoint(
             if (stun_result.nat_type != .unknown) messages.Endpoint{ .addr = stun_result.external.addr, .port = stun_result.external.port } else null,
@@ -915,7 +981,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
                 try writeFormatted(stdout, "  public endpoint: {s}:{d} (behind NAT, {s})\n", .{ pub_ip, stun_result.external.port, nat_type_str });
 
                 // Try UPnP port forwarding
-                try stdout.writeAll("  trying UPnP port forwarding...\n");
+                try stdout.writeStreamingAll(zio(), "  trying UPnP port forwarding...\n");
                 const UPnP = lib.nat.UPnP;
                 if (UPnP.addPortMapping(gossip_port, gossip_port, "meshguard", 3600)) |upnp_result| {
                     // Use UPnP external IP if available, otherwise fall back to STUN IP
@@ -935,7 +1001,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
                     try writeFormatted(stdout, "  UPnP: {s} (will use hole punching)\n", .{@errorName(upnp_err)});
                 }
             },
-            .unknown => try stdout.writeAll("  STUN: could not determine public endpoint\n"),
+            .unknown => try stdout.writeStreamingAll(zio(), "  STUN: could not determine public endpoint\n"),
         }
     }
 
@@ -960,13 +1026,13 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     // Run event loop
     if (use_kernel_wg) {
         // Kernel mode: SWIM owns the socket
-        try stdout.writeAll("meshguard is running (kernel WG mode). Press Ctrl+C to stop.\n");
+        try stdout.writeStreamingAll(zio(), "meshguard is running (kernel WG mode). Press Ctrl+C to stop.\n");
         swim.run() catch |err| {
             try writeFormatted(stderr, "error: gossip loop failed: {s}\n", .{@errorName(err)});
         };
     } else {
         // Userspace mode: multiplexed event loop with TUN
-        try stdout.writeAll("meshguard is running (userspace WG mode). Press Ctrl+C to stop.\n");
+        try stdout.writeStreamingAll(zio(), "meshguard is running (userspace WG mode). Press Ctrl+C to stop.\n");
 
         var wg_device = lib.wireguard.Device.WgDevice.init(wg_private_key, wg_public_key);
         wg_handler_ctx.wg_device = &wg_device;
@@ -976,7 +1042,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
             // ─── Linux: TUN device + rtnetlink + multiplexed event loop ───
             var tun_dev = lib.net.Tun.TunDevice.open("mg0") catch |err| {
                 try writeFormatted(stderr, "error: failed to open TUN device: {s}\n", .{@errorName(err)});
-                try stderr.writeAll("  hint: run with sudo or set CAP_NET_ADMIN\n");
+                try stderr.writeStreamingAll(zio(), "  hint: run with sudo or set CAP_NET_ADMIN\n");
                 std.process.exit(1);
             };
             defer tun_dev.close();
@@ -1002,9 +1068,9 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
 
             tun_dev.enableOffload();
             if (tun_dev.vnet_hdr) {
-                try stdout.writeAll("  GSO/GRO offloads: enabled (IFF_VNET_HDR)\n");
+                try stdout.writeStreamingAll(zio(), "  GSO/GRO offloads: enabled (IFF_VNET_HDR)\n");
             } else {
-                try stdout.writeAll("  GSO/GRO offloads: disabled (fallback to single-packet)\n");
+                try stdout.writeStreamingAll(zio(), "  GSO/GRO offloads: disabled (fallback to single-packet)\n");
             }
 
             userspaceEventLoop(&swim, &wg_device, &gossip_socket, tun_dev, stdout, encrypt_workers, &service_filter, &control) catch |err| {
@@ -1017,8 +1083,8 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
 
             var tun_dev = WintunDev.open("meshguard") catch |err| {
                 try writeFormatted(stderr, "error: failed to open Wintun adapter: {s}\n", .{@errorName(err)});
-                try stderr.writeAll("  hint: ensure wintun.dll is in the same directory as meshguard.exe\n");
-                try stderr.writeAll("  hint: run as Administrator\n");
+                try stderr.writeStreamingAll(zio(), "  hint: ensure wintun.dll is in the same directory as meshguard.exe\n");
+                try stderr.writeStreamingAll(zio(), "  hint: run as Administrator\n");
                 std.process.exit(1);
             };
             defer tun_dev.close();
@@ -1054,7 +1120,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
 
             var tun_dev = lib.net.Tun.TunDevice.open("utun") catch |err| {
                 try writeFormatted(stderr, "error: failed to open utun device: {s}\n", .{@errorName(err)});
-                try stderr.writeAll("  hint: run with sudo\n");
+                try stderr.writeStreamingAll(zio(), "  hint: run with sudo\n");
                 std.process.exit(1);
             };
             defer tun_dev.close();
@@ -1084,14 +1150,14 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
                 try writeFormatted(stderr, "warning: failed to set TUN non-blocking: {s}\n", .{@errorName(err)});
             };
 
-            try stdout.writeAll("  GSO/GRO offloads: not available (macOS)\n");
+            try stdout.writeStreamingAll(zio(), "  GSO/GRO offloads: not available (macOS)\n");
 
             // Run the macOS event loop (simplified, similar to Windows)
             macosEventLoop(&swim, &wg_device, &gossip_socket, &tun_dev, stdout, &service_filter, &control) catch |err| {
                 try writeFormatted(stderr, "error: event loop failed: {s}\n", .{@errorName(err)});
             };
         } else {
-            try stderr.writeAll("error: unsupported platform for userspace WireGuard mode\n");
+            try stderr.writeStreamingAll(zio(), "error: unsupported platform for userspace WireGuard mode\n");
             std.process.exit(1);
         }
 
@@ -1101,13 +1167,13 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     swim.broadcastLeave();
 
     // Cleanup
-    try stdout.writeAll("\nmeshguard stopping...\n");
+    try stdout.writeStreamingAll(zio(), "\nmeshguard stopping...\n");
     if (use_kernel_wg) {
         if (comptime @import("builtin").os.tag == .linux) {
             lib.wireguard.Config.teardown(lib.wireguard.Config.DEFAULT_IFNAME) catch {};
         }
     }
-    try stdout.writeAll("meshguard stopped.\n");
+    try stdout.writeStreamingAll(zio(), "meshguard stopped.\n");
 }
 
 // ─── Coordinated Punch (meshguard connect) ───
@@ -1139,7 +1205,7 @@ fn cmdConnect(allocator: std.mem.Allocator, extra_args: []const []const u8) !voi
                 i += 1;
                 punch_delay_min = std.fmt.parseInt(u64, extra_args[i], 10) catch 1;
             } else if (std.mem.eql(u8, extra_args[i], "--help") or std.mem.eql(u8, extra_args[i], "-h")) {
-                try stdout.writeAll(
+                try stdout.writeStreamingAll(zio(), 
                     \\meshguard connect — Direct peer connection via token exchange
                     \\
                     \\USAGE:
@@ -1164,7 +1230,7 @@ fn cmdConnect(allocator: std.mem.Allocator, extra_args: []const []const u8) !voi
     // Load identity
     const kp = Identity.load(allocator, config_dir) catch |err| {
         if (err == error.FileNotFound) {
-            try stderr.writeAll("error: no identity found. Run 'meshguard keygen' first.\n");
+            try stderr.writeStreamingAll(zio(), "error: no identity found. Run 'meshguard keygen' first.\n");
             std.process.exit(1);
         }
         return err;
@@ -1179,7 +1245,7 @@ fn cmdConnect(allocator: std.mem.Allocator, extra_args: []const []const u8) !voi
     wg_private_key[31] &= 127;
     wg_private_key[31] |= 64;
     const wg_public_key = std.crypto.dh.X25519.recoverPublicKey(wg_private_key) catch {
-        try stderr.writeAll("error: failed to derive WG public key\n");
+        try stderr.writeStreamingAll(zio(), "error: failed to derive WG public key\n");
         std.process.exit(1);
     };
 
@@ -1194,41 +1260,43 @@ fn cmdConnect(allocator: std.mem.Allocator, extra_args: []const []const u8) !voi
     // Only relevant on Linux where systemd may be managing the service.
     if (comptime @import("builtin").os.tag == .linux) {
         const was_running = blk: {
-            const stat = std.fs.openFileAbsolute("/etc/systemd/system/meshguard.service", .{}) catch break :blk false;
-            stat.close();
+            const stat = std.Io.Dir.openFileAbsolute(zio(), "/etc/systemd/system/meshguard.service", .{}) catch break :blk false;
+            stat.close(zio());
             // Check if service is active
-            var child = std.process.Child.init(&.{ "systemctl", "is-active", "--quiet", "meshguard" }, allocator);
-            child.stderr_behavior = .Ignore;
-            child.stdout_behavior = .Ignore;
-            const term = child.spawnAndWait() catch break :blk false;
-            break :blk (term.Exited == 0);
+            const term = spawnAndWaitChild(.{
+                .argv = &.{ "systemctl", "is-active", "--quiet", "meshguard" },
+                .stderr = .ignore,
+                .stdout = .ignore,
+            }) catch break :blk false;
+            break :blk childExitedSuccessfully(term);
         };
 
         if (was_running) {
-            try stdout.writeAll("  stopping meshguard service (need gossip port)...\n");
-            var stop = std.process.Child.init(&.{ "systemctl", "stop", "meshguard" }, allocator);
-            stop.stderr_behavior = .Ignore;
-            stop.stdout_behavior = .Ignore;
-            _ = stop.spawnAndWait() catch {};
+            try stdout.writeStreamingAll(zio(), "  stopping meshguard service (need gossip port)...\n");
+            _ = spawnAndWaitChild(.{
+                .argv = &.{ "systemctl", "stop", "meshguard" },
+                .stderr = .ignore,
+                .stdout = .ignore,
+            }) catch {};
             // Brief pause for port to be released
-            std.Thread.sleep(1 * std.time.ns_per_s);
+            sleepNs(std.time.ns_per_s);
         }
     }
 
     // Bind to the gossip port (same port meshguard up will use)
     var socket = lib.net.Udp.UdpSocket.bind(gossip_port) catch {
-        try stderr.writeAll("error: failed to bind gossip port 51821\n");
-        try stderr.writeAll("  hint: is meshguard already running? Stop it first.\n");
+        try stderr.writeStreamingAll(zio(), "error: failed to bind gossip port 51821\n");
+        try stderr.writeStreamingAll(zio(), "  hint: is meshguard already running? Stop it first.\n");
         std.process.exit(1);
     };
     defer socket.close();
 
     // STUN discovery
-    try stdout.writeAll("  discovering public endpoint (STUN)...\n");
+    try stdout.writeStreamingAll(zio(), "  discovering public endpoint (STUN)...\n");
     const stun_result = Stun.discover(&socket, gossip_port, &Stun.DEFAULT_STUN_SERVERS);
     if (stun_result.nat_type == .unknown) {
-        try stderr.writeAll("error: STUN failed — could not determine public endpoint\n");
-        try stderr.writeAll("  hint: check internet connectivity or firewall\n");
+        try stderr.writeStreamingAll(zio(), "error: STUN failed — could not determine public endpoint\n");
+        try stderr.writeStreamingAll(zio(), "  hint: check internet connectivity or firewall\n");
         std.process.exit(1);
     }
 
@@ -1243,11 +1311,11 @@ fn cmdConnect(allocator: std.mem.Allocator, extra_args: []const []const u8) !voi
     try writeFormatted(stdout, "  public endpoint: {s}:{d} ({s})\n", .{ pub_ip, stun_result.external.port, nat_label });
 
     if (stun_result.nat_type == .symmetric) {
-        try stderr.writeAll("warning: symmetric NAT detected — coordinated punch may fail\n");
+        try stderr.writeStreamingAll(zio(), "warning: symmetric NAT detected — coordinated punch may fail\n");
     }
 
     // Get synchronized time
-    try stdout.writeAll("  syncing time (NTP)...\n");
+    try stdout.writeStreamingAll(zio(), "  syncing time (NTP)...\n");
     const ntp_time = CoordinatedPunch.currentTimeSecs();
 
     // Pick STUN server used (for token)
@@ -1256,13 +1324,13 @@ fn cmdConnect(allocator: std.mem.Allocator, extra_args: []const []const u8) !voi
     switch (mode) {
         .generate => {
             // ── Initiator flow ──
-            try stdout.writeAll("\n── Coordinated Punch (initiator) ──\n\n");
+            try stdout.writeStreamingAll(zio(), "\n── Coordinated Punch (initiator) ──\n\n");
 
             const punch_time = ntp_time + (punch_delay_min * 60);
 
             // Generate nonce
             var nonce: [8]u8 = undefined;
-            std.crypto.random.bytes(&nonce);
+            zio().random(&nonce);
 
             // Build token
             var token = CoordinatedPunch.Token{
@@ -1289,27 +1357,27 @@ fn cmdConnect(allocator: std.mem.Allocator, extra_args: []const []const u8) !voi
 
             try writeFormatted(stdout, "  your mesh IP: {s}\n", .{mesh_ip_str});
             try writeFormatted(stdout, "  punch in: {d} minute(s)\n\n", .{punch_delay_min});
-            try stdout.writeAll("Send this command to your peer:\n\n  meshguard connect --join ");
-            try stdout.writeAll(uri);
-            try stdout.writeAll("\n\n");
-            try stdout.writeAll("Paste peer's response token: ");
+            try stdout.writeStreamingAll(zio(), "Send this command to your peer:\n\n  meshguard connect --join ");
+            try stdout.writeStreamingAll(zio(), uri);
+            try stdout.writeStreamingAll(zio(), "\n\n");
+            try stdout.writeStreamingAll(zio(), "Paste peer's response token: ");
 
             // Read peer's response token from stdin
-            const stdin = std.fs.File.stdin();
+            const stdin = std.Io.File.stdin();
             var input_buf: [256]u8 = undefined;
-            const input_len = stdin.read(&input_buf) catch {
-                try stderr.writeAll("\nerror: failed to read stdin\n");
+            const input_len = readSome(stdin, &input_buf) catch {
+                try stderr.writeStreamingAll(zio(), "\nerror: failed to read stdin\n");
                 std.process.exit(1);
             };
             if (input_len == 0) {
-                try stderr.writeAll("\nerror: no input received\n");
+                try stderr.writeStreamingAll(zio(), "\nerror: no input received\n");
                 std.process.exit(1);
             }
-            const peer_uri = std.mem.trimRight(u8, input_buf[0..input_len], "\n\r \t");
+            const peer_uri = std.mem.trimEnd(u8, input_buf[0..input_len], "\n\r \t");
 
             // Decode peer's token
             const peer_token = CoordinatedPunch.decodeTokenUri(peer_uri) catch {
-                try stderr.writeAll("error: invalid peer token\n");
+                try stderr.writeStreamingAll(zio(), "error: invalid peer token\n");
                 std.process.exit(1);
             };
 
@@ -1335,24 +1403,24 @@ fn cmdConnect(allocator: std.mem.Allocator, extra_args: []const []const u8) !voi
             if (result) |punch| {
                 try finalizePunch(allocator, config_dir, stdout, stderr, punch, peer_token);
             } else {
-                try stderr.writeAll("\n  ✗ punch failed after 3 attempts\n");
-                try stderr.writeAll("  hint: ensure both peers are running and behind cone NAT\n");
+                try stderr.writeStreamingAll(zio(), "\n  ✗ punch failed after 3 attempts\n");
+                try stderr.writeStreamingAll(zio(), "  hint: ensure both peers are running and behind cone NAT\n");
                 std.process.exit(1);
             }
         },
         .join => {
             // ── Joiner flow ──
             const peer_uri = join_token_arg orelse {
-                try stderr.writeAll("error: --join requires a mg:// token\n");
+                try stderr.writeStreamingAll(zio(), "error: --join requires a mg:// token\n");
                 std.process.exit(1);
             };
 
             const peer_token = CoordinatedPunch.decodeTokenUri(peer_uri) catch {
-                try stderr.writeAll("error: invalid token\n");
+                try stderr.writeStreamingAll(zio(), "error: invalid token\n");
                 std.process.exit(1);
             };
 
-            try stdout.writeAll("\n── Coordinated Punch (joiner) ──\n\n");
+            try stdout.writeStreamingAll(zio(), "\n── Coordinated Punch (joiner) ──\n\n");
 
             var peer_ip_buf: [15]u8 = undefined;
             const peer_ip = lib.wireguard.Ip.formatIp(peer_token.mesh_ip, &peer_ip_buf);
@@ -1365,7 +1433,7 @@ fn cmdConnect(allocator: std.mem.Allocator, extra_args: []const []const u8) !voi
 
             // Generate our nonce
             var nonce: [8]u8 = undefined;
-            std.crypto.random.bytes(&nonce);
+            zio().random(&nonce);
 
             // Build response token
             var response_token = CoordinatedPunch.Token{
@@ -1386,9 +1454,9 @@ fn cmdConnect(allocator: std.mem.Allocator, extra_args: []const []const u8) !voi
             var uri_buf: [156]u8 = undefined;
             const uri = CoordinatedPunch.encodeTokenUri(&response_token, &uri_buf);
 
-            try stdout.writeAll("\nPaste this response token on your peer's terminal:\n\n  ");
-            try stdout.writeAll(uri);
-            try stdout.writeAll("\n\n");
+            try stdout.writeStreamingAll(zio(), "\nPaste this response token on your peer's terminal:\n\n  ");
+            try stdout.writeStreamingAll(zio(), uri);
+            try stdout.writeStreamingAll(zio(), "\n\n");
 
             const secs_until = if (punch_time > ntp_time) punch_time - ntp_time else 0;
             try writeFormatted(stdout, "  punch in ~{d}s — waiting...\n", .{secs_until});
@@ -1409,8 +1477,8 @@ fn cmdConnect(allocator: std.mem.Allocator, extra_args: []const []const u8) !voi
             if (result) |punch| {
                 try finalizePunch(allocator, config_dir, stdout, stderr, punch, peer_token);
             } else {
-                try stderr.writeAll("\n  ✗ punch failed after 3 attempts\n");
-                try stderr.writeAll("  hint: ensure both peers are running and behind cone NAT\n");
+                try stderr.writeStreamingAll(zio(), "\n  ✗ punch failed after 3 attempts\n");
+                try stderr.writeStreamingAll(zio(), "  hint: ensure both peers are running and behind cone NAT\n");
                 std.process.exit(1);
             }
         },
@@ -1421,8 +1489,8 @@ fn cmdConnect(allocator: std.mem.Allocator, extra_args: []const []const u8) !voi
 fn finalizePunch(
     allocator: std.mem.Allocator,
     config_dir: []const u8,
-    stdout: std.fs.File,
-    stderr: std.fs.File,
+    stdout: std.Io.File,
+    stderr: std.Io.File,
     punch: lib.nat.CoordinatedPunch.PunchResult,
     peer_token: lib.nat.CoordinatedPunch.Token,
 ) !void {
@@ -1435,7 +1503,7 @@ fn finalizePunch(
     var peer_mesh_buf: [15]u8 = undefined;
     const peer_mesh = lib.wireguard.Ip.formatIp(peer_token.mesh_ip, &peer_mesh_buf);
 
-    try stdout.writeAll("\n  ✓ Direct connection established!\n");
+    try stdout.writeStreamingAll(zio(), "\n  ✓ Direct connection established!\n");
     try writeFormatted(stdout, "    peer: {s}\n", .{peer_mesh});
     try writeFormatted(stdout, "    endpoint: {s}\n\n", .{peer_ep});
 
@@ -1447,53 +1515,54 @@ fn finalizePunch(
     lib.identity.Trust.addAuthorizedKey(allocator, config_dir, &pk_b64_buf, "punch-peer") catch |err| {
         try writeFormatted(stderr, "  warning: could not auto-trust peer: {s}\n", .{@errorName(err)});
     };
-    try stdout.writeAll("  peer trusted (auto-added to authorized keys)\n");
+    try stdout.writeStreamingAll(zio(), "  peer trusted (auto-added to authorized keys)\n");
 
     // Save punched endpoint as seed
     lib.nat.CoordinatedPunch.savePunchedSeed(allocator, config_dir, punch.peer_addr, punch.peer_port) catch |err| {
         try writeFormatted(stderr, "  warning: could not save seed: {s}\n", .{@errorName(err)});
     };
-    try stdout.writeAll("  seed saved to config\n\n");
+    try stdout.writeStreamingAll(zio(), "  seed saved to config\n\n");
 
     // Offer next steps
-    try stdout.writeAll("  To start the mesh:\n");
+    try stdout.writeStreamingAll(zio(), "  To start the mesh:\n");
     try writeFormatted(stdout, "    meshguard up --seed {s}\n\n", .{peer_ep});
 
     // Check if systemd service exists and offer auto-restart (Linux only)
     if (comptime @import("builtin").os.tag == .linux) {
         const service_exists = blk: {
-            const stat = std.fs.openFileAbsolute("/etc/systemd/system/meshguard.service", .{}) catch break :blk false;
-            stat.close();
+            const stat = std.Io.Dir.openFileAbsolute(zio(), "/etc/systemd/system/meshguard.service", .{}) catch break :blk false;
+            stat.close(zio());
             break :blk true;
         };
 
         if (service_exists) {
-            try stdout.writeAll("  systemd service detected. Restart now? [Y/n] ");
+            try stdout.writeStreamingAll(zio(), "  systemd service detected. Restart now? [Y/n] ");
 
-            const stdin = std.fs.File.stdin();
+            const stdin = std.Io.File.stdin();
             var input_buf: [16]u8 = undefined;
-            const input_len = stdin.read(&input_buf) catch 0;
-            const answer = std.mem.trimRight(u8, input_buf[0..input_len], "\n\r \t");
+            const input_len = readSome(stdin, &input_buf) catch 0;
+            const answer = std.mem.trimEnd(u8, input_buf[0..input_len], "\n\r \t");
 
             if (answer.len == 0 or answer[0] == 'Y' or answer[0] == 'y') {
-                try stdout.writeAll("  restarting meshguard service...\n");
-                var child = std.process.Child.init(&.{ "systemctl", "restart", "meshguard" }, allocator);
-                child.stderr_behavior = .Ignore;
-                child.stdout_behavior = .Ignore;
-                const term = child.spawnAndWait() catch {
-                    try stderr.writeAll("  warning: failed to restart service. Run manually:\n");
-                    try stderr.writeAll("    sudo systemctl restart meshguard\n");
+                try stdout.writeStreamingAll(zio(), "  restarting meshguard service...\n");
+                const term = spawnAndWaitChild(.{
+                    .argv = &.{ "systemctl", "restart", "meshguard" },
+                    .stderr = .ignore,
+                    .stdout = .ignore,
+                }) catch {
+                    try stderr.writeStreamingAll(zio(), "  warning: failed to restart service. Run manually:\n");
+                    try stderr.writeStreamingAll(zio(), "    sudo systemctl restart meshguard\n");
                     return;
                 };
-                if (term.Exited == 0) {
-                    try stdout.writeAll("  ✓ meshguard service restarted\n");
+                if (childExitedSuccessfully(term)) {
+                    try stdout.writeStreamingAll(zio(), "  ✓ meshguard service restarted\n");
                 } else {
-                    try stderr.writeAll("  warning: systemctl returned non-zero. Run manually:\n");
-                    try stderr.writeAll("    sudo systemctl restart meshguard\n");
+                    try stderr.writeStreamingAll(zio(), "  warning: systemctl returned non-zero. Run manually:\n");
+                    try stderr.writeStreamingAll(zio(), "    sudo systemctl restart meshguard\n");
                 }
             } else {
-                try stdout.writeAll("  Remember to restart the service soon (NAT mapping expires):\n");
-                try stdout.writeAll("    sudo systemctl restart meshguard\n");
+                try stdout.writeStreamingAll(zio(), "  Remember to restart the service soon (NAT mapping expires):\n");
+                try stdout.writeStreamingAll(zio(), "    sudo systemctl restart meshguard\n");
             }
         }
     }
@@ -1503,7 +1572,7 @@ fn finalizePunch(
 
 var g_swim_stop: ?*lib.discovery.Swim.SwimProtocol = null;
 
-fn signalHandler(sig: i32) callconv(.c) void {
+fn signalHandler(sig: posix.SIG) callconv(.c) void {
     _ = sig;
     if (g_swim_stop) |swim_ref| {
         swim_ref.stop();
@@ -1545,7 +1614,7 @@ fn windowsCtrlHandler(ctrl_type: u32) callconv(.winapi) std.os.windows.BOOL {
 
 
 const WgHandlerCtx = struct {
-    stdout: std.fs.File,
+    stdout: std.Io.File,
     membership: *lib.discovery.Membership.MembershipTable,
     wg_device: ?*lib.wireguard.Device.WgDevice = null,
     socket: ?*lib.net.Udp.UdpSocket = null,
@@ -1592,17 +1661,28 @@ fn wgOnPeerJoin(ctx: *anyopaque, peer: *const lib.discovery.Membership.Peer) voi
                 return;
             };
 
-            // Initiate handshake if we have an endpoint
+            // Only one side should initiate. The userspace device keeps a
+            // single handshake state per peer, so simultaneous initiation
+            // races both peers into responder state and transport never comes
+            // up. Use a deterministic public-key tie-breaker so exactly one
+            // side starts the handshake.
+            const should_initiate = std.mem.order(u8, &dev.static_public, &wg_key) == .lt;
+
+            // Initiate handshake if we have an endpoint and won the tie-break.
             if (peer_addr[0] != 0 or peer_addr[1] != 0 or peer_addr[2] != 0 or peer_addr[3] != 0) {
-                if (dev.initiateHandshake(slot)) |init_msg| {
-                    // Send handshake initiation via UDP socket
-                    if (handler.socket) |sock| {
-                        const msg_bytes = std.mem.asBytes(&init_msg);
-                        _ = sock.sendTo(msg_bytes, peer_addr, peer_port) catch 0;
+                if (should_initiate) {
+                    if (dev.initiateHandshake(slot)) |init_msg| {
+                        // Send handshake initiation via UDP socket
+                        if (handler.socket) |sock| {
+                            const msg_bytes = std.mem.asBytes(&init_msg);
+                            _ = sock.sendTo(msg_bytes, peer_addr, peer_port) catch 0;
+                        }
+                        writeFormatted(handler.stdout, "  peer joined (userspace): {s} [handshake sent]\n", .{ip_str}) catch {};
+                    } else |_| {
+                        writeFormatted(handler.stdout, "  peer joined (userspace): {s} [handshake pending]\n", .{ip_str}) catch {};
                     }
-                    writeFormatted(handler.stdout, "  peer joined (userspace): {s} [handshake sent]\n", .{ip_str}) catch {};
-                } else |_| {
-                    writeFormatted(handler.stdout, "  peer joined (userspace): {s} [handshake pending]\n", .{ip_str}) catch {};
+                } else {
+                    writeFormatted(handler.stdout, "  peer joined (userspace): {s} [awaiting peer handshake]\n", .{ip_str}) catch {};
                 }
             } else {
                 writeFormatted(handler.stdout, "  peer joined (userspace): {s} [awaiting endpoint]\n", .{ip_str}) catch {};
@@ -2088,7 +2168,7 @@ fn dispatchBatch(
     });
 
     // 1. Lock per-peer push_lock briefly for nonce assignment + ring insertion
-    peer.tx_ring.push_lock.lock();
+    peer.tx_ring.push_lock.lockUncancelable(zio());
 
     // Bulk nonce assignment: fetchAdd(count) claims a contiguous block
     const start_nonce = tun.send_counter.fetchAdd(batch.count, .monotonic);
@@ -2099,7 +2179,7 @@ fn dispatchBatch(
     // Push batch index into per-peer TxRing (maintains nonce ordering)
     peer.tx_ring.push(batch_idx);
 
-    peer.tx_ring.push_lock.unlock();
+    peer.tx_ring.push_lock.unlock(zio());
 
     // 2. Mark batch as Encrypting and dispatch to crypto workers
     batch.state.store(@intFromEnum(Pipeline.BatchState.Encrypting), .release);
@@ -2141,7 +2221,7 @@ fn cryptoWorkerPipeline(
         // If another crypto worker is already sending for this peer, tryLock fails
         // and we safely go back to encrypting. They will drain our Ready batch.
         if (!peer.tx_ring.send_lock.tryLock()) continue;
-        defer peer.tx_ring.send_lock.unlock();
+        defer peer.tx_ring.send_lock.unlock(zio());
 
         flushPeerTxRing(peer, pool, udp_fd);
     }
@@ -2192,7 +2272,7 @@ fn flushPeerTxRing(
                                 GsoState.logged = true;
                                 var err_buf: [128]u8 = undefined;
                                 const msg = std.fmt.bufPrint(&err_buf, "  GSO failed: errno={d}, using sendmmsg fallback\n", .{result.err}) catch "  GSO failed\n";
-                                _ = posix.write(2, msg) catch {};
+                                writeFdNoErr(2, msg);
                             }
                             break;
                         }
@@ -2211,7 +2291,7 @@ fn flushPeerTxRing(
                         GsoState.logged = true;
                         var err_buf: [128]u8 = undefined;
                         const msg = std.fmt.bufPrint(&err_buf, "  GSO failed: errno={d}, using sendmmsg fallback\n", .{result.err}) catch "  GSO failed\n";
-                        _ = posix.write(2, msg) catch {};
+                        writeFdNoErr(2, msg);
                     }
                 }
                 gso_tx.reset();
@@ -2464,7 +2544,7 @@ fn writeCoalescedToTun(
             .{ .base = &vhdr_bytes, .len = Offload.VNET_HDR_LEN },
             .{ .base = pkt_a.ptr, .len = pkt_a.len },
         };
-        _ = posix.writev(tun_dev.fd, &iov) catch {};
+        writevFdNoErr(tun_dev.fd, iov[0..]);
         i += 1;
     }
 }
@@ -2507,9 +2587,9 @@ fn decryptRxWorker(
                     .{ .base = &vhdr_bytes, .len = Offload.VNET_HDR_LEN },
                     .{ .base = out_buf[0..dec.len].ptr, .len = dec.len },
                 };
-                _ = posix.writev(tun_fd, &iov) catch {};
+                writevFdNoErr(tun_fd, iov[0..]);
             } else {
-                _ = posix.write(tun_fd, out_buf[0..dec.len]) catch {};
+                writeFdNoErr(tun_fd, out_buf[0..dec.len]);
             }
         } else |_| {}
     }
@@ -2524,7 +2604,7 @@ fn processIncomingPacket(
     wg_dev: *lib.wireguard.Device.WgDevice,
     swim: *lib.discovery.Swim.SwimProtocol,
     udp_sock: *lib.net.Udp.UdpSocket,
-    stdout: std.fs.File,
+    stdout: std.Io.File,
     decrypt_storage: *[64][1500]u8,
     decrypt_lens: *[64]usize,
     decrypt_slots: *[64]usize,
@@ -2594,7 +2674,7 @@ fn windowsEventLoop(
     wg_dev: *lib.wireguard.Device.WgDevice,
     udp_sock: *lib.net.Udp.UdpSocket,
     tun_dev: *lib.net.Wintun.WintunDevice,
-    stdout: std.fs.File,
+    stdout: std.Io.File,
     service_filter: *const lib.services.Policy.ServiceFilter,
     control_socket: *lib.services.Control.ControlSocket,
 ) !void {
@@ -2727,7 +2807,7 @@ fn macosEventLoop(
     wg_dev: *lib.wireguard.Device.WgDevice,
     udp_sock: *lib.net.Udp.UdpSocket,
     tun_dev: *lib.net.Tun.TunDevice,
-    stdout: std.fs.File,
+    stdout: std.Io.File,
     service_filter: *const lib.services.Policy.ServiceFilter,
     control_socket: *lib.services.Control.ControlSocket,
 ) !void {
@@ -2860,7 +2940,7 @@ fn userspaceEventLoop(
     wg_dev: *lib.wireguard.Device.WgDevice,
     udp_sock: *lib.net.Udp.UdpSocket,
     tun_dev: lib.net.Tun.TunDevice,
-    stdout: std.fs.File,
+    stdout: std.Io.File,
     encrypt_workers_arg: usize,
     service_filter: *const lib.services.Policy.ServiceFilter,
     control_socket: *lib.services.Control.ControlSocket,
@@ -2908,8 +2988,21 @@ fn userspaceEventLoop(
     const use_io_uring = lib.net.IoUring.isAvailable();
     if (!use_io_uring) {
         for (0..opened_workers) |w| {
-            const flags = posix.fcntl(tun_fds[w], posix.F.GETFL, 0) catch continue;
-            _ = posix.fcntl(tun_fds[w], posix.F.SETFL, flags | @as(usize, 0x800)) catch {};
+            const flags = posix.system.fcntl(tun_fds[w], posix.F.GETFL, @as(usize, 0));
+            switch (posix.errno(flags)) {
+                .SUCCESS => {},
+                else => continue,
+            }
+
+            const rc = posix.system.fcntl(
+                tun_fds[w],
+                posix.F.SETFL,
+                @as(usize, @intCast(flags)) | @as(usize, 1 << @bitOffsetOf(posix.O, "NONBLOCK")),
+            );
+            switch (posix.errno(rc)) {
+                .SUCCESS => {},
+                else => {},
+            }
         }
     }
 
@@ -3076,7 +3169,7 @@ fn userspaceEventLoop(
                             writeCoalescedToTun(&tun_dev, &decrypt_storage, &decrypt_lens, n_decrypted);
                         } else {
                             for (0..n_decrypted) |d| {
-                                _ = posix.write(tun_dev.fd, decrypt_storage[d][0..decrypt_lens[d]]) catch {};
+                                writeFdNoErr(tun_dev.fd, decrypt_storage[d][0..decrypt_lens[d]]);
                             }
                         }
                         n_decrypted = 0;
@@ -3090,7 +3183,7 @@ fn userspaceEventLoop(
                     writeCoalescedToTun(&tun_dev, &decrypt_storage, &decrypt_lens, n_decrypted);
                 } else {
                     for (0..n_decrypted) |d| {
-                        _ = posix.write(tun_dev.fd, decrypt_storage[d][0..decrypt_lens[d]]) catch {};
+                        writeFdNoErr(tun_dev.fd, decrypt_storage[d][0..decrypt_lens[d]]);
                     }
                 }
             }
@@ -3115,7 +3208,7 @@ fn userspaceEventLoop(
 
     // Close extra TUN fds (skip tun_fds[0] — primary, closed by caller)
     for (1..opened_workers) |w| {
-        posix.close(tun_fds[w]);
+        _ = std.c.close(tun_fds[w]);
     }
 }
 
@@ -3168,20 +3261,20 @@ fn cmdDown(allocator: std.mem.Allocator) !void {
     const stderr = getStdErr();
 
     if (comptime @import("builtin").os.tag != .linux) {
-        try stderr.writeAll("error: 'meshguard down' is only supported on Linux (requires netlink)\n");
+        try stderr.writeStreamingAll(zio(), "error: 'meshguard down' is only supported on Linux (requires netlink)\n");
         std.process.exit(1);
     } else {
         lib.wireguard.Config.teardown(lib.wireguard.Config.DEFAULT_IFNAME) catch |err| {
             switch (err) {
-                error.SocketCreateFailed => try stderr.writeAll("error: permission denied. Run with sudo.\n"),
-                error.NetlinkError => try stderr.writeAll("error: interface mg0 not found.\n"),
+                error.SocketCreateFailed => try stderr.writeStreamingAll(zio(), "error: permission denied. Run with sudo.\n"),
+                error.NetlinkError => try stderr.writeStreamingAll(zio(), "error: interface mg0 not found.\n"),
                 else => try writeFormatted(stderr, "error: {s}\n", .{@errorName(err)}),
             }
             std.process.exit(1);
         };
     }
 
-    try stdout.writeAll("meshguard stopped. Interface mg0 removed.\n");
+    try stdout.writeStreamingAll(zio(), "meshguard stopped. Interface mg0 removed.\n");
 }
 
 fn cmdStatus(allocator: std.mem.Allocator) !void {
@@ -3189,7 +3282,7 @@ fn cmdStatus(allocator: std.mem.Allocator) !void {
     const stderr = getStdErr();
 
     if (comptime @import("builtin").os.tag != .linux) {
-        try stderr.writeAll("error: 'meshguard status' is only supported on Linux (requires netlink)\n");
+        try stderr.writeStreamingAll(zio(), "error: 'meshguard status' is only supported on Linux (requires netlink)\n");
         std.process.exit(1);
     }
 
@@ -3198,7 +3291,7 @@ fn cmdStatus(allocator: std.mem.Allocator) !void {
 
     // Check if interface exists
     const ifindex = lib.wireguard.RtNetlink.getInterfaceIndex("mg0") catch {
-        try stderr.writeAll("meshguard is not running (no mg0 interface).\n");
+        try stderr.writeStreamingAll(zio(), "meshguard is not running (no mg0 interface).\n");
         std.process.exit(1);
     };
 
@@ -3243,13 +3336,13 @@ fn cmdStatus(allocator: std.mem.Allocator) !void {
             const seeds_path = std.fs.path.join(allocator, &.{ dir, "seeds" }) catch null;
             if (seeds_path) |sp| {
                 defer allocator.free(sp);
-                const sf = std.fs.openFileAbsolute(sp, .{}) catch null;
+                const sf = std.Io.Dir.openFileAbsolute(zio(), sp, .{}) catch null;
                 if (sf) |f| {
-                    defer f.close();
+                    defer f.close(zio());
                     var sbuf: [512]u8 = undefined;
-                    const sread = f.readAll(&sbuf) catch 0;
+                    const sread = readAll(f, &sbuf) catch 0;
                     if (sread > 0) {
-                        const seeds_data = std.mem.trimRight(u8, sbuf[0..sread], "\n\r \t");
+                        const seeds_data = std.mem.trimEnd(u8, sbuf[0..sread], "\n\r \t");
                         // Count lines
                         var seed_count: u32 = 0;
                         var rest: []const u8 = seeds_data;
@@ -3257,7 +3350,7 @@ fn cmdStatus(allocator: std.mem.Allocator) !void {
                             const nl = std.mem.indexOfScalar(u8, rest, '\n');
                             const line = if (nl) |n| rest[0..n] else rest;
                             rest = if (nl) |n| rest[n + 1 ..] else rest[rest.len..];
-                            if (std.mem.trimRight(u8, line, "\r \t").len > 0) seed_count += 1;
+                            if (std.mem.trimEnd(u8, line, "\r \t").len > 0) seed_count += 1;
                         }
                         try writeFormatted(stdout, "  seeds: {d}\n", .{seed_count});
                     }
@@ -3267,17 +3360,19 @@ fn cmdStatus(allocator: std.mem.Allocator) !void {
 
         // Systemd uptime and memory
         {
-            var child = std.process.Child.init(&.{
-                "systemctl",                                     "show",       "meshguard",
-                "--property=ActiveEnterTimestamp,MemoryCurrent", "--no-pager",
-            }, allocator);
-            child.stdout_behavior = .Pipe;
-            child.stderr_behavior = .Ignore;
-            if (child.spawn()) |_| {} else |_| return;
+            var child = spawnChild(.{
+                .argv = &.{
+                    "systemctl",                                     "show",       "meshguard",
+                    "--property=ActiveEnterTimestamp,MemoryCurrent", "--no-pager",
+                },
+                .stdout = .pipe,
+                .stderr = .ignore,
+            }) catch return;
+            defer child.kill(zio());
 
             var out_buf: [512]u8 = undefined;
-            const out_read = child.stdout.?.readAll(&out_buf) catch 0;
-            _ = child.wait() catch {};
+            const out_read = readAll(child.stdout.?, &out_buf) catch 0;
+            _ = child.wait(zio()) catch {};
 
             if (out_read > 0) {
                 const output = out_buf[0..out_read];
@@ -3286,7 +3381,7 @@ fn cmdStatus(allocator: std.mem.Allocator) !void {
                 if (std.mem.indexOf(u8, output, "ActiveEnterTimestamp=")) |pos| {
                     const line_start = pos + "ActiveEnterTimestamp=".len;
                     const line_end = std.mem.indexOfScalarPos(u8, output, line_start, '\n') orelse output.len;
-                    const ts_str = std.mem.trimRight(u8, output[line_start..line_end], "\r \t");
+                    const ts_str = std.mem.trimEnd(u8, output[line_start..line_end], "\r \t");
                     if (ts_str.len > 0) {
                         try writeFormatted(stdout, "  started: {s}\n", .{ts_str});
                     }
@@ -3296,7 +3391,7 @@ fn cmdStatus(allocator: std.mem.Allocator) !void {
                 if (std.mem.indexOf(u8, output, "MemoryCurrent=")) |pos| {
                     const line_start = pos + "MemoryCurrent=".len;
                     const line_end = std.mem.indexOfScalarPos(u8, output, line_start, '\n') orelse output.len;
-                    const mem_str = std.mem.trimRight(u8, output[line_start..line_end], "\r \t");
+                    const mem_str = std.mem.trimEnd(u8, output[line_start..line_end], "\r \t");
                     const mem_bytes = std.fmt.parseInt(u64, mem_str, 10) catch 0;
                     if (mem_bytes > 0) {
                         const mb_whole = mem_bytes / (1024 * 1024);
@@ -3321,10 +3416,10 @@ fn cmdStatus(allocator: std.mem.Allocator) !void {
 
     if (dev.peer_count == 0) return;
 
-    try stdout.writeAll("\n");
+    try stdout.writeStreamingAll(zio(), "\n");
 
     // Display each peer
-    const now = std.time.timestamp();
+    const now = nowUnixSecs();
     for (dev.peers[0..dev.peer_count]) |peer| {
         // Peer pubkey (hex prefix)
         try writeFormatted(stdout, "  peer: {x:0>2}{x:0>2}{x:0>2}{x:0>2}...\n", .{
@@ -3359,7 +3454,7 @@ fn cmdStatus(allocator: std.mem.Allocator) !void {
                 try writeFormatted(stdout, "    last handshake: {d}h {d}m ago\n", .{ @divFloor(ago, 3600), @divFloor(@mod(ago, 3600), 60) });
             }
         } else {
-            try stdout.writeAll("    last handshake: never\n");
+            try stdout.writeStreamingAll(zio(), "    last handshake: never\n");
         }
 
         // Transfer stats
@@ -3431,14 +3526,14 @@ fn cmdService(allocator: std.mem.Allocator, extra_args: []const []const u8) !voi
     defer allocator.free(config_dir);
 
     if (extra_args.len == 0) {
-        try stdout.writeAll(service_usage);
+        try stdout.writeStreamingAll(zio(), service_usage);
         return;
     }
 
     const subcmd = extra_args[0];
 
     if (std.mem.eql(u8, subcmd, "-h") or std.mem.eql(u8, subcmd, "--help") or std.mem.eql(u8, subcmd, "help")) {
-        try stdout.writeAll(service_usage);
+        try stdout.writeStreamingAll(zio(), service_usage);
         return;
     }
 
@@ -3449,7 +3544,7 @@ fn cmdService(allocator: std.mem.Allocator, extra_args: []const []const u8) !voi
 
     if (std.mem.eql(u8, subcmd, "default")) {
         if (extra_args.len < 2) {
-            try stderr.writeAll("usage: meshguard service default <allow|deny>\n");
+            try stderr.writeStreamingAll(zio(), "usage: meshguard service default <allow|deny>\n");
             std.process.exit(1);
         }
         try cmdServiceDefault(allocator, config_dir, extra_args[1]);
@@ -3473,26 +3568,26 @@ fn cmdService(allocator: std.mem.Allocator, extra_args: []const []const u8) !voi
     }
 
     try writeFormatted(stderr, "error: unknown service command '{s}'\n\n", .{subcmd});
-    try stdout.writeAll(service_usage);
+    try stdout.writeStreamingAll(zio(), service_usage);
     std.process.exit(1);
 }
 
 fn ensureServicesDir(allocator: std.mem.Allocator, config_dir: []const u8) !void {
     const services_dir = try std.fs.path.join(allocator, &.{ config_dir, "services" });
     defer allocator.free(services_dir);
-    std.fs.makeDirAbsolute(services_dir) catch |err| {
+    std.Io.Dir.cwd().createDirPath(zio(), services_dir) catch |err| {
         if (err != error.PathAlreadyExists) return err;
     };
 
     const peer_dir = try std.fs.path.join(allocator, &.{ config_dir, "services", "peer" });
     defer allocator.free(peer_dir);
-    std.fs.makeDirAbsolute(peer_dir) catch |err| {
+    std.Io.Dir.cwd().createDirPath(zio(), peer_dir) catch |err| {
         if (err != error.PathAlreadyExists) return err;
     };
 
     const org_dir = try std.fs.path.join(allocator, &.{ config_dir, "services", "org" });
     defer allocator.free(org_dir);
-    std.fs.makeDirAbsolute(org_dir) catch |err| {
+    std.Io.Dir.cwd().createDirPath(zio(), org_dir) catch |err| {
         if (err != error.PathAlreadyExists) return err;
     };
 }
@@ -3502,7 +3597,7 @@ fn cmdServiceDefault(allocator: std.mem.Allocator, config_dir: []const u8, actio
     const stderr = getStdErr();
 
     if (!std.mem.eql(u8, action, "allow") and !std.mem.eql(u8, action, "deny")) {
-        try stderr.writeAll("error: default must be 'allow' or 'deny'\n");
+        try stderr.writeStreamingAll(zio(), "error: default must be 'allow' or 'deny'\n");
         std.process.exit(1);
     }
 
@@ -3511,10 +3606,10 @@ fn cmdServiceDefault(allocator: std.mem.Allocator, config_dir: []const u8, actio
     const path = try std.fs.path.join(allocator, &.{ config_dir, "services", "default" });
     defer allocator.free(path);
 
-    const file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
-    defer file.close();
-    try file.writeAll(action);
-    try file.writeAll("\n");
+    const file = try std.Io.Dir.createFileAbsolute(zio(), path, .{ .truncate = true });
+    defer file.close(zio());
+    try file.writeStreamingAll(zio(), action);
+    try file.writeStreamingAll(zio(), "\n");
 
     try writeFormatted(stdout, "Default policy set to: {s}\n", .{action});
 }
@@ -3546,7 +3641,7 @@ fn cmdServiceAddRule(allocator: std.mem.Allocator, config_dir: []const u8, args:
     }
 
     if (proto_str == null) {
-        try stderr.writeAll("usage: meshguard service allow|deny [--peer <name>] [--org <name>] <proto> [<port>]\n");
+        try stderr.writeStreamingAll(zio(), "usage: meshguard service allow|deny [--peer <name>] [--org <name>] <proto> [<port>]\n");
         std.process.exit(1);
     }
 
@@ -3560,14 +3655,14 @@ fn cmdServiceAddRule(allocator: std.mem.Allocator, config_dir: []const u8, args:
         if (port_str) |ps| {
             break :blk std.fmt.bufPrint(&rule_buf, "{s} {s} {s}\n", .{ action, proto_str.?, ps }) catch unreachable;
         }
-        try stderr.writeAll("error: missing port (use a port number, range, or 'all')\n");
+        try stderr.writeStreamingAll(zio(), "error: missing port (use a port number, range, or 'all')\n");
         std.process.exit(1);
     };
 
     // Validate the rule
     const PolicyMod = lib.services.Policy;
     _ = PolicyMod.parseRule(rule_line) catch {
-        try stderr.writeAll("error: invalid rule syntax\n");
+        try stderr.writeStreamingAll(zio(), "error: invalid rule syntax\n");
         std.process.exit(1);
     };
 
@@ -3583,18 +3678,21 @@ fn cmdServiceAddRule(allocator: std.mem.Allocator, config_dir: []const u8, args:
     defer allocator.free(policy_path);
 
     // Append rule to file
-    const file = std.fs.createFileAbsolute(policy_path, .{
+    const file = std.Io.Dir.createFileAbsolute(zio(), policy_path, .{
         .truncate = false,
         .exclusive = false,
     }) catch |err| {
         try writeFormatted(stderr, "error: cannot open policy file: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
-    defer file.close();
+    defer file.close(zio());
 
-    // Seek to end for append
-    file.seekFromEnd(0) catch {};
-    file.writeAll(rule_line) catch |err| {
+    // Append at the current end of file.
+    const end = (file.stat(zio()) catch |err| {
+        try writeFormatted(stderr, "error: cannot stat policy file: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    }).size;
+    file.writePositionalAll(zio(), rule_line, end) catch |err| {
         try writeFormatted(stderr, "error: cannot write rule: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
@@ -3612,8 +3710,8 @@ fn cmdServiceList(allocator: std.mem.Allocator, config_dir: []const u8) !void {
     defer allocator.free(services_dir);
 
     // Check if services/ exists
-    std.fs.accessAbsolute(services_dir, .{}) catch {
-        try stdout.writeAll("No service policies configured (default: allow all)\n");
+    std.Io.Dir.accessAbsolute(zio(), services_dir, .{}) catch {
+        try stdout.writeStreamingAll(zio(), "No service policies configured (default: allow all)\n");
         return;
     };
 
@@ -3621,10 +3719,10 @@ fn cmdServiceList(allocator: std.mem.Allocator, config_dir: []const u8) !void {
     const default_path = try std.fs.path.join(allocator, &.{ services_dir, "default" });
     defer allocator.free(default_path);
     const default_action = blk: {
-        const file = std.fs.openFileAbsolute(default_path, .{}) catch break :blk "allow";
-        defer file.close();
+        const file = std.Io.Dir.openFileAbsolute(zio(), default_path, .{}) catch break :blk "allow";
+        defer file.close(zio());
         var buf: [16]u8 = undefined;
-        const n = file.readAll(&buf) catch break :blk "allow";
+        const n = readAll(file, &buf) catch break :blk "allow";
         const trimmed = std.mem.trim(u8, buf[0..n], " \t\r\n");
         if (std.mem.eql(u8, trimmed, "deny")) break :blk "deny";
         break :blk "allow";
@@ -3647,11 +3745,11 @@ fn cmdServiceList(allocator: std.mem.Allocator, config_dir: []const u8) !void {
     try printPoliciesInDir(stdout, allocator, org_dir, "Org");
 }
 
-fn printPolicyFile(stdout: std.fs.File, path: []const u8, label: []const u8) !void {
-    const file = std.fs.openFileAbsolute(path, .{}) catch return;
-    defer file.close();
+fn printPolicyFile(stdout: std.Io.File, path: []const u8, label: []const u8) !void {
+    const file = std.Io.Dir.openFileAbsolute(zio(), path, .{}) catch return;
+    defer file.close(zio());
     var buf: [4096]u8 = undefined;
-    const n = file.readAll(&buf) catch return;
+    const n = readAll(file, &buf) catch return;
     if (n == 0) return;
 
     try writeFormatted(stdout, "[{s}]\n", .{label});
@@ -3662,16 +3760,15 @@ fn printPolicyFile(stdout: std.fs.File, path: []const u8, label: []const u8) !vo
         if (trimmed[0] == '#') continue;
         try writeFormatted(stdout, "  {s}\n", .{trimmed});
     }
-    try stdout.writeAll("\n");
+    try stdout.writeStreamingAll(zio(), "\n");
 }
 
-fn printPoliciesInDir(stdout: std.fs.File, allocator: std.mem.Allocator, dir_path: []const u8, scope: []const u8) !void {
-    var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch return;
-    defer dir.close();
+fn printPoliciesInDir(stdout: std.Io.File, allocator: std.mem.Allocator, dir_path: []const u8, scope: []const u8) !void {
+    const dir = std.Io.Dir.openDirAbsolute(zio(), dir_path, .{ .iterate = true }) catch return;
+    defer dir.close(zio());
 
     var iter = dir.iterate();
-    while (iter.next() catch null) |entry| {
-        if (entry.kind != .file) continue;
+    while (iter.next(zio()) catch null) |entry| {
         if (!std.mem.endsWith(u8, entry.name, ".policy")) continue;
 
         const name = entry.name[0 .. entry.name.len - 7]; // strip .policy
@@ -3701,10 +3798,10 @@ fn cmdServiceShow(allocator: std.mem.Allocator, config_dir: []const u8, target: 
 
         var peer_pk: [32]u8 = .{0} ** 32;
         var found_peer = false;
-        if (std.fs.openFileAbsolute(ak_path, .{})) |file| {
-            defer file.close();
+        if (std.Io.Dir.openFileAbsolute(zio(), ak_path, .{})) |file| {
+            defer file.close(zio());
             var pk_buf: [64]u8 = undefined;
-            const n = file.readAll(&pk_buf) catch 0;
+            const n = readAll(file, &pk_buf) catch 0;
             if (n > 0) {
                 const trimmed = std.mem.trim(u8, pk_buf[0..n], " \t\r\n");
                 _ = std.base64.standard.Decoder.decode(&peer_pk, trimmed) catch {};
@@ -3757,16 +3854,16 @@ fn cmdServiceReset(allocator: std.mem.Allocator, config_dir: []const u8) !void {
     defer allocator.free(services_dir);
 
     // Delete everything under services/
-    std.fs.deleteTreeAbsolute(services_dir) catch |err| {
+    std.Io.Dir.cwd().deleteTree(zio(), services_dir) catch |err| {
         if (err == error.FileNotFound) {
-            try stdout.writeAll("No service policies to reset.\n");
+            try stdout.writeStreamingAll(zio(), "No service policies to reset.\n");
             return;
         }
         try writeFormatted(stderr, "error: cannot remove services/: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
 
-    try stdout.writeAll("Service policies reset (default: allow all)\n");
+    try stdout.writeStreamingAll(zio(), "Service policies reset (default: allow all)\n");
 }
 
 // ─── Config Show ───
@@ -3776,18 +3873,18 @@ fn cmdConfigShow(allocator: std.mem.Allocator) !void {
     const stderr = getStdErr();
 
     const config_dir = Config.defaultConfigDir(allocator) catch {
-        try stderr.writeAll("error: cannot determine config directory\n");
+        try stderr.writeStreamingAll(zio(), "error: cannot determine config directory\n");
         std.process.exit(1);
     };
     defer allocator.free(config_dir);
 
-    try stdout.writeAll("meshguard v" ++ version ++ " — node configuration\n\n");
+    try stdout.writeStreamingAll(zio(), "meshguard v" ++ version ++ " — node configuration\n\n");
     try writeFormatted(stdout, "  config dir: {s}/\n", .{config_dir});
 
     // ─── Identity ───
     const has_identity = blk: {
         if (Identity.load(allocator, config_dir)) |kp| {
-            try stdout.writeAll("\n\x1b[1m─── Identity ───────────────────────────────────\x1b[0m\n");
+            try stdout.writeStreamingAll(zio(), "\n\x1b[1m─── Identity ───────────────────────────────────\x1b[0m\n");
 
             // Ed25519 public key (base64)
             var pk_b64: [44]u8 = undefined;
@@ -3823,7 +3920,7 @@ fn cmdConfigShow(allocator: std.mem.Allocator) !void {
     };
 
     if (!has_identity) {
-        try stdout.writeAll("\n  ⚠ No identity found. Run 'meshguard keygen' to create one.\n");
+        try stdout.writeStreamingAll(zio(), "\n  ⚠ No identity found. Run 'meshguard keygen' to create one.\n");
     }
 
     // ─── Org Membership (node.cert) ───
@@ -3832,7 +3929,7 @@ fn cmdConfigShow(allocator: std.mem.Allocator) !void {
 
     if (cert_path) |cp| {
         if (lib.identity.Org.loadCertificate(allocator, cp)) |cert| {
-            try stdout.writeAll("\n\x1b[1m─── Org Membership ─────────────────────────────\x1b[0m\n");
+            try stdout.writeStreamingAll(zio(), "\n\x1b[1m─── Org Membership ─────────────────────────────\x1b[0m\n");
 
             var org_b64: [44]u8 = undefined;
             const org_pub_b64 = std.base64.standard.Encoder.encode(&org_b64, &cert.org_pubkey);
@@ -3848,20 +3945,20 @@ fn cmdConfigShow(allocator: std.mem.Allocator) !void {
 
             try writeFormatted(stdout, "  issued at:      {d}\n", .{cert.issued_at});
             if (cert.expires_at == 0) {
-                try stdout.writeAll("  expires:        never\n");
+                try stdout.writeStreamingAll(zio(), "  expires:        never\n");
             } else {
                 try writeFormatted(stdout, "  expires:        {d}\n", .{cert.expires_at});
             }
 
             if (!cert.isValid()) {
-                try stdout.writeAll("  ⚠ certificate is EXPIRED or INVALID\n");
+                try stdout.writeStreamingAll(zio(), "  ⚠ certificate is EXPIRED or INVALID\n");
             }
         } else |_| {}
     }
 
     // ─── Org Admin (org/org.pub) ───
     if (lib.identity.Org.loadOrgKeyPair(allocator, config_dir)) |org_kp| {
-        try stdout.writeAll("\n\x1b[1m─── Org Admin ──────────────────────────────────\x1b[0m\n");
+        try stdout.writeStreamingAll(zio(), "\n\x1b[1m─── Org Admin ──────────────────────────────────\x1b[0m\n");
 
         var org_pk_b64: [44]u8 = undefined;
         const org_pk_str = std.base64.standard.Encoder.encode(&org_pk_b64, &org_kp.public_key.toBytes());
@@ -3881,7 +3978,7 @@ fn cmdConfigShow(allocator: std.mem.Allocator) !void {
     }
 
     if (peers.len > 0) {
-        try stdout.writeAll("\n");
+        try stdout.writeStreamingAll(zio(), "\n");
         try writeFormatted(stdout, "\x1b[1m─── Trusted Peers ({d}) ──────────────────────────\x1b[0m\n", .{peers.len});
         for (peers) |peer| {
             var peer_b64: [44]u8 = undefined;
@@ -3900,7 +3997,7 @@ fn cmdConfigShow(allocator: std.mem.Allocator) !void {
     }
 
     if (orgs.len > 0) {
-        try stdout.writeAll("\n");
+        try stdout.writeStreamingAll(zio(), "\n");
         try writeFormatted(stdout, "\x1b[1m─── Trusted Orgs ({d}) ───────────────────────────\x1b[0m\n", .{orgs.len});
         for (orgs) |org| {
             var org_b64_buf: [44]u8 = undefined;
@@ -3915,21 +4012,22 @@ fn cmdConfigShow(allocator: std.mem.Allocator) !void {
     defer if (vouch_dir) |vd| allocator.free(vd);
 
     if (vouch_dir) |vd| {
-        if (std.fs.openDirAbsolute(vd, .{ .iterate = true })) |dir| {
+        if (std.Io.Dir.openDirAbsolute(zio(), vd, .{ .iterate = true })) |dir| {
+            defer dir.close(zio());
             var vouch_count: usize = 0;
             var iter = dir.iterate();
-            while (iter.next() catch null) |entry| {
+            while (iter.next(zio()) catch null) |entry| {
                 if (std.mem.endsWith(u8, entry.name, ".vouch")) vouch_count += 1;
             }
             if (vouch_count > 0) {
-                try stdout.writeAll("\n");
+                try stdout.writeStreamingAll(zio(), "\n");
                 try writeFormatted(stdout, "\x1b[1m─── Vouched Nodes ({d}) ──────────────────────────\x1b[0m\n", .{vouch_count});
                 try writeFormatted(stdout, "  {d} pending vouch(es)\n", .{vouch_count});
             }
         } else |_| {}
     }
 
-    try stdout.writeAll("\n");
+    try stdout.writeStreamingAll(zio(), "\n");
 }
 
 /// Compare two semver strings "X.Y.Z" — returns true if `remote` is strictly newer than `current`.
@@ -3953,7 +4051,7 @@ fn parseSemver(s: []const u8) ?[3]u32 {
     return parts;
 }
 
-fn cmdUpgrade(allocator: std.mem.Allocator) !void {
+fn cmdUpgrade(_: std.mem.Allocator) !void {
     const stdout = getStdOut();
     const stderr = getStdErr();
 
@@ -3961,39 +4059,40 @@ fn cmdUpgrade(allocator: std.mem.Allocator) !void {
     try writeFormatted(stdout, "meshguard upgrade\n  current version: {s}\n", .{current});
 
     // Query GitHub API for latest release tag
-    try stdout.writeAll("  checking for updates...\n");
+    try stdout.writeStreamingAll(zio(), "  checking for updates...\n");
 
     const api_tmp = "/tmp/meshguard-api-response";
     {
-        var api_curl = std.process.Child.init(&.{
-            "curl",                                                          "-fsSL", "-o", api_tmp,
-            "https://api.github.com/repos/igorls/meshguard/releases/latest",
-        }, allocator);
-        api_curl.stderr_behavior = .Ignore;
-        api_curl.stdout_behavior = .Ignore;
-        const api_term = api_curl.spawnAndWait() catch {
-            try stderr.writeAll("error: failed to query GitHub API (is curl installed?)\n");
+        const api_term = spawnAndWaitChild(.{
+            .argv = &.{
+                "curl",                                                          "-fsSL", "-o", api_tmp,
+                "https://api.github.com/repos/igorls/meshguard/releases/latest",
+            },
+            .stderr = .ignore,
+            .stdout = .ignore,
+        }) catch {
+            try stderr.writeStreamingAll(zio(), "error: failed to query GitHub API (is curl installed?)\n");
             std.process.exit(1);
         };
-        if (api_term.Exited != 0) {
-            try stderr.writeAll("error: failed to fetch latest release info from GitHub\n");
-            try stderr.writeAll("  hint: check internet connectivity\n");
+        if (!childExitedSuccessfully(api_term)) {
+            try stderr.writeStreamingAll(zio(), "error: failed to fetch latest release info from GitHub\n");
+            try stderr.writeStreamingAll(zio(), "  hint: check internet connectivity\n");
             std.process.exit(1);
         }
     }
 
     // Parse tag_name from JSON response
-    const api_file = std.fs.openFileAbsolute(api_tmp, .{}) catch {
-        try stderr.writeAll("error: could not read API response\n");
+    const api_file = std.Io.Dir.openFileAbsolute(zio(), api_tmp, .{}) catch {
+        try stderr.writeStreamingAll(zio(), "error: could not read API response\n");
         std.process.exit(1);
     };
-    defer api_file.close();
-    defer std.fs.deleteFileAbsolute(api_tmp) catch {};
+    defer api_file.close(zio());
+    defer deleteFileAbsoluteNoErr(api_tmp);
 
     var api_buf: [8192]u8 = undefined;
-    const api_len = api_file.readAll(&api_buf) catch 0;
+    const api_len = readAll(api_file, &api_buf) catch 0;
     if (api_len == 0) {
-        try stderr.writeAll("error: empty API response\n");
+        try stderr.writeStreamingAll(zio(), "error: empty API response\n");
         std.process.exit(1);
     }
     const api_data = api_buf[0..api_len];
@@ -4001,7 +4100,7 @@ fn cmdUpgrade(allocator: std.mem.Allocator) !void {
     // Find "tag_name" in JSON — handle optional whitespace after colon
     const tag_key = "\"tag_name\"";
     const tag_key_pos = std.mem.indexOf(u8, api_data, tag_key) orelse {
-        try stderr.writeAll("error: could not parse release tag from GitHub API\n");
+        try stderr.writeStreamingAll(zio(), "error: could not parse release tag from GitHub API\n");
         std.process.exit(1);
     };
     // Skip past the key, colon, whitespace, and opening quote
@@ -4011,7 +4110,7 @@ fn cmdUpgrade(allocator: std.mem.Allocator) !void {
     // But we went one past the opening quote, so back up: actually we skipped the quote too
     // Find the closing quote
     const tag_end = std.mem.indexOfScalarPos(u8, api_data, tag_scan, '"') orelse {
-        try stderr.writeAll("error: malformed tag in API response\n");
+        try stderr.writeStreamingAll(zio(), "error: malformed tag in API response\n");
         std.process.exit(1);
     };
     const tag = api_data[tag_scan..tag_end]; // e.g. "v0.3.1"
@@ -4021,7 +4120,7 @@ fn cmdUpgrade(allocator: std.mem.Allocator) !void {
     try writeFormatted(stdout, "  latest version:  {s}\n", .{latest});
 
     if (std.mem.eql(u8, latest, current)) {
-        try stdout.writeAll("  ✓ already up to date\n");
+        try stdout.writeStreamingAll(zio(), "  ✓ already up to date\n");
         return;
     }
 
@@ -4035,50 +4134,52 @@ fn cmdUpgrade(allocator: std.mem.Allocator) !void {
     const download_path = "/tmp/meshguard-upgrade";
     var url_buf: [256]u8 = undefined;
     const download_url = std.fmt.bufPrint(&url_buf, "https://github.com/igorls/meshguard/releases/download/{s}/meshguard-linux-amd64", .{tag}) catch {
-        try stderr.writeAll("error: URL too long\n");
+        try stderr.writeStreamingAll(zio(), "error: URL too long\n");
         std.process.exit(1);
     };
 
     try writeFormatted(stdout, "\n  downloading {s}...\n", .{tag});
     {
-        var dl_curl = std.process.Child.init(&.{
-            "curl", "-fSL", "-o", download_path, download_url,
-        }, allocator);
-        dl_curl.stderr_behavior = .Pipe;
-        dl_curl.stdout_behavior = .Ignore;
-        const dl_term = dl_curl.spawnAndWait() catch {
-            try stderr.writeAll("error: failed to download release\n");
+        const dl_term = spawnAndWaitChild(.{
+            .argv = &.{ "curl", "-fSL", "-o", download_path, download_url },
+            .stderr = .pipe,
+            .stdout = .ignore,
+        }) catch {
+            try stderr.writeStreamingAll(zio(), "error: failed to download release\n");
             std.process.exit(1);
         };
-        if (dl_term.Exited != 0) {
-            try writeFormatted(stderr, "error: download failed (exit {d})\n", .{dl_term.Exited});
+        if (!childExitedSuccessfully(dl_term)) {
+            try writeFormatted(stderr, "error: download failed (exit {d})\n", .{childExitCode(dl_term) orelse 255});
             std.process.exit(1);
         }
     }
 
     // Make downloaded binary executable
     {
-        var chmod = std.process.Child.init(&.{ "chmod", "+x", download_path }, allocator);
-        chmod.stderr_behavior = .Ignore;
-        chmod.stdout_behavior = .Ignore;
-        _ = chmod.spawnAndWait() catch {};
+        _ = spawnAndWaitChild(.{
+            .argv = &.{ "chmod", "+x", download_path },
+            .stderr = .ignore,
+            .stdout = .ignore,
+        }) catch {};
     }
 
     // Verify downloaded binary
-    try stdout.writeAll("  verifying download...\n");
+    try stdout.writeStreamingAll(zio(), "  verifying download...\n");
     {
-        var verify = std.process.Child.init(&.{ download_path, "version" }, allocator);
-        verify.stdout_behavior = .Pipe;
-        verify.stderr_behavior = .Ignore;
-        if (verify.spawn()) |_| {} else |_| {
-            try stderr.writeAll("error: downloaded binary is not executable\n");
+        var verify = spawnChild(.{
+            .argv = &.{ download_path, "version" },
+            .stdout = .pipe,
+            .stderr = .ignore,
+        }) catch {
+            try stderr.writeStreamingAll(zio(), "error: downloaded binary is not executable\n");
             std.process.exit(1);
-        }
+        };
+        defer verify.kill(zio());
         var ver_buf: [128]u8 = undefined;
-        const ver_len = verify.stdout.?.readAll(&ver_buf) catch 0;
-        _ = verify.wait() catch {};
+        const ver_len = readAll(verify.stdout.?, &ver_buf) catch 0;
+        _ = verify.wait(zio()) catch {};
         if (ver_len > 0) {
-            const ver_str = std.mem.trimRight(u8, ver_buf[0..ver_len], "\n\r \t");
+            const ver_str = std.mem.trimEnd(u8, ver_buf[0..ver_len], "\n\r \t");
             try writeFormatted(stdout, "  downloaded: {s}\n", .{ver_str});
         }
     }
@@ -4087,12 +4188,13 @@ fn cmdUpgrade(allocator: std.mem.Allocator) !void {
     const install_path = "/usr/local/bin/meshguard";
 
     // Stop service if running
-    try stdout.writeAll("\n  stopping meshguard service...\n");
+    try stdout.writeStreamingAll(zio(), "\n  stopping meshguard service...\n");
     {
-        var stop = std.process.Child.init(&.{ "systemctl", "stop", "meshguard" }, allocator);
-        stop.stderr_behavior = .Ignore;
-        stop.stdout_behavior = .Ignore;
-        _ = stop.spawnAndWait() catch {};
+        _ = spawnAndWaitChild(.{
+            .argv = &.{ "systemctl", "stop", "meshguard" },
+            .stderr = .ignore,
+            .stdout = .ignore,
+        }) catch {};
     }
 
     // Brief pause for port release
@@ -4100,48 +4202,51 @@ fn cmdUpgrade(allocator: std.mem.Allocator) !void {
     _ = std.os.linux.nanosleep(&ts, null);
 
     // Swap binary: rm old, copy new
-    try stdout.writeAll("  installing new binary...\n");
-    std.fs.deleteFileAbsolute(install_path) catch {};
+    try stdout.writeStreamingAll(zio(), "  installing new binary...\n");
+    deleteFileAbsoluteNoErr(install_path);
     {
-        var cp = std.process.Child.init(&.{ "cp", download_path, install_path }, allocator);
-        cp.stderr_behavior = .Ignore;
-        cp.stdout_behavior = .Ignore;
-        const cp_term = cp.spawnAndWait() catch {
-            try stderr.writeAll("error: failed to install binary\n");
+        const cp_term = spawnAndWaitChild(.{
+            .argv = &.{ "cp", download_path, install_path },
+            .stderr = .ignore,
+            .stdout = .ignore,
+        }) catch {
+            try stderr.writeStreamingAll(zio(), "error: failed to install binary\n");
             std.process.exit(1);
         };
-        if (cp_term.Exited != 0) {
-            try stderr.writeAll("error: cp failed — check permissions (run with sudo)\n");
+        if (!childExitedSuccessfully(cp_term)) {
+            try stderr.writeStreamingAll(zio(), "error: cp failed — check permissions (run with sudo)\n");
             std.process.exit(1);
         }
     }
     {
-        var chmod = std.process.Child.init(&.{ "chmod", "+x", install_path }, allocator);
-        chmod.stderr_behavior = .Ignore;
-        chmod.stdout_behavior = .Ignore;
-        _ = chmod.spawnAndWait() catch {};
+        _ = spawnAndWaitChild(.{
+            .argv = &.{ "chmod", "+x", install_path },
+            .stderr = .ignore,
+            .stdout = .ignore,
+        }) catch {};
     }
 
     // Restart service
-    try stdout.writeAll("  restarting meshguard service...\n");
+    try stdout.writeStreamingAll(zio(), "  restarting meshguard service...\n");
     {
-        var restart = std.process.Child.init(&.{ "systemctl", "start", "meshguard" }, allocator);
-        restart.stderr_behavior = .Ignore;
-        restart.stdout_behavior = .Ignore;
-        const restart_term = restart.spawnAndWait() catch {
-            try stderr.writeAll("warning: could not restart service\n");
+        const restart_term = spawnAndWaitChild(.{
+            .argv = &.{ "systemctl", "start", "meshguard" },
+            .stderr = .ignore,
+            .stdout = .ignore,
+        }) catch {
+            try stderr.writeStreamingAll(zio(), "warning: could not restart service\n");
             return;
         };
-        if (restart_term.Exited == 0) {
-            try stdout.writeAll("  ✓ meshguard service restarted\n");
+        if (childExitedSuccessfully(restart_term)) {
+            try stdout.writeStreamingAll(zio(), "  ✓ meshguard service restarted\n");
         } else {
-            try stderr.writeAll("  warning: service restart failed — start manually\n");
+            try stderr.writeStreamingAll(zio(), "  warning: service restart failed — start manually\n");
         }
     }
 
     // Cleanup
-    std.fs.deleteFileAbsolute(download_path) catch {};
+    deleteFileAbsoluteNoErr(download_path);
 
-    try stdout.writeAll("\n  ✓ upgrade complete\n");
+    try stdout.writeStreamingAll(zio(), "\n  ✓ upgrade complete\n");
     try writeFormatted(stdout, "  {s} → {s}\n", .{ current, latest });
 }

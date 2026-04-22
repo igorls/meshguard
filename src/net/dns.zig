@@ -12,6 +12,16 @@ const posix = std.posix;
 const builtin = @import("builtin");
 const is_linux = builtin.os.tag == .linux;
 const is_windows = builtin.os.tag == .windows;
+const linux = if (is_linux) std.os.linux else struct {};
+
+/// Returns a blocking Io instance for synchronous operations.
+fn zio() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+fn nowMs() i64 {
+    return @intCast(std.Io.Timestamp.now(zio(), .awake).toMilliseconds());
+}
 
 // ─── DNS Wire Format Constants ───
 
@@ -51,22 +61,29 @@ pub fn getNameservers(buf: *[3][4]u8) usize {
 }
 
 fn getNameserversLinux(buf: *[3][4]u8) usize {
-    const file = std.fs.openFileAbsolute("/etc/resolv.conf", .{}) catch return 0;
-    defer file.close();
+    const z = zio();
+    const file = std.Io.Dir.openFileAbsolute(z, "/etc/resolv.conf", .{}) catch return 0;
+    defer file.close(z);
 
     var read_buf: [2048]u8 = undefined;
-    const n = file.readAll(&read_buf) catch return 0;
+    var file_reader = file.reader(z, &.{});
+    var n: usize = 0;
+    while (n < read_buf.len) {
+        const chunk = file_reader.interface.readSliceShort(read_buf[n..]) catch break;
+        if (chunk == 0) break;
+        n += chunk;
+    }
     const content = read_buf[0..n];
 
     var count: usize = 0;
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
         if (count >= 3) break;
-        const trimmed = std.mem.trimLeft(u8, line, " \t");
+        const trimmed = std.mem.trimStart(u8, line, " \t");
         if (std.mem.startsWith(u8, trimmed, "nameserver")) {
-            const rest = std.mem.trimLeft(u8, trimmed["nameserver".len..], " \t");
+            const rest = std.mem.trimStart(u8, trimmed["nameserver".len..], " \t");
             // Trim any trailing whitespace/CR
-            const ip_str = std.mem.trimRight(u8, rest, " \t\r");
+            const ip_str = std.mem.trimEnd(u8, rest, " \t\r");
             if (parseIpv4(ip_str)) |addr| {
                 buf[count] = addr;
                 count += 1;
@@ -140,21 +157,28 @@ pub fn queryMDNS(allocator: std.mem.Allocator, service_name: []const u8) ![][]co
     const query_len = buildQuery(&query_buf, service_name, TYPE_TXT, 0) catch return &.{};
 
     // Create UDP socket for mDNS
-    const sock_fd = posix.socket(posix.AF.INET, posix.SOCK.DGRAM, 0) catch return &.{};
+    const sock_fd = createDgramSocket() orelse return &.{};
     defer closeFd(sock_fd);
 
     // Set SO_REUSEADDR
     const one: i32 = 1;
-    posix.setsockopt(sock_fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one)) catch {};
+    if (comptime is_linux) {
+        _ = linux.setsockopt(sock_fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one), @sizeOf(i32));
+    } else {
+        posix.setsockopt(sock_fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one)) catch {};
+    }
 
     // Send multicast query
-    const mdns_addr = posix.sockaddr.in{
-        .family = posix.AF.INET,
+    const mdns_addr = linux.sockaddr.in{
+        .family = linux.AF.INET,
         .port = std.mem.nativeToBig(u16, MDNS_PORT),
         .addr = std.mem.nativeToBig(u32, @as(u32, @bitCast(MDNS_ADDR))),
         .zero = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
     };
-    _ = posix.sendto(sock_fd, query_buf[0..query_len], 0, @ptrCast(&mdns_addr), @sizeOf(posix.sockaddr.in)) catch return &.{};
+    if (comptime is_linux) {
+        const rc = linux.sendto(sock_fd, query_buf[0..query_len].ptr, query_len, 0, @ptrCast(&mdns_addr), @sizeOf(@TypeOf(mdns_addr)));
+        if (posix.errno(rc) != .SUCCESS) return &.{};
+    }
 
     // Collect responses with a short timeout (500ms)
     var results: std.ArrayList([]const u8) = .empty;
@@ -162,15 +186,15 @@ pub fn queryMDNS(allocator: std.mem.Allocator, service_name: []const u8) ![][]co
     // Poll for up to 1 second, collecting multiple responses
     var deadline: i32 = 1000;
     while (deadline > 0) {
-        const poll_start = std.time.milliTimestamp();
-        const n = pollReadFd(sock_fd, deadline);
-        const elapsed: i32 = @intCast(@min(std.time.milliTimestamp() - poll_start, deadline));
+        const poll_start = nowMs();
+        const n_ready = pollReadFd(sock_fd, deadline);
+        const elapsed: i32 = @intCast(@min(nowMs() - poll_start, deadline));
         deadline -= elapsed;
 
-        if (n <= 0) break; // timeout or error
+        if (n_ready <= 0) break; // timeout or error
 
         var resp_buf: [MAX_RESPONSE]u8 = undefined;
-        const resp_n = posix.recvfrom(sock_fd, &resp_buf, 0, null, null) catch break;
+        const resp_n = recvFromSocket(sock_fd, &resp_buf) orelse break;
         if (resp_n > HEADER_LEN) {
             const parsed = parseTXTResponse(allocator, &resp_buf, resp_n) catch continue;
             for (parsed) |txt| {
@@ -372,31 +396,65 @@ fn closeFd(fd: posix.socket_t) void {
     if (comptime is_windows) {
         const ws2 = std.os.windows.ws2_32;
         _ = ws2.closesocket(fd);
+    } else if (comptime is_linux) {
+        _ = linux.close(fd);
     } else {
-        posix.close(fd);
+        _ = std.c.close(fd);
+    }
+}
+
+/// Create a DGRAM socket (cross-platform).
+fn createDgramSocket() ?posix.socket_t {
+    if (comptime is_linux) {
+        const rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM, 0);
+        if (posix.errno(rc) != .SUCCESS) return null;
+        return @intCast(@as(i32, @bitCast(@as(u32, @truncate(rc)))));
+    } else if (comptime is_windows) {
+        const ws2 = std.os.windows.ws2_32;
+        const sock = ws2.socket(ws2.AF.INET, ws2.SOCK.DGRAM, 0);
+        if (sock == ws2.INVALID_SOCKET) return null;
+        return sock;
+    } else {
+        const sock = std.c.socket(std.c.AF.INET, std.c.SOCK.DGRAM, 0);
+        if (sock < 0) return null;
+        return sock;
+    }
+}
+
+/// Receive from a socket (cross-platform).
+fn recvFromSocket(fd: posix.socket_t, buf: []u8) ?usize {
+    if (comptime is_linux) {
+        const rc = linux.recvfrom(fd, buf.ptr, buf.len, 0, null, null);
+        if (posix.errno(rc) != .SUCCESS) return null;
+        return @intCast(rc);
+    } else {
+        return null;
     }
 }
 
 /// Send a DNS query to a nameserver and wait for a response (2s timeout).
 fn sendQuery(nameserver: [4]u8, port: u16, query: []const u8) ?QueryResponse {
-    const sock_fd = posix.socket(posix.AF.INET, posix.SOCK.DGRAM, 0) catch return null;
+    const sock_fd = createDgramSocket() orelse return null;
     defer closeFd(sock_fd);
 
-    const addr = posix.sockaddr.in{
-        .family = posix.AF.INET,
+    const addr = linux.sockaddr.in{
+        .family = linux.AF.INET,
         .port = std.mem.nativeToBig(u16, port),
         .addr = std.mem.nativeToBig(u32, @as(u32, @bitCast(nameserver))),
         .zero = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
     };
 
-    _ = posix.sendto(sock_fd, query, 0, @ptrCast(&addr), @sizeOf(posix.sockaddr.in)) catch return null;
+    if (comptime is_linux) {
+        const rc = linux.sendto(sock_fd, query.ptr, query.len, 0, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
+        if (posix.errno(rc) != .SUCCESS) return null;
+    }
 
     // Wait for response with 2s timeout (cross-platform)
     const ready = pollReadFd(sock_fd, 2000);
     if (ready <= 0) return null;
 
     var result: QueryResponse = undefined;
-    const n = posix.recvfrom(sock_fd, &result.data, 0, null, null) catch return null;
+    const n = recvFromSocket(sock_fd, &result.data) orelse return null;
     result.len = n;
     return result;
 }

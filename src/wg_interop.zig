@@ -16,13 +16,14 @@ const Tun = lib.net.Tun;
 const Udp = lib.net.Udp;
 const RtNetlink = lib.wireguard.RtNetlink;
 
-pub fn main() !void {
-    const stdout = std.fs.File{ .handle = std.posix.STDOUT_FILENO };
-    const stderr = std.fs.File{ .handle = std.posix.STDERR_FILENO };
+pub fn main(init: std.process.Init) !void {
+    const stdout = std.Io.File.stdout();
+    const stderr = std.Io.File.stderr();
+    const zio = init.io;
+    const arena = init.arena.allocator();
 
     // Parse CLI args
-    const args = try std.process.argsAlloc(std.heap.page_allocator);
-    defer std.process.argsFree(std.heap.page_allocator, args);
+    const args = try init.minimal.args.toSlice(arena);
 
     var private_key_b64: ?[]const u8 = null;
     var peer_pub_b64: ?[]const u8 = null;
@@ -51,70 +52,70 @@ pub fn main() !void {
     }
 
     if (private_key_b64 == null or peer_pub_b64 == null or peer_endpoint == null or local_ip_cidr == null) {
-        try stderr.writeAll("Usage: wg-interop-test --private-key <base64> --peer-pub <base64> --peer-endpoint <ip:port> --local-ip <a.b.c.d/mask> [--listen-port <port>]\n");
+        try stderr.writeStreamingAll(zio, "Usage: wg-interop-test --private-key <base64> --peer-pub <base64> --peer-endpoint <ip:port> --local-ip <a.b.c.d/mask> [--listen-port <port>]\n");
         std.process.exit(1);
     }
 
     // Decode base64 keys
     const private_key = decodeBase64Key(private_key_b64.?) catch {
-        try stderr.writeAll("error: invalid base64 private key\n");
+        try stderr.writeStreamingAll(zio, "error: invalid base64 private key\n");
         std.process.exit(1);
     };
     const peer_pub = decodeBase64Key(peer_pub_b64.?) catch {
-        try stderr.writeAll("error: invalid base64 peer public key\n");
+        try stderr.writeStreamingAll(zio, "error: invalid base64 peer public key\n");
         std.process.exit(1);
     };
 
     // Derive our public key
     const public_key = std.crypto.dh.X25519.recoverPublicKey(private_key) catch {
-        try stderr.writeAll("error: failed to derive public key\n");
+        try stderr.writeStreamingAll(zio, "error: failed to derive public key\n");
         std.process.exit(1);
     };
 
     // Parse local IP/mask
     const ip_info = parseIpCidr(local_ip_cidr.?) catch {
-        try stderr.writeAll("error: invalid local IP (expected a.b.c.d/mask)\n");
+        try stderr.writeStreamingAll(zio, "error: invalid local IP (expected a.b.c.d/mask)\n");
         std.process.exit(1);
     };
 
     // Parse peer endpoint
     const ep = parseEndpoint(peer_endpoint.?) catch {
-        try stderr.writeAll("error: invalid peer endpoint (expected ip:port)\n");
+        try stderr.writeStreamingAll(zio, "error: invalid peer endpoint (expected ip:port)\n");
         std.process.exit(1);
     };
 
     // Print config
-    try stdout.writeAll("=== WireGuard Interop Test ===\n");
+    try stdout.writeStreamingAll(zio, "=== WireGuard Interop Test ===\n");
     var pub_b64: [44]u8 = undefined;
     _ = std.base64.standard.Encoder.encode(&pub_b64, &public_key);
-    try writeFormatted(stdout, "  our pubkey: {s}\n", .{&pub_b64});
+    try writeFormatted(stdout, zio, "  our pubkey: {s}\n", .{&pub_b64});
     var peer_b64: [44]u8 = undefined;
     _ = std.base64.standard.Encoder.encode(&peer_b64, &peer_pub);
-    try writeFormatted(stdout, "  peer pubkey: {s}\n", .{&peer_b64});
-    try writeFormatted(stdout, "  local IP: {d}.{d}.{d}.{d}/{d}\n", .{ ip_info.ip[0], ip_info.ip[1], ip_info.ip[2], ip_info.ip[3], ip_info.mask });
-    try writeFormatted(stdout, "  peer endpoint: {d}.{d}.{d}.{d}:{d}\n", .{ ep.addr[0], ep.addr[1], ep.addr[2], ep.addr[3], ep.port });
-    try writeFormatted(stdout, "  listen port: {d}\n", .{listen_port});
+    try writeFormatted(stdout, zio, "  peer pubkey: {s}\n", .{&peer_b64});
+    try writeFormatted(stdout, zio, "  local IP: {d}.{d}.{d}.{d}/{d}\n", .{ ip_info.ip[0], ip_info.ip[1], ip_info.ip[2], ip_info.ip[3], ip_info.mask });
+    try writeFormatted(stdout, zio, "  peer endpoint: {d}.{d}.{d}.{d}:{d}\n", .{ ep.addr[0], ep.addr[1], ep.addr[2], ep.addr[3], ep.port });
+    try writeFormatted(stdout, zio, "  listen port: {d}\n", .{listen_port});
 
     // Create WG device
     var wg_dev = Device.WgDevice.init(private_key, public_key);
 
     // Open TUN
     var tun = Tun.TunDevice.open("wg-test0") catch |err| {
-        try writeFormatted(stderr, "error: failed to open TUN: {s}\n", .{@errorName(err)});
+        try writeFormatted(stderr, zio, "error: failed to open TUN: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
     defer tun.close();
 
     // Configure TUN IP
     const ifindex = RtNetlink.getInterfaceIndex("wg-test0") catch |err| {
-        try writeFormatted(stderr, "error: ifindex: {s}\n", .{@errorName(err)});
+        try writeFormatted(stderr, zio, "error: ifindex: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
     RtNetlink.addAddress(ifindex, ip_info.ip, ip_info.mask) catch |err| {
-        try writeFormatted(stderr, "error: addAddress: {s}\n", .{@errorName(err)});
+        try writeFormatted(stderr, zio, "error: addAddress: {s}\n", .{@errorName(err)});
     };
     RtNetlink.setInterfaceUp(ifindex, true) catch |err| {
-        try writeFormatted(stderr, "error: ifup: {s}\n", .{@errorName(err)});
+        try writeFormatted(stderr, zio, "error: ifup: {s}\n", .{@errorName(err)});
     };
     tun.setMtu(1420) catch {};
 
@@ -122,31 +123,31 @@ pub fn main() !void {
     const peer_subnet = [4]u8{ ip_info.ip[0], ip_info.ip[1], ip_info.ip[2], 0 };
     RtNetlink.addRoute(ifindex, peer_subnet, ip_info.mask) catch {};
 
-    try stdout.writeAll("  TUN wg-test0 configured\n");
+    try stdout.writeStreamingAll(zio, "  TUN wg-test0 configured\n");
 
     // Open UDP socket
     var udp = try Udp.UdpSocket.bind(listen_port);
     defer udp.close();
-    try writeFormatted(stdout, "  UDP listening on :{d}\n", .{listen_port});
+    try writeFormatted(stdout, zio, "  UDP listening on :{d}\n", .{listen_port});
 
     // Add peer
     const slot = wg_dev.addPeer(.{0} ** 32, peer_pub, ep.addr, ep.port) catch |err| {
-        try writeFormatted(stderr, "error: addPeer: {s}\n", .{@errorName(err)});
+        try writeFormatted(stderr, zio, "error: addPeer: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
-    try stdout.writeAll("  peer added\n");
+    try stdout.writeStreamingAll(zio, "  peer added\n");
 
     // Initiate handshake
     if (wg_dev.initiateHandshake(slot)) |init_msg| {
         const msg_bytes = std.mem.asBytes(&init_msg);
         _ = udp.sendTo(msg_bytes, ep.addr, ep.port) catch 0;
-        try stdout.writeAll("  handshake initiation sent\n");
+        try stdout.writeStreamingAll(zio, "  handshake initiation sent\n");
     } else |_| {
-        try stdout.writeAll("  handshake initiation failed\n");
+        try stdout.writeStreamingAll(zio, "  handshake initiation failed\n");
     }
 
     // Event loop
-    try stdout.writeAll("  running event loop (Ctrl+C to stop)...\n");
+    try stdout.writeStreamingAll(zio, "  running event loop (Ctrl+C to stop)...\n");
     try tun.setNonBlocking();
 
     var recv_buf: [1500]u8 = undefined;
@@ -174,7 +175,7 @@ pub fn main() !void {
                             if (wg_dev.handleInitiation(msg)) |hs| {
                                 const resp = std.mem.asBytes(&hs.response);
                                 _ = udp.sendTo(resp, recv.sender_addr, recv.sender_port) catch 0;
-                                try stdout.writeAll("  << responded to initiation\n");
+                                try stdout.writeStreamingAll(zio, "  << responded to initiation\n");
                             } else |_| {}
                         }
                     },
@@ -186,9 +187,9 @@ pub fn main() !void {
                                     p.endpoint_addr = recv.sender_addr;
                                     p.endpoint_port = recv.sender_port;
                                 }
-                                try stdout.writeAll("  << handshake completed!\n");
+                                try stdout.writeStreamingAll(zio, "  << handshake completed!\n");
                             } else |_| {
-                                try stdout.writeAll("  << handshake response failed\n");
+                                try stdout.writeStreamingAll(zio, "  << handshake response failed\n");
                             }
                         }
                     },
@@ -243,20 +244,20 @@ fn parseIpCidr(s: []const u8) !struct { ip: [4]u8, mask: u8 } {
     const ip_str = if (slash_idx) |si| s[0..si] else s;
     const mask_str = if (slash_idx) |si| s[si + 1 ..] else "24";
 
-    var ip: [4]u8 = undefined;
+    var ip_val: [4]u8 = undefined;
     var octet_idx: usize = 0;
     var start: usize = 0;
     for (ip_str, 0..) |c, idx| {
         if (c == '.' or idx == ip_str.len - 1) {
             const end = if (c == '.') idx else idx + 1;
-            ip[octet_idx] = std.fmt.parseInt(u8, ip_str[start..end], 10) catch return error.InvalidIp;
+            ip_val[octet_idx] = std.fmt.parseInt(u8, ip_str[start..end], 10) catch return error.InvalidIp;
             octet_idx += 1;
             start = idx + 1;
         }
     }
     if (octet_idx != 4) return error.InvalidIp;
     const mask = std.fmt.parseInt(u8, mask_str, 10) catch return error.InvalidMask;
-    return .{ .ip = ip, .mask = mask };
+    return .{ .ip = ip_val, .mask = mask };
 }
 
 fn parseEndpoint(s: []const u8) !struct { addr: [4]u8, port: u16 } {
@@ -271,8 +272,8 @@ fn parseEndpoint(s: []const u8) !struct { addr: [4]u8, port: u16 } {
     return .{ .addr = ip_result.ip, .port = port };
 }
 
-fn writeFormatted(file: std.fs.File, comptime fmt: []const u8, args: anytype) !void {
+fn writeFormatted(file: std.Io.File, zio: std.Io, comptime fmt: []const u8, args: anytype) !void {
     var buf: [512]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
-    _ = file.write(msg) catch {};
+    file.writeStreamingAll(zio, msg) catch {};
 }

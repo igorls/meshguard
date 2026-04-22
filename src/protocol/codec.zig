@@ -335,7 +335,7 @@ pub const DecodedAck = struct {
 pub fn decode(data: []const u8) DecodeError!DecodedMessage {
     if (data.len < 1) return error.BufferTooShort;
 
-    const msg_type = std.meta.intToEnum(messages.MessageType, data[0]) catch {
+    const msg_type = std.enums.fromInt(messages.MessageType, data[0]) orelse {
         return error.InvalidMessageType;
     };
 
@@ -449,7 +449,7 @@ fn decodeGossipEntry(data: []const u8) DecodeError!messages.GossipEntry {
         .nat_type = .unknown,
     };
     @memcpy(&entry.subject_pubkey, data[0..32]);
-    entry.event = std.meta.intToEnum(messages.MemberEvent, data[32]) catch return error.InvalidGossipEvent;
+    entry.event = std.enums.fromInt(messages.MemberEvent, data[32]) orelse return error.InvalidGossipEvent;
     entry.lamport = std.mem.readInt(u64, data[33..41], .little);
 
     if (data[41] == 1) {
@@ -479,7 +479,7 @@ fn decodeGossipEntry(data: []const u8) DecodeError!messages.GossipEntry {
     }
 
     // NAT type (byte 88)
-    entry.nat_type = std.meta.intToEnum(messages.NatType, data[88]) catch .unknown;
+    entry.nat_type = std.enums.fromInt(messages.NatType, data[88]) orelse .unknown;
 
     return entry;
 }

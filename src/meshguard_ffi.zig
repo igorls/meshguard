@@ -58,6 +58,10 @@ const SwimConfig = lib.discovery.Swim.SwimConfig;
 const LanDiscovery = lib.discovery.Lan.LanDiscovery;
 const Udp = lib.net.Udp;
 const noise = lib.wireguard.Noise;
+
+fn zio() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
 const crypto = lib.wireguard.Crypto;
 const Device = lib.wireguard.Device;
 const WgDevice = Device.WgDevice;
@@ -103,7 +107,7 @@ pub const MeshguardContext = struct {
     // WireGuard tunnel device (for encrypted audio/data tunnels)
     wg_device: ?WgDevice,
     // RwLock: exclusive for handshake/add/remove, shared for encrypt/decrypt
-    wg_lock: std.Thread.RwLock,
+    wg_lock: std.Io.RwLock,
 
     // Tunnel data inbox (separate from app messages, higher throughput)
     tunnel_inbox: [256]TunnelMessage,
@@ -170,7 +174,7 @@ export fn meshguard_init(
         .inbox_write = std.atomic.Value(u32).init(0),
         .inbox_read = std.atomic.Value(u32).init(0),
         .wg_device = null, // Initialized after key derivation
-        .wg_lock = .{},
+        .wg_lock = .init,
         .tunnel_inbox = std.mem.zeroes([256]TunnelMessage),
         .tunnel_inbox_write = std.atomic.Value(u32).init(0),
         .tunnel_inbox_read = std.atomic.Value(u32).init(0),
@@ -186,7 +190,7 @@ export fn meshguard_init(
         @memcpy(&ctx.ed25519_public, hash[0..32]);
     } else {
         // Generate a fresh keypair
-        const kp = Ed25519.KeyPair.generate();
+        const kp = Ed25519.KeyPair.generate(zio());
         const pub_bytes = kp.public_key.toBytes();
         const sec_bytes = kp.secret_key.toBytes();
         @memcpy(&ctx.ed25519_seed, sec_bytes[0..32]);
@@ -476,7 +480,7 @@ export fn meshguard_send(
 
     // Nonce: random 12 bytes
     var nonce: [12]u8 = undefined;
-    std.crypto.random.bytes(&nonce);
+    zio().random(&nonce);
     @memcpy(msg_buf[65..77], &nonce);
 
     // Derive shared key via X25519 + HKDF
@@ -895,7 +899,7 @@ fn eventLoop(ctx: *MeshguardContext) void {
                 // - Do NOT send PINGs or LAN beacons (saves battery)
                 // - Sleep longer between ticks (1s vs ~200ms)
                 swim.tickReceiveOnly() catch {};
-                std.Thread.sleep(800_000_000); // 800ms extra sleep (1s total w/ poll)
+                std.Io.sleep(zio(), std.Io.Duration.fromNanoseconds(800_000_000), .awake) catch {};
             } else {
                 // ACTIVE: full gossip + discovery
                 swim.tick() catch {};
@@ -914,7 +918,7 @@ fn eventLoop(ctx: *MeshguardContext) void {
             }
         } else {
             // No SWIM instance — sleep briefly
-            std.Thread.sleep(100_000_000); // 100ms
+            std.Io.sleep(zio(), std.Io.Duration.fromNanoseconds(100_000_000), .awake) catch {};
         }
     }
 }
@@ -1025,8 +1029,8 @@ fn handleWgPacket(ctx: *MeshguardContext, data: []const u8, sender_addr: [4]u8, 
         .wg_handshake_init => {
             // Incoming handshake initiation — we are the responder
             // Need exclusive lock: modifies peer state, index tables
-            ctx.wg_lock.lock();
-            defer ctx.wg_lock.unlock();
+            ctx.wg_lock.lockUncancelable(zio());
+            defer ctx.wg_lock.unlock(zio());
 
             var dev = &ctx.wg_device.?;
             if (data.len < @sizeOf(noise.HandshakeInitiation)) return;
@@ -1087,8 +1091,8 @@ fn handleWgPacket(ctx: *MeshguardContext, data: []const u8, sender_addr: [4]u8, 
         .wg_handshake_resp => {
             // Incoming handshake response — we were the initiator
             // Need exclusive lock: modifies tunnel keys
-            ctx.wg_lock.lock();
-            defer ctx.wg_lock.unlock();
+            ctx.wg_lock.lockUncancelable(zio());
+            defer ctx.wg_lock.unlock(zio());
 
             var dev = &ctx.wg_device.?;
             if (data.len < @sizeOf(noise.HandshakeResponse)) return;
@@ -1107,8 +1111,8 @@ fn handleWgPacket(ctx: *MeshguardContext, data: []const u8, sender_addr: [4]u8, 
         .wg_transport => {
             // Incoming transport data — decrypt and enqueue to tunnel inbox
             // Shared lock: decrypt only reads keys, counter is atomic
-            ctx.wg_lock.lockShared();
-            defer ctx.wg_lock.unlockShared();
+            ctx.wg_lock.lockSharedUncancelable(zio());
+            defer ctx.wg_lock.unlockShared(zio());
 
             var dev = &ctx.wg_device.?;
             var plaintext: [1500]u8 = undefined;
@@ -1200,8 +1204,8 @@ export fn meshguard_tunnel_open(
     const mesh_ip = ip_mod.deriveFromPubkey(pk);
 
     // Exclusive lock: adding peer + initiating handshake modifies device state
-    c.wg_lock.lock();
-    defer c.wg_lock.unlock();
+    c.wg_lock.lockUncancelable(zio());
+    defer c.wg_lock.unlock(zio());
 
     var dev = &c.wg_device.?;
     const slot = dev.addPeerWithMeshIp(target_key, peer_x25519, ep.addr, ep.port, mesh_ip) catch return -6;
@@ -1244,17 +1248,17 @@ export fn meshguard_tunnel_send(
 
     // Shared lock for encrypt (keys are read-only, nonce is atomic)
     // NOTE: Do NOT defer unlock — we manually unlock before I/O for rekey lock upgrade
-    c.wg_lock.lockShared();
+    c.wg_lock.lockSharedUncancelable(zio());
 
     var dev = &c.wg_device.?;
 
     // Find peer by identity key
     const slot = dev.findByIdentity(target_key) orelse {
-        c.wg_lock.unlockShared();
+        c.wg_lock.unlockShared(zio());
         return -4;
     };
     const peer = if (dev.peers[slot]) |*p| p else {
-        c.wg_lock.unlockShared();
+        c.wg_lock.unlockShared(zio());
         return -4;
     };
 
@@ -1272,7 +1276,7 @@ export fn meshguard_tunnel_send(
     // Encrypt the framed data
     var out_buf: [1500]u8 = undefined;
     const encrypted_len = dev.encryptForPeer(slot, framed_buf[0..framed_len], &out_buf) catch {
-        c.wg_lock.unlockShared();
+        c.wg_lock.unlockShared(zio());
         return -5;
     };
 
@@ -1291,7 +1295,7 @@ export fn meshguard_tunnel_send(
     const ep_port = peer.endpoint_port;
 
     // Release shared lock before I/O
-    c.wg_lock.unlockShared();
+    c.wg_lock.unlockShared(zio());
 
     // Send via UDP to peer's endpoint
     const socket = c.socket orelse return -6;
@@ -1299,8 +1303,8 @@ export fn meshguard_tunnel_send(
 
     // Rekeying requires exclusive lock (modifies index_map)
     if (requires_rekey) {
-        c.wg_lock.lock();
-        defer c.wg_lock.unlock();
+        c.wg_lock.lockUncancelable(zio());
+        defer c.wg_lock.unlock(zio());
         if (c.wg_device) |*wd| {
             var rekey_dev = wd;
             if (rekey_dev.initiateHandshake(slot)) |rekey_msg| {
@@ -1364,8 +1368,8 @@ export fn meshguard_tunnel_close(
     @memcpy(&target_key, peer_pubkey[0..32]);
 
     // Exclusive lock: removing peer modifies device state
-    c.wg_lock.lock();
-    defer c.wg_lock.unlock();
+    c.wg_lock.lockUncancelable(zio());
+    defer c.wg_lock.unlock(zio());
 
     var dev = &c.wg_device.?;
 

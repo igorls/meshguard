@@ -16,6 +16,10 @@
 const std = @import("std");
 const posix = std.posix;
 
+fn zio() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
 pub const CACHE_LINE = 64;
 pub const BATCH_SIZE: usize = 64;
 pub const WG_HEADER_LEN: usize = 16; // WireGuard TransportHeader size
@@ -60,12 +64,12 @@ pub const DataPlanePool = struct {
     batches: [MAX_BATCHES]PacketBatch align(CACHE_LINE) = undefined,
 
     // Buffer free-list (mutex-protected, but only hit once per batch of 64)
-    buf_lock: std.Thread.Mutex = .{},
+    buf_lock: std.Io.Mutex = .init,
     free_bufs: [MAX_BUFFERS]u16 = undefined,
     free_buf_count: usize = MAX_BUFFERS,
 
     // Batch free-list
-    batch_lock: std.Thread.Mutex = .{},
+    batch_lock: std.Io.Mutex = .init,
     free_batches: [MAX_BATCHES]u16 = undefined,
     free_batch_count: usize = MAX_BATCHES,
 
@@ -82,8 +86,8 @@ pub const DataPlanePool = struct {
 
     /// Allocate a single buffer index from the pool.
     pub fn allocBuffer(self: *DataPlanePool) ?u16 {
-        self.buf_lock.lock();
-        defer self.buf_lock.unlock();
+        self.buf_lock.lockUncancelable(zio());
+        defer self.buf_lock.unlock(zio());
         if (self.free_buf_count == 0) return null;
         self.free_buf_count -= 1;
         return self.free_bufs[self.free_buf_count];
@@ -91,8 +95,8 @@ pub const DataPlanePool = struct {
 
     /// Return buffer indices to the pool (bulk free).
     pub fn freeBuffers(self: *DataPlanePool, indices: []const u16) void {
-        self.buf_lock.lock();
-        defer self.buf_lock.unlock();
+        self.buf_lock.lockUncancelable(zio());
+        defer self.buf_lock.unlock(zio());
         for (indices) |idx| {
             self.free_bufs[self.free_buf_count] = idx;
             self.free_buf_count += 1;
@@ -101,8 +105,8 @@ pub const DataPlanePool = struct {
 
     /// Allocate a batch of buffer indices at once (bulk allocation).
     pub fn allocBufferBatch(self: *DataPlanePool, out: []u16) usize {
-        self.buf_lock.lock();
-        defer self.buf_lock.unlock();
+        self.buf_lock.lockUncancelable(zio());
+        defer self.buf_lock.unlock(zio());
         const count = @min(out.len, self.free_buf_count);
         for (0..count) |i| {
             self.free_buf_count -= 1;
@@ -113,8 +117,8 @@ pub const DataPlanePool = struct {
 
     /// Allocate a batch slot.
     pub fn allocBatch(self: *DataPlanePool) ?u16 {
-        self.batch_lock.lock();
-        defer self.batch_lock.unlock();
+        self.batch_lock.lockUncancelable(zio());
+        defer self.batch_lock.unlock(zio());
         if (self.free_batch_count == 0) return null;
         self.free_batch_count -= 1;
         const idx = self.free_batches[self.free_batch_count];
@@ -124,8 +128,8 @@ pub const DataPlanePool = struct {
 
     /// Return a batch to the pool.
     pub fn freeBatch(self: *DataPlanePool, idx: u16) void {
-        self.batch_lock.lock();
-        defer self.batch_lock.unlock();
+        self.batch_lock.lockUncancelable(zio());
+        defer self.batch_lock.unlock(zio());
         self.free_batches[self.free_batch_count] = idx;
         self.free_batch_count += 1;
     }
@@ -143,8 +147,8 @@ pub const CryptoQueue = struct {
     waiters: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     // Condition variable for blocking pop
-    mutex: std.Thread.Mutex = .{},
-    not_empty: std.Thread.Condition = .{},
+    mutex: std.Io.Mutex = .init,
+    not_empty: std.Io.Condition = .init,
 
     const EMPTY_SLOT: u32 = 0xFFFF;
 
@@ -178,9 +182,9 @@ pub const CryptoQueue = struct {
 
         // Only signal condvar if there are sleeping consumers
         if (self.waiters.load(.acquire) > 0) {
-            self.mutex.lock();
-            self.not_empty.signal();
-            self.mutex.unlock();
+            self.mutex.lockUncancelable(zio());
+            self.not_empty.signal(zio());
+            self.mutex.unlock(zio());
         }
         return true;
     }
@@ -214,29 +218,29 @@ pub const CryptoQueue = struct {
             if (self.tryPop()) |idx| return idx;
             if (self.closed.load(.acquire)) return null;
 
-            self.mutex.lock();
+            self.mutex.lockUncancelable(zio());
             // Re-check after acquiring lock
             if (self.tryPop()) |idx| {
-                self.mutex.unlock();
+                self.mutex.unlock(zio());
                 return idx;
             }
             if (self.closed.load(.acquire)) {
-                self.mutex.unlock();
+                self.mutex.unlock(zio());
                 return null;
             }
             _ = self.waiters.fetchAdd(1, .release);
-            self.not_empty.wait(&self.mutex);
+            self.not_empty.waitUncancelable(zio(), &self.mutex);
             _ = self.waiters.fetchSub(1, .release);
-            self.mutex.unlock();
+            self.mutex.unlock(zio());
         }
     }
 
     /// Close the queue, waking all blocked consumers.
     pub fn close(self: *CryptoQueue) void {
         self.closed.store(true, .release);
-        self.mutex.lock();
-        self.not_empty.broadcast();
-        self.mutex.unlock();
+        self.mutex.lockUncancelable(zio());
+        self.not_empty.broadcast(zio());
+        self.mutex.unlock(zio());
     }
 };
 
@@ -250,8 +254,8 @@ pub const PeerTxRing = struct {
     head: usize align(CACHE_LINE) = 0, // read by opportunistic sender
     tail: usize align(CACHE_LINE) = 0, // written by TUN reader
 
-    push_lock: std.Thread.Mutex align(CACHE_LINE) = .{}, // TUN reader holds briefly
-    send_lock: std.Thread.Mutex align(CACHE_LINE) = .{}, // crypto worker tryLock for Tx
+    push_lock: std.Io.Mutex align(CACHE_LINE) = .init, // TUN reader holds briefly
+    send_lock: std.Io.Mutex align(CACHE_LINE) = .init, // crypto worker tryLock for Tx
 
     pub fn push(self: *PeerTxRing, batch_idx: u16) void {
         // push_lock must be held by caller
@@ -290,8 +294,8 @@ pub const DecryptQueue = struct {
     closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     waiters: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
-    mutex: std.Thread.Mutex = .{},
-    not_empty: std.Thread.Condition = .{},
+    mutex: std.Io.Mutex = .init,
+    not_empty: std.Io.Condition = .init,
 
     /// Push an encrypted packet into the queue (called from control thread only).
     /// Returns false if queue is full.
@@ -308,9 +312,9 @@ pub const DecryptQueue = struct {
         _ = self.tail.fetchAdd(1, .release);
 
         if (self.waiters.load(.acquire) > 0) {
-            self.mutex.lock();
-            self.not_empty.signal();
-            self.mutex.unlock();
+            self.mutex.lockUncancelable(zio());
+            self.not_empty.signal(zio());
+            self.mutex.unlock(zio());
         }
         return true;
     }
@@ -333,19 +337,19 @@ pub const DecryptQueue = struct {
             if (self.tryPop()) |result| return result;
             if (self.closed.load(.acquire)) return null;
 
-            self.mutex.lock();
+            self.mutex.lockUncancelable(zio());
             if (self.tryPop()) |result| {
-                self.mutex.unlock();
+                self.mutex.unlock(zio());
                 return result;
             }
             if (self.closed.load(.acquire)) {
-                self.mutex.unlock();
+                self.mutex.unlock(zio());
                 return null;
             }
             _ = self.waiters.fetchAdd(1, .release);
-            self.not_empty.wait(&self.mutex);
+            self.not_empty.waitUncancelable(zio(), &self.mutex);
             _ = self.waiters.fetchSub(1, .release);
-            self.mutex.unlock();
+            self.mutex.unlock(zio());
         }
     }
 
@@ -357,8 +361,8 @@ pub const DecryptQueue = struct {
     /// Close the queue, waking all blocked consumers.
     pub fn close(self: *DecryptQueue) void {
         self.closed.store(true, .release);
-        self.mutex.lock();
-        self.not_empty.broadcast();
-        self.mutex.unlock();
+        self.mutex.lockUncancelable(zio());
+        self.not_empty.broadcast(zio());
+        self.mutex.unlock(zio());
     }
 };
