@@ -23,6 +23,10 @@ const is_windows = builtin.os.tag == .windows;
 const is_macos = builtin.os.tag == .macos;
 const is_ios = builtin.os.tag == .ios;
 const is_darwin = is_macos or is_ios;
+const win = if (is_windows) struct {
+    extern "ws2_32" fn ioctlsocket(socket: posix.socket_t, cmd: i32, argp: *u32) c_int;
+    extern "ws2_32" fn closesocket(socket: posix.socket_t) c_int;
+} else struct {};
 
 /// Multicast group for meshguard LAN discovery.
 pub const MULTICAST_GROUP = [4]u8{ 239, 99, 99, 1 };
@@ -39,14 +43,19 @@ const IP_MULTICAST_LOOP: u32 = if (is_linux) 34 else if (is_windows) 11 else if 
 fn linuxSocket(domain: u32, sock_type: u32, protocol: u32) !std.posix.socket_t {
     const fd = std.c.socket(@intCast(domain), @intCast(sock_type), @intCast(protocol));
     switch (std.posix.errno(fd)) {
-        .SUCCESS => return fd,
+        .SUCCESS => {
+            if (comptime is_windows) {
+                return @as(posix.socket_t, @ptrFromInt(@as(usize, @intCast(fd))));
+            }
+            return @intCast(fd);
+        },
         else => |err| return std.posix.unexpectedErrno(err),
     }
 }
 
 fn closeSocket(fd: posix.socket_t) void {
     if (comptime is_windows) {
-        _ = std.os.windows.ws2_32.closesocket(fd);
+        _ = win.closesocket(fd);
     } else {
         _ = std.c.close(fd);
     }
@@ -83,18 +92,36 @@ pub const LanDiscovery = struct {
 
         // On Windows, set non-blocking via ioctlsocket
         if (comptime is_windows) {
-            const ws2 = std.os.windows.ws2_32;
             var mode: u32 = 1; // non-blocking
-            _ = ws2.ioctlsocket(sock_fd, @bitCast(@as(i32, 0x4004667e)), &mode); // FIONBIO
+            _ = win.ioctlsocket(sock_fd, @bitCast(@as(i32, 0x4004667e)), &mode); // FIONBIO
         } else if (comptime is_darwin) {
             // On Darwin (macOS/iOS), set non-blocking via fcntl (no SOCK_NONBLOCK at creation)
-            const flags = try posix.fcntl(sock_fd, posix.F.GETFL, 0);
-            _ = try posix.fcntl(sock_fd, posix.F.SETFL, flags | @as(usize, 0x0004)); // O_NONBLOCK
+            const flags = posix.system.fcntl(sock_fd, posix.F.GETFL, @as(usize, 0));
+            switch (posix.errno(flags)) {
+                .SUCCESS => {},
+                else => return error.SocketCreateFailed,
+            }
+
+            const rc = posix.system.fcntl(
+                sock_fd,
+                posix.F.SETFL,
+                @as(usize, @intCast(flags)) | @as(usize, 1 << @bitOffsetOf(posix.O, "NONBLOCK")),
+            );
+            switch (posix.errno(rc)) {
+                .SUCCESS => {},
+                else => return error.SocketCreateFailed,
+            }
         }
 
         // Allow address reuse
         const one: c_int = 1;
-        try posix.setsockopt(sock_fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one));
+        if (comptime is_windows) {
+            if (std.c.setsockopt(sock_fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, @ptrCast(&one), @sizeOf(c_int)) != 0) {
+                return error.SocketCreateFailed;
+            }
+        } else {
+            try posix.setsockopt(sock_fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one));
+        }
 
         // Bind to multicast port
         const bind_addr = posix.sockaddr.in{
@@ -104,8 +131,7 @@ pub const LanDiscovery = struct {
             .zero = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
         };
         if (comptime is_windows) {
-            const ws2 = std.os.windows.ws2_32;
-            if (ws2.bind(sock_fd, @ptrCast(&bind_addr), @sizeOf(posix.sockaddr.in)) != 0) {
+            if (std.c.bind(sock_fd, @ptrCast(&bind_addr), @sizeOf(posix.sockaddr.in)) != 0) {
                 return error.AddressInUse;
             }
         } else {
@@ -122,15 +148,33 @@ pub const LanDiscovery = struct {
             .multiaddr = MULTICAST_GROUP,
             .interface = .{ 0, 0, 0, 0 }, // INADDR_ANY
         };
-        try posix.setsockopt(sock_fd, posix.IPPROTO.IP, IP_ADD_MEMBERSHIP, std.mem.asBytes(&mreq));
+        if (comptime is_windows) {
+            if (std.c.setsockopt(sock_fd, posix.IPPROTO.IP, IP_ADD_MEMBERSHIP, @ptrCast(&mreq), @sizeOf(@TypeOf(mreq))) != 0) {
+                return error.SocketCreateFailed;
+            }
+        } else {
+            try posix.setsockopt(sock_fd, posix.IPPROTO.IP, IP_ADD_MEMBERSHIP, std.mem.asBytes(&mreq));
+        }
 
         // Set multicast TTL to 1 (LAN only)
         const ttl: c_int = 1;
-        try posix.setsockopt(sock_fd, posix.IPPROTO.IP, IP_MULTICAST_TTL, std.mem.asBytes(&ttl));
+        if (comptime is_windows) {
+            if (std.c.setsockopt(sock_fd, posix.IPPROTO.IP, IP_MULTICAST_TTL, @ptrCast(&ttl), @sizeOf(c_int)) != 0) {
+                return error.SocketCreateFailed;
+            }
+        } else {
+            try posix.setsockopt(sock_fd, posix.IPPROTO.IP, IP_MULTICAST_TTL, std.mem.asBytes(&ttl));
+        }
 
         // Disable loopback (don't receive our own beacons)
         const loopback: c_int = 0;
-        try posix.setsockopt(sock_fd, posix.IPPROTO.IP, IP_MULTICAST_LOOP, std.mem.asBytes(&loopback));
+        if (comptime is_windows) {
+            if (std.c.setsockopt(sock_fd, posix.IPPROTO.IP, IP_MULTICAST_LOOP, @ptrCast(&loopback), @sizeOf(c_int)) != 0) {
+                return error.SocketCreateFailed;
+            }
+        } else {
+            try posix.setsockopt(sock_fd, posix.IPPROTO.IP, IP_MULTICAST_LOOP, std.mem.asBytes(&loopback));
+        }
 
         return .{
             .sock_fd = sock_fd,
@@ -162,8 +206,7 @@ pub const LanDiscovery = struct {
         };
 
         if (comptime is_windows) {
-            const ws2 = std.os.windows.ws2_32;
-            _ = ws2.sendto(self.sock_fd, buf[0..].ptr, @intCast(buf.len), 0, @ptrCast(&dest), @sizeOf(posix.sockaddr.in));
+            _ = std.c.sendto(self.sock_fd, buf[0..].ptr, buf.len, 0, @ptrCast(&dest), @sizeOf(posix.sockaddr.in));
         } else {
             _ = std.c.sendto(self.sock_fd, buf[0..].ptr, buf.len, 0, @ptrCast(&dest), @sizeOf(posix.sockaddr.in));
         }
@@ -178,8 +221,7 @@ pub const LanDiscovery = struct {
 
         while (count < 16) { // Max 16 beacons per tick
             const n = if (comptime is_windows) blk: {
-                const ws2 = std.os.windows.ws2_32;
-                const rc = ws2.recvfrom(self.sock_fd, buf[0..].ptr, @intCast(buf.len), 0, @ptrCast(&src_addr), @ptrCast(&addr_len));
+                const rc = std.c.recvfrom(self.sock_fd, buf[0..].ptr, buf.len, 0, @ptrCast(&src_addr), &addr_len);
                 if (rc < 0) break;
                 break :blk @as(usize, @intCast(rc));
             } else blk: {

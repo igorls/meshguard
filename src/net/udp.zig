@@ -11,6 +11,18 @@ const is_darwin = is_macos or is_ios;
 const posix = std.posix;
 
 const linux = if (is_linux) std.os.linux else struct {};
+const win = if (is_windows) struct {
+    const SOCKET = posix.socket_t;
+    const POLLIN: i16 = 0x0001;
+    const pollfd = extern struct {
+        fd: SOCKET,
+        events: i16,
+        revents: i16,
+    };
+
+    extern "ws2_32" fn WSAPoll(fds: [*]pollfd, nfds: u32, timeout: c_int) c_int;
+    extern "ws2_32" fn closesocket(socket: SOCKET) c_int;
+} else struct {};
 
 /// Received datagram with sender info.
 pub const RecvResult = struct {
@@ -40,15 +52,14 @@ pub const UdpSocket = struct {
                 }
                 break :blk @as(posix.socket_t, @intCast(@as(i32, @bitCast(@as(u32, @truncate(rc))))));
             } else if (comptime is_windows) {
-                const ws2 = std.os.windows.ws2_32;
-                const sock = ws2.socket(ws2.AF.INET, ws2.SOCK.DGRAM, 0);
-                if (sock == ws2.INVALID_SOCKET) return error.SocketCreateFailed;
-                break :blk sock;
+                const sock = std.c.socket(std.c.AF.INET, std.c.SOCK.DGRAM, 0);
+                if (sock < 0) return error.SocketCreateFailed;
+                break :blk @as(posix.socket_t, @ptrFromInt(@as(usize, @intCast(sock))));
             } else {
                 // macOS/iOS: use std.c
                 const sock = std.c.socket(std.c.AF.INET, std.c.SOCK.DGRAM, 0);
                 if (sock < 0) return error.SocketCreateFailed;
-                break :blk sock;
+                break :blk @as(posix.socket_t, @intCast(sock));
             }
         };
         errdefer closeSocket(fd);
@@ -58,6 +69,10 @@ pub const UdpSocket = struct {
         if (comptime is_linux) {
             _ = linux.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one), @sizeOf(u32));
             _ = linux.setsockopt(fd, posix.SOL.SOCKET, linux.SO.REUSEPORT, std.mem.asBytes(&one), @sizeOf(u32));
+        } else if (comptime is_windows) {
+            if (std.c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, @ptrCast(&one), @sizeOf(u32)) != 0) {
+                return error.SocketCreateFailed;
+            }
         } else {
             try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one));
             if (comptime is_darwin) {
@@ -75,8 +90,7 @@ pub const UdpSocket = struct {
                 else => |err| return posix.unexpectedErrno(err),
             }
         } else if (comptime is_windows) {
-            const ws2 = std.os.windows.ws2_32;
-            if (ws2.bind(fd, @ptrCast(&bind_addr), @sizeOf(@TypeOf(bind_addr))) != 0) return error.BindFailed;
+            if (std.c.bind(fd, @ptrCast(&bind_addr), @sizeOf(@TypeOf(bind_addr))) != 0) return error.BindFailed;
         } else {
             if (std.c.bind(fd, @ptrCast(&bind_addr), @sizeOf(@TypeOf(bind_addr))) != 0) return error.BindFailed;
         }
@@ -88,7 +102,7 @@ pub const UdpSocket = struct {
         if (comptime is_linux) {
             _ = linux.getsockname(fd, @ptrCast(&bound_addr), &bound_len);
         } else if (comptime is_windows) {
-            _ = std.os.windows.ws2_32.getsockname(fd, @ptrCast(&bound_addr), @ptrCast(&bound_len));
+            _ = std.c.getsockname(fd, @ptrCast(&bound_addr), @ptrCast(&bound_len));
         } else {
             _ = std.c.getsockname(fd, @ptrCast(&bound_addr), @ptrCast(&bound_len));
         }
@@ -110,14 +124,13 @@ pub const UdpSocket = struct {
                 }
                 break :blk @as(posix.socket_t, @intCast(@as(i32, @bitCast(@as(u32, @truncate(rc))))));
             } else if (comptime is_windows) {
-                const ws2 = std.os.windows.ws2_32;
-                const sock = ws2.socket(ws2.AF.INET, ws2.SOCK.DGRAM, 0);
-                if (sock == ws2.INVALID_SOCKET) return error.SocketCreateFailed;
-                break :blk sock;
+                const sock = std.c.socket(std.c.AF.INET, std.c.SOCK.DGRAM, 0);
+                if (sock < 0) return error.SocketCreateFailed;
+                break :blk @as(posix.socket_t, @ptrFromInt(@as(usize, @intCast(sock))));
             } else {
                 const sock = std.c.socket(std.c.AF.INET, std.c.SOCK.DGRAM, 0);
                 if (sock < 0) return error.SocketCreateFailed;
-                break :blk sock;
+                break :blk @as(posix.socket_t, @intCast(sock));
             }
         };
         errdefer closeSocket(fd);
@@ -172,8 +185,7 @@ pub const UdpSocket = struct {
             }
             return @intCast(rc);
         } else if (comptime is_windows) {
-            const ws2 = std.os.windows.ws2_32;
-            const n = ws2.sendto(self.fd, data.ptr, @intCast(data.len), 0, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
+            const n = std.c.sendto(self.fd, data.ptr, data.len, 0, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
             if (n < 0) return error.SendFailed;
             return @intCast(n);
         } else {
@@ -185,8 +197,8 @@ pub const UdpSocket = struct {
 
     /// Receive a datagram (non-blocking). Returns null if no data available.
     pub fn recvFrom(self: UdpSocket, buf: []u8) !?RecvResult {
-        var src_addr: linux.sockaddr.in = undefined;
-        var addr_len: u32 = @sizeOf(linux.sockaddr.in);
+        var src_addr: posix.sockaddr.in = undefined;
+        var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
 
         if (comptime is_linux) {
             const rc = linux.recvfrom(self.fd, buf.ptr, buf.len, 0, @ptrCast(&src_addr), &addr_len);
@@ -207,7 +219,18 @@ pub const UdpSocket = struct {
                 .sender_port = port_val,
             };
         } else {
-            @compileError("recvFrom not yet ported for non-Linux in 0.16");
+            const rc = std.c.recvfrom(self.fd, buf.ptr, buf.len, 0, @ptrCast(&src_addr), &addr_len);
+            if (rc < 0) return null;
+
+            const n: usize = @intCast(rc);
+            const ip_bytes: [4]u8 = @bitCast(src_addr.addr);
+            const port_val = std.mem.bigToNative(u16, src_addr.port);
+
+            return RecvResult{
+                .data = buf[0..n],
+                .sender_addr = ip_bytes,
+                .sender_port = port_val,
+            };
         }
     }
 
@@ -227,16 +250,14 @@ pub const UdpSocket = struct {
             _ = try std.posix.poll(&fds, timeout_ms);
             return (fds[0].revents & POLLIN) != 0;
         } else if (comptime is_windows) {
-            // Use WSAPoll directly from ws2_32 (mingw doesn't export poll)
-            const ws2 = std.os.windows.ws2_32;
-            var fds = [1]ws2.pollfd{.{
+            var fds = [1]win.pollfd{.{
                 .fd = self.fd,
-                .events = ws2.POLL.IN,
+                .events = win.POLLIN,
                 .revents = 0,
             }};
-            const rc = ws2.WSAPoll(&fds, 1, timeout_ms);
+            const rc = win.WSAPoll(&fds, 1, timeout_ms);
             if (rc < 0) return error.PollFailed;
-            return rc > 0 and (fds[0].revents & ws2.POLL.IN) != 0;
+            return rc > 0 and (fds[0].revents & win.POLLIN) != 0;
         } else {
             @compileError("Unsupported OS for pollRead");
         }
@@ -251,8 +272,7 @@ pub const UdpSocket = struct {
 /// Cross-platform socket close.
 fn closeSocket(fd: posix.socket_t) void {
     if (comptime is_windows) {
-        // Windows sockets must be closed with closesocket, not CloseHandle
-        _ = std.os.windows.ws2_32.closesocket(fd);
+        _ = win.closesocket(fd);
     } else if (comptime is_linux) {
         _ = linux.close(fd);
     } else {
@@ -261,9 +281,9 @@ fn closeSocket(fd: posix.socket_t) void {
 }
 
 /// Build a Linux sockaddr.in from IP bytes and port.
-fn makeSockaddrIn(addr: [4]u8, port: u16) linux.sockaddr.in {
+fn makeSockaddrIn(addr: [4]u8, port: u16) posix.sockaddr.in {
     return .{
-        .family = linux.AF.INET,
+        .family = posix.AF.INET,
         .port = std.mem.nativeToBig(u16, port),
         .addr = @bitCast(addr),
         .zero = .{ 0, 0, 0, 0, 0, 0, 0, 0 },

@@ -23,6 +23,11 @@ const BOOL = windows.BOOL;
 const BYTE = u8;
 const LPCWSTR = [*:0]const u16;
 
+extern "kernel32" fn LoadLibraryW(lpLibFileName: LPCWSTR) callconv(.winapi) ?HMODULE;
+extern "kernel32" fn FreeLibrary(hLibModule: HMODULE) callconv(.winapi) BOOL;
+extern "kernel32" fn GetProcAddress(hModule: HMODULE, lpProcName: [*:0]const u8) callconv(.winapi) ?windows.FARPROC;
+extern "kernel32" fn GetLastError() callconv(.winapi) windows.Win32Error;
+
 // Opaque handles
 const WINTUN_ADAPTER_HANDLE = *opaque {};
 const WINTUN_SESSION_HANDLE = *opaque {};
@@ -95,9 +100,9 @@ const WintunApi = struct {
 
 fn loadWintunApi() !WintunApi {
     const dll_name = std.unicode.utf8ToUtf16LeStringLiteral("wintun.dll");
-    const dll = windows.kernel32.LoadLibraryW(dll_name) orelse
+    const dll = LoadLibraryW(dll_name) orelse
         return error.WintunDllNotFound;
-    errdefer _ = windows.kernel32.FreeLibrary(dll);
+    errdefer _ = FreeLibrary(dll);
 
     return .{
         .dll = dll,
@@ -114,7 +119,7 @@ fn loadWintunApi() !WintunApi {
 }
 
 fn getProcOrError(dll: HMODULE, name: [*:0]const u8) ?windows.FARPROC {
-    return windows.kernel32.GetProcAddress(dll, name);
+    return GetProcAddress(dll, name);
 }
 
 // ─── WintunDevice ───
@@ -132,7 +137,7 @@ pub const WintunDevice = struct {
     /// Requires administrator privileges.
     pub fn open(name: []const u8) !WintunDevice {
         const api = try loadWintunApi();
-        errdefer _ = windows.kernel32.FreeLibrary(api.dll);
+        errdefer _ = FreeLibrary(api.dll);
 
         // Convert adapter name to wide string
         var wide_name: [128]u16 = undefined;
@@ -186,7 +191,7 @@ pub const WintunDevice = struct {
         }
 
         // No packet available — check if it's just empty or a real error
-        const last_error = windows.kernel32.GetLastError();
+        const last_error = GetLastError();
         if (last_error == .NO_MORE_ITEMS) {
             return 0; // Ring buffer empty, not an error
         } else if (last_error == .HANDLE_EOF) {
@@ -209,7 +214,7 @@ pub const WintunDevice = struct {
             @memcpy(ptr[0..data.len], data);
             self.api.sendPacket(self.session, ptr);
         } else {
-            const last_error = windows.kernel32.GetLastError();
+            const last_error = GetLastError();
             if (last_error == .HANDLE_EOF) {
                 return error.WintunSessionClosed;
             }
@@ -247,7 +252,7 @@ pub const WintunDevice = struct {
     pub fn close(self: *WintunDevice) void {
         self.api.endSession(self.session);
         self.api.closeAdapter(self.adapter);
-        _ = windows.kernel32.FreeLibrary(self.api.dll);
+        _ = FreeLibrary(self.api.dll);
     }
 };
 

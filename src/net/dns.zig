@@ -13,6 +13,18 @@ const builtin = @import("builtin");
 const is_linux = builtin.os.tag == .linux;
 const is_windows = builtin.os.tag == .windows;
 const linux = if (is_linux) std.os.linux else struct {};
+const win = if (is_windows) struct {
+    const SOCKET = posix.socket_t;
+    const POLLIN: i16 = 0x0001;
+    const pollfd = extern struct {
+        fd: SOCKET,
+        events: i16,
+        revents: i16,
+    };
+
+    extern "ws2_32" fn WSAPoll(fds: [*]pollfd, nfds: u32, timeout: c_int) c_int;
+    extern "ws2_32" fn closesocket(socket: SOCKET) c_int;
+} else struct {};
 
 /// Returns a blocking Io instance for synchronous operations.
 fn zio() std.Io {
@@ -165,12 +177,12 @@ pub fn queryMDNS(allocator: std.mem.Allocator, service_name: []const u8) ![][]co
     if (comptime is_linux) {
         _ = linux.setsockopt(sock_fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one), @sizeOf(i32));
     } else {
-        posix.setsockopt(sock_fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one)) catch {};
+        _ = std.c.setsockopt(sock_fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, @ptrCast(&one), @sizeOf(i32));
     }
 
     // Send multicast query
-    const mdns_addr = linux.sockaddr.in{
-        .family = linux.AF.INET,
+    const mdns_addr = posix.sockaddr.in{
+        .family = posix.AF.INET,
         .port = std.mem.nativeToBig(u16, MDNS_PORT),
         .addr = std.mem.nativeToBig(u32, @as(u32, @bitCast(MDNS_ADDR))),
         .zero = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
@@ -178,6 +190,10 @@ pub fn queryMDNS(allocator: std.mem.Allocator, service_name: []const u8) ![][]co
     if (comptime is_linux) {
         const rc = linux.sendto(sock_fd, query_buf[0..query_len].ptr, query_len, 0, @ptrCast(&mdns_addr), @sizeOf(@TypeOf(mdns_addr)));
         if (posix.errno(rc) != .SUCCESS) return &.{};
+    } else {
+        if (std.c.sendto(sock_fd, query_buf[0..query_len].ptr, query_len, 0, @ptrCast(&mdns_addr), @sizeOf(@TypeOf(mdns_addr))) < 0) {
+            return &.{};
+        }
     }
 
     // Collect responses with a short timeout (500ms)
@@ -377,9 +393,8 @@ const QueryResponse = struct {
 /// Returns > 0 if readable, 0 on timeout, < 0 on error.
 fn pollReadFd(fd: posix.socket_t, timeout_ms: i32) i32 {
     if (comptime is_windows) {
-        const ws2 = std.os.windows.ws2_32;
-        var fds = [1]ws2.pollfd{.{ .fd = fd, .events = ws2.POLL.IN, .revents = 0 }};
-        return ws2.WSAPoll(&fds, 1, timeout_ms);
+        var fds = [1]win.pollfd{.{ .fd = fd, .events = win.POLLIN, .revents = 0 }};
+        return win.WSAPoll(&fds, 1, timeout_ms);
     } else {
         var fds = [_]posix.pollfd{
             .{ .fd = fd, .events = posix.POLL.IN, .revents = 0 },
@@ -394,8 +409,7 @@ fn pollReadFd(fd: posix.socket_t, timeout_ms: i32) i32 {
 /// Cross-platform socket close.
 fn closeFd(fd: posix.socket_t) void {
     if (comptime is_windows) {
-        const ws2 = std.os.windows.ws2_32;
-        _ = ws2.closesocket(fd);
+        _ = win.closesocket(fd);
     } else if (comptime is_linux) {
         _ = linux.close(fd);
     } else {
@@ -410,14 +424,13 @@ fn createDgramSocket() ?posix.socket_t {
         if (posix.errno(rc) != .SUCCESS) return null;
         return @intCast(@as(i32, @bitCast(@as(u32, @truncate(rc)))));
     } else if (comptime is_windows) {
-        const ws2 = std.os.windows.ws2_32;
-        const sock = ws2.socket(ws2.AF.INET, ws2.SOCK.DGRAM, 0);
-        if (sock == ws2.INVALID_SOCKET) return null;
-        return sock;
+        const sock = std.c.socket(std.c.AF.INET, std.c.SOCK.DGRAM, 0);
+        if (sock < 0) return null;
+        return @ptrFromInt(@as(usize, @intCast(sock)));
     } else {
         const sock = std.c.socket(std.c.AF.INET, std.c.SOCK.DGRAM, 0);
         if (sock < 0) return null;
-        return sock;
+        return @intCast(sock);
     }
 }
 
@@ -428,7 +441,9 @@ fn recvFromSocket(fd: posix.socket_t, buf: []u8) ?usize {
         if (posix.errno(rc) != .SUCCESS) return null;
         return @intCast(rc);
     } else {
-        return null;
+        const rc = std.c.recvfrom(fd, buf.ptr, buf.len, 0, null, null);
+        if (rc < 0) return null;
+        return @intCast(rc);
     }
 }
 
@@ -437,8 +452,8 @@ fn sendQuery(nameserver: [4]u8, port: u16, query: []const u8) ?QueryResponse {
     const sock_fd = createDgramSocket() orelse return null;
     defer closeFd(sock_fd);
 
-    const addr = linux.sockaddr.in{
-        .family = linux.AF.INET,
+    const addr = posix.sockaddr.in{
+        .family = posix.AF.INET,
         .port = std.mem.nativeToBig(u16, port),
         .addr = std.mem.nativeToBig(u32, @as(u32, @bitCast(nameserver))),
         .zero = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
@@ -447,6 +462,8 @@ fn sendQuery(nameserver: [4]u8, port: u16, query: []const u8) ?QueryResponse {
     if (comptime is_linux) {
         const rc = linux.sendto(sock_fd, query.ptr, query.len, 0, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
         if (posix.errno(rc) != .SUCCESS) return null;
+    } else {
+        if (std.c.sendto(sock_fd, query.ptr, query.len, 0, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) < 0) return null;
     }
 
     // Wait for response with 2s timeout (cross-platform)

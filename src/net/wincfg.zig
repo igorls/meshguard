@@ -5,6 +5,10 @@
 
 const std = @import("std");
 
+fn zio() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
 /// Set a static IP address on a named network adapter.
 /// Equivalent of Linux: ip addr add {ip}/{prefix} dev {name}
 pub fn setAdapterIp(allocator: std.mem.Allocator, name: []const u8, ip: [4]u8, prefix: u8) !void {
@@ -62,10 +66,16 @@ pub fn setMtu(allocator: std.mem.Allocator, name: []const u8, mtu: u32) !void {
 // ─── Helpers ───
 
 fn runCommand(allocator: std.mem.Allocator, argv: []const []const u8) !void {
-    var child = std.process.Child.init(argv, allocator);
-    child.spawn() catch return error.CommandFailed;
-    const term = child.wait() catch return error.CommandFailed;
-    if (term.Exited != 0) return error.CommandFailed;
+    _ = allocator;
+    var child = std.process.spawn(zio(), .{
+        .argv = argv,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return error.CommandFailed;
+    defer child.kill(zio());
+    const term = child.wait(zio()) catch return error.CommandFailed;
+    if (term != .exited or term.exited != 0) return error.CommandFailed;
 }
 
 fn prefixToMask(prefix: u8) [4]u8 {

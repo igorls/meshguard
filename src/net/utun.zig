@@ -160,18 +160,26 @@ pub const TunDevice = struct {
             .{ .base = &hdr, .len = UTUN_HEADER_LEN },
             .{ .base = data.ptr, .len = data.len },
         };
-        _ = try posix.writev(self.fd, &iov);
+        if (std.c.writev(self.fd, &iov, iov.len) < 0) return error.WriteFailed;
     }
 
     /// Set the utun fd to non-blocking mode.
     pub fn setNonBlocking(self: *TunDevice) !void {
-        // macOS O_NONBLOCK = 0x0004
-        const flags = try posix.fcntl(self.fd, posix.F.GETFL, 0);
-        _ = try posix.fcntl(
+        const flags = posix.system.fcntl(self.fd, posix.F.GETFL, @as(usize, 0));
+        switch (posix.errno(flags)) {
+            .SUCCESS => {},
+            else => return error.TunSetupFailed,
+        }
+
+        const rc = posix.system.fcntl(
             self.fd,
             posix.F.SETFL,
-            flags | @as(usize, 0x0004), // O_NONBLOCK
+            @as(usize, @intCast(flags)) | @as(usize, 1 << @bitOffsetOf(posix.O, "NONBLOCK")),
         );
+        switch (posix.errno(rc)) {
+            .SUCCESS => {},
+            else => return error.TunSetupFailed,
+        }
     }
 
     /// Get the interface name as a slice.

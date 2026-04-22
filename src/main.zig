@@ -79,6 +79,10 @@ fn nowUnixSecs() i64 {
     return @intCast(std.Io.Timestamp.now(zio(), .real).toSeconds());
 }
 
+fn nowAwakeNs() i128 {
+    return @intCast(std.Io.Timestamp.now(zio(), .awake).toNanoseconds());
+}
+
 fn spawnChild(options: std.process.SpawnOptions) !std.process.Child {
     return std.process.spawn(zio(), options);
 }
@@ -1598,7 +1602,7 @@ fn installSignalHandler(swim_ref: *lib.discovery.Swim.SwimProtocol) void {
                 add: std.os.windows.BOOL,
             ) callconv(.winapi) std.os.windows.BOOL;
         };
-        _ = k32.SetConsoleCtrlHandler(&windowsCtrlHandler, 1);
+        _ = k32.SetConsoleCtrlHandler(&windowsCtrlHandler, @enumFromInt(1));
     }
 }
 
@@ -1606,9 +1610,9 @@ fn windowsCtrlHandler(ctrl_type: u32) callconv(.winapi) std.os.windows.BOOL {
     // CTRL_C_EVENT = 0, CTRL_CLOSE_EVENT = 2
     if (ctrl_type == 0 or ctrl_type == 2) {
         if (g_swim_stop) |swim| swim.stop();
-        return 1; // Handled
+        return @enumFromInt(1); // Handled
     }
-    return 0; // Not handled
+    return @enumFromInt(0); // Not handled
 }
 
 
@@ -2775,7 +2779,7 @@ fn windowsEventLoop(
         }
 
         // ─── 4. Periodic handshake initiation for peers without tunnels ───
-        const now_ns = std.time.nanoTimestamp();
+        const now_ns = nowAwakeNs();
         if (now_ns - last_handshake_check_ns >= 10 * std.time.ns_per_s) {
             last_handshake_check_ns = now_ns;
             for (&wg_dev.peers, 0..) |*slot, i| {
@@ -2794,7 +2798,7 @@ fn windowsEventLoop(
         _ = control_socket.poll();
 
         // ─── 6. Short sleep to avoid CPU spin (10ms) ───
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        std.Io.sleep(zio(), std.Io.Duration.fromNanoseconds(10 * std.time.ns_per_ms), .awake) catch {};
     }
 }
 
@@ -2904,7 +2908,7 @@ fn macosEventLoop(
         }
 
         // ─── 4. Periodic handshake initiation for peers without tunnels ───
-        const now_ns = std.time.nanoTimestamp();
+        const now_ns = nowAwakeNs();
         if (now_ns - last_handshake_check_ns >= 10 * std.time.ns_per_s) {
             last_handshake_check_ns = now_ns;
             for (&wg_dev.peers, 0..) |*slot, i| {

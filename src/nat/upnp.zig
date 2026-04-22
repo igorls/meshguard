@@ -18,11 +18,26 @@ const is_macos = builtin.os.tag == .macos;
 const is_ios = builtin.os.tag == .ios;
 const is_darwin = is_macos or is_ios;
 const linux = if (is_linux) std.os.linux else struct {};
+const win = if (is_windows) struct {
+    const POLLIN: i16 = 0x0001;
+    const pollfd = extern struct {
+        fd: posix.socket_t,
+        events: i16,
+        revents: i16,
+    };
+
+    extern "ws2_32" fn WSAPoll(fds: [*]pollfd, nfds: u32, timeout: c_int) c_int;
+} else struct {};
 
 fn linuxSocket(domain: u32, sock_type: u32, protocol: u32) !std.posix.socket_t {
     const fd = std.c.socket(@intCast(domain), @intCast(sock_type), @intCast(protocol));
     switch (std.posix.errno(fd)) {
-        .SUCCESS => return fd,
+        .SUCCESS => {
+            if (comptime is_windows) {
+                return @as(posix.socket_t, @ptrFromInt(@as(usize, @intCast(fd))));
+            }
+            return @intCast(fd);
+        },
         else => |err| return std.posix.unexpectedErrno(err),
     }
 }
@@ -177,7 +192,11 @@ fn ssdpDiscover(gateway_ip: *[4]u8, location_buf: *[512]u8) ?[]const u8 {
 
     // Allow reuse
     const one: u32 = 1;
-    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one)) catch {};
+    if (comptime is_windows) {
+        _ = std.c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, @ptrCast(&one), @sizeOf(u32));
+    } else {
+        posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one)) catch {};
+    }
 
     // Bind to any port (required for receiving multicast responses)
     var bind_addr = ipv4Sockaddr(.{ 0, 0, 0, 0 }, 0);
@@ -214,14 +233,14 @@ fn ssdpDiscover(gateway_ip: *[4]u8, location_buf: *[512]u8) ?[]const u8 {
                 continue;
             }
         } else if (comptime is_windows) {
-            const ws2 = std.os.windows.ws2_32;
-            var fds = [1]ws2.pollfd{.{ .fd = fd, .events = ws2.POLL.IN, .revents = 0 }};
-            const rc = ws2.WSAPoll(&fds, 1, 500);
+            const POLLIN: i16 = 0x0001;
+            var fds = [1]win.pollfd{.{ .fd = fd, .events = POLLIN, .revents = 0 }};
+            const rc = win.WSAPoll(&fds, 1, 500);
             if (rc <= 0) {
                 timeouts += 1;
                 continue;
             }
-            if ((fds[0].revents & ws2.POLL.IN) == 0) {
+            if ((fds[0].revents & POLLIN) == 0) {
                 timeouts += 1;
                 continue;
             }
@@ -362,11 +381,11 @@ fn httpRequest(
             _ = posix.poll(&fds, 2000) catch break;
             if ((fds[0].revents & POLLIN) == 0) break;
         } else if (comptime is_windows) {
-            const ws2 = std.os.windows.ws2_32;
-            var fds = [1]ws2.pollfd{.{ .fd = fd, .events = ws2.POLL.IN, .revents = 0 }};
-            const rc = ws2.WSAPoll(&fds, 1, 2000);
+            const POLLIN: i16 = 0x0001;
+            var fds = [1]win.pollfd{.{ .fd = fd, .events = POLLIN, .revents = 0 }};
+            const rc = win.WSAPoll(&fds, 1, 2000);
             if (rc <= 0) break;
-            if ((fds[0].revents & ws2.POLL.IN) == 0) break;
+            if ((fds[0].revents & POLLIN) == 0) break;
         }
 
         const rc = std.c.read(fd, out[total..].ptr, out.len - total);

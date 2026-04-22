@@ -71,9 +71,14 @@ const win = if (is_windows) struct {
     const LPCWSTR = [*:0]const u16;
 
     // Functions not in Zig 0.15 std — declare as extern
-    extern "kernel32" fn ConnectNamedPipe(hNamedPipe: HANDLE, lpOverlapped: ?*windows.OVERLAPPED) callconv(.winapi) BOOL;
+    extern "kernel32" fn CreateNamedPipeW(lpName: LPCWSTR, dwOpenMode: DWORD, dwPipeMode: DWORD, nMaxInstances: DWORD, nOutBufferSize: DWORD, nInBufferSize: DWORD, nDefaultTimeOut: DWORD, lpSecurityAttributes: ?*anyopaque) callconv(.winapi) HANDLE;
+    extern "kernel32" fn ConnectNamedPipe(hNamedPipe: HANDLE, lpOverlapped: ?*anyopaque) callconv(.winapi) BOOL;
     extern "kernel32" fn DisconnectNamedPipe(hNamedPipe: HANDLE) callconv(.winapi) BOOL;
     extern "kernel32" fn CloseHandle(hObject: HANDLE) callconv(.winapi) BOOL;
+    extern "kernel32" fn GetLastError() callconv(.winapi) windows.Win32Error;
+    extern "kernel32" fn ReadFile(hFile: HANDLE, lpBuffer: ?*anyopaque, nNumberOfBytesToRead: DWORD, lpNumberOfBytesRead: ?*DWORD, lpOverlapped: ?*anyopaque) callconv(.winapi) BOOL;
+    extern "kernel32" fn WriteFile(hFile: HANDLE, lpBuffer: ?*const anyopaque, nNumberOfBytesToWrite: DWORD, lpNumberOfBytesWritten: ?*DWORD, lpOverlapped: ?*anyopaque) callconv(.winapi) BOOL;
+    extern "kernel32" fn FlushFileBuffers(hFile: HANDLE) callconv(.winapi) BOOL;
 } else struct {};
 
 pub const DEFAULT_SOCKET_PATH = if (is_windows) "\\\\.\\pipe\\meshguard" else "/run/meshguard/meshguard.sock";
@@ -172,7 +177,7 @@ pub const ControlSocket = struct {
         const pipe_name = std.unicode.utf8ToUtf16LeStringLiteral("\\\\.\\pipe\\meshguard");
 
         // PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE
-        const pipe_handle = win.kernel32.CreateNamedPipeW(
+        const pipe_handle = win.CreateNamedPipeW(
             pipe_name,
             0x00000003 | 0x00080000, // PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE
             0x00000000 | 0x00000000, // PIPE_TYPE_BYTE | PIPE_READMODE_BYTE
@@ -219,8 +224,8 @@ pub const ControlSocket = struct {
 
         // Try to connect a client (non-blocking)
         const connected = win.ConnectNamedPipe(pipe, null);
-        if (connected == 0) {
-            const err = win.kernel32.GetLastError();
+            if (connected == @as(win.BOOL, @enumFromInt(0))) {
+            const err = win.GetLastError();
             // ERROR_PIPE_CONNECTED (535) means client already connected
             if (err != @as(win.windows.Win32Error, @enumFromInt(535)) and
                 err != @as(win.windows.Win32Error, @enumFromInt(232)))
@@ -232,8 +237,8 @@ pub const ControlSocket = struct {
         // Read command from pipe
         var buf: [64]u8 = undefined;
         var bytes_read: win.DWORD = 0;
-        const read_ok = win.kernel32.ReadFile(pipe, @ptrCast(&buf), buf.len, &bytes_read, null);
-        if (read_ok == 0 or bytes_read == 0) {
+        const read_ok = win.ReadFile(pipe, @ptrCast(&buf), buf.len, &bytes_read, null);
+            if (read_ok == @as(win.BOOL, @enumFromInt(0)) or bytes_read == 0) {
             _ = win.DisconnectNamedPipe(pipe);
             return false;
         }
@@ -259,8 +264,8 @@ pub const ControlSocket = struct {
         // Write response
         if (resp_len > 0) {
             var bytes_written: win.DWORD = 0;
-            _ = win.kernel32.WriteFile(pipe, @ptrCast(resp_buf[0..resp_len].ptr), @intCast(resp_len), &bytes_written, null);
-            _ = win.kernel32.FlushFileBuffers(pipe);
+            _ = win.WriteFile(pipe, @ptrCast(resp_buf[0..resp_len].ptr), @intCast(resp_len), &bytes_written, null);
+            _ = win.FlushFileBuffers(pipe);
         }
 
         // Disconnect client so next client can connect
