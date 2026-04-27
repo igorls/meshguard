@@ -1086,7 +1086,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
             lib.wireguard.RtNetlink.addRoute(ifindex, .{ 10, 99, 0, 0 }, 16) catch |err| {
                 try writeFormatted(stderr, "warning: failed to add mesh route: {s}\n", .{@errorName(err)});
             };
-            lib.wireguard.RtNetlink.addRoute6(ifindex, lib.wireguard.Ip.default_mesh_prefix6 ++ ([_]u8{0} ** 8), lib.wireguard.Ip.default_mesh_mask6) catch |err| {
+            lib.wireguard.RtNetlink.addRoute6(ifindex, lib.wireguard.Ip.default_mesh_network6, lib.wireguard.Ip.default_mesh_mask6) catch |err| {
                 try writeFormatted(stderr, "warning: failed to add mesh IPv6 route: {s}\n", .{@errorName(err)});
             };
 
@@ -1134,7 +1134,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
             WinCfg.addRoute(allocator, tun_dev.getName(), .{ 10, 99, 0, 0 }, 16) catch |err| {
                 try writeFormatted(stderr, "warning: failed to add mesh route: {s}\n", .{@errorName(err)});
             };
-            WinCfg.addRoute6(allocator, tun_dev.getName(), lib.wireguard.Ip.default_mesh_prefix6 ++ ([_]u8{0} ** 8), lib.wireguard.Ip.default_mesh_mask6) catch |err| {
+            WinCfg.addRoute6(allocator, tun_dev.getName(), lib.wireguard.Ip.default_mesh_network6, lib.wireguard.Ip.default_mesh_mask6) catch |err| {
                 try writeFormatted(stderr, "warning: failed to add mesh IPv6 route: {s}\n", .{@errorName(err)});
             };
 
@@ -1175,7 +1175,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
             DarwinCfg.addRoute(allocator, tun_dev.getName(), .{ 10, 99, 0, 0 }, 16) catch |err| {
                 try writeFormatted(stderr, "warning: failed to add mesh route: {s}\n", .{@errorName(err)});
             };
-            DarwinCfg.addRoute6(allocator, tun_dev.getName(), lib.wireguard.Ip.default_mesh_prefix6 ++ ([_]u8{0} ** 8), lib.wireguard.Ip.default_mesh_mask6) catch |err| {
+            DarwinCfg.addRoute6(allocator, tun_dev.getName(), lib.wireguard.Ip.default_mesh_network6, lib.wireguard.Ip.default_mesh_mask6) catch |err| {
                 try writeFormatted(stderr, "warning: failed to add mesh IPv6 route: {s}\n", .{@errorName(err)});
             };
 

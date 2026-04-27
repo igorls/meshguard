@@ -12,6 +12,7 @@ pub const default_mesh_prefix = [2]u8{ 10, 99 };
 pub const default_mesh_mask: u8 = 16;
 /// Default IPv6 ULA mesh prefix: fd99:6d67::/64 ("mg" in hex).
 pub const default_mesh_prefix6 = [8]u8{ 0xfd, 0x99, 0x6d, 0x67, 0, 0, 0, 0 };
+pub const default_mesh_network6 = default_mesh_prefix6 ++ ([_]u8{0} ** 8);
 pub const default_mesh_mask6: u8 = 64;
 
 /// Derive a mesh IP from a public key.

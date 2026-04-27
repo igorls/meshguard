@@ -98,7 +98,7 @@ pub const WgPeer = struct {
     pub fn endpoint(self: *const WgPeer) ?messages.Endpoint {
         if (self.endpoint_port == 0) return null;
         if (self.endpoint_addr6) |addr6| return messages.Endpoint.initV6(addr6, self.endpoint_port);
-        if (std.mem.eql(u8, &self.endpoint_addr, &([_]u8{0} ** 4))) return null;
+        if (std.mem.allEqual(u8, &self.endpoint_addr, 0)) return null;
         return messages.Endpoint.initV4(self.endpoint_addr, self.endpoint_port);
     }
 };

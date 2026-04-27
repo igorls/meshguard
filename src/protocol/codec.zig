@@ -611,7 +611,8 @@ test "ping with IPv6 gossip endpoint roundtrip" {
         .ping => |p| {
             const g = p.gossip();
             try std.testing.expect(g[0].endpoint.?.addr6 != null);
-            try std.testing.expectEqualSlices(u8, &addr6, &g[0].endpoint.?.addr6.?);
+            const decoded_addr6 = g[0].endpoint.?.addr6.?;
+            try std.testing.expectEqualSlices(u8, &addr6, &decoded_addr6);
             try std.testing.expectEqual(g[0].public_endpoint.?.port, 51822);
         },
         else => return error.InvalidMessageType,
