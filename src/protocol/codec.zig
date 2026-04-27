@@ -255,6 +255,7 @@ fn encodeGossipEntry(buf: []u8, entry: messages.GossipEntry) usize {
 }
 
 fn encodeEndpoint(buf: []u8, endpoint: ?messages.Endpoint) usize {
+    if (buf.len < ENDPOINT_SIZE) return 0;
     if (endpoint) |ep| {
         buf[0] = 1;
         if (ep.addr6) |addr6| {
@@ -458,6 +459,7 @@ fn decodeGossipEntry(data: []const u8) DecodeError!messages.GossipEntry {
 }
 
 fn decodeEndpoint(data: []const u8) ?messages.Endpoint {
+    if (data.len < ENDPOINT_SIZE) return null;
     if (data[0] == 0) return null;
     const port = std.mem.readInt(u16, data[18..][0..2], .little);
     if (data[1] == 6) {

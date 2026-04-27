@@ -122,9 +122,11 @@ fn parseIpv6(s: []const u8) ?[16]u8 {
         }
         const start = i;
         while (i < s.len and s[i] != ':') : (i += 1) {}
-        if (group_count >= 8 or i - start == 0 or i - start > 4) return null;
+        if (group_count >= 8 or i - start > 4) return null;
         groups[group_count] = std.fmt.parseInt(u16, s[start..i], 16) catch return null;
         group_count += 1;
+        // Consume a single group separator, but leave "::" for the compression
+        // branch at the start of the next loop iteration.
         if (i < s.len and s[i] == ':' and !(i + 1 < s.len and s[i + 1] == ':')) i += 1;
     }
 

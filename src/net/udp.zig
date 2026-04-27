@@ -58,7 +58,7 @@ pub const UdpSocket = struct {
                     .SUCCESS => {},
                     else => |err| return posix.unexpectedErrno(err),
                 }
-                break :blk @as(posix.socket_t, @intCast(@as(i32, @bitCast(@as(u32, @truncate(rc))))));
+                break :blk linuxSocketToPosix(rc);
             } else if (comptime is_windows) {
                 const sock = std.c.socket(std.c.AF.INET, std.c.SOCK.DGRAM, 0);
                 if (sock < 0) return error.SocketCreateFailed;
@@ -128,7 +128,7 @@ pub const UdpSocket = struct {
                     .SUCCESS => {},
                     else => |err| return posix.unexpectedErrno(err),
                 }
-                break :blk @as(posix.socket_t, @intCast(@as(i32, @bitCast(@as(u32, @truncate(rc))))));
+                break :blk linuxSocketToPosix(rc);
             } else {
                 const sock = std.c.socket(std.c.AF.INET6, std.c.SOCK.DGRAM, 0);
                 if (sock < 0) return error.SocketCreateFailed;
@@ -397,6 +397,13 @@ fn closeSocket(fd: posix.socket_t) void {
     } else {
         _ = std.c.close(fd);
     }
+}
+
+fn linuxSocketToPosix(rc: usize) posix.socket_t {
+    // std.os.linux.socket returns a syscall-sized unsigned value; after errno
+    // handling the low 32 bits contain the signed file descriptor expected by
+    // std.posix on Linux.
+    return @as(posix.socket_t, @intCast(@as(i32, @bitCast(@as(u32, @truncate(rc))))));
 }
 
 /// Build a Linux sockaddr.in from IP bytes and port.

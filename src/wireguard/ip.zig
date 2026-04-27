@@ -49,7 +49,8 @@ pub fn deriveIpv6FromPubkeyBytes(public_key: [32]u8) [16]u8 {
     var ip: [16]u8 = undefined;
     @memcpy(ip[0..8], &default_mesh_prefix6);
     @memcpy(ip[8..16], hash[0..8]);
-    // Avoid the subnet-router anycast address with an all-zero host ID.
+    // Avoid the subnet-router anycast address with an all-zero host ID
+    // (RFC 4291 §2.6.1).
     if (std.mem.allEqual(u8, ip[8..16], 0)) ip[15] = 1;
     return ip;
 }
