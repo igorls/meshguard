@@ -13,7 +13,7 @@
 //! The app_id field allows different meshguard applications to coexist
 //! on the same multicast group without interfering with each other.
 //!
-//! Cross-platform: supports both Linux and Windows.
+//! Cross-platform: supports Linux, BSD/Darwin, and Windows.
 
 const std = @import("std");
 const posix = std.posix;
@@ -23,6 +23,8 @@ const is_windows = builtin.os.tag == .windows;
 const is_macos = builtin.os.tag == .macos;
 const is_ios = builtin.os.tag == .ios;
 const is_darwin = is_macos or is_ios;
+const is_freebsd = builtin.os.tag == .freebsd;
+const is_bsd = is_darwin or is_freebsd;
 const win = if (is_windows) struct {
     extern "ws2_32" fn ioctlsocket(socket: posix.socket_t, cmd: i32, argp: *u32) c_int;
     extern "ws2_32" fn closesocket(socket: posix.socket_t) c_int;
@@ -35,10 +37,10 @@ const BEACON_MAGIC = "MGLAN";
 const BEACON_SIZE: usize = 5 + 2 + 32 + 2; // 41 bytes
 
 /// Cross-platform IP-level socket option constants for multicast.
-/// Linux, macOS (BSD), and Windows use different values for these options.
-const IP_ADD_MEMBERSHIP: u32 = if (is_linux) 35 else if (is_windows) 12 else if (is_darwin) 12 else 35;
-const IP_MULTICAST_TTL: u32 = if (is_linux) 33 else if (is_windows) 10 else if (is_darwin) 10 else 33;
-const IP_MULTICAST_LOOP: u32 = if (is_linux) 34 else if (is_windows) 11 else if (is_darwin) 11 else 34;
+/// Linux, BSD/Darwin, and Windows use different values for these options.
+const IP_ADD_MEMBERSHIP: u32 = if (is_linux) 35 else if (is_windows) 12 else if (is_bsd) 12 else 35;
+const IP_MULTICAST_TTL: u32 = if (is_linux) 33 else if (is_windows) 10 else if (is_bsd) 10 else 33;
+const IP_MULTICAST_LOOP: u32 = if (is_linux) 34 else if (is_windows) 11 else if (is_bsd) 11 else 34;
 
 fn linuxSocket(domain: u32, sock_type: u32, protocol: u32) !std.posix.socket_t {
     const fd = std.c.socket(@intCast(domain), @intCast(sock_type), @intCast(protocol));
@@ -94,8 +96,8 @@ pub const LanDiscovery = struct {
         if (comptime is_windows) {
             var mode: u32 = 1; // non-blocking
             _ = win.ioctlsocket(sock_fd, @bitCast(@as(i32, 0x4004667e)), &mode); // FIONBIO
-        } else if (comptime is_darwin) {
-            // On Darwin (macOS/iOS), set non-blocking via fcntl (no SOCK_NONBLOCK at creation)
+        } else if (comptime is_bsd) {
+            // On BSD/Darwin, set non-blocking via fcntl (no SOCK_NONBLOCK at creation)
             const flags = posix.system.fcntl(sock_fd, posix.F.GETFL, @as(usize, 0));
             switch (posix.errno(flags)) {
                 .SUCCESS => {},

@@ -279,6 +279,13 @@ docker compose -f docker-compose.bench.yml up
 - **wintun.dll** — bundled automatically by the build system and install script
 - No libsodium needed — uses `std.crypto` on Windows
 
+### FreeBSD
+
+- **Zig 0.15+** (for building from source)
+- **FreeBSD** with `tun(4)` available at `/dev/tun`
+- **Root privileges** for TUN interface creation and `ifconfig`/`route` network configuration
+- No libsodium needed — uses `std.crypto` on FreeBSD
+
 ### Android (FFI)
 
 - **Zig 0.15+** (cross-compiles to Android targets)
@@ -304,11 +311,15 @@ zig build -Dtarget=aarch64-linux-gnu -Doptimize=ReleaseFast
 zig build -Dtarget=x86_64-windows -Doptimize=ReleaseFast
 # → zig-out/bin/meshguard.exe + wintun.dll
 
+# FreeBSD (cross-compile)
+zig build -Dtarget=x86_64-freebsd -Doptimize=ReleaseFast
+
 # Android aarch64 (produces libmeshguard-ffi.so only)
 zig build -Dtarget=aarch64-linux-android -Doptimize=ReleaseFast
 ```
 
 Windows builds automatically bundle `wintun.dll` alongside `meshguard.exe`.
+FreeBSD builds use `std.crypto` and do not require libsodium.
 Android builds produce only `libmeshguard-ffi.so` — the CLI binary, static library, and unit tests are excluded.
 
 ## Status
@@ -352,7 +363,7 @@ Core functionality is implemented and under active benchmarking:
 - [ ] IPv6 support
 - [x] DNS / mDNS seed discovery
 - [ ] macOS support (utun)
-- [ ] FreeBSD support
+- [x] FreeBSD support (`/dev/tun`, `kqueue`, `ifconfig`/`route`, `x86_64-freebsd`)
 - [x] Windows support (Wintun + named pipe IPC)
 
 ## Mobile / Embedded

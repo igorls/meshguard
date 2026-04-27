@@ -781,7 +781,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
 
     try stdout.writeStreamingAll(zio(), "meshguard starting...\n");
     try writeFormatted(stdout, "  mesh IP: {s}\n", .{ip_str});
-    try writeFormatted(stdout, "  interface: {s}\n", .{if (comptime @import("builtin").os.tag == .linux) lib.wireguard.Config.DEFAULT_IFNAME else if (comptime @import("builtin").os.tag == .macos) "utun" else "wintun"});
+    try writeFormatted(stdout, "  interface: {s}\n", .{if (comptime @import("builtin").os.tag == .linux) lib.wireguard.Config.DEFAULT_IFNAME else if (comptime @import("builtin").os.tag == .macos) "utun" else if (comptime @import("builtin").os.tag == .freebsd) "tun" else "wintun"});
 
     try writeFormatted(stdout, "  mode: {s}\n", .{if (use_kernel_wg) "kernel" else "userspace"});
 
@@ -1158,6 +1158,45 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
 
             // Run the macOS event loop (simplified, similar to Windows)
             macosEventLoop(&swim, &wg_device, &gossip_socket, &tun_dev, stdout, &service_filter, &control) catch |err| {
+                try writeFormatted(stderr, "error: event loop failed: {s}\n", .{@errorName(err)});
+            };
+        } else if (comptime @import("builtin").os.tag == .freebsd) {
+            // ─── FreeBSD: tun(4) via /dev/tun + ifconfig/route config + kqueue ───
+            const FreeBsdCfg = lib.net.FreeBsdCfg;
+
+            var tun_dev = lib.net.Tun.TunDevice.open("tun") catch |err| {
+                try writeFormatted(stderr, "error: failed to open /dev/tun: {s}\n", .{@errorName(err)});
+                try stderr.writeStreamingAll(zio(), "  hint: run with sudo or ensure tun(4) is available\n");
+                std.process.exit(1);
+            };
+            defer tun_dev.close();
+
+            try writeFormatted(stdout, "  TUN device: {s} (fd={d})\n", .{ tun_dev.getName(), tun_dev.fd });
+
+            FreeBsdCfg.setInterfaceIp(allocator, tun_dev.getName(), mesh_ip, 16) catch |err| {
+                try writeFormatted(stderr, "warning: failed to set interface IP: {s}\n", .{@errorName(err)});
+            };
+            FreeBsdCfg.setInterfaceUp(allocator, tun_dev.getName()) catch |err| {
+                try writeFormatted(stderr, "warning: failed to bring up interface: {s}\n", .{@errorName(err)});
+            };
+            FreeBsdCfg.setMtu(allocator, tun_dev.getName(), 1420) catch |err| {
+                try writeFormatted(stderr, "warning: failed to set MTU: {s}\n", .{@errorName(err)});
+            };
+            FreeBsdCfg.addRoute(allocator, tun_dev.getName(), .{ 10, 99, 0, 0 }, 16) catch |err| {
+                try writeFormatted(stderr, "warning: failed to add mesh route: {s}\n", .{@errorName(err)});
+            };
+
+            try writeFormatted(stdout, "  mesh IP: {d}.{d}.{d}.{d}/16 (mtu=1420)\n", .{
+                mesh_ip[0], mesh_ip[1], mesh_ip[2], mesh_ip[3],
+            });
+
+            tun_dev.setNonBlocking() catch |err| {
+                try writeFormatted(stderr, "warning: failed to set TUN non-blocking: {s}\n", .{@errorName(err)});
+            };
+
+            try stdout.writeStreamingAll(zio(), "  GSO/GRO offloads: not available (FreeBSD tun)\n");
+
+            freebsdEventLoop(&swim, &wg_device, &gossip_socket, &tun_dev, stdout, &service_filter, &control) catch |err| {
                 try writeFormatted(stderr, "error: event loop failed: {s}\n", .{@errorName(err)});
             };
         } else {
@@ -1586,7 +1625,7 @@ fn signalHandler(sig: posix.SIG) callconv(.c) void {
 fn installSignalHandler(swim_ref: *lib.discovery.Swim.SwimProtocol) void {
     g_swim_stop = swim_ref;
 
-    if (comptime @import("builtin").os.tag == .linux or @import("builtin").os.tag == .macos) {
+    if (comptime @import("builtin").os.tag == .linux or @import("builtin").os.tag == .macos or @import("builtin").os.tag == .freebsd) {
         const sa: posix.Sigaction = .{
             .handler = .{ .handler = &signalHandler },
             .mask = std.mem.zeroes(@TypeOf(@as(posix.Sigaction, undefined).mask)),
@@ -2806,6 +2845,24 @@ fn windowsEventLoop(
     }
 }
 
+fn setFdNonBlocking(fd: posix.fd_t) !void {
+    const flags = posix.system.fcntl(fd, posix.F.GETFL, @as(usize, 0));
+    switch (posix.errno(flags)) {
+        .SUCCESS => {},
+        else => |err| return posix.unexpectedErrno(err),
+    }
+
+    const rc = posix.system.fcntl(
+        fd,
+        posix.F.SETFL,
+        @as(usize, @intCast(flags)) | @as(usize, 1 << @bitOffsetOf(posix.O, "NONBLOCK")),
+    );
+    switch (posix.errno(rc)) {
+        .SUCCESS => {},
+        else => |err| return posix.unexpectedErrno(err),
+    }
+}
+
 /// macOS userspace event loop — simplified single-threaded poll loop.
 ///
 /// Similar to windowsEventLoop: alternates between TUN reads and UDP gossip.
@@ -2930,6 +2987,136 @@ fn macosEventLoop(
         }
 
         // ─── 5. Poll control socket for status queries ───
+        _ = control_socket.poll();
+    }
+}
+
+/// FreeBSD userspace event loop — kqueue-driven TUN/UDP readiness loop.
+fn freebsdEventLoop(
+    swim: *lib.discovery.Swim.SwimProtocol,
+    wg_dev: *lib.wireguard.Device.WgDevice,
+    udp_sock: *lib.net.Udp.UdpSocket,
+    tun_dev: *lib.net.Tun.TunDevice,
+    stdout: std.Io.File,
+    service_filter: *const lib.services.Policy.ServiceFilter,
+    control_socket: *lib.services.Control.ControlSocket,
+) !void {
+    const Device = lib.wireguard.Device;
+    const Noise = lib.wireguard.Noise;
+
+    setFdNonBlocking(udp_sock.fd) catch {};
+
+    var kq = try lib.net.Kqueue.Kqueue.init();
+    defer kq.close();
+    try kq.addRead(tun_dev.fd);
+    try kq.addRead(@intCast(udp_sock.fd));
+
+    var events: [2]lib.net.Kqueue.Kqueue.Event = undefined;
+    var tun_buf: [65536]u8 = undefined;
+    var udp_recv_buf: [2048]u8 = undefined;
+    var decrypt_buf: [1500]u8 = undefined;
+    var encrypt_buf: [2048]u8 = undefined;
+    var last_handshake_check_ns: i128 = 0;
+
+    const tun_ident: usize = @intCast(tun_dev.fd);
+    const udp_ident: usize = @intCast(udp_sock.fd);
+
+    while (swim.running.load(.acquire)) {
+        const event_count = kq.wait(&events, 100) catch 0;
+
+        swim.tickTimersOnly();
+
+        for (events[0..event_count]) |ev| {
+            if (ev.ident == udp_ident) {
+                var udp_count: u32 = 0;
+                while (udp_count < 64) : (udp_count += 1) {
+                    const recv = (udp_sock.recvFrom(&udp_recv_buf) catch break) orelse break;
+                    const pkt = recv.data;
+
+                    const pkt_type = Device.PacketType.classify(pkt);
+                    if (pkt_type == .wg_transport) {
+                        if (wg_dev.decryptTransport(pkt, &decrypt_buf)) |result| {
+                            const PolicyMod = lib.services.Policy;
+                            if (PolicyMod.parseTransportHeader(decrypt_buf[0..result.len])) |ti| {
+                                if (wg_dev.peers[result.slot]) |peer| {
+                                    const org_pk = if (swim.membership.peers.getPtr(peer.identity_key)) |mp| mp.org_pubkey else null;
+                                    if (!service_filter.check(peer.identity_key, org_pk, ti.proto, ti.dst_port)) continue;
+                                }
+                            }
+                            tun_dev.write(decrypt_buf[0..result.len]) catch {};
+                        } else |_| {}
+                    } else switch (pkt_type) {
+                        .wg_handshake_init => {
+                            if (pkt.len >= @sizeOf(Noise.HandshakeInitiation)) {
+                                const msg: *const Noise.HandshakeInitiation = @ptrCast(@alignCast(pkt.ptr));
+                                if (wg_dev.handleInitiation(msg)) |hs_result| {
+                                    const resp_bytes = std.mem.asBytes(&hs_result.response);
+                                    _ = udp_sock.sendTo(resp_bytes, recv.sender_addr, recv.sender_port) catch 0;
+                                    writeFormatted(stdout, "  WG handshake: responded to initiation\n", .{}) catch {};
+                                } else |_| {}
+                            }
+                        },
+                        .wg_handshake_resp => {
+                            if (pkt.len >= @sizeOf(Noise.HandshakeResponse)) {
+                                const msg: *const Noise.HandshakeResponse = @ptrCast(@alignCast(pkt.ptr));
+                                if (wg_dev.handleResponse(msg)) |slot| {
+                                    if (wg_dev.peers[slot]) |*p| {
+                                        p.endpoint_addr = recv.sender_addr;
+                                        p.endpoint_port = recv.sender_port;
+                                    }
+                                    writeFormatted(stdout, "  WG handshake: completed with peer\n", .{}) catch {};
+                                } else |_| {}
+                            }
+                        },
+                        .wg_transport => unreachable,
+                        .wg_cookie => {},
+                        .stun => swim.feedPacket(pkt, recv.sender_addr, recv.sender_port),
+                        .swim => swim.feedPacket(pkt, recv.sender_addr, recv.sender_port),
+                        .unknown => {},
+                    }
+                }
+            } else if (ev.ident == tun_ident) {
+                var tun_count: u32 = 0;
+                while (tun_count < 64) : (tun_count += 1) {
+                    const tun_n = tun_dev.read(&tun_buf) catch break;
+                    if (tun_n == 0) break;
+
+                    const ip_pkt = tun_buf[0..tun_n];
+                    if (tun_n < 20) continue;
+                    const dst_ip: [4]u8 = .{ ip_pkt[16], ip_pkt[17], ip_pkt[18], ip_pkt[19] };
+
+                    if (wg_dev.lookupByMeshIp(dst_ip)) |slot| {
+                        const peer = wg_dev.peers[slot] orelse continue;
+                        if (peer.endpoint_port == 0) continue;
+
+                        if (wg_dev.encryptForPeer(slot, ip_pkt, &encrypt_buf)) |enc_len| {
+                            _ = udp_sock.sendTo(encrypt_buf[0..enc_len], peer.endpoint_addr, peer.endpoint_port) catch {};
+                        } else |_| {
+                            if (wg_dev.initiateHandshake(slot)) |init_msg| {
+                                const init_bytes = std.mem.asBytes(&init_msg);
+                                _ = udp_sock.sendTo(init_bytes, peer.endpoint_addr, peer.endpoint_port) catch {};
+                            } else |_| {}
+                        }
+                    }
+                }
+            }
+        }
+
+        const now_ns = nowAwakeNs();
+        if (now_ns - last_handshake_check_ns >= 10 * std.time.ns_per_s) {
+            last_handshake_check_ns = now_ns;
+            for (&wg_dev.peers, 0..) |*slot, i| {
+                if (slot.*) |peer| {
+                    if (peer.active_tunnel == null and peer.endpoint_port != 0) {
+                        if (wg_dev.initiateHandshake(i)) |init_msg| {
+                            const init_bytes = std.mem.asBytes(&init_msg);
+                            _ = udp_sock.sendTo(init_bytes, peer.endpoint_addr, peer.endpoint_port) catch {};
+                        } else |_| {}
+                    }
+                }
+            }
+        }
+
         _ = control_socket.poll();
     }
 }

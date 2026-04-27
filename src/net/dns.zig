@@ -5,13 +5,14 @@
 //!   - TXT records (service discovery via `_meshguard._udp.domain`)
 //!   - mDNS queries (multicast to 224.0.0.251:5353)
 //!
-//! Cross-platform: supports both Linux and Windows.
+//! Cross-platform: supports Linux, BSD/Darwin, and Windows.
 
 const std = @import("std");
 const posix = std.posix;
 const builtin = @import("builtin");
 const is_linux = builtin.os.tag == .linux;
 const is_windows = builtin.os.tag == .windows;
+const is_freebsd = builtin.os.tag == .freebsd;
 const linux = if (is_linux) std.os.linux else struct {};
 const win = if (is_windows) struct {
     const SOCKET = posix.socket_t;
@@ -61,18 +62,18 @@ const DnsHeader = struct {
 
 // ─── Public API ───
 
-/// Get nameserver IPv4 addresses. On Linux, parses /etc/resolv.conf.
+/// Get nameserver IPv4 addresses. On Unix-like systems, parses /etc/resolv.conf.
 /// On Windows, uses well-known public DNS servers as fallback.
 pub fn getNameservers(buf: *[3][4]u8) usize {
-    if (comptime is_linux) {
-        return getNameserversLinux(buf);
+    if (comptime is_linux or is_freebsd) {
+        return getNameserversResolvConf(buf);
     } else if (comptime is_windows) {
         return getNameserversWindows(buf);
     }
     return 0;
 }
 
-fn getNameserversLinux(buf: *[3][4]u8) usize {
+fn getNameserversResolvConf(buf: *[3][4]u8) usize {
     const z = zio();
     const file = std.Io.Dir.openFileAbsolute(z, "/etc/resolv.conf", .{}) catch return 0;
     defer file.close(z);

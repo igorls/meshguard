@@ -8,6 +8,7 @@ const is_linux = builtin.os.tag == .linux;
 const is_macos = builtin.os.tag == .macos;
 const is_ios = builtin.os.tag == .ios;
 const is_darwin = is_macos or is_ios;
+const is_freebsd = builtin.os.tag == .freebsd;
 const posix = std.posix;
 
 const linux = if (is_linux) std.os.linux else struct {};
@@ -237,8 +238,8 @@ pub const UdpSocket = struct {
     /// Poll the socket for readability with a timeout (milliseconds).
     /// Returns true if data is available.
     pub fn pollRead(self: UdpSocket, timeout_ms: i32) !bool {
-        if (comptime is_linux or is_darwin) {
-            // Use std.posix.poll — works on Linux, macOS, iOS, and Android
+        if (comptime is_linux or is_darwin or is_freebsd) {
+            // Use std.posix.poll — works on Linux, BSD/Darwin, and Android
             // without requiring C headers (critical for iOS cross-compilation).
             const POLLIN: i16 = 0x0001;
             var fds = [1]std.posix.pollfd{.{

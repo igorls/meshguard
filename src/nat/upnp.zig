@@ -17,6 +17,8 @@ const is_windows = builtin.os.tag == .windows;
 const is_macos = builtin.os.tag == .macos;
 const is_ios = builtin.os.tag == .ios;
 const is_darwin = is_macos or is_ios;
+const is_freebsd = builtin.os.tag == .freebsd;
+const is_bsd = is_darwin or is_freebsd;
 const linux = if (is_linux) std.os.linux else struct {};
 const win = if (is_windows) struct {
     const POLLIN: i16 = 0x0001;
@@ -206,8 +208,8 @@ fn ssdpDiscover(gateway_ip: *[4]u8, location_buf: *[512]u8) ?[]const u8 {
     const ttl: u32 = 4;
     if (comptime is_linux) {
         posix.setsockopt(fd, posix.IPPROTO.IP, linux.IP.MULTICAST_TTL, std.mem.asBytes(&ttl)) catch {};
-    } else if (comptime is_darwin) {
-        // Darwin IP_MULTICAST_TTL = 10
+    } else if (comptime is_bsd) {
+        // BSD/Darwin IP_MULTICAST_TTL = 10
         posix.setsockopt(fd, posix.IPPROTO.IP, 10, std.mem.asBytes(&ttl)) catch {};
     }
 
@@ -224,7 +226,7 @@ fn ssdpDiscover(gateway_ip: *[4]u8, location_buf: *[512]u8) ?[]const u8 {
     // poll timeouts (no data available) toward the give-up threshold.
     var timeouts: u32 = 0;
     while (timeouts < 10) { // 10 timeouts × 500ms = 5s of silence gives up
-        if (comptime is_linux or is_darwin) {
+        if (comptime is_linux or is_bsd) {
             const POLLIN: i16 = 0x0001;
             var fds = [1]posix.pollfd{.{ .fd = fd, .events = POLLIN, .revents = 0 }};
             _ = posix.poll(&fds, 500) catch 0;
@@ -375,7 +377,7 @@ fn httpRequest(
     var total: usize = 0;
     var attempts: u32 = 0;
     while (total < out.len and attempts < 20) : (attempts += 1) {
-        if (comptime is_linux or is_darwin) {
+        if (comptime is_linux or is_bsd) {
             const POLLIN: i16 = 0x0001;
             var fds = [1]posix.pollfd{.{ .fd = fd, .events = POLLIN, .revents = 0 }};
             _ = posix.poll(&fds, 2000) catch break;
