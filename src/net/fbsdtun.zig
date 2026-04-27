@@ -15,6 +15,7 @@ pub const TunDevice = struct {
     fd: posix.fd_t,
     name: [16]u8,
     name_len: usize,
+    /// FreeBSD tun(4) has no virtio-net header support; kept for API parity.
     vnet_hdr: bool = false,
 
     const Ifreq = extern struct {
@@ -23,6 +24,7 @@ pub const TunDevice = struct {
     };
 
     pub fn open(name: []const u8) !TunDevice {
+        // FreeBSD's /dev/tun clone device assigns the actual interface name.
         _ = name;
         const fd = std.c.open("/dev/tun", .{ .ACCMODE = .RDWR });
         switch (posix.errno(fd)) {

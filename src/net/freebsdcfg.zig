@@ -3,19 +3,18 @@
 //! Uses ifconfig/route commands to configure cloned tun(4) interfaces.
 const std = @import("std");
 
-fn zio() std.Io {
+fn getIo() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
 }
 
 fn runCommand(argv: []const []const u8) !std.process.Child.Term {
-    var child = try std.process.spawn(zio(), .{
+    var child = try std.process.spawn(getIo(), .{
         .argv = argv,
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
     });
-    defer child.kill(zio());
-    return child.wait(zio());
+    return child.wait(getIo());
 }
 
 pub fn setInterfaceIp(allocator: std.mem.Allocator, iface_name: []const u8, mesh_ip: [4]u8, prefix_len: u8) !void {
