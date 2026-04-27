@@ -10,6 +10,9 @@ const Keys = @import("../identity/keys.zig");
 /// Gives us 65,534 usable addresses (10.99.0.1 - 10.99.255.254)
 pub const default_mesh_prefix = [2]u8{ 10, 99 };
 pub const default_mesh_mask: u8 = 16;
+/// Default IPv6 ULA mesh prefix: fd99:6d67::/64 ("mg" in hex).
+pub const default_mesh_prefix6 = [8]u8{ 0xfd, 0x99, 0x6d, 0x67, 0, 0, 0, 0 };
+pub const default_mesh_mask6: u8 = 64;
 
 /// Derive a mesh IP from a public key.
 /// Uses Blake3 hash of the public key to fill the host portion.
@@ -31,11 +34,48 @@ pub fn deriveFromPubkey(public_key: Keys.PublicKey) [4]u8 {
     return .{ default_mesh_prefix[0], default_mesh_prefix[1], host_lo, host_hi };
 }
 
+/// Derive a mesh IPv6 address from a public key.
+/// Uses the default ULA /64 and the first 64 bits of Blake3(pubkey) as host ID.
+pub fn deriveIpv6FromPubkey(public_key: Keys.PublicKey) [16]u8 {
+    return deriveIpv6FromPubkeyBytes(public_key.toBytes());
+}
+
+/// Derive a mesh IPv6 address directly from raw Ed25519 public-key bytes.
+pub fn deriveIpv6FromPubkeyBytes(public_key: [32]u8) [16]u8 {
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(&public_key, &hash, .{});
+
+    var ip: [16]u8 = undefined;
+    @memcpy(ip[0..8], &default_mesh_prefix6);
+    @memcpy(ip[8..16], hash[0..8]);
+    if (std.mem.allEqual(u8, ip[8..16], 0)) ip[15] = 1;
+    return ip;
+}
+
 /// Format a mesh IP as a CIDR string (e.g., "10.99.42.100/16").
 pub fn formatCidr(ip: [4]u8, mask: u8, buf: []u8) []const u8 {
     const result = std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}/{d}", .{
         ip[0], ip[1], ip[2], ip[3], mask,
     }) catch return "?.?.?.?/?";
+    return result;
+}
+
+/// Format an IPv6 mesh address as a CIDR string.
+pub fn formatIpv6Cidr(ip: [16]u8, mask: u8, buf: []u8) []const u8 {
+    const result = std.fmt.bufPrint(buf, "{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}/{d}", .{
+        ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], ip[6], ip[7],
+        ip[8], ip[9], ip[10], ip[11], ip[12], ip[13], ip[14], ip[15],
+        mask,
+    }) catch return "?::?/?";
+    return result;
+}
+
+/// Format an IPv6 mesh address.
+pub fn formatIpv6(ip: [16]u8, buf: []u8) []const u8 {
+    const result = std.fmt.bufPrint(buf, "{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}", .{
+        ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], ip[6], ip[7],
+        ip[8], ip[9], ip[10], ip[11], ip[12], ip[13], ip[14], ip[15],
+    }) catch return "?::?";
     return result;
 }
 
@@ -76,6 +116,12 @@ test "derived IPs use correct prefix" {
     const ip = deriveFromPubkey(kp.public_key);
     try std.testing.expectEqual(ip[0], 10);
     try std.testing.expectEqual(ip[1], 99);
+}
+
+test "derived IPv6 addresses use mesh ULA prefix" {
+    const kp = Keys.generate();
+    const ip = deriveIpv6FromPubkey(kp.public_key);
+    try std.testing.expectEqualSlices(u8, &default_mesh_prefix6, ip[0..8]);
 }
 
 test "derived IPs avoid reserved addresses" {

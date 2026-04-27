@@ -6,6 +6,7 @@
 const std = @import("std");
 const noise = @import("noise.zig");
 const tunnel = @import("tunnel.zig");
+const messages = @import("../protocol/messages.zig");
 
 fn zio() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
@@ -67,6 +68,8 @@ pub const WgPeer = struct {
     wg_pubkey: [32]u8,
     /// Mesh IP address (10.99.x.y)
     mesh_ip: [4]u8 = .{0} ** 4,
+    /// Mesh IPv6 address (fd99:6d67::/64)
+    mesh_ip6: [16]u8 = .{0} ** 16,
     /// Noise handshake state
     handshake: noise.Handshake,
     /// Active tunnel (after successful handshake)
@@ -75,6 +78,7 @@ pub const WgPeer = struct {
     sender_index: u32 = 0,
     /// Peer's endpoint
     endpoint_addr: [4]u8 = .{0} ** 4,
+    endpoint_addr6: ?[16]u8 = null,
     endpoint_port: u16 = 0,
     /// Last handshake attempt time (for rate limiting)
     last_handshake_ns: i128 = 0,
@@ -89,6 +93,13 @@ pub const WgPeer = struct {
             t.deinit();
             self.active_tunnel = null;
         }
+    }
+
+    pub fn endpoint(self: *const WgPeer) ?messages.Endpoint {
+        if (self.endpoint_port == 0) return null;
+        if (self.endpoint_addr6) |addr6| return messages.Endpoint.initV6(addr6, self.endpoint_port);
+        if (std.mem.eql(u8, &self.endpoint_addr, &([_]u8{0} ** 4))) return null;
+        return messages.Endpoint.initV4(self.endpoint_addr, self.endpoint_port);
     }
 };
 
@@ -271,11 +282,17 @@ pub const WgDevice = struct {
 
     /// Add or update a peer with mesh IP for O(1) data-plane routing.
     pub fn addPeerWithMeshIp(self: *WgDevice, identity_key: [32]u8, wg_pubkey: [32]u8, addr: [4]u8, port: u16, mesh_ip: [4]u8) !usize {
+        return self.addPeerWithEndpoint(identity_key, wg_pubkey, messages.Endpoint.initV4(addr, port), mesh_ip, .{0} ** 16);
+    }
+
+    /// Add or update a peer with IPv4/IPv6 endpoint and mesh addresses.
+    pub fn addPeerWithEndpoint(self: *WgDevice, identity_key: [32]u8, wg_pubkey: [32]u8, endpoint: messages.Endpoint, mesh_ip: [4]u8, mesh_ip6: [16]u8) !usize {
         // Check if peer already exists
         if (self.static_map.get(wg_pubkey)) |existing| {
             if (self.peers[existing]) |*peer| {
-                peer.endpoint_addr = addr;
-                peer.endpoint_port = port;
+                peer.endpoint_addr = endpoint.addr;
+                peer.endpoint_addr6 = endpoint.addr6;
+                peer.endpoint_port = endpoint.port;
                 // Update mesh IP routing if provided
                 if (mesh_ip[0] != 0 or mesh_ip[1] != 0) {
                     // Clear old mapping if mesh_ip changed
@@ -284,6 +301,7 @@ pub const WgDevice = struct {
                         self.ip_to_slot[old_host] = 0xFF;
                     }
                     peer.mesh_ip = mesh_ip;
+                    peer.mesh_ip6 = mesh_ip6;
                     self.ip_to_slot[meshIpHostId(mesh_ip)] = @intCast(existing);
                 }
                 return existing;
@@ -303,9 +321,11 @@ pub const WgDevice = struct {
                     .identity_key = identity_key,
                     .wg_pubkey = wg_pubkey,
                     .mesh_ip = mesh_ip,
+                    .mesh_ip6 = mesh_ip6,
                     .handshake = handshake,
-                    .endpoint_addr = addr,
-                    .endpoint_port = port,
+                    .endpoint_addr = endpoint.addr,
+                    .endpoint_addr6 = endpoint.addr6,
+                    .endpoint_port = endpoint.port,
                     .sender_index = sender_idx,
                 };
                 self.peer_count += 1;
@@ -470,6 +490,15 @@ pub const WgDevice = struct {
         const slot = self.ip_to_slot[meshIpHostId(dst_ip)];
         if (slot == 0xFF) return null;
         return @as(usize, slot);
+    }
+
+    pub fn lookupByMeshIp6(self: *const WgDevice, dst_ip: [16]u8) ?usize {
+        for (self.peers, 0..) |slot, i| {
+            if (slot) |peer| {
+                if (std.mem.eql(u8, &peer.mesh_ip6, &dst_ip)) return i;
+            }
+        }
+        return null;
     }
 };
 

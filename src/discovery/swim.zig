@@ -51,8 +51,7 @@ const GossipSlot = struct {
 /// Pending ping tracking.
 const PendingPing = struct {
     target_pubkey: [32]u8,
-    target_addr: [4]u8,
-    target_port: u16,
+    target_endpoint: messages.Endpoint,
     seq: u64,
     sent_at_ns: i128,
     escalated: bool, // whether we've already sent ping-req
@@ -66,6 +65,7 @@ pub const SwimProtocol = struct {
     our_pubkey: [32]u8,
     our_wg_pubkey: [32]u8,
     our_mesh_ip: [4]u8,
+    our_mesh_ip6: [16]u8,
     our_wg_port: u16,
     socket: Udp.UdpSocket,
     handler: ?EventHandler,
@@ -148,6 +148,7 @@ pub const SwimProtocol = struct {
             .our_pubkey = our_pubkey,
             .our_wg_pubkey = our_wg_pubkey,
             .our_mesh_ip = our_mesh_ip,
+            .our_mesh_ip6 = @import("../wireguard/ip.zig").deriveIpv6FromPubkeyBytes(our_pubkey),
             .our_wg_port = our_wg_port,
             .socket = socket,
             .handler = handler,
@@ -265,7 +266,7 @@ pub const SwimProtocol = struct {
             const peer = entry.value_ptr;
             if (peer.state == .alive or peer.state == .suspected) {
                 if (peer.gossip_endpoint) |ep| {
-                    _ = self.socket.sendTo(buf[0..written], ep.addr, ep.port) catch {};
+                    _ = self.socket.sendToEndpoint(buf[0..written], ep) catch {};
                 }
             }
         }
@@ -284,7 +285,7 @@ pub const SwimProtocol = struct {
                 if (result == null) break;
                 const recv = result.?;
                 self.raw_recv += 1;
-                self.handleMessage(recv.data, recv.sender_addr, recv.sender_port);
+                self.handleMessage(recv.data, recv.endpoint());
             }
         }
 
@@ -315,7 +316,7 @@ pub const SwimProtocol = struct {
         if (now_ns - self.last_ping_sent_ns >= interval_ns) {
             if (self.membership.randomAlivePeer()) |peer| {
                 if (peer.gossip_endpoint) |ep| {
-                    self.sendPing(ep.addr, ep.port, peer.pubkey);
+                    self.sendPing(ep, peer.pubkey);
                     self.last_ping_sent_ns = now_ns;
                 }
             }
@@ -338,7 +339,7 @@ pub const SwimProtocol = struct {
         for (seeds) |seed| {
             // Send a ping to each seed — we don't know their pubkey yet,
             // so we use a zero pubkey as "hello" ping
-            self.sendPing(seed.addr, seed.port, [_]u8{0} ** 32);
+            self.sendPing(seed, [_]u8{0} ** 32);
         }
     }
 
@@ -370,7 +371,7 @@ pub const SwimProtocol = struct {
         if (now_ns - self.last_ping_sent_ns >= interval_ns) {
             if (self.membership.randomAlivePeer()) |peer| {
                 if (peer.gossip_endpoint) |ep| {
-                    self.sendPing(ep.addr, ep.port, peer.pubkey);
+                    self.sendPing(ep, peer.pubkey);
                     self.last_ping_sent_ns = now_ns;
                 }
             }
@@ -404,7 +405,7 @@ pub const SwimProtocol = struct {
                 if (result == null) break;
                 const recv = result.?;
                 self.raw_recv += 1;
-                self.handleMessage(recv.data, recv.sender_addr, recv.sender_port);
+                self.handleMessage(recv.data, recv.endpoint());
             }
         }
 
@@ -422,7 +423,7 @@ pub const SwimProtocol = struct {
             const peer = entry.value_ptr;
             if (peer.state == .alive or peer.state == .suspected) {
                 if (peer.gossip_endpoint) |ep| {
-                    self.sendPing(ep.addr, ep.port, peer.pubkey);
+                    self.sendPing(ep, peer.pubkey);
                 }
             }
         }
@@ -430,22 +431,26 @@ pub const SwimProtocol = struct {
 
     /// Feed a received packet to SWIM from an external event loop.
     pub fn feedPacket(self: *SwimProtocol, data: []const u8, sender_addr: [4]u8, sender_port: u16) void {
-        self.handleMessage(data, sender_addr, sender_port);
+        self.handleMessage(data, messages.Endpoint.initV4(sender_addr, sender_port));
     }
 
     // ─── Message handling ───
 
-    fn handleMessage(self: *SwimProtocol, data: []const u8, sender_addr: [4]u8, sender_port: u16) void {
+    pub fn feedPacketEndpoint(self: *SwimProtocol, data: []const u8, sender_endpoint: messages.Endpoint) void {
+        self.handleMessage(data, sender_endpoint);
+    }
+
+    fn handleMessage(self: *SwimProtocol, data: []const u8, sender_endpoint: messages.Endpoint) void {
         // Check for holepunch probes (raw UDP with MGHP magic, not SWIM-encoded)
         if (data.len >= 4 and Holepuncher.isProbe(data[0..4])) {
-            self.handleHolepunchProbe(sender_addr, sender_port);
+            self.handleHolepunchProbe(sender_endpoint);
             return;
         }
 
         // Check for app messages (type 0x50) — relay or deliver locally
         // Wire: [0x50][32B dest][32B sender][12B nonce][N ciphertext][16B tag]
         if (data.len > 0 and data[0] == 0x50) {
-            self.handleAppMessage(data, sender_addr, sender_port);
+            self.handleAppMessage(data, sender_endpoint);
             return;
         }
 
@@ -456,7 +461,7 @@ pub const SwimProtocol = struct {
             if (msg_type >= 1 and msg_type <= 4) {
                 if (self.handler) |h| {
                     if (h.onWgPacket) |cb| {
-                        cb(h.ctx, data, sender_addr, sender_port);
+                        cb(h.ctx, data, sender_endpoint.addr, sender_endpoint.port);
                     }
                 }
                 return;
@@ -481,10 +486,10 @@ pub const SwimProtocol = struct {
         if (!self.isAuthorizedPeer(sender_pubkey)) return;
 
         switch (decoded) {
-            .ping => |p| self.handlePing(&p, sender_addr, sender_port),
-            .ack => |a| self.handleAck(&a, sender_addr, sender_port),
-            .ping_req => |r| self.handlePingReq(r, sender_addr, sender_port),
-            .holepunch_request => |req| self.handleHolepunchRequest(req, sender_addr, sender_port),
+            .ping => |p| self.handlePing(&p, sender_endpoint),
+            .ack => |a| self.handleAck(&a, sender_endpoint),
+            .ping_req => |r| self.handlePingReq(r, sender_endpoint),
+            .holepunch_request => |req| self.handleHolepunchRequest(req, sender_endpoint),
             .holepunch_response => |resp| self.handleHolepunchResponse(resp),
             .org_alias_announce => |ann| self.handleOrgAlias(ann),
             .org_cert_revoke => |rev| self.handleOrgRevoke(rev),
@@ -494,9 +499,8 @@ pub const SwimProtocol = struct {
 
     /// Handle an incoming 0x50 app message: deliver locally or relay.
     /// Wire: [0x50][32B dest_pubkey][32B sender_pubkey][12B nonce][N ciphertext][16B tag]
-    fn handleAppMessage(self: *SwimProtocol, data: []const u8, sender_addr: [4]u8, sender_port: u16) void {
-        _ = sender_addr;
-        _ = sender_port;
+    fn handleAppMessage(self: *SwimProtocol, data: []const u8, sender_endpoint: messages.Endpoint) void {
+        _ = sender_endpoint;
         // Min size: 1 + 32 + 32 + 12 + 0 + 16 = 93 (empty payload)
         if (data.len < 93) return;
 
@@ -527,13 +531,12 @@ pub const SwimProtocol = struct {
         };
 
         // Forward the entire message as-is (encrypted, we can't read it)
-        _ = self.socket.sendTo(data, ep.addr, ep.port) catch {
+        _ = self.socket.sendToEndpoint(data, ep) catch {
             std.debug.print("  📨 APP msg relay FAILED: sendTo error\n", .{});
             return;
         };
-        std.debug.print("  📨 APP msg relayed ({d}B) → {d}.{d}.{d}.{d}:{d}\n", .{
-            data.len, ep.addr[0], ep.addr[1], ep.addr[2], ep.addr[3], ep.port,
-        });
+        var ep_buf: [64]u8 = undefined;
+        std.debug.print("  📨 APP msg relayed ({d}B) → {s}\n", .{ data.len, ep.format(&ep_buf) });
     }
 
     /// Handle an OrgAliasAnnounce: register or update org alias, with Lamport conflict resolution.
@@ -641,10 +644,10 @@ pub const SwimProtocol = struct {
         }
     }
 
-    fn handlePing(self: *SwimProtocol, ping: *const codec.DecodedPing, sender_addr: [4]u8, sender_port: u16) void {
+    fn handlePing(self: *SwimProtocol, ping: *const codec.DecodedPing, sender_endpoint: messages.Endpoint) void {
         // Register sender FIRST so gossip callbacks see the real network address
         if (!std.mem.eql(u8, &ping.sender_pubkey, &([_]u8{0} ** 32))) {
-            self.registerOrUpdatePeer(ping.sender_pubkey, sender_addr, sender_port);
+            self.registerOrUpdatePeerEndpoint(ping.sender_pubkey, sender_endpoint);
         }
 
         // Process piggybacked gossip (onPeerJoin may fire here)
@@ -662,23 +665,20 @@ pub const SwimProtocol = struct {
 
         var buf: [1500]u8 = undefined;
         const written = codec.encodeAck(&buf, ack) catch return;
-        const send_result = self.socket.sendTo(buf[0..written], sender_addr, sender_port);
+        const send_result = self.socket.sendToEndpoint(buf[0..written], sender_endpoint);
         if (send_result) |bytes| {
-            std.debug.print("  ACK sent ({d}B) → {d}.{d}.{d}.{d}:{d}\n", .{
-                bytes, sender_addr[0], sender_addr[1], sender_addr[2], sender_addr[3], sender_port,
-            });
+            var ep_buf: [64]u8 = undefined;
+            std.debug.print("  ACK sent ({d}B) → {s}\n", .{ bytes, sender_endpoint.format(&ep_buf) });
         } else |err| {
-            std.debug.print("  ACK FAILED → {d}.{d}.{d}.{d}:{d} err={s}\n", .{
-                sender_addr[0],  sender_addr[1], sender_addr[2], sender_addr[3], sender_port,
-                @errorName(err),
-            });
+            var ep_buf: [64]u8 = undefined;
+            std.debug.print("  ACK FAILED → {s} err={s}\n", .{ sender_endpoint.format(&ep_buf), @errorName(err) });
         }
     }
 
-    fn handleAck(self: *SwimProtocol, ack: *const codec.DecodedAck, sender_addr: [4]u8, sender_port: u16) void {
+    fn handleAck(self: *SwimProtocol, ack: *const codec.DecodedAck, sender_endpoint: messages.Endpoint) void {
         // Register sender FIRST so gossip callbacks see the real network address
         if (!std.mem.eql(u8, &ack.sender_pubkey, &([_]u8{0} ** 32))) {
-            self.registerOrUpdatePeer(ack.sender_pubkey, sender_addr, sender_port);
+            self.registerOrUpdatePeerEndpoint(ack.sender_pubkey, sender_endpoint);
         }
 
         // Process piggybacked gossip (onPeerJoin may fire here)
@@ -690,21 +690,20 @@ pub const SwimProtocol = struct {
         self.clearPending(ack.seq);
     }
 
-    fn handlePingReq(self: *SwimProtocol, req: messages.PingReq, sender_addr: [4]u8, sender_port: u16) void {
-        _ = sender_addr;
-        _ = sender_port;
+    fn handlePingReq(self: *SwimProtocol, req: messages.PingReq, sender_endpoint: messages.Endpoint) void {
+        _ = sender_endpoint;
 
         // Forward ping to the target
         if (self.membership.peers.get(req.target_pubkey)) |target| {
             if (target.gossip_endpoint) |ep| {
-                self.sendPing(ep.addr, ep.port, req.target_pubkey);
+                self.sendPing(ep, req.target_pubkey);
             }
         }
     }
 
     // ─── Hole Punching ───
 
-    fn handleHolepunchRequest(self: *SwimProtocol, req: messages.HolepunchRequest, sender_addr: [4]u8, sender_port: u16) void {
+    fn handleHolepunchRequest(self: *SwimProtocol, req: messages.HolepunchRequest, sender_endpoint: messages.Endpoint) void {
         // Are we the target?
         if (std.mem.eql(u8, &req.target_pubkey, &self.our_pubkey)) {
             // We're the target — respond with our public endpoint
@@ -717,7 +716,7 @@ pub const SwimProtocol = struct {
                 var buf: [128]u8 = undefined;
                 const written = codec.encodeHolepunchResponse(&buf, resp) catch return;
                 // Send response back through the rendezvous (sender)
-                _ = self.socket.sendTo(buf[0..written], sender_addr, sender_port) catch {};
+                _ = self.socket.sendToEndpoint(buf[0..written], sender_endpoint) catch {};
 
                 // Also start probing the initiator's endpoint
                 _ = self.holepuncher.initiate(self.our_pubkey, req.sender_pubkey, our_ep);
@@ -735,7 +734,7 @@ pub const SwimProtocol = struct {
                 if (target.gossip_endpoint) |ep| {
                     var buf: [128]u8 = undefined;
                     const written = codec.encodeHolepunchRequest(&buf, req) catch return;
-                    _ = self.socket.sendTo(buf[0..written], ep.addr, ep.port) catch {};
+                    _ = self.socket.sendToEndpoint(buf[0..written], ep) catch {};
                 }
             }
         }
@@ -749,7 +748,7 @@ pub const SwimProtocol = struct {
         }
     }
 
-    fn handleHolepunchProbe(self: *SwimProtocol, sender_addr: [4]u8, sender_port: u16) void {
+    fn handleHolepunchProbe(self: *SwimProtocol, sender_endpoint: messages.Endpoint) void {
         // A probe arrived — the hole is punched!
         // Find which peer this corresponds to by checking active punches
         // For now, check all peers with matching public endpoints
@@ -757,18 +756,15 @@ pub const SwimProtocol = struct {
         while (iter.next()) |entry| {
             const peer = entry.value_ptr;
             if (peer.public_endpoint) |pub_ep| {
-                if (std.mem.eql(u8, &pub_ep.addr, &sender_addr)) {
+                if (pub_ep.eql(sender_endpoint)) {
                     // Found the peer — notify handler to configure WG endpoint
-                    std.debug.print("  [punch] hole punched with {x:0>2}{x:0>2}... at {d}.{d}.{d}.{d}:{d}\n", .{
-                        peer.pubkey[0], peer.pubkey[1],
-                        sender_addr[0], sender_addr[1],
-                        sender_addr[2], sender_addr[3],
-                        sender_port,
+                    var ep_buf: [64]u8 = undefined;
+                    std.debug.print("  [punch] hole punched with {x:0>2}{x:0>2}... at {s}\n", .{
+                        peer.pubkey[0], peer.pubkey[1], sender_endpoint.format(&ep_buf),
                     });
-                    const punched_ep = messages.Endpoint{ .addr = sender_addr, .port = sender_port };
                     if (self.handler) |h| {
                         if (h.onPeerPunched) |callback| {
-                            callback(h.ctx, peer, punched_ep);
+                            callback(h.ctx, peer, sender_endpoint);
                         }
                     }
                     return;
@@ -814,7 +810,7 @@ pub const SwimProtocol = struct {
                     std.debug.print("  [punch] initiating punch to {x:0>2}{x:0>2}... via rendezvous\n", .{ peer.pubkey[0], peer.pubkey[1] });
                     var buf: [128]u8 = undefined;
                     const written = codec.encodeHolepunchRequest(&buf, req) catch continue;
-                    _ = self.socket.sendTo(buf[0..written], rvz_ep.addr, rvz_ep.port) catch {};
+                    _ = self.socket.sendToEndpoint(buf[0..written], rvz_ep) catch {};
                 }
             }
         }
@@ -823,6 +819,10 @@ pub const SwimProtocol = struct {
     // ─── Peer management ───
 
     pub fn registerOrUpdatePeer(self: *SwimProtocol, pubkey: [32]u8, addr: [4]u8, port: u16) void {
+        self.registerOrUpdatePeerEndpoint(pubkey, messages.Endpoint.initV4(addr, port));
+    }
+
+    pub fn registerOrUpdatePeerEndpoint(self: *SwimProtocol, pubkey: [32]u8, endpoint: messages.Endpoint) void {
         // Skip self
         if (std.mem.eql(u8, &pubkey, &self.our_pubkey)) return;
         // Skip zero pubkey (used for initial seed pings)
@@ -841,14 +841,16 @@ pub const SwimProtocol = struct {
             const ip_mod = @import("../wireguard/ip.zig");
             const pk = std.crypto.sign.Ed25519.PublicKey.fromBytes(pubkey) catch return;
             const mesh_ip = ip_mod.deriveFromPubkey(pk);
+            const mesh_ip6 = ip_mod.deriveIpv6FromPubkey(pk);
 
             self.membership.upsert(.{
                 .pubkey = pubkey,
                 .name = "",
                 .state = .alive,
-                .gossip_endpoint = .{ .addr = addr, .port = port },
+                .gossip_endpoint = endpoint,
                 .wg_pubkey = null, // Will be set via gossip wg_pubkey field
                 .mesh_ip = mesh_ip,
+                .mesh_ip6 = mesh_ip6,
                 .wg_port = 51830,
                 .lamport = self.membership.lamport,
                 .last_seen_ns = nowNs(),
@@ -865,7 +867,7 @@ pub const SwimProtocol = struct {
                 .subject_pubkey = self.our_pubkey,
                 .event = .alive,
                 .lamport = self.membership.lamport,
-                .endpoint = self.our_public_endpoint orelse .{ .addr = self.our_mesh_ip, .port = self.config.gossip_port },
+                .endpoint = self.our_public_endpoint orelse messages.Endpoint.initV6(self.our_mesh_ip6, self.config.gossip_port),
                 .wg_pubkey = self.our_wg_pubkey,
                 .public_endpoint = self.our_public_endpoint,
                 .nat_type = self.our_nat_type,
@@ -877,7 +879,7 @@ pub const SwimProtocol = struct {
                 .subject_pubkey = pubkey,
                 .event = .join,
                 .lamport = self.membership.lamport,
-                .endpoint = .{ .addr = addr, .port = port },
+                .endpoint = endpoint,
                 .wg_pubkey = if (peer_info) |p| p.wg_pubkey else null,
                 .public_endpoint = if (peer_info) |p| p.public_endpoint else null,
                 .nat_type = if (peer_info) |p| p.nat_type else .unknown,
@@ -887,7 +889,7 @@ pub const SwimProtocol = struct {
 
     // ─── PING/timeout management ───
 
-    fn sendPing(self: *SwimProtocol, addr: [4]u8, port: u16, target_pubkey: [32]u8) void {
+    fn sendPing(self: *SwimProtocol, endpoint: messages.Endpoint, target_pubkey: [32]u8) void {
         self.seq += 1;
         const gossip = self.collectGossip();
 
@@ -899,15 +901,14 @@ pub const SwimProtocol = struct {
 
         var buf: [1500]u8 = undefined;
         const written = codec.encodePing(&buf, ping) catch return;
-        _ = self.socket.sendTo(buf[0..written], addr, port) catch return;
+        _ = self.socket.sendToEndpoint(buf[0..written], endpoint) catch return;
         self.pkts_sent += 1;
 
         // Track pending
         if (self.pending_count < self.pending.len) {
             self.pending[self.pending_count] = .{
                 .target_pubkey = target_pubkey,
-                .target_addr = addr,
-                .target_port = port,
+                .target_endpoint = endpoint,
                 .seq = self.seq,
                 .sent_at_ns = nowNs(),
                 .escalated = false,
@@ -977,7 +978,7 @@ pub const SwimProtocol = struct {
 
             var buf: [128]u8 = undefined;
             const written = codec.encodePingReq(&buf, req) catch continue;
-            _ = self.socket.sendTo(buf[0..written], ep.addr, ep.port) catch continue;
+            _ = self.socket.sendToEndpoint(buf[0..written], ep) catch continue;
             sent += 1;
         }
     }
@@ -1047,7 +1048,7 @@ pub const SwimProtocol = struct {
                 // pings (set in handlePing/handleAck) is more reliable.
                 if (entry.endpoint) |ep| {
                     if (self.membership.peers.getPtr(entry.subject_pubkey) == null) {
-                        self.registerOrUpdatePeer(entry.subject_pubkey, ep.addr, ep.port);
+                        self.registerOrUpdatePeerEndpoint(entry.subject_pubkey, ep);
                     } else {
                         // Peer exists — just refresh alive state without changing endpoint
                         if (self.membership.peers.getPtr(entry.subject_pubkey)) |peer| {
@@ -1126,18 +1127,17 @@ test "swim creates sequential pings" {
     );
 
     const target_pubkey = [_]u8{3} ** 32;
-    const target_addr = [4]u8{ 127, 0, 0, 1 };
-    const target_port = 12345;
+    const target = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 12345);
 
     // Send first ping
-    swim.sendPing(target_addr, target_port, target_pubkey);
+    swim.sendPing(target, target_pubkey);
     try std.testing.expectEqual(@as(u64, 1), swim.seq);
     try std.testing.expectEqual(@as(usize, 1), swim.pending_count);
     try std.testing.expectEqual(target_pubkey, swim.pending[0].target_pubkey);
     try std.testing.expectEqual(@as(u64, 1), swim.pending[0].seq);
 
     // Send second ping
-    swim.sendPing(target_addr, target_port + 1, target_pubkey);
+    swim.sendPing(messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 12346), target_pubkey);
     try std.testing.expectEqual(@as(u64, 2), swim.seq);
     try std.testing.expectEqual(@as(usize, 2), swim.pending_count);
     try std.testing.expectEqual(@as(u64, 2), swim.pending[1].seq);

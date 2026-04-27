@@ -162,7 +162,7 @@ pub const Holepuncher = struct {
                 if (state.target_public_endpoint) |target_ep| {
                     if (state.probes_sent < MAX_PROBES) {
                         // Send probe packet
-                        _ = socket.sendTo(&PROBE_MAGIC, target_ep.addr, target_ep.port) catch {};
+                        _ = socket.sendToEndpoint(&PROBE_MAGIC, target_ep) catch {};
                         state.probes_sent += 1;
                     }
 
