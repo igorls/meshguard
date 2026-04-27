@@ -15,6 +15,14 @@ fn zio() std.Io {
 
 const version = "0.8.0";
 
+fn defaultInterfaceName() []const u8 {
+    const os = @import("builtin").os.tag;
+    if (comptime os == .linux) return lib.wireguard.Config.DEFAULT_IFNAME;
+    if (comptime os == .macos) return "utun";
+    if (comptime os == .freebsd) return "tun";
+    return "wintun";
+}
+
 const usage =
     \\meshguard — decentralized WireGuard mesh VPN daemon
     \\
@@ -781,7 +789,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
 
     try stdout.writeStreamingAll(zio(), "meshguard starting...\n");
     try writeFormatted(stdout, "  mesh IP: {s}\n", .{ip_str});
-    try writeFormatted(stdout, "  interface: {s}\n", .{if (comptime @import("builtin").os.tag == .linux) lib.wireguard.Config.DEFAULT_IFNAME else if (comptime @import("builtin").os.tag == .macos) "utun" else if (comptime @import("builtin").os.tag == .freebsd) "tun" else "wintun"});
+    try writeFormatted(stdout, "  interface: {s}\n", .{defaultInterfaceName()});
 
     try writeFormatted(stdout, "  mode: {s}\n", .{if (use_kernel_wg) "kernel" else "userspace"});
 
