@@ -264,6 +264,27 @@ pub const UdpSocket = struct {
         }
     }
 
+    /// Set this UDP socket to non-blocking mode on POSIX platforms.
+    pub fn setNonBlocking(self: *UdpSocket) !void {
+        if (comptime is_windows) return error.Unsupported;
+
+        const flags = posix.system.fcntl(self.fd, posix.F.GETFL, @as(usize, 0));
+        switch (posix.errno(flags)) {
+            .SUCCESS => {},
+            else => |err| return posix.unexpectedErrno(err),
+        }
+
+        const rc = posix.system.fcntl(
+            self.fd,
+            posix.F.SETFL,
+            @as(usize, @intCast(flags)) | @as(usize, 1 << @bitOffsetOf(posix.O, "NONBLOCK")),
+        );
+        switch (posix.errno(rc)) {
+            .SUCCESS => {},
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    }
+
     /// Close the socket.
     pub fn close(self: *UdpSocket) void {
         closeSocket(self.fd);

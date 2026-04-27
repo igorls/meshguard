@@ -64,7 +64,14 @@ fn formatIp(ip: [4]u8, buf: *[15]u8) []const u8 {
 }
 
 fn formatNetmask(prefix_len: u8, buf: *[15]u8) []const u8 {
-    const mask: u32 = if (prefix_len >= 32) 0xFFFFFFFF else (@as(u32, 0xFFFFFFFF) << @intCast(32 - @as(u6, @intCast(prefix_len))));
+    const mask: u32 = if (prefix_len == 0)
+        0
+    else if (prefix_len >= 32)
+        0xFFFFFFFF
+    else blk: {
+        const shift: u5 = @intCast(32 - prefix_len);
+        break :blk @as(u32, 0xFFFFFFFF) << shift;
+    };
     return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{
         @as(u8, @truncate(mask >> 24)),
         @as(u8, @truncate(mask >> 16)),

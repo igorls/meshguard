@@ -2853,24 +2853,6 @@ fn windowsEventLoop(
     }
 }
 
-fn setFdNonBlocking(fd: posix.fd_t) !void {
-    const flags = posix.system.fcntl(fd, posix.F.GETFL, @as(usize, 0));
-    switch (posix.errno(flags)) {
-        .SUCCESS => {},
-        else => |err| return posix.unexpectedErrno(err),
-    }
-
-    const rc = posix.system.fcntl(
-        fd,
-        posix.F.SETFL,
-        @as(usize, @intCast(flags)) | @as(usize, 1 << @bitOffsetOf(posix.O, "NONBLOCK")),
-    );
-    switch (posix.errno(rc)) {
-        .SUCCESS => {},
-        else => |err| return posix.unexpectedErrno(err),
-    }
-}
-
 /// macOS userspace event loop — simplified single-threaded poll loop.
 ///
 /// Similar to windowsEventLoop: alternates between TUN reads and UDP gossip.
@@ -3012,7 +2994,7 @@ fn freebsdEventLoop(
     const Device = lib.wireguard.Device;
     const Noise = lib.wireguard.Noise;
 
-    setFdNonBlocking(udp_sock.fd) catch {};
+    udp_sock.setNonBlocking() catch {};
 
     var kq = try lib.net.Kqueue.Kqueue.init();
     defer kq.close();
