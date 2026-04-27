@@ -37,7 +37,7 @@ pub const Kqueue = struct {
     pub fn wait(self: *Kqueue, events: []Event, timeout_ms: i32) !usize {
         var timeout = c.struct_timespec{
             .tv_sec = @intCast(@divTrunc(timeout_ms, 1000)),
-            .tv_nsec = @as(c_long, @intCast(@mod(timeout_ms, 1000))) * @as(c_long, std.time.ns_per_ms),
+            .tv_nsec = @as(c_long, @intCast(@mod(timeout_ms, 1000))) * 1_000_000,
         };
         const rc = c.kevent(self.fd, null, 0, events.ptr, @intCast(events.len), &timeout);
         if (rc < 0) return error.KqueueWaitFailed;
