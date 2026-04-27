@@ -41,7 +41,7 @@ pub fn encodePing(buf: []u8, ping: messages.Ping) !usize {
     pos += 1;
 
     for (ping.gossip[0..gossip_count]) |entry| {
-        pos += encodeGossipEntry(buf[pos..], entry);
+        pos += try encodeGossipEntry(buf[pos..], entry);
     }
 
     return pos;
@@ -68,7 +68,7 @@ pub fn encodeAck(buf: []u8, ack: messages.Ack) !usize {
     pos += 1;
 
     for (ack.gossip[0..gossip_count]) |entry| {
-        pos += encodeGossipEntry(buf[pos..], entry);
+        pos += try encodeGossipEntry(buf[pos..], entry);
     }
 
     return pos;
@@ -110,7 +110,7 @@ pub fn encodeHolepunchRequest(buf: []u8, req: messages.HolepunchRequest) !usize 
     @memcpy(buf[pos..][0..32], &req.target_pubkey);
     pos += 32;
 
-    pos += encodeEndpoint(buf[pos..], req.public_endpoint);
+    pos += try encodeEndpoint(buf[pos..], req.public_endpoint);
 
     @memcpy(buf[pos..][0..16], &req.token);
     pos += 16;
@@ -129,7 +129,7 @@ pub fn encodeHolepunchResponse(buf: []u8, resp: messages.HolepunchResponse) !usi
     @memcpy(buf[pos..][0..32], &resp.sender_pubkey);
     pos += 32;
 
-    pos += encodeEndpoint(buf[pos..], resp.public_endpoint);
+    pos += try encodeEndpoint(buf[pos..], resp.public_endpoint);
 
     @memcpy(buf[pos..][0..16], &resp.token_echo);
     pos += 16;
@@ -217,7 +217,7 @@ pub fn encodeOrgTrustVouch(buf: []u8, msg: messages.OrgTrustVouch) !usize {
     return pos;
 }
 
-fn encodeGossipEntry(buf: []u8, entry: messages.GossipEntry) usize {
+fn encodeGossipEntry(buf: []u8, entry: messages.GossipEntry) !usize {
     var pos: usize = 0;
 
     @memcpy(buf[pos..][0..32], &entry.subject_pubkey);
@@ -229,7 +229,7 @@ fn encodeGossipEntry(buf: []u8, entry: messages.GossipEntry) usize {
     std.mem.writeInt(u64, buf[pos..][0..8], entry.lamport, .little);
     pos += 8;
 
-    pos += encodeEndpoint(buf[pos..], entry.endpoint);
+    pos += try encodeEndpoint(buf[pos..], entry.endpoint);
 
     // WG public key
     if (entry.wg_pubkey) |wg_key| {
@@ -245,7 +245,7 @@ fn encodeGossipEntry(buf: []u8, entry: messages.GossipEntry) usize {
     }
 
     // Public endpoint (STUN-discovered)
-    pos += encodeEndpoint(buf[pos..], entry.public_endpoint);
+    pos += try encodeEndpoint(buf[pos..], entry.public_endpoint);
 
     // NAT type
     buf[pos] = @intFromEnum(entry.nat_type);
@@ -254,8 +254,8 @@ fn encodeGossipEntry(buf: []u8, entry: messages.GossipEntry) usize {
     return pos;
 }
 
-fn encodeEndpoint(buf: []u8, endpoint: ?messages.Endpoint) usize {
-    if (buf.len < ENDPOINT_SIZE) return 0;
+fn encodeEndpoint(buf: []u8, endpoint: ?messages.Endpoint) !usize {
+    if (buf.len < ENDPOINT_SIZE) return error.BufferTooShort;
     if (endpoint) |ep| {
         buf[0] = 1;
         if (ep.addr6) |addr6| {

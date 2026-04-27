@@ -102,42 +102,27 @@ fn splitHostPort(s: []const u8) ?struct { host: []const u8, port: []const u8 } {
 
 fn parseIpv6(s: []const u8) ?[16]u8 {
     if (std.mem.indexOfScalar(u8, s, ':') == null) return null;
-    var out: [16]u8 = .{0} ** 16;
     var groups: [8]u16 = .{0} ** 8;
     var group_count: usize = 0;
-    var compress_at: ?usize = null;
-    var i: usize = 0;
-    while (i < s.len) {
-        if (s[i] == ':') {
-            if (i + 1 < s.len and s[i + 1] == ':') {
-                if (compress_at != null) return null;
-                compress_at = group_count;
-                i += 2;
-                if (i >= s.len) break;
-                continue;
-            }
-            // A single ':' is only valid as a separator, and separators are
-            // consumed after parsing a non-empty group below.
-            return null;
-        }
-        const start = i;
-        while (i < s.len and s[i] != ':') : (i += 1) {}
-        if (group_count >= 8 or i - start > 4) return null;
-        groups[group_count] = std.fmt.parseInt(u16, s[start..i], 16) catch return null;
-        group_count += 1;
-        // Consume a single group separator, but leave "::" for the compression
-        // branch at the start of the next loop iteration.
-        if (i < s.len and s[i] == ':' and !(i + 1 < s.len and s[i + 1] == ':')) i += 1;
-    }
 
-    const zeros = if (compress_at) |_| 8 - group_count else 0;
-    if (compress_at == null and group_count != 8) return null;
-    if (compress_at != null and group_count >= 8) return null;
+    const compress_idx = std.mem.indexOf(u8, s, "::");
+    if (compress_idx != null and std.mem.indexOf(u8, s[compress_idx.? + 2 ..], "::") != null) return null;
+
+    const left = if (compress_idx) |idx| s[0..idx] else s;
+    const right = if (compress_idx) |idx| s[idx + 2 ..] else "";
+
+    group_count += parseIpv6Part(left, groups[group_count..]) orelse return null;
+    const right_count = parseIpv6Part(right, groups[group_count..]) orelse return null;
+    if (group_count + right_count > 8) return null;
+    if (compress_idx == null and group_count + right_count != 8) return null;
+    if (compress_idx != null and group_count + right_count >= 8) return null;
+    const zeros = if (compress_idx != null) 8 - group_count - right_count else 0;
 
     var src: usize = 0;
     var dst: usize = 0;
+    var out: [16]u8 = .{0} ** 16;
     while (dst < 8) : (dst += 1) {
-        const value: u16 = if (compress_at != null and dst >= compress_at.? and dst < compress_at.? + zeros)
+        const value: u16 = if (compress_idx != null and dst >= group_count and dst < group_count + zeros)
             0
         else blk: {
             const v = groups[src];
@@ -148,6 +133,18 @@ fn parseIpv6(s: []const u8) ?[16]u8 {
         out[dst * 2 + 1] = @truncate(value);
     }
     return out;
+}
+
+fn parseIpv6Part(part: []const u8, out: []u16) ?usize {
+    if (part.len == 0) return 0;
+    var count: usize = 0;
+    var iter = std.mem.splitScalar(u8, part, ':');
+    while (iter.next()) |group| {
+        if (group.len == 0 or group.len > 4 or count >= out.len) return null;
+        out[count] = std.fmt.parseInt(u16, group, 16) catch return null;
+        count += 1;
+    }
+    return count;
 }
 
 /// Resolve a "hostname:port" seed by looking up the hostname via DNS A record.

@@ -284,7 +284,9 @@ pub const UdpSocket = struct {
 
     /// Receive a datagram (non-blocking). Returns null if no data available.
     pub fn recvFrom(self: UdpSocket, buf: []u8) !?RecvResult {
-        if (self.ipv6) return self.recvFrom6(buf);
+        if (self.ipv6) {
+            return self.recvFrom6(buf);
+        }
         var src_addr: posix.sockaddr.in = undefined;
         var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
 

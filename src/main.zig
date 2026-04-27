@@ -1661,6 +1661,7 @@ const WgHandlerCtx = struct {
 
 fn wgOnPeerJoin(ctx: *anyopaque, peer: *const lib.discovery.Membership.Peer) void {
     const handler: *WgHandlerCtx = @ptrCast(@alignCast(ctx));
+    const Endpoint = @import("protocol/messages.zig").Endpoint;
 
     if (peer.wg_pubkey) |wg_key| {
         var ip_buf: [15]u8 = undefined;
@@ -1691,9 +1692,9 @@ fn wgOnPeerJoin(ctx: *anyopaque, peer: *const lib.discovery.Membership.Peer) voi
             }
         } else if (handler.wg_device) |dev| {
             // Userspace mode: register peer in WgDevice
-            const peer_endpoint = if (peer.gossip_endpoint) |ep| ep else if (peer.public_endpoint) |pub_ep| pub_ep else @as(?@import("protocol/messages.zig").Endpoint, null);
+            const peer_endpoint: ?Endpoint = if (peer.gossip_endpoint) |ep| ep else if (peer.public_endpoint) |pub_ep| pub_ep else null;
 
-            const slot = dev.addPeerWithEndpoint(peer.pubkey, wg_key, peer_endpoint orelse @import("protocol/messages.zig").Endpoint.initV4(.{ 0, 0, 0, 0 }, 0), peer.mesh_ip, peer.mesh_ip6) catch {
+            const slot = dev.addPeerWithEndpoint(peer.pubkey, wg_key, peer_endpoint orelse Endpoint.initV4(.{ 0, 0, 0, 0 }, 0), peer.mesh_ip, peer.mesh_ip6) catch {
                 writeFormatted(handler.stdout, "  warning: failed to add userspace WG peer {s}\n", .{ip_str}) catch {};
                 return;
             };
