@@ -5,6 +5,8 @@
 const std = @import("std");
 const linux = std.os.linux;
 const nl = @import("nlsocket.zig");
+const RTA_DST: u16 = 1;
+const RTA_OIF: u16 = 4;
 
 /// Create a WireGuard network interface.
 pub fn createWgInterface(name: []const u8) !void {
@@ -231,13 +233,11 @@ pub fn addRoute(ifindex: u32, dst: [4]u8, prefix_len: u8) !void {
         .flags = 0,
     });
 
-    // RTA_DST = 1
-    b.addAttr(1, &dst);
+    b.addAttr(RTA_DST, &dst);
 
-    // RTA_OIF = 4 (output interface)
     var oif_bytes: [4]u8 = undefined;
     std.mem.writeInt(u32, &oif_bytes, ifindex, .little);
-    b.addAttr(4, &oif_bytes);
+    b.addAttr(RTA_OIF, &oif_bytes);
 
     const msg = b.finish();
     try sock.sendAndAck(msg);
@@ -278,10 +278,10 @@ pub fn addRoute6(ifindex: u32, dst: [16]u8, prefix_len: u8) !void {
         .flags = 0,
     });
 
-    b.addAttr(1, &dst);
+    b.addAttr(RTA_DST, &dst);
     var oif_bytes: [4]u8 = undefined;
     std.mem.writeInt(u32, &oif_bytes, ifindex, .little);
-    b.addAttr(4, &oif_bytes);
+    b.addAttr(RTA_OIF, &oif_bytes);
 
     const msg = b.finish();
     try sock.sendAndAck(msg);

@@ -116,6 +116,8 @@ fn parseIpv6(s: []const u8) ?[16]u8 {
                 if (i >= s.len) break;
                 continue;
             }
+            // A single ':' is only valid as a separator, and separators are
+            // consumed after parsing a non-empty group below.
             return null;
         }
         const start = i;
@@ -182,6 +184,15 @@ test "parse IPv6 endpoint" {
     try std.testing.expectEqual(ep.addr6.?[0], 0xfd);
     try std.testing.expectEqual(ep.addr6.?[1], 0x99);
     try std.testing.expectEqual(ep.port, 51821);
+
+    const compressed_zero = parseEndpoint("[::0]:51821").?;
+    try std.testing.expect(compressed_zero.addr6 != null);
+    try std.testing.expectEqual(compressed_zero.addr6.?[15], 0);
+
+    const zero_group = parseEndpoint("[fd99:0::1]:51821").?;
+    try std.testing.expect(zero_group.addr6 != null);
+    try std.testing.expectEqual(zero_group.addr6.?[2], 0);
+    try std.testing.expectEqual(zero_group.addr6.?[3], 0);
 }
 
 test "parse invalid endpoint" {
