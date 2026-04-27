@@ -24,7 +24,7 @@ pub const PacketType = enum {
     stun, // STUN binding response
     unknown,
 
-    pub inline fn classify(data: []const u8) PacketType {
+    pub fn classify(data: []const u8) PacketType {
         if (data.len < 4) return .unknown;
 
         // WireGuard messages: first byte is type, next 3 are zeros

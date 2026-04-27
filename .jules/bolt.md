@@ -1,4 +1,7 @@
 
 ## 2024-05-19 - Optimization: Dominant packet path extraction
-**Learning:** Zig switch statements over integer values compile down to jump tables or sequential branches depending on the optimizer. In hot loops like `PacketType.classify(pkt)` checking, an enum `switch` can cause a pipeline stall on jump evaluation.
-**Action:** Extracting the dominant data-plane case (e.g. `if (pkt_type == .wg_transport)`) explicitly before the `switch` statement forces the compiler to emit a direct branch instruction, which the CPU branch predictor handles much more efficiently, avoiding jump table overhead on the hot path. Remember to include the unreachable case within the switch so the code compiles.
+**Learning:** There are two distinct hot-path switches in packet classification:
+1. `PacketType.classify` switches over the raw integer `msg_type` (a `u32` read from the first 4 bytes). Zig compiles integer switches to jump tables or sequential branches depending on the optimizer; on this critical inner loop the jump table evaluation adds measurable overhead.
+2. The event loops (`processIncomingPacket`, `windowsEventLoop`, `macosEventLoop`) switch over the `PacketType` enum returned by `classify`.
+
+**Action:** In both cases, extracting the dominant data-plane case as an explicit `if` branch before the `switch` — `if (msg_type == 4) return .wg_transport;` in `classify`, and `if (pkt_type == .wg_transport)` in the event loops — forces the compiler to emit a single, predictable branch instruction that the CPU branch predictor handles efficiently. The remaining `switch` arm for the extracted value is then marked `unreachable` so the switch stays exhaustive and the compiler can elide it on the fast path.
