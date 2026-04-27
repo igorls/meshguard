@@ -1,7 +1,7 @@
-///! FreeBSD TUN device interface for userspace WireGuard.
-///!
-///! Opens the clone TUN device at /dev/tun and uses TUNGIFNAME to discover
-///! the kernel-assigned interface name.
+//! FreeBSD TUN device interface for userspace WireGuard.
+//!
+//! Opens the clone TUN device at /dev/tun and uses TUNGIFNAME to discover
+//! the kernel-assigned interface name.
 const std = @import("std");
 const posix = std.posix;
 

@@ -1,4 +1,4 @@
-///! Minimal FreeBSD kqueue wrapper for userspace TUN/UDP readiness.
+//! Minimal FreeBSD kqueue wrapper for userspace TUN/UDP readiness.
 const std = @import("std");
 const posix = std.posix;
 

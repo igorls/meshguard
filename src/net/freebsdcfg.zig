@@ -1,6 +1,6 @@
-///! FreeBSD network interface configuration for meshguard.
-///!
-///! Uses ifconfig/route commands to configure cloned tun(4) interfaces.
+//! FreeBSD network interface configuration for meshguard.
+//!
+//! Uses ifconfig/route commands to configure cloned tun(4) interfaces.
 const std = @import("std");
 
 fn zio() std.Io {
