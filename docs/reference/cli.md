@@ -243,3 +243,73 @@ meshguard connect --join mg://...
 | Variable               | Description                                                |
 | ---------------------- | ---------------------------------------------------------- |
 | `MESHGUARD_CONFIG_DIR` | Override config directory (default: `~/.config/meshguard`) |
+
+---
+
+## `meshguard org-keygen`
+
+Generate a new Ed25519 organization keypair.
+
+```bash
+meshguard org-keygen
+```
+
+**Output files** (in `$MESHGUARD_CONFIG_DIR/org/`):
+
+- `org/org.key` — secret key (permissions `0600`)
+- `org/org.pub` — public key
+
+---
+
+## `meshguard org-sign`
+
+Sign a node's public key with the organization key.
+
+```bash
+meshguard org-sign <node-key-or-path> [--name <label>] [--expires <unix-timestamp>]
+```
+
+| Argument | Description |
+| -------- | ----------- |
+| `<node-key-or-path>` | Base64 public key string _or_ path to a `.pub` file |
+| `--name` | Human-readable name for the node |
+| `--expires` | Unix timestamp when the signature expires (default: 0, never expires) |
+
+---
+
+## `meshguard org-vouch`
+
+Vouch for an external node. This action auto-propagates to organization members.
+
+```bash
+meshguard org-vouch <node-key-or-path>
+```
+
+| Argument | Description |
+| -------- | ----------- |
+| `<node-key-or-path>` | Base64 public key string _or_ path to a `.pub` file |
+
+---
+
+## `meshguard upgrade`
+
+Upgrade meshguard to the latest release from GitHub.
+
+> **Platform:** Linux (amd64) only. This command downloads the `meshguard-linux-amd64` asset from the latest GitHub release. It is not supported on other operating systems or architectures.
+>
+> **Privileges:** Requires write access to `/usr/local/bin/meshguard`. Run with `sudo` if the current user does not have sufficient permissions.
+>
+> **Service management:** Uses `systemctl` to stop the `meshguard` service before installing the new binary and restart it afterwards. Ensure `systemd` is available on your system.
+
+```bash
+meshguard upgrade
+# or, if elevated privileges are required:
+sudo meshguard upgrade
+```
+
+The command:
+1. Queries the GitHub Releases API for the latest tag.
+2. Downloads `meshguard-linux-amd64` from that release.
+3. Stops the `meshguard` systemd service.
+4. Installs the new binary to `/usr/local/bin/meshguard`.
+5. Restarts the `meshguard` systemd service.
