@@ -254,10 +254,10 @@ Generate a new Ed25519 organization keypair.
 meshguard org-keygen
 ```
 
-**Output files** (in `$MESHGUARD_CONFIG_DIR`):
+**Output files** (in `$MESHGUARD_CONFIG_DIR/org/`):
 
-- `org.key` — secret key (permissions `0600`)
-- `org.pub` — public key
+- `org/org.key` — secret key (permissions `0600`)
+- `org/org.pub` — public key
 
 ---
 
@@ -295,6 +295,21 @@ meshguard org-vouch <node-key-or-path>
 
 Upgrade meshguard to the latest release from GitHub.
 
+> **Platform:** Linux (amd64) only. This command downloads the `meshguard-linux-amd64` asset from the latest GitHub release. It is not supported on other operating systems or architectures.
+>
+> **Privileges:** Requires write access to `/usr/local/bin/meshguard`. Run with `sudo` if the current user does not have sufficient permissions.
+>
+> **Service management:** Uses `systemctl` to stop the `meshguard` service before installing the new binary and restart it afterwards. Ensure `systemd` is available on your system.
+
 ```bash
 meshguard upgrade
+# or, if elevated privileges are required:
+sudo meshguard upgrade
 ```
+
+The command:
+1. Queries the GitHub Releases API for the latest tag.
+2. Downloads `meshguard-linux-amd64` from that release.
+3. Stops the `meshguard` systemd service.
+4. Installs the new binary to `/usr/local/bin/meshguard`.
+5. Restarts the `meshguard` systemd service.
