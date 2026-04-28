@@ -14,7 +14,7 @@ env:
 jobs:
   # ─── Validate that the tag matches src/version.zig ───
   validate:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, zig]
     steps:
       - uses: actions/checkout@v4
 
@@ -40,45 +40,30 @@ jobs:
 
   build:
     needs: validate
+    runs-on: [self-hosted, zig]
     strategy:
       matrix:
         include:
           - target: x86_64-linux-gnu
             artifact: meshguard-linux-amd64
             ext: ""
-            sodium: true
           - target: x86_64-windows
             artifact: meshguard-windows-amd64
             ext: ".exe"
-            sodium: false
           - target: x86_64-freebsd
             artifact: meshguard-freebsd-amd64
             ext: ""
-            sodium: false
           - target: x86_64-macos
             artifact: meshguard-macos-amd64
             ext: ""
-            sodium: false
           - target: aarch64-macos
             artifact: meshguard-macos-arm64
             ext: ""
-            sodium: false
           # NOTE: aarch64-linux-gnu excluded — batch_udp.zig uses hardcoded
-          # x86_64 syscall numbers (SYS_sendmmsg=307, SYS_recvmmsg=299).
-          # Track fix: make syscall numbers arch-aware via linux.SYS enum.
+          # x86_64 syscall numbers. Track fix separately.
 
-    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install dependencies
-        if: matrix.sodium
-        run: sudo apt-get update && sudo apt-get install -y libsodium-dev
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
 
       - name: Build
         run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
@@ -94,7 +79,7 @@ jobs:
 
   release:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, zig]
     steps:
       - uses: actions/checkout@v4
 
