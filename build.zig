@@ -13,6 +13,7 @@ pub fn build(b: *std.Build) void {
     const is_ios = resolved_os == .ios;
     const is_windows = resolved_os == .windows;
     const is_macos = resolved_os == .macos;
+    const is_freebsd = resolved_os == .freebsd;
 
     // ─── FFI module (for mobile embedding — not built on Windows) ───
     if (!is_windows) {
@@ -32,8 +33,8 @@ pub fn build(b: *std.Build) void {
         });
 
         // Link libsodium on Linux desktop targets for AVX2-accelerated crypto.
-        // On Android, macOS, iOS, and Windows, the Zig std.crypto software fallback is used.
-        if (!is_android and !is_macos and !is_ios) {
+        // On Android, macOS, iOS, FreeBSD, and Windows, the Zig std.crypto software fallback is used.
+        if (!is_android and !is_macos and !is_ios and !is_freebsd) {
             ffi_mod.linkSystemLibrary("sodium", .{});
         }
 
@@ -63,8 +64,8 @@ pub fn build(b: *std.Build) void {
             .root_module = exe_mod,
         });
         // Link libsodium on Linux desktop only (AVX2 ChaCha20-Poly1305 assembly)
-        // macOS and Windows use std.crypto
-        if (!is_windows and !is_macos) {
+        // macOS, FreeBSD, and Windows use std.crypto
+        if (!is_windows and !is_macos and !is_freebsd) {
             exe_mod.linkSystemLibrary("sodium", .{});
         }
         // On Windows, link ws2_32 for Winsock2 sockets
@@ -79,7 +80,7 @@ pub fn build(b: *std.Build) void {
         }
 
         // ─── WG interop test binary (Linux only — requires kernel WG) ───
-        if (!is_windows and !is_macos) {
+        if (!is_windows and !is_macos and !is_freebsd) {
             const interop_mod = b.createModule(.{
                 .root_source_file = b.path("src/wg_interop.zig"),
                 .target = target,
@@ -123,7 +124,7 @@ pub fn build(b: *std.Build) void {
         const unit_tests = b.addTest(.{
             .root_module = test_mod,
         });
-        if (!is_windows and !is_macos) {
+        if (!is_windows and !is_macos and !is_freebsd) {
             test_mod.linkSystemLibrary("sodium", .{});
         }
         if (is_windows) {

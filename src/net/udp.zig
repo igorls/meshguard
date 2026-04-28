@@ -1,5 +1,5 @@
 //! UDP socket abstraction for meshguard gossip.
-//! Cross-platform: Linux (syscalls), Windows (Winsock2).
+//! Cross-platform: Linux (syscalls), Windows (Winsock2), macOS/FreeBSD (BSD sockets).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -8,6 +8,8 @@ const is_linux = builtin.os.tag == .linux;
 const is_macos = builtin.os.tag == .macos;
 const is_ios = builtin.os.tag == .ios;
 const is_darwin = is_macos or is_ios;
+const is_freebsd = builtin.os.tag == .freebsd;
+const is_bsd = is_darwin or is_freebsd;
 const posix = std.posix;
 const messages = @import("../protocol/messages.zig");
 
@@ -83,7 +85,7 @@ pub const UdpSocket = struct {
             }
         } else {
             try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one));
-            if (comptime is_darwin) {
+            if (comptime is_bsd) {
                 const SO_REUSEPORT: u32 = 0x0200;
                 posix.setsockopt(fd, posix.SOL.SOCKET, SO_REUSEPORT, std.mem.asBytes(&one)) catch {};
             }
@@ -358,8 +360,8 @@ pub const UdpSocket = struct {
     /// Poll the socket for readability with a timeout (milliseconds).
     /// Returns true if data is available.
     pub fn pollRead(self: UdpSocket, timeout_ms: i32) !bool {
-        if (comptime is_linux or is_darwin) {
-            // Use std.posix.poll — works on Linux, macOS, iOS, and Android
+        if (comptime is_linux or is_bsd) {
+            // Use std.posix.poll — works on Linux, macOS, iOS, FreeBSD, and Android
             // without requiring C headers (critical for iOS cross-compilation).
             const POLLIN: i16 = 0x0001;
             var fds = [1]std.posix.pollfd{.{
