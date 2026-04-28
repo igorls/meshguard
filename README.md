@@ -5,7 +5,7 @@
 
 **Decentralized, serverless, WireGuard®-compatible mesh VPN daemon.**
 
-Zero central authority. Trust-agnostic. Single static binary.
+Zero central authority. Trust-agnostic. Dual-stack IPv4/IPv6. Single static binary.
 
 ## The Problem
 
@@ -61,9 +61,10 @@ Building a secure mesh network between N nodes (blockchain validators, edge serv
 | **Dual WireGuard modes**     | Kernel module (fastest) or full userspace (portable, zero dependencies)                                                               |
 | **Trust-agnostic**           | `authorized_keys/` directory — you decide how keys get there                                                                          |
 | **Org trust (hierarchical)** | Trust one org key → auto-accept all nodes signed by that org                                                                          |
-| **Deterministic mesh IPs**   | Blake3(pubkey) → `10.99.X.Y`. No DHCP, no conflicts, no coordination                                                                  |
+| **Deterministic mesh IPs**   | Blake3(pubkey) → `10.99.X.Y` (IPv4) + `fd99:6d67::X:Y` (IPv6 ULA). No DHCP, no conflicts, no coordination                            |
 | **Deterministic mesh DNS**   | Blake3(org_pubkey) → `*.a1b2c3.mesh`. Per-org deterministic subdomains                                                                |
-| **Android FFI embedding**    | C-ABI shared library — SWIM gossip + encrypted messaging without WireGuard TUN. Build with `zig build -Dtarget=aarch64-linux-android` |
+| **Cross-platform**           | Linux, macOS, FreeBSD, Windows, Android, iOS — same Zig codebase, platform-specific TUN + ifconfig/netlink                            |
+| **Android/iOS FFI**          | C-ABI shared/static library — SWIM gossip + encrypted messaging without TUN. Build with `zig build -Dtarget=aarch64-linux-android`    |
 | **libc `poll()` compat**     | Uses POSIX `poll()` via libc instead of raw Linux syscall — required for Android seccomp                                              |
 
 ## Quick Start
@@ -185,7 +186,9 @@ Trust authorization order:
 ### Identity & Addressing
 
 - Ed25519 keypair per node (`identity.key` / `identity.pub`)
-- Mesh IP deterministically derived: `Blake3(pubkey) → 10.99.X.Y`
+- Mesh IPv4 deterministically derived: `Blake3(pubkey) → 10.99.X.Y/16`
+- Mesh IPv6 deterministically derived: `Blake3(pubkey) → fd99:6d67::X:Y/64` (ULA, RFC 4193)
+- Dual-stack: both addresses assigned to the TUN interface automatically
 - Authorized keys directory gates mesh membership
 - **Org certificates**: 186-byte Ed25519-signed `NodeCertificate` for fleet trust
 - **Mesh DNS**: deterministic `*.a1b2c3.mesh` domains per org, gossip-propagated aliases
@@ -267,23 +270,36 @@ docker compose -f docker-compose.bench.yml up
 
 ### Linux Server / Desktop
 
-- **Zig 0.15+**
+- **Zig 0.16+**
 - **Linux** (kernel WireGuard module _or_ TUN device support)
 - **libsodium** (`libsodium-dev` for building, `libsodium23` at runtime)
 - `sudo` or `CAP_NET_ADMIN` for interface creation
 
+### macOS
+
+- **Zig 0.16+**
+- `sudo` for utun interface creation
+- No libsodium needed — uses `std.crypto` on macOS
+
+### FreeBSD
+
+- **Zig 0.16+**
+- `sudo` or root for `/dev/tun` access
+- No libsodium needed — uses `std.crypto` on FreeBSD
+
 ### Windows
 
-- **Zig 0.15+** (for building from source)
+- **Zig 0.16+** (for building from source)
 - **Administrator privileges** for TUN interface creation
 - **wintun.dll** — bundled automatically by the build system and install script
 - No libsodium needed — uses `std.crypto` on Windows
 
-### Android (FFI)
+### Android / iOS (FFI)
 
-- **Zig 0.15+** (cross-compiles to Android targets)
+- **Zig 0.16+** (cross-compiles to Android/iOS targets)
 - **No libsodium** — the FFI library uses `std.crypto` only
-- Android NDK **not required** — Zig's bundled libc includes Bionic headers
+- Android NDK / iOS SDK **not required** — Zig's bundled libc includes platform headers
+- iOS builds produce a static library (`libmeshguard-ffi.a`)
 
 ## Building
 
@@ -300,12 +316,21 @@ zig build test
 # Cross-compile for aarch64 Linux
 zig build -Dtarget=aarch64-linux-gnu -Doptimize=ReleaseFast
 
+# macOS (native or cross-compile)
+zig build -Dtarget=aarch64-macos -Doptimize=ReleaseFast
+
+# FreeBSD (cross-compile)
+zig build -Dtarget=x86_64-freebsd -Doptimize=ReleaseFast
+
 # Windows (native or cross-compile)
 zig build -Dtarget=x86_64-windows -Doptimize=ReleaseFast
 # → zig-out/bin/meshguard.exe + wintun.dll
 
 # Android aarch64 (produces libmeshguard-ffi.so only)
 zig build -Dtarget=aarch64-linux-android -Doptimize=ReleaseFast
+
+# iOS aarch64 (produces libmeshguard-ffi.a — static)
+zig build -Dtarget=aarch64-ios -Doptimize=ReleaseFast
 ```
 
 Windows builds automatically bundle `wintun.dll` alongside `meshguard.exe`.
@@ -346,14 +371,15 @@ Core functionality is implemented and under active benchmarking:
 - [x] Open mode (`--open` flag for trust-free operation)
 - [x] Service access control (`meshguard service` — per-peer/org/global port policies)
 - [x] WireGuard tunnel FFI API (open/send/recv/close for encrypted audio/data channels)
-- [x] Compile-time AEAD backend selection (libsodium on Linux, std.crypto on Android)
-- [ ] Multi-queue TUN (`IFF_MULTI_QUEUE`)
-- [ ] `io_uring` event loop
-- [ ] IPv6 support
+- [x] Compile-time AEAD backend selection (libsodium on Linux, std.crypto on Android/macOS/FreeBSD/Windows)
+- [x] Multi-queue TUN (`IFF_MULTI_QUEUE` — Linux, parallel I/O via flow-hash distribution)
+- [x] `io_uring` TUN reader (implemented, runtime-disabled pending bare-metal TUN validation)
+- [x] IPv6 dual-stack (ULA `fd99:6d67::/64`, deterministic from pubkey via Blake3)
 - [x] DNS / mDNS seed discovery
-- [ ] macOS support (utun)
-- [ ] FreeBSD support
+- [x] macOS support (utun + ifconfig/route)
+- [x] FreeBSD support (tun(4) + ifconfig/route)
 - [x] Windows support (Wintun + named pipe IPC)
+- [x] iOS FFI static library (`libmeshguard-ffi.a`)
 
 ## Mobile / Embedded
 

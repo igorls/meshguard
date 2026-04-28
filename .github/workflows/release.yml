@@ -9,12 +9,74 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  # ─── Validate that the tag matches src/version.zig ───
+  validate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check version consistency
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          SRC=$(grep 'pub const version' src/version.zig | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$TAG" != "$SRC" ]; then
+            echo "::error::Tag v$TAG does not match src/version.zig ($SRC)"
+            echo "  Update src/version.zig before tagging."
+            exit 1
+          fi
+          echo "✓ Tag v$TAG matches src/version.zig"
+
+      - name: Check CHANGELOG entry
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          if ! grep -q "## \[$TAG\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no entry for [$TAG]"
+            exit 1
+          fi
+          echo "✓ CHANGELOG.md has entry for $TAG"
+
+  build:
+    needs: validate
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-linux-gnu
+            os: ubuntu-latest
+            artifact: meshguard-linux-amd64
+            ext: ""
+            sodium: true
+          - target: aarch64-linux-gnu
+            os: ubuntu-latest
+            artifact: meshguard-linux-arm64
+            ext: ""
+            sodium: true
+          - target: x86_64-windows
+            os: ubuntu-latest
+            artifact: meshguard-windows-amd64
+            ext: ".exe"
+            sodium: false
+          - target: x86_64-freebsd
+            os: ubuntu-latest
+            artifact: meshguard-freebsd-amd64
+            ext: ""
+            sodium: false
+          - target: x86_64-macos
+            os: ubuntu-latest
+            artifact: meshguard-macos-amd64
+            ext: ""
+            sodium: false
+          - target: aarch64-macos
+            os: ubuntu-latest
+            artifact: meshguard-macos-arm64
+            ext: ""
+            sodium: false
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
       - name: Install dependencies
+        if: matrix.sodium
         run: sudo apt-get update && sudo apt-get install -y libsodium-dev
 
       - name: Setup Zig
@@ -22,51 +84,52 @@ jobs:
         with:
           version: 0.16.0
 
-      # ─── Linux amd64 ───
-      - name: Build Linux amd64
-        run: zig build -Doptimize=ReleaseFast
+      - name: Build
+        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
 
-      - name: Rename Linux binary
-        run: mv zig-out/bin/meshguard meshguard-linux-amd64
+      - name: Rename artifact
+        run: mv zig-out/bin/meshguard${{ matrix.ext }} ${{ matrix.artifact }}${{ matrix.ext }}
 
-      # ─── Windows amd64 (cross-compile) ───
-      - name: Build Windows amd64
-        run: zig build -Dtarget=x86_64-windows -Doptimize=ReleaseFast
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}${{ matrix.ext }}
 
-      - name: Rename Windows binary
-        run: mv zig-out/bin/meshguard.exe meshguard-windows-amd64.exe
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Copy wintun.dll
-        run: cp deps/wintun/wintun.dll wintun.dll
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
 
-      # ─── Checksums ───
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+          # Flatten artifacts into release dir
+          for dir in artifacts/*/; do
+            cp "$dir"* release/ 2>/dev/null || true
+          done
+          # Bundle wintun.dll for Windows
+          cp deps/wintun/wintun.dll release/wintun.dll
+
       - name: Generate checksums
-        run: sha256sum meshguard-linux-amd64 meshguard-windows-amd64.exe wintun.dll > checksums.txt
+        working-directory: release
+        run: sha256sum * > checksums.txt
 
-      # ─── Release ───
+      - name: Extract changelog for this version
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          # Extract the section for this version from CHANGELOG.md
+          awk "/^## \[$TAG\]/{found=1; next} /^## \[/{if(found) exit} found{print}" CHANGELOG.md > release_notes.md
+          cat release_notes.md
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
-          files: |
-            meshguard-linux-amd64
-            meshguard-windows-amd64.exe
-            wintun.dll
-            checksums.txt
-          body: |
-            ## Install
-
-            **Linux:**
-            ```bash
-            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | bash
-            ```
-
-            **Windows (PowerShell as Admin):**
-            ```powershell
-            irm https://raw.githubusercontent.com/${{ github.repository }}/main/install.ps1 | iex
-            ```
-
-            Or download manually from the assets below.
-
-            **Linux runtime dependency:** `libsodium` — the install script handles this automatically.
-            **Windows runtime dependency:** `wintun.dll` — bundled in the release and install script.
+          body_path: release_notes.md
+          files: release/*

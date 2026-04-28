@@ -13,7 +13,7 @@ fn zio() std.Io {
     return runtime_io orelse @panic("meshguard Io not initialized");
 }
 
-const version = "0.8.0";
+const version = @import("version.zig").version;
 
 const usage =
     \\meshguard — decentralized WireGuard mesh VPN daemon
