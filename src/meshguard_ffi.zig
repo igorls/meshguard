@@ -221,6 +221,20 @@ export fn meshguard_init(
     return ctx;
 }
 
+/// Initialize a new meshguard instance with an IPv6 UDP socket.
+export fn meshguard_init_ipv6(
+    identity_seed: ?[*]const u8,
+    listen_port: u16,
+) ?*MeshguardContext {
+    const ctx = meshguard_init(identity_seed, listen_port) orelse return null;
+    if (ctx.socket) |*s| s.close();
+    ctx.socket = Udp.UdpSocket.bindAddr6(.{0} ** 16, listen_port) catch {
+        ctx.alloc.destroy(ctx);
+        return null;
+    };
+    return ctx;
+}
+
 /// Destroy a meshguard instance, stopping all networking.
 export fn meshguard_destroy(ctx: ?*MeshguardContext) void {
     const c = ctx orelse return;
@@ -311,10 +325,64 @@ export fn meshguard_join(
     // Seed the mesh — use the SEED's port for the seed endpoint
     var seed_addr: [4]u8 = undefined;
     @memcpy(&seed_addr, seed_ip[0..4]);
-    const seeds = [_]messages.Endpoint{.{ .addr = seed_addr, .port = target_seed_port }};
+    const seeds = [_]messages.Endpoint{messages.Endpoint.initV4(seed_addr, target_seed_port)};
     c.swim.?.seedPeers(&seeds);
 
     // Start event loop on a background thread
+    c.running.store(true, .release);
+    c.event_loop_thread = std.Thread.spawn(.{}, eventLoop, .{c}) catch {
+        c.running.store(false, .release);
+        c.swim = null;
+        return -1;
+    };
+
+    return 0;
+}
+
+/// Join the mesh by connecting to an IPv6 seed peer.
+export fn meshguard_join_ipv6(
+    ctx: ?*MeshguardContext,
+    seed_ip: [*]const u8,
+    seed_port: u16,
+) i32 {
+    const c = ctx orelse return -1;
+    if (c.running.load(.acquire)) return -2;
+
+    const ip_mod = @import("wireguard/ip.zig");
+    const pk = Ed25519.PublicKey.fromBytes(c.ed25519_public) catch return -1;
+    const mesh_ip = ip_mod.deriveFromPubkey(pk);
+    const target_seed_port = if (seed_port == 0) @as(u16, 51821) else seed_port;
+    const our_port = c.socket.?.port;
+
+    const handler = EventHandler{
+        .ctx = @ptrCast(c),
+        .onPeerJoin = &onPeerJoinCallback,
+        .onPeerDead = &onPeerDeadCallback,
+        .onPeerPunched = null,
+        .onAppMessage = &onAppMessageCallback,
+        .onWgPacket = &onWgPacketCallback,
+    };
+
+    c.swim = SwimProtocol.init(
+        &c.membership,
+        c.socket.?,
+        SwimConfig{
+            .gossip_port = our_port,
+            .gossip_interval_ms = 3000,
+            .ping_timeout_ms = 5000,
+        },
+        c.ed25519_public,
+        c.x25519_public,
+        mesh_ip,
+        our_port,
+        handler,
+    );
+
+    var seed_addr6: [16]u8 = undefined;
+    @memcpy(&seed_addr6, seed_ip[0..16]);
+    const seeds = [_]messages.Endpoint{messages.Endpoint.initV6(seed_addr6, target_seed_port)};
+    c.swim.?.seedPeers(&seeds);
+
     c.running.store(true, .release);
     c.event_loop_thread = std.Thread.spawn(.{}, eventLoop, .{c}) catch {
         c.running.store(false, .release);

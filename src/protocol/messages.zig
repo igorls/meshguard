@@ -132,14 +132,43 @@ pub const NatType = enum(u8) {
 
 /// Network endpoint (IP:port pair).
 pub const Endpoint = struct {
-    addr: [4]u8, // IPv4 — extend to support IPv6 later
+    addr: [4]u8 = .{0} ** 4,
+    addr6: ?[16]u8 = null,
     port: u16,
 
+    pub fn initV4(addr: [4]u8, port: u16) Endpoint {
+        return .{ .addr = addr, .port = port };
+    }
+
+    pub fn initV6(addr6: [16]u8, port: u16) Endpoint {
+        return .{ .addr6 = addr6, .port = port };
+    }
+
+    pub fn isIpv6(self: Endpoint) bool {
+        return self.addr6 != null;
+    }
+
     pub fn format(self: Endpoint, buf: []u8) []const u8 {
-        const result = std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}:{d}", .{
-            self.addr[0], self.addr[1], self.addr[2], self.addr[3], self.port,
-        }) catch return "?";
-        return result;
+        const result = if (self.addr6) |a6|
+            std.fmt.bufPrint(buf, "[{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}]:{d}", .{
+                a6[0], a6[1], a6[2], a6[3], a6[4], a6[5], a6[6], a6[7],
+                a6[8], a6[9], a6[10], a6[11], a6[12], a6[13], a6[14], a6[15],
+                self.port,
+            })
+        else
+            std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}:{d}", .{
+                self.addr[0], self.addr[1], self.addr[2], self.addr[3], self.port,
+            });
+        return result catch "?";
+    }
+
+    pub fn eql(a: Endpoint, b: Endpoint) bool {
+        if (a.port != b.port) return false;
+        if (a.addr6) |a6| {
+            if (b.addr6) |b6| return std.mem.eql(u8, &a6, &b6);
+            return false;
+        }
+        return b.addr6 == null and std.mem.eql(u8, &a.addr, &b.addr);
     }
 };
 

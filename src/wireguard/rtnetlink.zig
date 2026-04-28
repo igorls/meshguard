@@ -5,6 +5,8 @@
 const std = @import("std");
 const linux = std.os.linux;
 const nl = @import("nlsocket.zig");
+const RTA_DST: u16 = 1;
+const RTA_OIF: u16 = 4;
 
 /// Create a WireGuard network interface.
 pub fn createWgInterface(name: []const u8) !void {
@@ -145,6 +147,32 @@ pub fn addAddress(ifindex: u32, ip: [4]u8, prefix_len: u8) !void {
     try sock.sendAndAck(msg);
 }
 
+/// Add an IPv6 address to an interface.
+pub fn addAddress6(ifindex: u32, ip: [16]u8, prefix_len: u8) !void {
+    var sock = try nl.NetlinkSocket.open(linux.NETLINK.ROUTE);
+    defer sock.close();
+
+    var b = nl.MessageBuilder.init(
+        @intFromEnum(linux.NetlinkMessageType.RTM_NEWADDR),
+        linux.NLM_F_REQUEST | linux.NLM_F_ACK | linux.NLM_F_CREATE | linux.NLM_F_REPLACE,
+        sock.nextSeq(),
+    );
+
+    b.appendStruct(nl.ifaddrmsg, .{
+        .family = linux.AF.INET6,
+        .prefixlen = prefix_len,
+        .flags = 0,
+        .scope = 0,
+        .index = ifindex,
+    });
+
+    b.addAttr(@intFromEnum(linux.IFA.LOCAL), &ip);
+    b.addAttr(@intFromEnum(linux.IFA.ADDRESS), &ip);
+
+    const msg = b.finish();
+    try sock.sendAndAck(msg);
+}
+
 /// Bring an interface up or down.
 pub fn setInterfaceUp(ifindex: u32, up: bool) !void {
     var sock = try nl.NetlinkSocket.open(linux.NETLINK.ROUTE);
@@ -205,13 +233,55 @@ pub fn addRoute(ifindex: u32, dst: [4]u8, prefix_len: u8) !void {
         .flags = 0,
     });
 
-    // RTA_DST = 1
-    b.addAttr(1, &dst);
+    b.addAttr(RTA_DST, &dst);
 
-    // RTA_OIF = 4 (output interface)
     var oif_bytes: [4]u8 = undefined;
     std.mem.writeInt(u32, &oif_bytes, ifindex, .little);
-    b.addAttr(4, &oif_bytes);
+    b.addAttr(RTA_OIF, &oif_bytes);
+
+    const msg = b.finish();
+    try sock.sendAndAck(msg);
+}
+
+/// Add an IPv6 route: dst/prefix_len via interface ifindex.
+pub fn addRoute6(ifindex: u32, dst: [16]u8, prefix_len: u8) !void {
+    var sock = try nl.NetlinkSocket.open(linux.NETLINK.ROUTE);
+    defer sock.close();
+
+    var b = nl.MessageBuilder.init(
+        @intFromEnum(linux.NetlinkMessageType.RTM_NEWROUTE),
+        linux.NLM_F_REQUEST | linux.NLM_F_ACK | linux.NLM_F_CREATE | linux.NLM_F_REPLACE,
+        sock.nextSeq(),
+    );
+
+    const rtm = extern struct {
+        family: u8,
+        dst_len: u8,
+        src_len: u8,
+        tos: u8,
+        table: u8,
+        protocol: u8,
+        scope: u8,
+        rt_type: u8,
+        flags: u32,
+    };
+
+    b.appendStruct(rtm, .{
+        .family = linux.AF.INET6,
+        .dst_len = prefix_len,
+        .src_len = 0,
+        .tos = 0,
+        .table = 254,
+        .protocol = 3,
+        .scope = 253,
+        .rt_type = 1,
+        .flags = 0,
+    });
+
+    b.addAttr(RTA_DST, &dst);
+    var oif_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &oif_bytes, ifindex, .little);
+    b.addAttr(RTA_OIF, &oif_bytes);
 
     const msg = b.finish();
     try sock.sendAndAck(msg);

@@ -658,7 +658,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     const messages = @import("protocol/messages.zig");
     var seed_buf: [16]messages.Endpoint = undefined;
     var seed_count: usize = 0;
-    var announce_addr: ?[4]u8 = null;
+    var announce_addr: ?messages.Endpoint = null;
     var use_kernel_wg: bool = false;
     var dns_domain: []const u8 = "";
     var use_mdns: bool = false;
@@ -683,7 +683,10 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
                 i += 1;
                 // Parse IP address (just the IP, ports come from config)
                 const ip_str_arg = extra_args[i];
-                announce_addr = parseIpv4(ip_str_arg);
+                announce_addr = if (parseIpv4(ip_str_arg)) |addr|
+                    messages.Endpoint.initV4(addr, 0)
+                else
+                    parseIpv6Endpoint(ip_str_arg, 0);
                 if (announce_addr == null) {
                     try writeFormatted(stderr, "warning: ignoring invalid announce address '{s}'\n", .{ip_str_arg});
                 }
@@ -776,11 +779,15 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     // Derive mesh IP from public key
     const pub_key = try std.crypto.sign.Ed25519.PublicKey.fromBytes(kp.public_key.toBytes());
     const mesh_ip = lib.wireguard.Ip.deriveFromPubkey(pub_key);
+    const mesh_ip6 = lib.wireguard.Ip.deriveIpv6FromPubkey(pub_key);
     var ip_str_buf: [15]u8 = undefined;
     const ip_str = lib.wireguard.Ip.formatIp(mesh_ip, &ip_str_buf);
+    var ip6_str_buf: [64]u8 = undefined;
+    const ip6_str = lib.wireguard.Ip.formatIpv6(mesh_ip6, &ip6_str_buf);
 
     try stdout.writeStreamingAll(zio(), "meshguard starting...\n");
     try writeFormatted(stdout, "  mesh IP: {s}\n", .{ip_str});
+    try writeFormatted(stdout, "  mesh IPv6: {s}/{d}\n", .{ ip6_str, lib.wireguard.Ip.default_mesh_mask6 });
     try writeFormatted(stdout, "  interface: {s}\n", .{if (comptime @import("builtin").os.tag == .linux) lib.wireguard.Config.DEFAULT_IFNAME else if (comptime @import("builtin").os.tag == .macos) "utun" else "wintun"});
 
     try writeFormatted(stdout, "  mode: {s}\n", .{if (use_kernel_wg) "kernel" else "userspace"});
@@ -837,9 +844,18 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     // Bind gossip UDP socket
     const gossip_port: u16 = 51821;
     var gossip_socket = blk: {
-        if (announce_addr) |addr| {
+        if (announce_addr) |ep| {
             // Bind to announced IP for correct source-based routing on multi-homed servers
-            break :blk lib.net.Udp.UdpSocket.bindAddr(addr, gossip_port) catch {
+            break :blk if (ep.addr6) |addr6|
+                lib.net.Udp.UdpSocket.bindAddr6(addr6, gossip_port) catch {
+                    try stderr.writeStreamingAll(zio(), "error: failed to bind gossip port to announced IPv6 address\n");
+                    if (comptime @import("builtin").os.tag == .linux) {
+                        lib.wireguard.Config.teardown(lib.wireguard.Config.DEFAULT_IFNAME) catch {};
+                    }
+                    std.process.exit(1);
+                }
+            else
+                lib.net.Udp.UdpSocket.bindAddr(ep.addr, gossip_port) catch {
                 try stderr.writeStreamingAll(zio(), "error: failed to bind gossip port to announced address\n");
                 if (comptime @import("builtin").os.tag == .linux) {
                     lib.wireguard.Config.teardown(lib.wireguard.Config.DEFAULT_IFNAME) catch {};
@@ -958,11 +974,11 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
 
     // Determine public endpoint: --announce overrides STUN
     if (announce_addr) |addr| {
-        const announced_ep = messages.Endpoint{ .addr = addr, .port = gossip_port };
+        var announced_ep = addr;
+        announced_ep.port = gossip_port;
         swim.setPublicEndpoint(announced_ep, .public);
-        var ann_ip_buf: [15]u8 = undefined;
-        const ann_ip = lib.wireguard.Ip.formatIp(addr, &ann_ip_buf);
-        try writeFormatted(stdout, "  announced endpoint: {s}:{d}\n", .{ ann_ip, gossip_port });
+        var ann_ip_buf: [64]u8 = undefined;
+        try writeFormatted(stdout, "  announced endpoint: {s}\n", .{announced_ep.format(&ann_ip_buf)});
     } else {
         // Run STUN to discover our public endpoint and NAT type
         const Stun = lib.nat.Stun;
@@ -1058,6 +1074,9 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
             lib.wireguard.RtNetlink.addAddress(ifindex, mesh_ip, 16) catch |err| {
                 try writeFormatted(stderr, "error: failed to set TUN IP: {s}\n", .{@errorName(err)});
             };
+            lib.wireguard.RtNetlink.addAddress6(ifindex, mesh_ip6, lib.wireguard.Ip.default_mesh_mask6) catch |err| {
+                try writeFormatted(stderr, "warning: failed to set TUN IPv6: {s}\n", .{@errorName(err)});
+            };
             lib.wireguard.RtNetlink.setInterfaceUp(ifindex, true) catch |err| {
                 try writeFormatted(stderr, "error: failed to bring up TUN: {s}\n", .{@errorName(err)});
             };
@@ -1066,6 +1085,9 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
             };
             lib.wireguard.RtNetlink.addRoute(ifindex, .{ 10, 99, 0, 0 }, 16) catch |err| {
                 try writeFormatted(stderr, "warning: failed to add mesh route: {s}\n", .{@errorName(err)});
+            };
+            lib.wireguard.RtNetlink.addRoute6(ifindex, lib.wireguard.Ip.default_mesh_network6, lib.wireguard.Ip.default_mesh_mask6) catch |err| {
+                try writeFormatted(stderr, "warning: failed to add mesh IPv6 route: {s}\n", .{@errorName(err)});
             };
 
             try writeFormatted(stdout, "  TUN device: {s} (fd={d}, mtu=1420)\n", .{ tun_dev.getName(), tun_dev.fd });
@@ -1099,6 +1121,9 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
             WinCfg.setAdapterIp(allocator, tun_dev.getName(), mesh_ip, 16) catch |err| {
                 try writeFormatted(stderr, "warning: failed to set adapter IP: {s}\n", .{@errorName(err)});
             };
+            WinCfg.setAdapterIp6(allocator, tun_dev.getName(), mesh_ip6, lib.wireguard.Ip.default_mesh_mask6) catch |err| {
+                try writeFormatted(stderr, "warning: failed to set adapter IPv6: {s}\n", .{@errorName(err)});
+            };
 
             // Set MTU
             WinCfg.setMtu(allocator, tun_dev.getName(), 1420) catch |err| {
@@ -1108,6 +1133,9 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
             // Add mesh subnet route
             WinCfg.addRoute(allocator, tun_dev.getName(), .{ 10, 99, 0, 0 }, 16) catch |err| {
                 try writeFormatted(stderr, "warning: failed to add mesh route: {s}\n", .{@errorName(err)});
+            };
+            WinCfg.addRoute6(allocator, tun_dev.getName(), lib.wireguard.Ip.default_mesh_network6, lib.wireguard.Ip.default_mesh_mask6) catch |err| {
+                try writeFormatted(stderr, "warning: failed to add mesh IPv6 route: {s}\n", .{@errorName(err)});
             };
 
             try writeFormatted(stdout, "  mesh IP: {d}.{d}.{d}.{d}/16 (mtu=1420)\n", .{
@@ -1135,6 +1163,9 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
             DarwinCfg.setInterfaceIp(allocator, tun_dev.getName(), mesh_ip, 16) catch |err| {
                 try writeFormatted(stderr, "warning: failed to set interface IP: {s}\n", .{@errorName(err)});
             };
+            DarwinCfg.setInterfaceIp6(allocator, tun_dev.getName(), mesh_ip6, lib.wireguard.Ip.default_mesh_mask6) catch |err| {
+                try writeFormatted(stderr, "warning: failed to set interface IPv6: {s}\n", .{@errorName(err)});
+            };
             DarwinCfg.setInterfaceUp(allocator, tun_dev.getName()) catch |err| {
                 try writeFormatted(stderr, "warning: failed to bring up interface: {s}\n", .{@errorName(err)});
             };
@@ -1143,6 +1174,9 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
             };
             DarwinCfg.addRoute(allocator, tun_dev.getName(), .{ 10, 99, 0, 0 }, 16) catch |err| {
                 try writeFormatted(stderr, "warning: failed to add mesh route: {s}\n", .{@errorName(err)});
+            };
+            DarwinCfg.addRoute6(allocator, tun_dev.getName(), lib.wireguard.Ip.default_mesh_network6, lib.wireguard.Ip.default_mesh_mask6) catch |err| {
+                try writeFormatted(stderr, "warning: failed to add mesh IPv6 route: {s}\n", .{@errorName(err)});
             };
 
             try writeFormatted(stdout, "  mesh IP: {d}.{d}.{d}.{d}/16 (mtu=1420)\n", .{
@@ -1627,6 +1661,7 @@ const WgHandlerCtx = struct {
 
 fn wgOnPeerJoin(ctx: *anyopaque, peer: *const lib.discovery.Membership.Peer) void {
     const handler: *WgHandlerCtx = @ptrCast(@alignCast(ctx));
+    const Endpoint = @import("protocol/messages.zig").Endpoint;
 
     if (peer.wg_pubkey) |wg_key| {
         var ip_buf: [15]u8 = undefined;
@@ -1657,10 +1692,9 @@ fn wgOnPeerJoin(ctx: *anyopaque, peer: *const lib.discovery.Membership.Peer) voi
             }
         } else if (handler.wg_device) |dev| {
             // Userspace mode: register peer in WgDevice
-            const peer_addr = if (peer.gossip_endpoint) |ep| ep.addr else if (peer.public_endpoint) |pub_ep| pub_ep.addr else [4]u8{ 0, 0, 0, 0 };
-            const peer_port = if (peer.gossip_endpoint) |ep| ep.port else if (peer.public_endpoint) |pub_ep| pub_ep.port else @as(u16, 0);
+            const peer_endpoint: ?Endpoint = if (peer.gossip_endpoint) |ep| ep else if (peer.public_endpoint) |pub_ep| pub_ep else null;
 
-            const slot = dev.addPeerWithMeshIp(peer.pubkey, wg_key, peer_addr, peer_port, peer.mesh_ip) catch {
+            const slot = dev.addPeerWithEndpoint(peer.pubkey, wg_key, peer_endpoint orelse Endpoint.initV4(.{ 0, 0, 0, 0 }, 0), peer.mesh_ip, peer.mesh_ip6) catch {
                 writeFormatted(handler.stdout, "  warning: failed to add userspace WG peer {s}\n", .{ip_str}) catch {};
                 return;
             };
@@ -1673,13 +1707,13 @@ fn wgOnPeerJoin(ctx: *anyopaque, peer: *const lib.discovery.Membership.Peer) voi
             const should_initiate = std.mem.order(u8, &dev.static_public, &wg_key) == .lt;
 
             // Initiate handshake if we have an endpoint and won the tie-break.
-            if (peer_addr[0] != 0 or peer_addr[1] != 0 or peer_addr[2] != 0 or peer_addr[3] != 0) {
+            if (peer_endpoint) |ep| {
                 if (should_initiate) {
                     if (dev.initiateHandshake(slot)) |init_msg| {
                         // Send handshake initiation via UDP socket
                         if (handler.socket) |sock| {
                             const msg_bytes = std.mem.asBytes(&init_msg);
-                            _ = sock.sendTo(msg_bytes, peer_addr, peer_port) catch 0;
+                            _ = sock.sendToEndpoint(msg_bytes, ep) catch 0;
                         }
                         writeFormatted(handler.stdout, "  peer joined (userspace): {s} [handshake sent]\n", .{ip_str}) catch {};
                     } else |_| {
@@ -1746,6 +1780,7 @@ fn wgOnPeerPunched(ctx: *anyopaque, peer: *const lib.discovery.Membership.Peer, 
             if (dev.findByWgPubkey(wg_key)) |slot| {
                 if (dev.peers[slot]) |*p| {
                     p.endpoint_addr = endpoint.addr;
+                    p.endpoint_addr6 = endpoint.addr6;
                     p.endpoint_port = endpoint.port;
                 }
             }
@@ -3263,6 +3298,15 @@ fn parseIpv4(s: []const u8) ?[4]u8 {
     if (dots != 3 or octet > 255) return null;
     result[3] = @intCast(octet);
     return result;
+}
+
+fn parseIpv6Endpoint(s: []const u8, port: u16) ?@import("protocol/messages.zig").Endpoint {
+    var ep_buf: [96]u8 = undefined;
+    const ep_str = if (s.len > 0 and s[0] == '[')
+        std.fmt.bufPrint(&ep_buf, "{s}:{d}", .{ s, port }) catch return null
+    else
+        std.fmt.bufPrint(&ep_buf, "[{s}]:{d}", .{ s, port }) catch return null;
+    return lib.discovery.Seed.parseEndpoint(ep_str);
 }
 
 fn cmdDown(allocator: std.mem.Allocator) !void {

@@ -39,6 +39,8 @@ pub const Peer = struct {
     wg_pubkey: ?[32]u8,
     /// Deterministic mesh IP
     mesh_ip: [4]u8,
+    /// Deterministic mesh IPv6 address
+    mesh_ip6: [16]u8 = .{0} ** 16,
     /// WireGuard listen port
     wg_port: u16,
     /// Lamport timestamp of last state change

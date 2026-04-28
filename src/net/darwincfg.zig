@@ -33,6 +33,18 @@ pub fn setInterfaceIp(allocator: std.mem.Allocator, iface_name: []const u8, mesh
     if (term != .exited or term.exited != 0) return error.ConfigFailed;
 }
 
+/// Set an IPv6 address on a utun interface.
+pub fn setInterfaceIp6(allocator: std.mem.Allocator, iface_name: []const u8, mesh_ip: [16]u8, prefix_len: u8) !void {
+    var ip_buf: [64]u8 = undefined;
+    const ip_str = formatIpv6(mesh_ip, &ip_buf);
+    var prefix_buf: [4]u8 = undefined;
+    const prefix_str = std.fmt.bufPrint(&prefix_buf, "{d}", .{prefix_len}) catch return error.ConfigFailed;
+
+    _ = allocator;
+    const term = try runCommand(&.{ "ifconfig", iface_name, "inet6", ip_str, "prefixlen", prefix_str });
+    if (term != .exited or term.exited != 0) return error.ConfigFailed;
+}
+
 /// Bring the interface up.
 /// Runs: ifconfig <iface> up
 pub fn setInterfaceUp(allocator: std.mem.Allocator, iface_name: []const u8) !void {
@@ -66,6 +78,16 @@ pub fn addRoute(allocator: std.mem.Allocator, iface_name: []const u8, network: [
     _ = term;
 }
 
+pub fn addRoute6(allocator: std.mem.Allocator, iface_name: []const u8, network: [16]u8, prefix_len: u8) !void {
+    var net_buf: [80]u8 = undefined;
+    var ip_buf: [64]u8 = undefined;
+    const ip_str = formatIpv6(network, &ip_buf);
+    const net_str = std.fmt.bufPrint(&net_buf, "{s}/{d}", .{ ip_str, prefix_len }) catch return error.ConfigFailed;
+
+    _ = allocator;
+    _ = try runCommand(&.{ "route", "add", "-inet6", net_str, "-interface", iface_name });
+}
+
 /// Bring the interface down.
 /// Runs: ifconfig <iface> down
 pub fn setInterfaceDown(allocator: std.mem.Allocator, iface_name: []const u8) !void {
@@ -89,4 +111,11 @@ fn formatNetmask(prefix_len: u8, buf: *[15]u8) []const u8 {
         @as(u8, @truncate(mask)),
     }) catch return "255.255.0.0";
     return result;
+}
+
+fn formatIpv6(ip: [16]u8, buf: []u8) []const u8 {
+    return std.fmt.bufPrint(buf, "{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}", .{
+        ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], ip[6], ip[7],
+        ip[8], ip[9], ip[10], ip[11], ip[12], ip[13], ip[14], ip[15],
+    }) catch "::";
 }

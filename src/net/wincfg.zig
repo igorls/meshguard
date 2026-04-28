@@ -32,6 +32,19 @@ pub fn setAdapterIp(allocator: std.mem.Allocator, name: []const u8, ip: [4]u8, p
     try runCommand(allocator, &argv);
 }
 
+/// Add an IPv6 address on a named network adapter.
+pub fn setAdapterIp6(allocator: std.mem.Allocator, name: []const u8, ip: [16]u8, prefix: u8) !void {
+    var ip_buf: [64]u8 = undefined;
+    const ip_str = formatIpv6(ip, &ip_buf);
+    var cidr_buf: [80]u8 = undefined;
+    const cidr = std.fmt.bufPrint(&cidr_buf, "{s}/{d}", .{ ip_str, prefix }) catch return error.FormatFailed;
+    const argv = [_][]const u8{
+        "netsh", "interface", "ipv6", "add", "address",
+        name, cidr,
+    };
+    try runCommand(allocator, &argv);
+}
+
 /// Add a route to the mesh subnet via the named adapter.
 /// Equivalent of Linux: ip route add {dest}/{prefix} dev {name}
 pub fn addRoute(allocator: std.mem.Allocator, name: []const u8, dest: [4]u8, prefix: u8) !void {
@@ -46,6 +59,18 @@ pub fn addRoute(allocator: std.mem.Allocator, name: []const u8, dest: [4]u8, pre
         dest_str, name,
     };
     // Route might already exist — that's OK
+    runCommand(allocator, &argv) catch {};
+}
+
+pub fn addRoute6(allocator: std.mem.Allocator, name: []const u8, dest: [16]u8, prefix: u8) !void {
+    var ip_buf: [64]u8 = undefined;
+    var dest_buf: [80]u8 = undefined;
+    const dest_ip = formatIpv6(dest, &ip_buf);
+    const dest_str = std.fmt.bufPrint(&dest_buf, "{s}/{d}", .{ dest_ip, prefix }) catch return error.FormatFailed;
+    const argv = [_][]const u8{
+        "netsh", "interface", "ipv6", "add", "route",
+        dest_str, name,
+    };
     runCommand(allocator, &argv) catch {};
 }
 
@@ -87,4 +112,11 @@ fn prefixToMask(prefix: u8) [4]u8 {
         @intCast((mask >> 8) & 0xFF),
         @intCast(mask & 0xFF),
     };
+}
+
+fn formatIpv6(ip: [16]u8, buf: []u8) []const u8 {
+    return std.fmt.bufPrint(buf, "{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}", .{
+        ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], ip[6], ip[7],
+        ip[8], ip[9], ip[10], ip[11], ip[12], ip[13], ip[14], ip[15],
+    }) catch "::";
 }

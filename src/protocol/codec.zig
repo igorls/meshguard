@@ -6,12 +6,13 @@
 //! Ack:      [0x03][32B pubkey][8B seq][1B gossip_count][N × gossip_entry]
 //! PingReq:  [0x02][32B sender][32B target][8B seq]
 //!
-//! GossipEntry: [32B subject][1B event][8B lamport][1B has_ep][4B addr][2B port]
+//! GossipEntry endpoints: [1B has_ep][1B family: 4/6][16B addr][2B port]
 
 const std = @import("std");
 const messages = @import("messages.zig");
 
-const GOSSIP_ENTRY_SIZE = 32 + 1 + 8 + 1 + 4 + 2 + 1 + 32 + 1 + 4 + 2 + 1; // 89 bytes
+const ENDPOINT_SIZE = 1 + 1 + 16 + 2;
+const GOSSIP_ENTRY_SIZE = 32 + 1 + 8 + ENDPOINT_SIZE + 1 + 32 + ENDPOINT_SIZE + 1; // 115 bytes
 
 // ─── Encoding ───
 
@@ -40,7 +41,7 @@ pub fn encodePing(buf: []u8, ping: messages.Ping) !usize {
     pos += 1;
 
     for (ping.gossip[0..gossip_count]) |entry| {
-        pos += encodeGossipEntry(buf[pos..], entry);
+        pos += try encodeGossipEntry(buf[pos..], entry);
     }
 
     return pos;
@@ -67,7 +68,7 @@ pub fn encodeAck(buf: []u8, ack: messages.Ack) !usize {
     pos += 1;
 
     for (ack.gossip[0..gossip_count]) |entry| {
-        pos += encodeGossipEntry(buf[pos..], entry);
+        pos += try encodeGossipEntry(buf[pos..], entry);
     }
 
     return pos;
@@ -96,9 +97,8 @@ pub fn encodePingReq(buf: []u8, req: messages.PingReq) !usize {
 }
 
 /// Encode a HolepunchRequest. Returns bytes written.
-/// Wire: [0x33][32B sender][32B target][4B addr][2B port][16B token]
 pub fn encodeHolepunchRequest(buf: []u8, req: messages.HolepunchRequest) !usize {
-    if (buf.len < 1 + 32 + 32 + 4 + 2 + 16) return error.BufferTooShort;
+    if (buf.len < 1 + 32 + 32 + ENDPOINT_SIZE + 16) return error.BufferTooShort;
     var pos: usize = 0;
 
     buf[pos] = @intFromEnum(messages.MessageType.holepunch_request);
@@ -110,11 +110,7 @@ pub fn encodeHolepunchRequest(buf: []u8, req: messages.HolepunchRequest) !usize 
     @memcpy(buf[pos..][0..32], &req.target_pubkey);
     pos += 32;
 
-    @memcpy(buf[pos..][0..4], &req.public_endpoint.addr);
-    pos += 4;
-
-    std.mem.writeInt(u16, buf[pos..][0..2], req.public_endpoint.port, .little);
-    pos += 2;
+    pos += try encodeEndpoint(buf[pos..], req.public_endpoint);
 
     @memcpy(buf[pos..][0..16], &req.token);
     pos += 16;
@@ -123,9 +119,8 @@ pub fn encodeHolepunchRequest(buf: []u8, req: messages.HolepunchRequest) !usize 
 }
 
 /// Encode a HolepunchResponse. Returns bytes written.
-/// Wire: [0x34][32B sender][4B addr][2B port][16B token_echo]
 pub fn encodeHolepunchResponse(buf: []u8, resp: messages.HolepunchResponse) !usize {
-    if (buf.len < 1 + 32 + 4 + 2 + 16) return error.BufferTooShort;
+    if (buf.len < 1 + 32 + ENDPOINT_SIZE + 16) return error.BufferTooShort;
     var pos: usize = 0;
 
     buf[pos] = @intFromEnum(messages.MessageType.holepunch_response);
@@ -134,11 +129,7 @@ pub fn encodeHolepunchResponse(buf: []u8, resp: messages.HolepunchResponse) !usi
     @memcpy(buf[pos..][0..32], &resp.sender_pubkey);
     pos += 32;
 
-    @memcpy(buf[pos..][0..4], &resp.public_endpoint.addr);
-    pos += 4;
-
-    std.mem.writeInt(u16, buf[pos..][0..2], resp.public_endpoint.port, .little);
-    pos += 2;
+    pos += try encodeEndpoint(buf[pos..], resp.public_endpoint);
 
     @memcpy(buf[pos..][0..16], &resp.token_echo);
     pos += 16;
@@ -226,7 +217,7 @@ pub fn encodeOrgTrustVouch(buf: []u8, msg: messages.OrgTrustVouch) !usize {
     return pos;
 }
 
-fn encodeGossipEntry(buf: []u8, entry: messages.GossipEntry) usize {
+fn encodeGossipEntry(buf: []u8, entry: messages.GossipEntry) !usize {
     var pos: usize = 0;
 
     @memcpy(buf[pos..][0..32], &entry.subject_pubkey);
@@ -238,19 +229,7 @@ fn encodeGossipEntry(buf: []u8, entry: messages.GossipEntry) usize {
     std.mem.writeInt(u64, buf[pos..][0..8], entry.lamport, .little);
     pos += 8;
 
-    if (entry.endpoint) |ep| {
-        buf[pos] = 1;
-        pos += 1;
-        @memcpy(buf[pos..][0..4], &ep.addr);
-        pos += 4;
-        std.mem.writeInt(u16, buf[pos..][0..2], ep.port, .little);
-        pos += 2;
-    } else {
-        buf[pos] = 0;
-        pos += 1;
-        @memset(buf[pos..][0..6], 0);
-        pos += 6;
-    }
+    pos += try encodeEndpoint(buf[pos..], entry.endpoint);
 
     // WG public key
     if (entry.wg_pubkey) |wg_key| {
@@ -266,25 +245,32 @@ fn encodeGossipEntry(buf: []u8, entry: messages.GossipEntry) usize {
     }
 
     // Public endpoint (STUN-discovered)
-    if (entry.public_endpoint) |pub_ep| {
-        buf[pos] = 1;
-        pos += 1;
-        @memcpy(buf[pos..][0..4], &pub_ep.addr);
-        pos += 4;
-        std.mem.writeInt(u16, buf[pos..][0..2], pub_ep.port, .little);
-        pos += 2;
-    } else {
-        buf[pos] = 0;
-        pos += 1;
-        @memset(buf[pos..][0..6], 0);
-        pos += 6;
-    }
+    pos += try encodeEndpoint(buf[pos..], entry.public_endpoint);
 
     // NAT type
     buf[pos] = @intFromEnum(entry.nat_type);
     pos += 1;
 
     return pos;
+}
+
+fn encodeEndpoint(buf: []u8, endpoint: ?messages.Endpoint) !usize {
+    if (buf.len < ENDPOINT_SIZE) return error.BufferTooShort;
+    if (endpoint) |ep| {
+        buf[0] = 1;
+        if (ep.addr6) |addr6| {
+            buf[1] = 6;
+            @memcpy(buf[2..][0..16], &addr6);
+        } else {
+            buf[1] = 4;
+            @memset(buf[2..][0..16], 0);
+            @memcpy(buf[2..][0..4], &ep.addr);
+        }
+        std.mem.writeInt(u16, buf[18..][0..2], ep.port, .little);
+    } else {
+        @memset(buf[0..ENDPOINT_SIZE], 0);
+    }
+    return ENDPOINT_SIZE;
 }
 
 // ─── Decoding ───
@@ -412,26 +398,24 @@ fn decodePingReq(data: []const u8) DecodeError!messages.PingReq {
 }
 
 fn decodeHolepunchRequest(data: []const u8) DecodeError!messages.HolepunchRequest {
-    if (data.len < 32 + 32 + 4 + 2 + 16) return error.BufferTooShort;
+    if (data.len < 32 + 32 + ENDPOINT_SIZE + 16) return error.BufferTooShort;
 
     var result: messages.HolepunchRequest = undefined;
     @memcpy(&result.sender_pubkey, data[0..32]);
     @memcpy(&result.target_pubkey, data[32..64]);
-    @memcpy(&result.public_endpoint.addr, data[64..68]);
-    result.public_endpoint.port = std.mem.readInt(u16, data[68..70], .little);
-    @memcpy(&result.token, data[70..86]);
+    result.public_endpoint = decodeEndpoint(data[64..][0..ENDPOINT_SIZE]) orelse return error.BufferTooShort;
+    @memcpy(&result.token, data[64 + ENDPOINT_SIZE ..][0..16]);
 
     return result;
 }
 
 fn decodeHolepunchResponse(data: []const u8) DecodeError!messages.HolepunchResponse {
-    if (data.len < 32 + 4 + 2 + 16) return error.BufferTooShort;
+    if (data.len < 32 + ENDPOINT_SIZE + 16) return error.BufferTooShort;
 
     var result: messages.HolepunchResponse = undefined;
     @memcpy(&result.sender_pubkey, data[0..32]);
-    @memcpy(&result.public_endpoint.addr, data[32..36]);
-    result.public_endpoint.port = std.mem.readInt(u16, data[36..38], .little);
-    @memcpy(&result.token_echo, data[38..54]);
+    result.public_endpoint = decodeEndpoint(data[32..][0..ENDPOINT_SIZE]) orelse return error.BufferTooShort;
+    @memcpy(&result.token_echo, data[32 + ENDPOINT_SIZE ..][0..16]);
 
     return result;
 }
@@ -452,36 +436,40 @@ fn decodeGossipEntry(data: []const u8) DecodeError!messages.GossipEntry {
     entry.event = std.enums.fromInt(messages.MemberEvent, data[32]) orelse return error.InvalidGossipEvent;
     entry.lamport = std.mem.readInt(u64, data[33..41], .little);
 
-    if (data[41] == 1) {
-        var addr: [4]u8 = undefined;
-        @memcpy(&addr, data[42..46]);
-        entry.endpoint = .{
-            .addr = addr,
-            .port = std.mem.readInt(u16, data[46..48], .little),
-        };
-    }
+    var pos: usize = 41;
+    entry.endpoint = decodeEndpoint(data[pos..][0..ENDPOINT_SIZE]);
+    pos += ENDPOINT_SIZE;
 
-    // WG public key (byte 48 = has_wg, bytes 49..81 = key)
-    if (data[48] == 1) {
+    // WG public key
+    if (data[pos] == 1) {
         var wg_key: [32]u8 = undefined;
-        @memcpy(&wg_key, data[49..81]);
+        @memcpy(&wg_key, data[pos + 1 ..][0..32]);
         entry.wg_pubkey = wg_key;
     }
+    pos += 1 + 32;
 
-    // Public endpoint (byte 81 = has_pub_ep, bytes 82..88 = addr:port)
-    if (data[81] == 1) {
-        var pub_addr: [4]u8 = undefined;
-        @memcpy(&pub_addr, data[82..86]);
-        entry.public_endpoint = .{
-            .addr = pub_addr,
-            .port = std.mem.readInt(u16, data[86..88], .little),
-        };
-    }
+    // Public endpoint
+    entry.public_endpoint = decodeEndpoint(data[pos..][0..ENDPOINT_SIZE]);
+    pos += ENDPOINT_SIZE;
 
-    // NAT type (byte 88)
-    entry.nat_type = std.enums.fromInt(messages.NatType, data[88]) orelse .unknown;
+    // NAT type
+    entry.nat_type = std.enums.fromInt(messages.NatType, data[pos]) orelse .unknown;
 
     return entry;
+}
+
+fn decodeEndpoint(data: []const u8) ?messages.Endpoint {
+    if (data.len < ENDPOINT_SIZE) return null;
+    if (data[0] == 0) return null;
+    const port = std.mem.readInt(u16, data[18..][0..2], .little);
+    if (data[1] == 6) {
+        var addr6: [16]u8 = undefined;
+        @memcpy(&addr6, data[2..][0..16]);
+        return messages.Endpoint.initV6(addr6, port);
+    }
+    var addr: [4]u8 = undefined;
+    @memcpy(&addr, data[2..][0..4]);
+    return messages.Endpoint.initV4(addr, port);
 }
 
 fn decodeOrgAliasAnnounce(data: []const u8) DecodeError!messages.OrgAliasAnnounce {
@@ -594,6 +582,40 @@ test "ping with gossip roundtrip" {
             try std.testing.expectEqual(g[0].lamport, 42);
             try std.testing.expect(g[0].endpoint != null);
             try std.testing.expectEqual(g[0].endpoint.?.port, 51821);
+        },
+        else => return error.InvalidMessageType,
+    }
+}
+
+test "ping with IPv6 gossip endpoint roundtrip" {
+    const pubkey = [_]u8{0x01} ** 32;
+    const subject = [_]u8{0x02} ** 32;
+    const addr6 = [16]u8{ 0xfd, 0x99, 0x6d, 0x67, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+
+    const gossip = [_]messages.GossipEntry{.{
+        .subject_pubkey = subject,
+        .event = .alive,
+        .lamport = 43,
+        .endpoint = messages.Endpoint.initV6(addr6, 51821),
+        .public_endpoint = messages.Endpoint.initV6(addr6, 51822),
+    }};
+
+    const ping = messages.Ping{
+        .sender_pubkey = pubkey,
+        .seq = 8,
+        .gossip = &gossip,
+    };
+
+    var buf: [512]u8 = undefined;
+    const written = try encodePing(&buf, ping);
+    const decoded = try decode(buf[0..written]);
+    switch (decoded) {
+        .ping => |p| {
+            const g = p.gossip();
+            try std.testing.expect(g[0].endpoint.?.addr6 != null);
+            const decoded_addr6 = g[0].endpoint.?.addr6.?;
+            try std.testing.expectEqualSlices(u8, &addr6, &decoded_addr6);
+            try std.testing.expectEqual(g[0].public_endpoint.?.port, 51822);
         },
         else => return error.InvalidMessageType,
     }
