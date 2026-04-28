@@ -9,6 +9,7 @@ const is_windows = builtin.os.tag == .windows;
 const is_macos = builtin.os.tag == .macos;
 const is_ios = builtin.os.tag == .ios;
 const is_darwin = is_macos or is_ios;
+const is_freebsd = builtin.os.tag == .freebsd;
 
 pub const identity = struct {
     pub const Keys = @import("identity/keys.zig");
@@ -55,10 +56,11 @@ pub const net = struct {
     pub const BatchUdp = if (is_linux) @import("net/batch_udp.zig") else struct {};
     pub const Offload = if (is_linux) @import("net/offload.zig") else struct {};
     pub const Io = @import("net/io.zig");
-    pub const Tun = if (is_linux) @import("net/tun.zig") else if (is_darwin) @import("net/utun.zig") else struct {};
+    pub const Tun = if (is_linux) @import("net/tun.zig") else if (is_darwin) @import("net/utun.zig") else if (is_freebsd) @import("net/fbsdtun.zig") else struct {};
     pub const Wintun = if (is_windows) @import("net/wintun.zig") else struct {};
     pub const WinCfg = if (is_windows) @import("net/wincfg.zig") else struct {};
     pub const DarwinCfg = if (is_darwin) @import("net/darwincfg.zig") else struct {};
+    pub const FreeBsdCfg = if (is_freebsd) @import("net/freebsdcfg.zig") else struct {};
     pub const Dns = @import("net/dns.zig");
     pub const Pipeline = @import("net/pipeline.zig");
     pub const IoUring = if (is_linux) @import("net/io_uring.zig") else struct {};

@@ -788,7 +788,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     try stdout.writeStreamingAll(zio(), "meshguard starting...\n");
     try writeFormatted(stdout, "  mesh IP: {s}\n", .{ip_str});
     try writeFormatted(stdout, "  mesh IPv6: {s}/{d}\n", .{ ip6_str, lib.wireguard.Ip.default_mesh_mask6 });
-    try writeFormatted(stdout, "  interface: {s}\n", .{if (comptime @import("builtin").os.tag == .linux) lib.wireguard.Config.DEFAULT_IFNAME else if (comptime @import("builtin").os.tag == .macos) "utun" else "wintun"});
+    try writeFormatted(stdout, "  interface: {s}\n", .{if (comptime @import("builtin").os.tag == .linux) lib.wireguard.Config.DEFAULT_IFNAME else if (comptime @import("builtin").os.tag == .macos) "utun" else if (comptime @import("builtin").os.tag == .freebsd) "tun" else "wintun"});
 
     try writeFormatted(stdout, "  mode: {s}\n", .{if (use_kernel_wg) "kernel" else "userspace"});
 
@@ -1191,6 +1191,54 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
             try stdout.writeStreamingAll(zio(), "  GSO/GRO offloads: not available (macOS)\n");
 
             // Run the macOS event loop (simplified, similar to Windows)
+            macosEventLoop(&swim, &wg_device, &gossip_socket, &tun_dev, stdout, &service_filter, &control) catch |err| {
+                try writeFormatted(stderr, "error: event loop failed: {s}\n", .{@errorName(err)});
+            };
+        } else if (comptime @import("builtin").os.tag == .freebsd) {
+            // ─── FreeBSD: tun(4) device + ifconfig/route config + poll-based event loop ───
+            const FreeBsdCfg = lib.net.FreeBsdCfg;
+
+            var tun_dev = lib.net.Tun.TunDevice.open("tun") catch |err| {
+                try writeFormatted(stderr, "error: failed to open tun device: {s}\n", .{@errorName(err)});
+                try stderr.writeStreamingAll(zio(), "  hint: run with sudo or ensure /dev/tun is accessible\n");
+                std.process.exit(1);
+            };
+            defer tun_dev.close();
+
+            try writeFormatted(stdout, "  TUN device: {s} (fd={d})\n", .{ tun_dev.getName(), tun_dev.fd });
+
+            // Configure IP address and routing
+            FreeBsdCfg.setInterfaceIp(allocator, tun_dev.getName(), mesh_ip, 16) catch |err| {
+                try writeFormatted(stderr, "warning: failed to set interface IP: {s}\n", .{@errorName(err)});
+            };
+            FreeBsdCfg.setInterfaceIp6(allocator, tun_dev.getName(), mesh_ip6, lib.wireguard.Ip.default_mesh_mask6) catch |err| {
+                try writeFormatted(stderr, "warning: failed to set interface IPv6: {s}\n", .{@errorName(err)});
+            };
+            FreeBsdCfg.setInterfaceUp(allocator, tun_dev.getName()) catch |err| {
+                try writeFormatted(stderr, "warning: failed to bring up interface: {s}\n", .{@errorName(err)});
+            };
+            FreeBsdCfg.setMtu(allocator, tun_dev.getName(), 1420) catch |err| {
+                try writeFormatted(stderr, "warning: failed to set MTU: {s}\n", .{@errorName(err)});
+            };
+            FreeBsdCfg.addRoute(allocator, tun_dev.getName(), .{ 10, 99, 0, 0 }, 16) catch |err| {
+                try writeFormatted(stderr, "warning: failed to add mesh route: {s}\n", .{@errorName(err)});
+            };
+            FreeBsdCfg.addRoute6(allocator, tun_dev.getName(), lib.wireguard.Ip.default_mesh_network6, lib.wireguard.Ip.default_mesh_mask6) catch |err| {
+                try writeFormatted(stderr, "warning: failed to add mesh IPv6 route: {s}\n", .{@errorName(err)});
+            };
+
+            try writeFormatted(stdout, "  mesh IP: {d}.{d}.{d}.{d}/16 (mtu=1420)\n", .{
+                mesh_ip[0], mesh_ip[1], mesh_ip[2], mesh_ip[3],
+            });
+
+            // Set TUN fd to non-blocking for the event loop
+            tun_dev.setNonBlocking() catch |err| {
+                try writeFormatted(stderr, "warning: failed to set TUN non-blocking: {s}\n", .{@errorName(err)});
+            };
+
+            try stdout.writeStreamingAll(zio(), "  GSO/GRO offloads: not available (FreeBSD)\n");
+
+            // Reuse macOS event loop — both are BSD with poll-based TunDevice API
             macosEventLoop(&swim, &wg_device, &gossip_socket, &tun_dev, stdout, &service_filter, &control) catch |err| {
                 try writeFormatted(stderr, "error: event loop failed: {s}\n", .{@errorName(err)});
             };
