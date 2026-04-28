@@ -139,13 +139,13 @@ pub const UdpRing = struct {
             self.iov = .{ .base = &self.buf, .len = self.buf.len };
             @memset(&self.cmsg_buf, 0);
             self.msg = .{
-                .msg_name = @ptrCast(&self.addr),
-                .msg_namelen = @sizeOf(posix.sockaddr.in),
-                .msg_iov = @ptrCast(&self.iov),
-                .msg_iovlen = 1,
-                .msg_control = @ptrCast(&self.cmsg_buf),
-                .msg_controllen = self.cmsg_buf.len,
-                .msg_flags = 0,
+                .name = @ptrCast(&self.addr),
+                .namelen = @sizeOf(posix.sockaddr.in),
+                .iov = @ptrCast(&self.iov),
+                .iovlen = 1,
+                .control = @ptrCast(&self.cmsg_buf),
+                .controllen = self.cmsg_buf.len,
+                .flags = 0,
             };
         }
 
@@ -153,20 +153,20 @@ pub const UdpRing = struct {
             self.addr = std.mem.zeroes(posix.sockaddr.in);
             self.iov.len = self.buf.len;
             @memset(&self.cmsg_buf, 0);
-            self.msg.msg_namelen = @sizeOf(posix.sockaddr.in);
-            self.msg.msg_controllen = self.cmsg_buf.len;
-            self.msg.msg_flags = 0;
+            self.msg.namelen = @sizeOf(posix.sockaddr.in);
+            self.msg.controllen = self.cmsg_buf.len;
+            self.msg.flags = 0;
         }
 
         fn segmentSize(self: *const RecvSlot) u16 {
-            if (self.msg.msg_controllen == 0) return 0;
+            if (self.msg.controllen == 0) return 0;
             var offset: usize = 0;
-            while (offset + @sizeOf(Cmsghdr) <= self.msg.msg_controllen) {
+            while (offset + @sizeOf(Cmsghdr) <= self.msg.controllen) {
                 const cmsg: *const Cmsghdr = @ptrCast(@alignCast(&self.cmsg_buf[offset]));
                 if (cmsg.len < @sizeOf(Cmsghdr)) break;
                 if (cmsg.level == SOL_UDP and cmsg.type == UDP_GRO) {
                     const data_offset = offset + @sizeOf(Cmsghdr);
-                    if (data_offset + 2 <= self.msg.msg_controllen) {
+                    if (data_offset + 2 <= self.msg.controllen) {
                         return std.mem.readInt(u16, self.cmsg_buf[data_offset..][0..2], NATIVE_ENDIAN);
                     }
                     break;
@@ -189,13 +189,13 @@ pub const UdpRing = struct {
             self.addr = std.mem.zeroes(posix.sockaddr.in);
             self.iov = .{ .base = &self.buf, .len = 0 };
             self.msg = .{
-                .msg_name = @ptrCast(&self.addr),
-                .msg_namelen = @sizeOf(posix.sockaddr.in),
-                .msg_iov = @ptrCast(&self.iov),
-                .msg_iovlen = 1,
-                .msg_control = null,
-                .msg_controllen = 0,
-                .msg_flags = 0,
+                .name = @ptrCast(&self.addr),
+                .namelen = @sizeOf(posix.sockaddr.in),
+                .iov = @ptrCast(&self.iov),
+                .iovlen = 1,
+                .control = null,
+                .controllen = 0,
+                .flags = 0,
             };
             self.busy = false;
         }
@@ -229,9 +229,10 @@ pub const UdpRing = struct {
             self.ring.deinit();
         }
 
-        const flags = posix.system.fcntl(fd, posix.F.GETFL, @as(usize, 0));
-        switch (posix.errno(flags)) {
+        const raw_flags = posix.system.fcntl(fd, posix.F.GETFL, @as(usize, 0));
+        switch (posix.errno(raw_flags)) {
             .SUCCESS => {
+                const flags: usize = @intCast(raw_flags);
                 self.original_status_flags = flags;
                 if ((flags & O_NONBLOCK_FLAG) != 0) {
                     // Blocking fds let io_uring arm async socket receive instead of completing
@@ -338,7 +339,7 @@ pub const UdpRing = struct {
                 .zero = .{0} ** 8,
             };
             slot.iov = .{ .base = &slot.buf, .len = data.len };
-            slot.msg.msg_namelen = @sizeOf(posix.sockaddr.in);
+            slot.msg.namelen = @sizeOf(posix.sockaddr.in);
             slot.busy = true;
             _ = try self.ring.sendmsg(UDP_SEND_USER_DATA | @as(u64, @intCast(i)), fd, &slot.msg, 0);
             _ = try self.ring.submit();
@@ -388,7 +389,7 @@ test "UdpRing parses UDP_GRO cmsg segment size" {
         .type = UDP_GRO,
     };
     std.mem.writeInt(u16, slot.cmsg_buf[@sizeOf(Cmsghdr)..][0..2], 1440, NATIVE_ENDIAN);
-    slot.msg.msg_controllen = cmsg_space;
+    slot.msg.controllen = cmsg_space;
 
     try std.testing.expectEqual(@as(u16, 1440), slot.segmentSize());
 }
