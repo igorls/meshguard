@@ -11,6 +11,8 @@ const UDP_SLOT_MASK: u64 = 0x0000_0000_0000_ffff;
 
 const UDP_GRO = 104;
 const SOL_UDP = 17;
+// UDP_GRO cmsg payloads are emitted by the Linux kernel in native byte order.
+const NATIVE_ENDIAN = builtin.cpu.arch.endian();
 // posix.O is a packed flag struct on this Zig version; compute the raw bit for fcntl(F_SETFL).
 const O_NONBLOCK_FLAG: usize = 1 << @bitOffsetOf(posix.O, "NONBLOCK");
 
@@ -165,7 +167,7 @@ pub const UdpRing = struct {
                 if (cmsg.level == SOL_UDP and cmsg.type == UDP_GRO) {
                     const data_offset = offset + @sizeOf(Cmsghdr);
                     if (data_offset + 2 <= self.msg.msg_controllen) {
-                        return std.mem.readInt(u16, self.cmsg_buf[data_offset..][0..2], builtin.cpu.arch.endian());
+                        return std.mem.readInt(u16, self.cmsg_buf[data_offset..][0..2], NATIVE_ENDIAN);
                     }
                     break;
                 }
@@ -233,7 +235,8 @@ pub const UdpRing = struct {
                 self.original_status_flags = flags;
                 if ((flags & O_NONBLOCK_FLAG) != 0) {
                     // Blocking fds let io_uring arm async socket receive instead of completing
-                    // immediately with EAGAIN on every pre-submitted recvmsg SQE.
+                    // immediately with EAGAIN on every pre-submitted recvmsg SQE. The saved
+                    // original flags are restored by restoreFdFlags() during cleanup.
                     const set_rc = posix.system.fcntl(fd, posix.F.SETFL, flags & ~O_NONBLOCK_FLAG);
                     switch (posix.errno(set_rc)) {
                         .SUCCESS => {},
@@ -241,7 +244,7 @@ pub const UdpRing = struct {
                     }
                 }
             },
-            else => {},
+            else => |err| return posix.unexpectedErrno(err),
         }
 
         for (0..RECV_DEPTH) |i| {
@@ -384,7 +387,7 @@ test "UdpRing parses UDP_GRO cmsg segment size" {
         .level = SOL_UDP,
         .type = UDP_GRO,
     };
-    std.mem.writeInt(u16, slot.cmsg_buf[@sizeOf(Cmsghdr)..][0..2], 1440, builtin.cpu.arch.endian());
+    std.mem.writeInt(u16, slot.cmsg_buf[@sizeOf(Cmsghdr)..][0..2], 1440, NATIVE_ENDIAN);
     slot.msg.msg_controllen = cmsg_space;
 
     try std.testing.expectEqual(@as(u16, 1440), slot.segmentSize());
