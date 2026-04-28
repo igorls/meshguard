@@ -3226,14 +3226,14 @@ fn userspaceEventLoop(
     var decrypt_storage: [MAX_DECRYPTED][1500]u8 = undefined;
     var decrypt_lens: [MAX_DECRYPTED]usize = undefined;
     var decrypt_slots: [MAX_DECRYPTED]usize = undefined;
+    var udp_ring_cqes: [lib.net.IoUring.UdpRing.RECV_DEPTH + lib.net.IoUring.UdpRing.SEND_DEPTH]std.os.linux.io_uring_cqe = undefined;
 
     while (swim.running.load(.acquire)) {
         if (use_udp_ring) {
-            var cqes: [lib.net.IoUring.UdpRing.RECV_DEPTH + lib.net.IoUring.UdpRing.SEND_DEPTH]std.os.linux.io_uring_cqe = undefined;
-            const n_cqes = udp_ring.copyCompletions(&cqes, 0) catch 0;
+            const n_cqes = udp_ring.copyCompletions(&udp_ring_cqes, 0) catch 0;
             var n_decrypted: usize = 0;
 
-            for (cqes[0..n_cqes]) |cqe| {
+            for (udp_ring_cqes[0..n_cqes]) |cqe| {
                 udp_ring.noteSendCompletion(cqe);
                 const recv = udp_ring.recvCompletion(cqe) orelse {
                     if (lib.net.IoUring.UdpRing.recvSlotFromUserData(cqe.user_data)) |slot| {
@@ -3286,7 +3286,7 @@ fn userspaceEventLoop(
                 }
             }
 
-            if (n_cqes == 0) sleepNs(std.time.ns_per_ms);
+            if (n_cqes == 0) sleepNs(100 * std.time.ns_per_us);
 
             // Final flush of remaining decrypted packets
             if (n_decrypted > 0) {

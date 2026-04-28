@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 const linux = std.os.linux;
 const IoUring = linux.IoUring;
@@ -162,7 +163,7 @@ pub const UdpRing = struct {
                 if (cmsg.level == SOL_UDP and cmsg.type == UDP_GRO) {
                     const data_offset = offset + @sizeOf(Cmsghdr);
                     if (data_offset + 2 <= self.msg.msg_controllen) {
-                        return std.mem.readInt(u16, self.cmsg_buf[data_offset..][0..2], .little);
+                        return std.mem.readInt(u16, self.cmsg_buf[data_offset..][0..2], builtin.cpu.arch.endian());
                     }
                     break;
                 }
@@ -227,7 +228,11 @@ pub const UdpRing = struct {
             .SUCCESS => {
                 self.original_status_flags = flags;
                 if ((flags & O_NONBLOCK_FLAG) != 0) {
-                    _ = posix.system.fcntl(fd, posix.F.SETFL, flags & ~O_NONBLOCK_FLAG);
+                    const set_rc = posix.system.fcntl(fd, posix.F.SETFL, flags & ~O_NONBLOCK_FLAG);
+                    switch (posix.errno(set_rc)) {
+                        .SUCCESS => {},
+                        else => |err| return posix.unexpectedErrno(err),
+                    }
                 }
             },
             else => {},
@@ -307,7 +312,7 @@ pub const UdpRing = struct {
     /// into a registered ring-owned slot so the caller's buffer may go out of
     /// scope immediately after this function returns.
     pub fn sendTo(self: *UdpRing, fd: posix.fd_t, data: []const u8, dest_addr: [4]u8, dest_port: u16) !bool {
-        if (data.len > SEND_BUF_SIZE) return error.DatagramTooLarge;
+        if (data.len > SEND_BUF_SIZE) return error.TooBig;
 
         for (0..SEND_DEPTH) |i| {
             if (self.send_slots[i].busy) continue;
@@ -369,7 +374,7 @@ test "UdpRing parses UDP_GRO cmsg segment size" {
         .level = SOL_UDP,
         .type = UDP_GRO,
     };
-    std.mem.writeInt(u16, slot.cmsg_buf[@sizeOf(Cmsghdr)..][0..2], 1440, .little);
+    std.mem.writeInt(u16, slot.cmsg_buf[@sizeOf(Cmsghdr)..][0..2], 1440, builtin.cpu.arch.endian());
     slot.msg.msg_controllen = cmsg_space;
 
     try std.testing.expectEqual(@as(u16, 1440), slot.segmentSize());
