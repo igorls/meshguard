@@ -8,6 +8,9 @@ on:
 permissions:
   contents: write
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   # ─── Validate that the tag matches src/version.zig ───
   validate:
@@ -41,37 +44,30 @@ jobs:
       matrix:
         include:
           - target: x86_64-linux-gnu
-            os: ubuntu-latest
             artifact: meshguard-linux-amd64
             ext: ""
             sodium: true
-          - target: aarch64-linux-gnu
-            os: ubuntu-latest
-            artifact: meshguard-linux-arm64
-            ext: ""
-            sodium: true
           - target: x86_64-windows
-            os: ubuntu-latest
             artifact: meshguard-windows-amd64
             ext: ".exe"
             sodium: false
           - target: x86_64-freebsd
-            os: ubuntu-latest
             artifact: meshguard-freebsd-amd64
             ext: ""
             sodium: false
           - target: x86_64-macos
-            os: ubuntu-latest
             artifact: meshguard-macos-amd64
             ext: ""
             sodium: false
           - target: aarch64-macos
-            os: ubuntu-latest
             artifact: meshguard-macos-arm64
             ext: ""
             sodium: false
+          # NOTE: aarch64-linux-gnu excluded — batch_udp.zig uses hardcoded
+          # x86_64 syscall numbers (SYS_sendmmsg=307, SYS_recvmmsg=299).
+          # Track fix: make syscall numbers arch-aware via linux.SYS enum.
 
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -110,11 +106,9 @@ jobs:
       - name: Prepare release files
         run: |
           mkdir -p release
-          # Flatten artifacts into release dir
           for dir in artifacts/*/; do
             cp "$dir"* release/ 2>/dev/null || true
           done
-          # Bundle wintun.dll for Windows
           cp deps/wintun/wintun.dll release/wintun.dll
 
       - name: Generate checksums
@@ -124,7 +118,6 @@ jobs:
       - name: Extract changelog for this version
         run: |
           TAG="${GITHUB_REF#refs/tags/v}"
-          # Extract the section for this version from CHANGELOG.md
           awk "/^## \[$TAG\]/{found=1; next} /^## \[/{if(found) exit} found{print}" CHANGELOG.md > release_notes.md
           cat release_notes.md
 

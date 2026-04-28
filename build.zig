@@ -15,6 +15,13 @@ pub fn build(b: *std.Build) void {
     const is_macos = resolved_os == .macos;
     const is_freebsd = resolved_os == .freebsd;
 
+    // Build option: disable libsodium linkage (for cross-compilation CI where
+    // the target arch's libsodium is not available). Falls back to std.crypto.
+    const no_sodium = b.option(bool, "no-sodium", "Disable libsodium linkage (use std.crypto)") orelse false;
+
+    // Platforms that never use libsodium
+    const skip_sodium = no_sodium or is_android or is_macos or is_ios or is_freebsd;
+
     // ─── FFI module (for mobile embedding — not built on Windows) ───
     if (!is_windows) {
         const ffi_mod = b.createModule(.{
@@ -34,7 +41,7 @@ pub fn build(b: *std.Build) void {
 
         // Link libsodium on Linux desktop targets for AVX2-accelerated crypto.
         // On Android, macOS, iOS, FreeBSD, and Windows, the Zig std.crypto software fallback is used.
-        if (!is_android and !is_macos and !is_ios and !is_freebsd) {
+        if (!skip_sodium) {
             ffi_mod.linkSystemLibrary("sodium", .{});
         }
 
@@ -65,7 +72,7 @@ pub fn build(b: *std.Build) void {
         });
         // Link libsodium on Linux desktop only (AVX2 ChaCha20-Poly1305 assembly)
         // macOS, FreeBSD, and Windows use std.crypto
-        if (!is_windows and !is_macos and !is_freebsd) {
+        if (!is_windows and !skip_sodium) {
             exe_mod.linkSystemLibrary("sodium", .{});
         }
         // On Windows, link ws2_32 for Winsock2 sockets
@@ -91,7 +98,9 @@ pub fn build(b: *std.Build) void {
                 .name = "wg-interop-test",
                 .root_module = interop_mod,
             });
-            interop_mod.linkSystemLibrary("sodium", .{});
+            if (!skip_sodium) {
+                interop_mod.linkSystemLibrary("sodium", .{});
+            }
             b.installArtifact(interop_exe);
         }
 
@@ -118,13 +127,12 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .link_libc = true,
-
         });
 
         const unit_tests = b.addTest(.{
             .root_module = test_mod,
         });
-        if (!is_windows and !is_macos and !is_freebsd) {
+        if (!is_windows and !skip_sodium) {
             test_mod.linkSystemLibrary("sodium", .{});
         }
         if (is_windows) {
@@ -135,4 +143,3 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_unit_tests.step);
     }
 }
-
