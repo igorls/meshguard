@@ -3209,38 +3209,52 @@ fn userspaceEventLoop(
     posix.setsockopt(udp_sock.fd, posix.SOL.SOCKET, SO_BUSY_POLL, std.mem.asBytes(&busy_poll_us)) catch {};
 
     var gro_rx = BatchUdp.GROReceiver{};
+    var udp_ring: lib.net.IoUring.UdpRing = undefined;
+    const use_udp_ring = blk: {
+        udp_ring.init(udp_sock.fd) catch break :blk false;
+        break :blk true;
+    };
+    defer if (use_udp_ring) udp_ring.deinit();
+    if (use_udp_ring) {
+        const sqpoll_msg = if (udp_ring.sqpoll) "SQPOLL" else "submit";
+        writeFormatted(stdout, "  io_uring UDP: recvmsg/sendmsg ring active ({s}, registered buffers)\n", .{sqpoll_msg}) catch {};
+    } else {
+        writeFormatted(stdout, "  io_uring UDP: unavailable, using poll+recvmsg path\n", .{}) catch {};
+    }
+
     const MAX_DECRYPTED = 64;
     var decrypt_storage: [MAX_DECRYPTED][1500]u8 = undefined;
     var decrypt_lens: [MAX_DECRYPTED]usize = undefined;
     var decrypt_slots: [MAX_DECRYPTED]usize = undefined;
 
     while (swim.running.load(.acquire)) {
-        var fds = [_]posix.pollfd{
-            .{ .fd = udp_sock.fd, .events = posix.POLL.IN, .revents = 0 },
-        };
-        _ = posix.poll(&fds, 50) catch continue;
-
-        if (fds[0].revents & posix.POLL.IN != 0) {
+        if (use_udp_ring) {
+            var cqes: [lib.net.IoUring.UdpRing.RECV_DEPTH + lib.net.IoUring.UdpRing.SEND_DEPTH]std.os.linux.io_uring_cqe = undefined;
+            const n_cqes = udp_ring.copyCompletions(&cqes, 0) catch 0;
             var n_decrypted: usize = 0;
 
-            // Drain loop: process all pending GRO batches before returning to poll()
-            while (true) {
-                const total_bytes = gro_rx.recvGRO(udp_sock.fd);
-                if (total_bytes == 0) break; // EAGAIN — socket drained
+            for (cqes[0..n_cqes]) |cqe| {
+                udp_ring.noteSendCompletion(cqe);
+                const recv = udp_ring.recvCompletion(cqe) orelse {
+                    if (lib.net.IoUring.UdpRing.recvSlotFromUserData(cqe.user_data)) |slot| {
+                        udp_ring.resubmitRecv(slot, udp_sock.fd) catch {};
+                    }
+                    continue;
+                };
 
-                const sender = gro_rx.getSender();
-                const seg_size: usize = if (gro_rx.segment_size > 0) gro_rx.segment_size else total_bytes;
+                const total_bytes = recv.data.len;
+                const seg_size: usize = if (recv.segment_size > 0) recv.segment_size else total_bytes;
 
                 var offset: usize = 0;
                 while (offset < total_bytes) {
                     const remaining = total_bytes - offset;
                     const pkt_len = @min(seg_size, remaining);
-                    const pkt = gro_rx.buf[offset..][0..pkt_len];
+                    const pkt = recv.data[offset..][0..pkt_len];
 
                     processIncomingPacket(
                         pkt,
-                        sender.addr,
-                        sender.port,
+                        recv.sender_addr,
+                        recv.sender_port,
                         wg_dev,
                         swim,
                         udp_sock,
@@ -3254,6 +3268,8 @@ fn userspaceEventLoop(
 
                     offset += pkt_len;
                 }
+
+                udp_ring.resubmitRecv(recv.slot, udp_sock.fd) catch {};
 
                 // Flush decrypted packets to TUN if buffer is filling up
                 if (n_decrypted >= MAX_DECRYPTED - 44) {
@@ -3270,6 +3286,8 @@ fn userspaceEventLoop(
                 }
             }
 
+            if (n_cqes == 0) sleepNs(std.time.ns_per_ms);
+
             // Final flush of remaining decrypted packets
             if (n_decrypted > 0) {
                 if (tun_dev.vnet_hdr) {
@@ -3277,6 +3295,73 @@ fn userspaceEventLoop(
                 } else {
                     for (0..n_decrypted) |d| {
                         writeFdNoErr(tun_dev.fd, decrypt_storage[d][0..decrypt_lens[d]]);
+                    }
+                }
+            }
+        } else {
+            var fds = [_]posix.pollfd{
+                .{ .fd = udp_sock.fd, .events = posix.POLL.IN, .revents = 0 },
+            };
+            _ = posix.poll(&fds, 50) catch continue;
+
+            if (fds[0].revents & posix.POLL.IN != 0) {
+                var n_decrypted: usize = 0;
+
+                // Drain loop: process all pending GRO batches before returning to poll()
+                while (true) {
+                    const total_bytes = gro_rx.recvGRO(udp_sock.fd);
+                    if (total_bytes == 0) break; // EAGAIN — socket drained
+
+                    const sender = gro_rx.getSender();
+                    const seg_size: usize = if (gro_rx.segment_size > 0) gro_rx.segment_size else total_bytes;
+
+                    var offset: usize = 0;
+                    while (offset < total_bytes) {
+                        const remaining = total_bytes - offset;
+                        const pkt_len = @min(seg_size, remaining);
+                        const pkt = gro_rx.buf[offset..][0..pkt_len];
+
+                        processIncomingPacket(
+                            pkt,
+                            sender.addr,
+                            sender.port,
+                            wg_dev,
+                            swim,
+                            udp_sock,
+                            stdout,
+                            &decrypt_storage,
+                            &decrypt_lens,
+                            &decrypt_slots,
+                            &n_decrypted,
+                            service_filter,
+                        );
+
+                        offset += pkt_len;
+                    }
+
+                    // Flush decrypted packets to TUN if buffer is filling up
+                    if (n_decrypted >= MAX_DECRYPTED - 44) {
+                        if (n_decrypted > 0) {
+                            if (tun_dev.vnet_hdr) {
+                                writeCoalescedToTun(&tun_dev, &decrypt_storage, &decrypt_lens, n_decrypted);
+                            } else {
+                                for (0..n_decrypted) |d| {
+                                    writeFdNoErr(tun_dev.fd, decrypt_storage[d][0..decrypt_lens[d]]);
+                                }
+                            }
+                            n_decrypted = 0;
+                        }
+                    }
+                }
+
+                // Final flush of remaining decrypted packets
+                if (n_decrypted > 0) {
+                    if (tun_dev.vnet_hdr) {
+                        writeCoalescedToTun(&tun_dev, &decrypt_storage, &decrypt_lens, n_decrypted);
+                    } else {
+                        for (0..n_decrypted) |d| {
+                            writeFdNoErr(tun_dev.fd, decrypt_storage[d][0..decrypt_lens[d]]);
+                        }
                     }
                 }
             }
