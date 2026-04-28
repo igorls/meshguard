@@ -21,12 +21,11 @@ const Cmsghdr = extern struct {
 };
 
 fn initRing(entries: u16, use_sqpoll: bool) !IoUring {
-    if (use_sqpoll) {
-        return IoUring.init(entries, linux.IORING_SETUP_SQPOLL) catch {
-            return try IoUring.init(entries, 0);
-        };
-    }
-    return try IoUring.init(entries, 0);
+    const flags: u32 = if (use_sqpoll) linux.IORING_SETUP_SQPOLL else 0;
+    return IoUring.init(entries, flags) catch |err| {
+        if (!use_sqpoll) return err;
+        return try IoUring.init(entries, 0);
+    };
 }
 
 /// TUN reader backed by io_uring.
@@ -219,6 +218,8 @@ pub const UdpRing = struct {
             .registered_buffers = false,
             .sqpoll = false,
         };
+        // initRing may fall back when SQPOLL is denied by permissions/seccomp;
+        // the kernel-returned flags are the source of truth for runtime logging.
         self.sqpoll = (self.ring.flags & linux.IORING_SETUP_SQPOLL) != 0;
         errdefer {
             self.restoreFdFlags();
@@ -319,7 +320,7 @@ pub const UdpRing = struct {
     /// into a registered ring-owned slot so the caller's buffer may go out of
     /// scope immediately after this function returns.
     pub fn sendTo(self: *UdpRing, fd: posix.fd_t, data: []const u8, dest_addr: [4]u8, dest_port: u16) !bool {
-        if (data.len > SEND_BUF_SIZE) return error.TooBig;
+        if (data.len > SEND_BUF_SIZE) return error.ExceedsSendBufferSize;
 
         for (0..SEND_DEPTH) |i| {
             if (self.send_slots[i].busy) continue;

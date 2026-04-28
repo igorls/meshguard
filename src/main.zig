@@ -3228,6 +3228,7 @@ fn userspaceEventLoop(
     var decrypt_lens: [MAX_DECRYPTED]usize = undefined;
     var decrypt_slots: [MAX_DECRYPTED]usize = undefined;
     var udp_ring_cqes: [lib.net.IoUring.UdpRing.RECV_DEPTH + lib.net.IoUring.UdpRing.SEND_DEPTH]std.os.linux.io_uring_cqe = undefined;
+    const UDP_RING_IDLE_BACKOFF_NS = 100 * std.time.ns_per_us;
 
     while (swim.running.load(.acquire)) {
         if (use_udp_ring) {
@@ -3289,7 +3290,7 @@ fn userspaceEventLoop(
 
             // Short backoff avoids spinning while keeping control-plane latency below the
             // 50ms poll fallback timeout when the SQPOLL thread has no completions ready.
-            if (n_cqes == 0) sleepNs(100 * std.time.ns_per_us);
+            if (n_cqes == 0) sleepNs(UDP_RING_IDLE_BACKOFF_NS);
 
             // Final flush of remaining decrypted packets
             if (n_decrypted > 0) {
