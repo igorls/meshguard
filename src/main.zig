@@ -3217,7 +3217,8 @@ fn userspaceEventLoop(
     defer if (use_udp_ring) udp_ring.deinit();
     if (use_udp_ring) {
         const sqpoll_msg = if (udp_ring.sqpoll) "SQPOLL" else "submit";
-        writeFormatted(stdout, "  io_uring UDP: recvmsg/sendmsg ring active ({s}, registered buffers)\n", .{sqpoll_msg}) catch {};
+        const buffer_msg = if (udp_ring.registered_buffers) "registered buffers" else "unregistered buffers";
+        writeFormatted(stdout, "  io_uring UDP: recvmsg/sendmsg ring active ({s}, {s})\n", .{ sqpoll_msg, buffer_msg }) catch {};
     } else {
         writeFormatted(stdout, "  io_uring UDP: unavailable, using poll+recvmsg path\n", .{}) catch {};
     }
@@ -3286,6 +3287,8 @@ fn userspaceEventLoop(
                 }
             }
 
+            // Short backoff avoids spinning while keeping control-plane latency below the
+            // 50ms poll fallback timeout when the SQPOLL thread has no completions ready.
             if (n_cqes == 0) sleepNs(100 * std.time.ns_per_us);
 
             // Final flush of remaining decrypted packets

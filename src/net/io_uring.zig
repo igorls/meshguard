@@ -11,6 +11,7 @@ const UDP_SLOT_MASK: u64 = 0x0000_0000_0000_ffff;
 
 const UDP_GRO = 104;
 const SOL_UDP = 17;
+// posix.O is a packed flag struct on this Zig version; compute the raw bit for fcntl(F_SETFL).
 const O_NONBLOCK_FLAG: usize = 1 << @bitOffsetOf(posix.O, "NONBLOCK");
 
 const Cmsghdr = extern struct {
@@ -111,6 +112,7 @@ pub const TunRingReader = struct {
 pub const UdpRing = struct {
     pub const RECV_DEPTH: u16 = 32;
     pub const SEND_DEPTH: u16 = 32;
+    // Keep spare SQEs beyond recv+send slots for completions/resubmits during bursts.
     pub const RING_DEPTH: u16 = 128;
     pub const RECV_BUF_SIZE: usize = 65536;
     pub const SEND_BUF_SIZE: usize = 2048;
@@ -228,6 +230,8 @@ pub const UdpRing = struct {
             .SUCCESS => {
                 self.original_status_flags = flags;
                 if ((flags & O_NONBLOCK_FLAG) != 0) {
+                    // Blocking fds let io_uring arm async socket receive instead of completing
+                    // immediately with EAGAIN on every pre-submitted recvmsg SQE.
                     const set_rc = posix.system.fcntl(fd, posix.F.SETFL, flags & ~O_NONBLOCK_FLAG);
                     switch (posix.errno(set_rc)) {
                         .SUCCESS => {},
@@ -255,7 +259,10 @@ pub const UdpRing = struct {
 
         if (self.ring.register_buffers(&self.registered_iovecs)) |_| {
             self.registered_buffers = true;
-        } else |_| {}
+        } else |_| {
+            // Registration can fail in containers with low memlock limits; the ring still works,
+            // just without fixed/pinned buffers.
+        }
 
         for (0..RECV_DEPTH) |i| {
             try self.submitRecv(@intCast(i), fd);
