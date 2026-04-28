@@ -107,7 +107,8 @@ pub const TunRingReader = struct {
 /// UDP receive/send event loop backed by io_uring.
 /// Keeps receive SQEs in flight and uses registered fixed buffers plus SQPOLL
 /// when the kernel/container permits it. UDP payload buffers are stable for the
-/// lifetime of the ring, so callers can process completions without a copy.
+/// lifetime of the ring (until deinit), so callers can process completions
+/// without a copy.
 pub const UdpRing = struct {
     pub const RECV_DEPTH: u16 = 32;
     pub const SEND_DEPTH: u16 = 32;
@@ -319,6 +320,7 @@ pub const UdpRing = struct {
     /// Queue a UDP datagram through IORING_OP_SENDMSG. The payload is copied
     /// into a registered ring-owned slot so the caller's buffer may go out of
     /// scope immediately after this function returns.
+    /// Returns error.ExceedsSendBufferSize when `data.len` is greater than SEND_BUF_SIZE.
     pub fn sendTo(self: *UdpRing, fd: posix.fd_t, data: []const u8, dest_addr: [4]u8, dest_port: u16) !bool {
         if (data.len > SEND_BUF_SIZE) return error.ExceedsSendBufferSize;
 

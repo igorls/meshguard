@@ -3227,15 +3227,15 @@ fn userspaceEventLoop(
     var decrypt_storage: [MAX_DECRYPTED][1500]u8 = undefined;
     var decrypt_lens: [MAX_DECRYPTED]usize = undefined;
     var decrypt_slots: [MAX_DECRYPTED]usize = undefined;
-    var udp_ring_cqes: [lib.net.IoUring.UdpRing.RECV_DEPTH + lib.net.IoUring.UdpRing.SEND_DEPTH]std.os.linux.io_uring_cqe = undefined;
+    var cqe_buffer: [lib.net.IoUring.UdpRing.RECV_DEPTH + lib.net.IoUring.UdpRing.SEND_DEPTH]std.os.linux.io_uring_cqe = undefined;
     const UDP_RING_IDLE_BACKOFF_NS = 100 * std.time.ns_per_us;
 
     while (swim.running.load(.acquire)) {
         if (use_udp_ring) {
-            const n_cqes = udp_ring.copyCompletions(&udp_ring_cqes, 0) catch 0;
+            const n_cqes = udp_ring.copyCompletions(&cqe_buffer, 0) catch 0;
             var n_decrypted: usize = 0;
 
-            for (udp_ring_cqes[0..n_cqes]) |cqe| {
+            for (cqe_buffer[0..n_cqes]) |cqe| {
                 udp_ring.noteSendCompletion(cqe);
                 const recv = udp_ring.recvCompletion(cqe) orelse {
                     if (lib.net.IoUring.UdpRing.recvSlotFromUserData(cqe.user_data)) |slot| {
@@ -3290,6 +3290,7 @@ fn userspaceEventLoop(
 
             // Short backoff avoids spinning while keeping control-plane latency below the
             // 50ms poll fallback timeout when the SQPOLL thread has no completions ready.
+            // The fallback branch blocks in poll(), so it does not need this extra backoff.
             if (n_cqes == 0) sleepNs(UDP_RING_IDLE_BACKOFF_NS);
 
             // Final flush of remaining decrypted packets
