@@ -46,6 +46,8 @@ const usage =
     \\  --mdns               Discover seeds via mDNS on LAN
     \\  --announce <ip>      Override public IP (skip STUN)
     \\  --kernel             Use kernel WireGuard (requires root)
+    \\  --gossip-only        Run discovery/rendezvous only, without TUN/WireGuard
+    \\  --no-tun             Alias for --gossip-only
     \\  --open               Accept all peers (skip trust enforcement)
     \\  -h, --help          Show this help
     \\
@@ -103,8 +105,6 @@ fn childExitCode(term: std.process.Child.Term) ?u8 {
 fn childExitedSuccessfully(term: std.process.Child.Term) bool {
     return childExitCode(term) == 0;
 }
-
-
 
 pub fn main(init: std.process.Init) !void {
     runtime_io = init.io;
@@ -664,6 +664,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     var use_mdns: bool = false;
     var encrypt_workers: usize = 0; // 0 = auto (CPU count)
     var open_mode: bool = false; // --open: skip trust, accept any peer
+    var gossip_only: bool = false; // --gossip-only/--no-tun: seed/rendezvous mode
     // Collect raw seed strings for hostname resolution
     var seed_strs: [16][]const u8 = undefined;
     var seed_str_count: usize = 0;
@@ -702,6 +703,8 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
                 encrypt_workers = std.fmt.parseInt(usize, extra_args[i], 10) catch 0;
             } else if (std.mem.eql(u8, extra_args[i], "--open")) {
                 open_mode = true;
+            } else if (std.mem.eql(u8, extra_args[i], "--gossip-only") or std.mem.eql(u8, extra_args[i], "--no-tun")) {
+                gossip_only = true;
             }
         }
     }
@@ -788,9 +791,9 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     try stdout.writeStreamingAll(zio(), "meshguard starting...\n");
     try writeFormatted(stdout, "  mesh IP: {s}\n", .{ip_str});
     try writeFormatted(stdout, "  mesh IPv6: {s}/{d}\n", .{ ip6_str, lib.wireguard.Ip.default_mesh_mask6 });
-    try writeFormatted(stdout, "  interface: {s}\n", .{if (comptime @import("builtin").os.tag == .linux) lib.wireguard.Config.DEFAULT_IFNAME else if (comptime @import("builtin").os.tag == .macos) "utun" else if (comptime @import("builtin").os.tag == .freebsd) "tun" else "wintun"});
+    try writeFormatted(stdout, "  interface: {s}\n", .{if (gossip_only) "none" else if (comptime @import("builtin").os.tag == .linux) lib.wireguard.Config.DEFAULT_IFNAME else if (comptime @import("builtin").os.tag == .macos) "utun" else if (comptime @import("builtin").os.tag == .freebsd) "tun" else "wintun"});
 
-    try writeFormatted(stdout, "  mode: {s}\n", .{if (use_kernel_wg) "kernel" else "userspace"});
+    try writeFormatted(stdout, "  mode: {s}\n", .{if (gossip_only) "gossip-only" else if (use_kernel_wg) "kernel" else "userspace"});
 
     // Derive a WireGuard X25519 private key from the Ed25519 seed
     // Standard Ed25519→X25519 conversion: SHA-512(seed), take first 32 bytes, clamp
@@ -811,7 +814,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     };
 
     // Setup WireGuard interface (kernel or TUN)
-    if (use_kernel_wg) {
+    if (use_kernel_wg and !gossip_only) {
         if (comptime @import("builtin").os.tag != .linux) {
             try stderr.writeStreamingAll(zio(), "error: kernel WireGuard mode is only available on Linux\n");
             std.process.exit(1);
@@ -838,8 +841,11 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
         // TUN creation happens later in the event loop setup
     }
 
-
-    try stdout.writeStreamingAll(zio(), "  interface mg0 created and configured\n");
+    if (gossip_only) {
+        try stdout.writeStreamingAll(zio(), "  interface setup: skipped\n");
+    } else {
+        try stdout.writeStreamingAll(zio(), "  interface mg0 created and configured\n");
+    }
 
     // Bind gossip UDP socket
     const gossip_port: u16 = 51821;
@@ -856,12 +862,12 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
                 }
             else
                 lib.net.Udp.UdpSocket.bindAddr(ep.addr, gossip_port) catch {
-                try stderr.writeStreamingAll(zio(), "error: failed to bind gossip port to announced address\n");
-                if (comptime @import("builtin").os.tag == .linux) {
-                    lib.wireguard.Config.teardown(lib.wireguard.Config.DEFAULT_IFNAME) catch {};
-                }
-                std.process.exit(1);
-            };
+                    try stderr.writeStreamingAll(zio(), "error: failed to bind gossip port to announced address\n");
+                    if (comptime @import("builtin").os.tag == .linux) {
+                        lib.wireguard.Config.teardown(lib.wireguard.Config.DEFAULT_IFNAME) catch {};
+                    }
+                    std.process.exit(1);
+                };
         } else {
             break :blk lib.net.Udp.UdpSocket.bind(gossip_port) catch {
                 try stderr.writeStreamingAll(zio(), "error: failed to bind gossip port 51821\n");
@@ -870,7 +876,6 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
                 }
                 std.process.exit(1);
             };
-
         }
     };
     defer gossip_socket.close();
@@ -892,7 +897,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     defer control.deinit(allocator);
 
     // Create WG event handler context
-    var wg_handler_ctx = WgHandlerCtx{ .stdout = stdout, .membership = &membership, .socket = &gossip_socket };
+    var wg_handler_ctx = WgHandlerCtx{ .stdout = stdout, .membership = &membership, .socket = &gossip_socket, .use_kernel = !gossip_only };
 
     // Initialize SWIM protocol
     var swim = lib.discovery.Swim.SwimProtocol.init(
@@ -1044,7 +1049,12 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     installSignalHandler(swim_ptr);
 
     // Run event loop
-    if (use_kernel_wg) {
+    if (gossip_only) {
+        try stdout.writeStreamingAll(zio(), "meshguard is running (gossip-only seed mode). Press Ctrl+C to stop.\n");
+        gossipOnlyEventLoop(&swim, &control) catch |err| {
+            try writeFormatted(stderr, "error: gossip-only loop failed: {s}\n", .{@errorName(err)});
+        };
+    } else if (use_kernel_wg) {
         // Kernel mode: SWIM owns the socket
         try stdout.writeStreamingAll(zio(), "meshguard is running (kernel WG mode). Press Ctrl+C to stop.\n");
         swim.run() catch |err| {
@@ -1246,7 +1256,6 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
             try stderr.writeStreamingAll(zio(), "error: unsupported platform for userspace WireGuard mode\n");
             std.process.exit(1);
         }
-
     }
 
     // Send leave announcement safely from the main thread (covers kernel mode)
@@ -1291,7 +1300,7 @@ fn cmdConnect(allocator: std.mem.Allocator, extra_args: []const []const u8) !voi
                 i += 1;
                 punch_delay_min = std.fmt.parseInt(u64, extra_args[i], 10) catch 1;
             } else if (std.mem.eql(u8, extra_args[i], "--help") or std.mem.eql(u8, extra_args[i], "-h")) {
-                try stdout.writeStreamingAll(zio(), 
+                try stdout.writeStreamingAll(zio(),
                     \\meshguard connect — Direct peer connection via token exchange
                     \\
                     \\USAGE:
@@ -1696,8 +1705,6 @@ fn windowsCtrlHandler(ctrl_type: u32) callconv(.winapi) std.os.windows.BOOL {
     }
     return @enumFromInt(0); // Not handled
 }
-
-
 
 const WgHandlerCtx = struct {
     stdout: std.Io.File,
@@ -2889,6 +2896,21 @@ fn windowsEventLoop(
     }
 }
 
+/// Discovery-only event loop for seed/rendezvous servers.
+///
+/// This keeps SWIM gossip and the control socket alive without creating a TUN
+/// device or configuring WireGuard. It is useful for local development and for
+/// public seed nodes that only need to help peers discover each other.
+fn gossipOnlyEventLoop(
+    swim: *lib.discovery.Swim.SwimProtocol,
+    control_socket: *lib.services.Control.ControlSocket,
+) !void {
+    while (swim.running.load(.acquire)) {
+        try swim.tick();
+        _ = control_socket.poll();
+    }
+}
+
 /// macOS userspace event loop — simplified single-threaded poll loop.
 ///
 /// Similar to windowsEventLoop: alternates between TUN reads and UDP gossip.
@@ -3038,7 +3060,6 @@ fn userspaceEventLoop(
     service_filter: *const lib.services.Policy.ServiceFilter,
     control_socket: *lib.services.Control.ControlSocket,
 ) !void {
-
     const BatchUdp = lib.net.BatchUdp;
 
     // Determine TUN reader count: min(cpus, MAX_WORKERS), at least 1
@@ -3477,7 +3498,6 @@ fn cmdStatus(allocator: std.mem.Allocator) !void {
         try stderr.writeStreamingAll(zio(), "error: 'meshguard status' is only supported on Linux (requires netlink)\n");
         std.process.exit(1);
     }
-
 
     const Netlink = lib.wireguard.Netlink;
 

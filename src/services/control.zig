@@ -26,6 +26,24 @@ fn linuxSocket(domain: u32, sock_type: u32, protocol: u32) !std.posix.socket_t {
     }
 }
 
+fn setNonBlocking(fd: posix.socket_t) !void {
+    const flags = posix.system.fcntl(fd, posix.F.GETFL, @as(usize, 0));
+    switch (posix.errno(flags)) {
+        .SUCCESS => {},
+        else => return error.SocketSetupFailed,
+    }
+
+    const rc = posix.system.fcntl(
+        fd,
+        posix.F.SETFL,
+        @as(usize, @intCast(flags)) | @as(usize, 1 << @bitOffsetOf(posix.O, "NONBLOCK")),
+    );
+    switch (posix.errno(rc)) {
+        .SUCCESS => {},
+        else => return error.SocketSetupFailed,
+    }
+}
+
 fn closeSocket(fd: posix.socket_t) void {
     _ = std.c.close(fd);
 }
@@ -151,8 +169,15 @@ pub const ControlSocket = struct {
         deleteFileAbsolute(self.socket_path);
 
         const addr = try initUnixSocketAddress(self.socket_path);
-        const sock = try linuxSocket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
+        const sock_type = if (comptime is_linux)
+            posix.SOCK.STREAM | posix.SOCK.NONBLOCK
+        else
+            posix.SOCK.STREAM;
+        const sock = try linuxSocket(posix.AF.UNIX, sock_type, 0);
         errdefer closeSocket(sock);
+        if (comptime !is_linux) {
+            try setNonBlocking(sock);
+        }
 
         if (std.c.bind(sock, @ptrCast(&addr.addr), addr.len) != 0) {
             return error.BindFailed;
@@ -224,7 +249,7 @@ pub const ControlSocket = struct {
 
         // Try to connect a client (non-blocking)
         const connected = win.ConnectNamedPipe(pipe, null);
-            if (connected == @as(win.BOOL, @enumFromInt(0))) {
+        if (connected == @as(win.BOOL, @enumFromInt(0))) {
             const err = win.GetLastError();
             // ERROR_PIPE_CONNECTED (535) means client already connected
             if (err != @as(win.windows.Win32Error, @enumFromInt(535)) and
@@ -238,7 +263,7 @@ pub const ControlSocket = struct {
         var buf: [64]u8 = undefined;
         var bytes_read: win.DWORD = 0;
         const read_ok = win.ReadFile(pipe, @ptrCast(&buf), buf.len, &bytes_read, null);
-            if (read_ok == @as(win.BOOL, @enumFromInt(0)) or bytes_read == 0) {
+        if (read_ok == @as(win.BOOL, @enumFromInt(0)) or bytes_read == 0) {
             _ = win.DisconnectNamedPipe(pipe);
             return false;
         }

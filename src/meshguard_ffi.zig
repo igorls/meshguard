@@ -13,10 +13,12 @@ const std = @import("std");
 const builtin = @import("builtin");
 const lib = @import("lib.zig");
 
-// Android panic handler: Zig's default panic handler tries to load DWARF debug
-// info from the .so file. On Android the library is embedded inside the APK and
-// can't be opened as a regular file, causing a null-pointer crash in
-// debug.Dwarf.ElfModule.load. Override to simply abort.
+const is_mobile = builtin.abi == .android or builtin.os.tag == .ios;
+
+// Mobile panic handler: Zig's default panic handler tries to load debug info
+// from the library. On Android the library is embedded inside the APK, and on
+// iOS simulator the default Mach-O unwinder can reference unavailable dyld
+// private symbols. Override to simply abort.
 pub const std_options: std.Options = .{
     .logFn = if (builtin.abi == .android) androidLogFn else std.log.defaultLog,
 };
@@ -35,19 +37,14 @@ fn androidLogFn(
     // which writes to stderr (logcat picks it up).
 }
 
-pub const panic = if (builtin.abi == .android)
-    std.debug.FullPanic(androidPanic)
+pub const panic = if (is_mobile)
+    std.debug.FullPanic(mobilePanic)
 else
     std.debug.FullPanic(std.debug.defaultPanic);
 
-fn androidPanic(msg: []const u8, _: ?usize) noreturn {
-    // On Android, bypass the DWARF-based stack trace completely.
-    // Write to stderr via POSIX write() syscall — logcat picks this up.
-    const stderr_fd: std.posix.fd_t = 2; // stderr
-    const prefix = "MESHGUARD PANIC: ";
-    _ = std.posix.write(stderr_fd, prefix) catch {};
-    _ = std.posix.write(stderr_fd, msg) catch {};
-    _ = std.posix.write(stderr_fd, "\n") catch {};
+fn mobilePanic(msg: []const u8, _: ?usize) noreturn {
+    // Bypass debug-info-based stack traces completely.
+    _ = msg;
     std.process.abort();
 }
 
@@ -62,6 +59,16 @@ const noise = lib.wireguard.Noise;
 fn zio() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
 }
+
+fn fillIdentitySeed(out: *[32]u8) void {
+    if (builtin.os.tag.isDarwin()) {
+        std.c.arc4random_buf(out, out.len);
+        return;
+    }
+
+    zio().random(out);
+}
+
 const crypto = lib.wireguard.Crypto;
 const Device = lib.wireguard.Device;
 const WgDevice = Device.WgDevice;
@@ -181,21 +188,21 @@ export fn meshguard_init(
         .alloc = allocator,
     };
 
-    // Identity: use provided seed or generate
+    // Identity: use provided seed or generate.
+    var identity_seed_bytes: [32]u8 = undefined;
     if (identity_seed) |seed| {
-        @memcpy(&ctx.ed25519_seed, seed[0..32]);
-        // Derive a deterministic public key by hashing the seed (Ed25519 convention)
-        var hash: [64]u8 = undefined;
-        std.crypto.hash.sha2.Sha512.hash(seed[0..32], &hash, .{});
-        @memcpy(&ctx.ed25519_public, hash[0..32]);
+        @memcpy(&identity_seed_bytes, seed[0..32]);
     } else {
-        // Generate a fresh keypair
-        const kp = Ed25519.KeyPair.generate(zio());
-        const pub_bytes = kp.public_key.toBytes();
-        const sec_bytes = kp.secret_key.toBytes();
-        @memcpy(&ctx.ed25519_seed, sec_bytes[0..32]);
-        @memcpy(&ctx.ed25519_public, &pub_bytes);
+        fillIdentitySeed(&identity_seed_bytes);
     }
+
+    const kp = Ed25519.KeyPair.generateDeterministic(identity_seed_bytes) catch {
+        allocator.destroy(ctx);
+        return null;
+    };
+    const pub_bytes = kp.public_key.toBytes();
+    @memcpy(&ctx.ed25519_seed, &identity_seed_bytes);
+    @memcpy(&ctx.ed25519_public, &pub_bytes);
 
     // Derive X25519 keys for Noise handshakes
     // Use first 32 bytes of Ed25519 seed, clamped for Curve25519

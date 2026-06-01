@@ -122,6 +122,12 @@ pub const LanDiscovery = struct {
         } else {
             try posix.setsockopt(sock_fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one));
         }
+        if (comptime @hasDecl(posix.SO, "REUSEPORT")) {
+            try posix.setsockopt(sock_fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, std.mem.asBytes(&one));
+        }
+        if (comptime @hasDecl(posix.SO, "BROADCAST")) {
+            try posix.setsockopt(sock_fd, posix.SOL.SOCKET, posix.SO.BROADCAST, std.mem.asBytes(&one));
+        }
 
         // Bind to multicast port
         const bind_addr = posix.sockaddr.in{
@@ -210,6 +216,14 @@ pub const LanDiscovery = struct {
         } else {
             _ = std.c.sendto(self.sock_fd, buf[0..].ptr, buf.len, 0, @ptrCast(&dest), @sizeOf(posix.sockaddr.in));
         }
+
+        const broadcast_dest = posix.sockaddr.in{
+            .family = posix.AF.INET,
+            .port = std.mem.nativeToBig(u16, MULTICAST_PORT),
+            .addr = std.mem.nativeToBig(u32, 0xFFFF_FFFF),
+            .zero = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+        };
+        _ = std.c.sendto(self.sock_fd, buf[0..].ptr, buf.len, 0, @ptrCast(&broadcast_dest), @sizeOf(posix.sockaddr.in));
     }
 
     /// Check for incoming beacons (non-blocking). Returns number of peers discovered.
