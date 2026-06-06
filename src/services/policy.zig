@@ -12,7 +12,6 @@
 
 const std = @import("std");
 
-
 /// Read all available bytes from an Io.File into buf. Returns bytes read.
 fn readFileBytes(f: std.Io.File, buf: []u8) !usize {
     var reader = f.reader(zio(), &.{});
@@ -33,7 +32,6 @@ fn zio() std.Io {
 fn openDirAbsolute(path: []const u8) !std.Io.Dir {
     return std.Io.Dir.openDirAbsolute(zio(), path, .{ .iterate = true });
 }
-
 
 // ─── Rule types ───
 
@@ -253,6 +251,27 @@ pub const ServiceFilter = struct {
 
         // 4. Default
         return self.default_action == .allow;
+    }
+
+    /// Decide whether a decrypted inner IP packet is allowed, parsing both IPv4
+    /// and IPv6. TCP/UDP are matched against policy; ICMP/ICMPv6 pass as control
+    /// traffic; anything we cannot classify falls back to the default action.
+    ///
+    /// SECURITY (M5): IPv6 packets previously returned null from
+    /// parseTransportHeader and were written to TUN with NO filtering, leaking
+    /// all IPv6 under a default-deny policy. This path classifies IPv6 and FAILS
+    /// CLOSED on anything unclassifiable when the default action is deny.
+    pub fn allowPacket(
+        self: *const ServiceFilter,
+        peer_pubkey: [32]u8,
+        peer_org_pubkey: ?[32]u8,
+        ip_packet: []const u8,
+    ) bool {
+        return switch (classifyPacket(ip_packet)) {
+            .transport => |ti| self.check(peer_pubkey, peer_org_pubkey, ti.proto, ti.dst_port),
+            .pass => true,
+            .unclassified => self.default_action == .allow,
+        };
     }
 
     /// Load all service policies from the config directory.
@@ -496,6 +515,52 @@ pub fn parseTransportHeader(ip_packet: []const u8) ?TransportInfo {
     return .{ .proto = proto, .dst_port = dst_port };
 }
 
+/// Classification of a decrypted inner IP packet for the service filter.
+pub const FilterClass = union(enum) {
+    /// TCP/UDP with a destination port to match against policy.
+    transport: TransportInfo,
+    /// ICMP / ICMPv6 control traffic — always passed.
+    pass,
+    /// Could not determine proto/port (IPv6 extension headers, truncated,
+    /// non-IP). Callers apply the default action — i.e. fail closed under deny.
+    unclassified,
+};
+
+fn classifyL4(protocol: u8, ip_packet: []const u8, l4_off: usize) FilterClass {
+    switch (protocol) {
+        6, 17 => {
+            if (ip_packet.len < l4_off + 4) return .unclassified;
+            const dp = std.mem.readInt(u16, ip_packet[l4_off + 2 ..][0..2], .big);
+            return .{ .transport = .{ .proto = if (protocol == 6) .tcp else .udp, .dst_port = dp } };
+        },
+        1, 58 => return .pass, // ICMP / ICMPv6
+        else => return .unclassified,
+    }
+}
+
+/// Parse an inner IP packet (IPv4 or IPv6) for the service filter. Unlike
+/// parseTransportHeader (IPv4-only, used by its tests), this classifies IPv6 too
+/// and distinguishes "pass" (ICMP) from "unclassified" so callers can fail closed.
+pub fn classifyPacket(ip_packet: []const u8) FilterClass {
+    if (ip_packet.len < 1) return .unclassified;
+    switch (ip_packet[0] >> 4) {
+        4 => {
+            if (ip_packet.len < 20) return .unclassified;
+            const ihl = @as(usize, ip_packet[0] & 0x0F) * 4;
+            if (ihl < 20) return .unclassified;
+            return classifyL4(ip_packet[9], ip_packet, ihl);
+        },
+        6 => {
+            if (ip_packet.len < 40) return .unclassified;
+            // Note: a chain of IPv6 extension headers makes the L4 offset != 40;
+            // classifyL4 will treat such next-header values as `.unclassified`,
+            // which fails closed under default-deny.
+            return classifyL4(ip_packet[6], ip_packet, 40);
+        },
+        else => return .unclassified,
+    }
+}
+
 // ─── Small file reader (no allocator) ───
 
 const SmallFile = struct {
@@ -674,4 +739,39 @@ test "parseTransportHeader: ICMP returns null" {
     pkt[9] = 1; // ICMP
 
     try std.testing.expectEqual(parseTransportHeader(&pkt), null);
+}
+
+test "classifyPacket handles IPv6 and allowPacket fails closed (M5 regression)" {
+    // IPv6 TCP to port 80 → classified as transport (was bypassing the filter).
+    var v6 = std.mem.zeroes([44]u8);
+    v6[0] = 0x60; // IPv6 version
+    v6[6] = 6; // next header = TCP
+    v6[43] = 80; // dst port (offset 40 + 2)
+    const c = classifyPacket(&v6);
+    try std.testing.expect(c == .transport);
+    try std.testing.expectEqual(@as(u16, 80), c.transport.dst_port);
+    try std.testing.expectEqual(Proto.tcp, c.transport.proto);
+
+    // IPv6 with an extension/unknown next header → unclassified (fail-closed input).
+    var v6ext = std.mem.zeroes([44]u8);
+    v6ext[0] = 0x60;
+    v6ext[6] = 0; // hop-by-hop extension header
+    try std.testing.expect(classifyPacket(&v6ext) == .unclassified);
+
+    // ICMPv6 → pass (control traffic).
+    var icmp6 = std.mem.zeroes([44]u8);
+    icmp6[0] = 0x60;
+    icmp6[6] = 58;
+    try std.testing.expect(classifyPacket(&icmp6) == .pass);
+
+    // Truncated IPv6 → unclassified (no OOB).
+    try std.testing.expect(classifyPacket(&[_]u8{ 0x60, 0, 0 }) == .unclassified);
+
+    // allowPacket: under default-deny, unclassified IPv6 is dropped, ICMPv6 passes.
+    const deny = ServiceFilter{ .default_action = .deny, .peer_count = 0, .org_count = 0 };
+    try std.testing.expect(!deny.allowPacket(.{0} ** 32, null, &v6ext));
+    try std.testing.expect(deny.allowPacket(.{0} ** 32, null, &icmp6));
+    // Under default-allow (unconfigured), behavior is unchanged (passes).
+    const allow = ServiceFilter{ .default_action = .allow, .peer_count = 0, .org_count = 0 };
+    try std.testing.expect(allow.allowPacket(.{0} ** 32, null, &v6ext));
 }

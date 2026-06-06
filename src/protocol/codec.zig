@@ -217,6 +217,38 @@ pub fn encodeOrgTrustVouch(buf: []u8, msg: messages.OrgTrustVouch) !usize {
     return pos;
 }
 
+// ─── Canonical signed-payload builders for org control messages ───
+//
+// These define exactly which bytes the org's Ed25519 signature covers, so that
+// both a future signer and the receive-side verifier agree. Layouts match the
+// `signature:` comments in messages.zig; the lamport is little-endian to match
+// the wire encoding above.
+
+/// OrgAliasAnnounce signed payload: alias(32) ‖ lamport(8 LE).
+pub fn orgAliasSignedBytes(msg: messages.OrgAliasAnnounce) [40]u8 {
+    var out: [40]u8 = undefined;
+    @memcpy(out[0..32], &msg.alias);
+    std.mem.writeInt(u64, out[32..40], msg.lamport, .little);
+    return out;
+}
+
+/// OrgCertRevoke signed payload: node_pubkey(32) ‖ reason(1) ‖ lamport(8 LE).
+pub fn orgRevokeSignedBytes(msg: messages.OrgCertRevoke) [41]u8 {
+    var out: [41]u8 = undefined;
+    @memcpy(out[0..32], &msg.node_pubkey);
+    out[32] = msg.reason;
+    std.mem.writeInt(u64, out[33..41], msg.lamport, .little);
+    return out;
+}
+
+/// OrgTrustVouch signed payload: vouched_pubkey(32) ‖ lamport(8 LE).
+pub fn orgVouchSignedBytes(msg: messages.OrgTrustVouch) [40]u8 {
+    var out: [40]u8 = undefined;
+    @memcpy(out[0..32], &msg.vouched_pubkey);
+    std.mem.writeInt(u64, out[32..40], msg.lamport, .little);
+    return out;
+}
+
 fn encodeGossipEntry(buf: []u8, entry: messages.GossipEntry) !usize {
     var pos: usize = 0;
 

@@ -2247,6 +2247,10 @@ fn dispatchBatch(
     batch_idx: u16,
 ) void {
     const Pipeline = lib.net.Pipeline;
+    // SECURITY (H6): shared lock excludes removePeer from zeroing this tunnel
+    // mid-use. Outermost on the data path (taken before tx_ring.push_lock).
+    wg_dev.lock.lockSharedUncancelable(zio());
+    defer wg_dev.lock.unlockShared(zio());
     var peer = &(wg_dev.peers[peer_slot] orelse return);
     var batch = &pool.batches[batch_idx];
     batch.peer_slot = peer_slot;
@@ -2294,6 +2298,11 @@ fn cryptoWorkerPipeline(
 
     while (running.load(.acquire)) {
         const batch_idx = crypto_q.pop() orelse break; // null = closed
+        // SECURITY (H6): shared lock for this batch's tunnel access (encrypt +
+        // opportunistic flush) so removePeer cannot zero the keys mid-encrypt.
+        // Outermost lock; send_lock below is acquired via tryLock (never blocks).
+        wg_dev.lock.lockSharedUncancelable(zio());
+        defer wg_dev.lock.unlockShared(zio());
         var batch = &pool.batches[batch_idx];
         var peer = &(wg_dev.peers[batch.peer_slot] orelse continue);
         var tun = &(peer.active_tunnel orelse continue);
@@ -2643,6 +2652,15 @@ fn writeCoalescedToTun(
     }
 }
 
+/// Read a peer's org pubkey from the membership table under a shared lock.
+/// SECURITY (H7): data-plane worker threads read membership while the SWIM thread
+/// may be rehashing `peers` (peers.put); the read lock prevents a freed-bucket UAF.
+fn orgPubkeyLocked(membership: *lib.discovery.Membership.MembershipTable, identity_key: [32]u8) ?[32]u8 {
+    membership.lock.lockSharedUncancelable(zio());
+    defer membership.lock.unlockShared(zio());
+    return if (membership.peers.getPtr(identity_key)) |mp| mp.org_pubkey else null;
+}
+
 /// Parallel decrypt worker: pulls encrypted transport packets from the DecryptQueue,
 /// decrypts them using wg_dev.decryptTransport (thread-safe via replay_lock), and writes
 /// plaintext to TUN. This parallelizes the download path across N cores.
@@ -2667,11 +2685,12 @@ fn decryptRxWorker(
 
         const pkt = decrypt_q.getPacket(result.idx);
         if (wg_dev.decryptTransport(pkt, &out_buf)) |dec| {
-            // Service filter: check port access before TUN write
-            if (lib.services.Policy.parseTransportHeader(out_buf[0..dec.len])) |ti| {
-                const peer = wg_dev.peers[dec.slot] orelse continue;
-                const org_pk = if (membership.peers.getPtr(peer.identity_key)) |mp| mp.org_pubkey else null;
-                if (!service_filter.check(peer.identity_key, org_pk, ti.proto, ti.dst_port)) continue;
+            // Service filter: check access before TUN write (IPv4 + IPv6, M5).
+            {
+                // identity_key comes from decryptTransport (captured under the
+                // device lock) — no unlocked peers[] re-read (H6 race).
+                const org_pk = orgPubkeyLocked(membership, dec.identity_key);
+                if (!service_filter.allowPacket(dec.identity_key, org_pk, out_buf[0..dec.len])) continue;
             }
 
             // Write decrypted packet to TUN
@@ -2712,13 +2731,10 @@ fn processIncomingPacket(
     if (pkt_type == .wg_transport) {
         if (n_decrypted.* < 64) {
             if (wg_dev.decryptTransport(pkt, &decrypt_storage[n_decrypted.*])) |result| {
-                // Check service filter before buffering
-                const PolicyMod = lib.services.Policy;
-                if (PolicyMod.parseTransportHeader(decrypt_storage[n_decrypted.*][0..result.len])) |ti| {
-                    if (wg_dev.peers[result.slot]) |peer| {
-                        const org_pk = if (swim.membership.peers.getPtr(peer.identity_key)) |mp| mp.org_pubkey else null;
-                        if (!service_filter.check(peer.identity_key, org_pk, ti.proto, ti.dst_port)) return;
-                    }
+                // Check service filter before buffering (IPv4 + IPv6, M5).
+                {
+                    const org_pk = orgPubkeyLocked(swim.membership, result.identity_key);
+                    if (!service_filter.allowPacket(result.identity_key, org_pk, decrypt_storage[n_decrypted.*][0..result.len])) return;
                 }
                 decrypt_lens[n_decrypted.*] = result.len;
                 decrypt_slots[n_decrypted.*] = result.slot;
@@ -2729,7 +2745,7 @@ fn processIncomingPacket(
         .wg_handshake_init => {
             if (pkt.len >= @sizeOf(lib.wireguard.Noise.HandshakeInitiation)) {
                 const msg: *const lib.wireguard.Noise.HandshakeInitiation = @ptrCast(@alignCast(pkt.ptr));
-                if (wg_dev.handleInitiation(msg)) |hs_result| {
+                if (wg_dev.handleInitiation(msg, sender_addr)) |hs_result| {
                     const resp_bytes = std.mem.asBytes(&hs_result.response);
                     _ = udp_sock.sendTo(resp_bytes, sender_addr, sender_port) catch 0;
                     writeFormatted(stdout, "  WG handshake: responded to initiation\n", .{}) catch {};
@@ -2796,13 +2812,10 @@ fn windowsEventLoop(
             if (pkt_type == .wg_transport) {
                 // Decrypt WG transport → write plaintext to Wintun
                 if (wg_dev.decryptTransport(pkt, &decrypt_buf)) |result| {
-                    // Apply service filter before writing to TUN
-                    const PolicyMod = lib.services.Policy;
-                    if (PolicyMod.parseTransportHeader(decrypt_buf[0..result.len])) |ti| {
-                        if (wg_dev.peers[result.slot]) |peer| {
-                            const org_pk = if (swim.membership.peers.getPtr(peer.identity_key)) |mp| mp.org_pubkey else null;
-                            if (!service_filter.check(peer.identity_key, org_pk, ti.proto, ti.dst_port)) continue;
-                        }
+                    // Apply service filter before writing to TUN (IPv4 + IPv6, M5).
+                    {
+                        const org_pk = orgPubkeyLocked(swim.membership, result.identity_key);
+                        if (!service_filter.allowPacket(result.identity_key, org_pk, decrypt_buf[0..result.len])) continue;
                     }
                     tun_dev.write(decrypt_buf[0..result.len]) catch {};
                 } else |_| {}
@@ -2810,7 +2823,7 @@ fn windowsEventLoop(
                 .wg_handshake_init => {
                     if (pkt.len >= @sizeOf(Noise.HandshakeInitiation)) {
                         const msg: *const Noise.HandshakeInitiation = @ptrCast(@alignCast(pkt.ptr));
-                        if (wg_dev.handleInitiation(msg)) |hs_result| {
+                        if (wg_dev.handleInitiation(msg, recv.sender_addr)) |hs_result| {
                             const resp_bytes = std.mem.asBytes(&hs_result.response);
                             _ = udp_sock.sendTo(resp_bytes, recv.sender_addr, recv.sender_port) catch 0;
                             writeFormatted(stdout, "  WG handshake: responded to initiation\n", .{}) catch {};
@@ -2948,13 +2961,10 @@ fn macosEventLoop(
             if (pkt_type == .wg_transport) {
                 // Decrypt WG transport → write plaintext to utun
                 if (wg_dev.decryptTransport(pkt, &decrypt_buf)) |result| {
-                    // Apply service filter before writing to TUN
-                    const PolicyMod = lib.services.Policy;
-                    if (PolicyMod.parseTransportHeader(decrypt_buf[0..result.len])) |ti| {
-                        if (wg_dev.peers[result.slot]) |peer| {
-                            const org_pk = if (swim.membership.peers.getPtr(peer.identity_key)) |mp| mp.org_pubkey else null;
-                            if (!service_filter.check(peer.identity_key, org_pk, ti.proto, ti.dst_port)) continue;
-                        }
+                    // Apply service filter before writing to TUN (IPv4 + IPv6, M5).
+                    {
+                        const org_pk = orgPubkeyLocked(swim.membership, result.identity_key);
+                        if (!service_filter.allowPacket(result.identity_key, org_pk, decrypt_buf[0..result.len])) continue;
                     }
                     tun_dev.write(decrypt_buf[0..result.len]) catch {};
                 } else |_| {}
@@ -2962,7 +2972,7 @@ fn macosEventLoop(
                 .wg_handshake_init => {
                     if (pkt.len >= @sizeOf(Noise.HandshakeInitiation)) {
                         const msg: *const Noise.HandshakeInitiation = @ptrCast(@alignCast(pkt.ptr));
-                        if (wg_dev.handleInitiation(msg)) |hs_result| {
+                        if (wg_dev.handleInitiation(msg, recv.sender_addr)) |hs_result| {
                             const resp_bytes = std.mem.asBytes(&hs_result.response);
                             _ = udp_sock.sendTo(resp_bytes, recv.sender_addr, recv.sender_port) catch 0;
                             writeFormatted(stdout, "  WG handshake: responded to initiation\n", .{}) catch {};
@@ -3423,7 +3433,9 @@ fn findPeerByMeshIp(
     mesh_ip: [4]u8,
 ) ?usize {
     // Walk membership table to find identity_key for this mesh IP,
-    // then map to WgDevice slot
+    // then map to WgDevice slot. SECURITY (H7): read lock vs SWIM-thread rehash.
+    swim.membership.lock.lockSharedUncancelable(zio());
+    defer swim.membership.lock.unlockShared(zio());
     var iter = swim.membership.peers.iterator();
     while (iter.next()) |entry| {
         const peer = entry.value_ptr;

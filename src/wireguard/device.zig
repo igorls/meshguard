@@ -227,6 +227,70 @@ fn meshIpHostId(ip: [4]u8) u16 {
     return (@as(u16, ip[2]) << 8) | @as(u16, ip[3]);
 }
 
+/// SECURITY (H4): token-bucket rate limiter for inbound WireGuard handshake
+/// initiations. Each accepted init forces an X25519 on the (single) control
+/// thread; the MAC1 key is public, so without this a forged-init flood starves
+/// SWIM + the data plane. A small per-source table provides fairness; a global
+/// bucket bounds total work even under source-address spoofing (the spoofing
+/// case is fully addressed only by the planned cookie/MAC2 follow-up).
+const HandshakeLimiter = struct {
+    const SLOTS: usize = 512; // distinct source IPs tracked (hashed, evict-on-collision)
+    const PER_SRC_BURST: u32 = 8;
+    const PER_SRC_REFILL_NS: i128 = 250 * std.time.ns_per_ms; // 1 token / 250ms ≈ 4/s
+    const GLOBAL_BURST: u32 = 256;
+    const GLOBAL_REFILL_NS: i128 = 10 * std.time.ns_per_ms; // 1 token / 10ms = 100/s
+
+    const Bucket = struct {
+        ip: [4]u8 = .{ 0, 0, 0, 0 },
+        tokens: u32 = PER_SRC_BURST,
+        last_ns: i128 = 0,
+    };
+
+    mutex: std.Io.Mutex = .init,
+    buckets: [SLOTS]Bucket = .{Bucket{}} ** SLOTS,
+    global_tokens: u32 = GLOBAL_BURST,
+    global_last_ns: i128 = 0,
+
+    fn refill(tokens: u32, max: u32, last_ns: *i128, now_ns: i128, interval_ns: i128) u32 {
+        if (now_ns <= last_ns.*) return tokens;
+        const gained: u64 = @intCast(@divTrunc(now_ns - last_ns.*, interval_ns));
+        if (gained == 0) return tokens;
+        last_ns.* += @as(i128, @intCast(gained)) * interval_ns;
+        const t: u64 = @as(u64, tokens) + gained;
+        return if (t > max) max else @intCast(t);
+    }
+
+    /// Returns true if a handshake from `ip` may proceed (consuming a token).
+    fn allow(self: *HandshakeLimiter, ip: [4]u8, now_ns: i128) bool {
+        self.mutex.lockUncancelable(zio());
+        defer self.mutex.unlock(zio());
+
+        // Global backstop first: bounds total X25519/sec even under spoofing.
+        self.global_tokens = refill(self.global_tokens, GLOBAL_BURST, &self.global_last_ns, now_ns, GLOBAL_REFILL_NS);
+        if (self.global_tokens == 0) return false;
+
+        // Per-source bucket (hash → slot, reset on collision with a different IP).
+        const h = (((@as(usize, ip[0]) *% 131 +% @as(usize, ip[1])) *% 131 +% @as(usize, ip[2])) *% 131 +% @as(usize, ip[3]));
+        const b = &self.buckets[h % SLOTS];
+        if (!std.mem.eql(u8, &b.ip, &ip)) {
+            b.* = .{ .ip = ip, .tokens = PER_SRC_BURST, .last_ns = now_ns };
+        } else {
+            b.tokens = refill(b.tokens, PER_SRC_BURST, &b.last_ns, now_ns, PER_SRC_REFILL_NS);
+        }
+        if (b.tokens == 0) return false;
+
+        b.tokens -= 1;
+        self.global_tokens -= 1;
+        return true;
+    }
+};
+
+/// Result of processing an inbound handshake initiation (we are responder).
+pub const InitiationResult = struct {
+    response: noise.HandshakeResponse,
+    slot: usize,
+};
+
 /// Userspace WireGuard device.
 pub const WgDevice = struct {
     /// Our X25519 keypair
@@ -252,6 +316,23 @@ pub const WgDevice = struct {
 
     /// Next sender index to assign (random-ish via wrapping increment)
     next_index: u32 = 0,
+
+    /// SECURITY (H6): guards the peer table against concurrent access. Data-plane
+    /// worker threads take the SHARED lock to encrypt/decrypt; the control thread
+    /// (peer death → removePeer) and handshake handlers take the EXCLUSIVE lock.
+    /// Without this, removePeer secureZeros key material and nils a slot while a
+    /// worker is mid-encrypt, yielding torn reads / use-after-zero ciphertext on
+    /// the wire (silent under ReleaseFast). The lock is the OUTERMOST lock on the
+    /// data path (acquired before tx_ring push/send locks) so there is no
+    /// ordering inversion.
+    lock: std.Io.RwLock = .init,
+
+    /// SECURITY (H4): per-source + global rate limit on inbound handshake
+    /// initiations, checked before the expensive X25519. The MAC1 anti-DoS key is
+    /// our public key, broadcast in cleartext gossip, so MAC1 alone cannot gate a
+    /// forged-init flood. (A full WireGuard cookie/MAC2 reply — which also defends
+    /// against source-spoofed floods — is a planned follow-up.)
+    hs_limiter: HandshakeLimiter = .{},
 
     pub fn init(static_private: [32]u8, static_public: [32]u8) WgDevice {
         // Start with a random sender index for unpredictability
@@ -287,6 +368,8 @@ pub const WgDevice = struct {
 
     /// Add or update a peer with IPv4/IPv6 endpoint and mesh addresses.
     pub fn addPeerWithEndpoint(self: *WgDevice, identity_key: [32]u8, wg_pubkey: [32]u8, endpoint: messages.Endpoint, mesh_ip: [4]u8, mesh_ip6: [16]u8) !usize {
+        self.lock.lockUncancelable(zio()); // H6: exclusive — mutates the peer table
+        defer self.lock.unlock(zio());
         // Check if peer already exists
         if (self.static_map.get(wg_pubkey)) |existing| {
             if (self.peers[existing]) |*peer| {
@@ -342,6 +425,8 @@ pub const WgDevice = struct {
 
     /// Remove a peer by WG public key.
     pub fn removePeer(self: *WgDevice, wg_pubkey: [32]u8) void {
+        self.lock.lockUncancelable(zio()); // H6: exclusive — zeroes keys + nils the slot
+        defer self.lock.unlock(zio());
         if (self.static_map.get(wg_pubkey)) |slot| {
             if (self.peers[slot]) |*peer| {
                 self.index_map.remove(peer.sender_index);
@@ -360,6 +445,8 @@ pub const WgDevice = struct {
 
     /// Initiate a handshake with a peer.
     pub fn initiateHandshake(self: *WgDevice, slot: usize) !noise.HandshakeInitiation {
+        self.lock.lockUncancelable(zio()); // H6: exclusive — mutates index_map + peer
+        defer self.lock.unlock(zio());
         const peer = if (self.peers[slot]) |*p| p else return error.PeerNotFound;
         const now = nowNs();
 
@@ -381,12 +468,34 @@ pub const WgDevice = struct {
 
     /// Handle an incoming handshake initiation (we are responder).
     /// O(1) lookup via static key table instead of O(N) peer iteration.
-    pub fn handleInitiation(self: *WgDevice, msg: *const noise.HandshakeInitiation) !struct { response: noise.HandshakeResponse, slot: usize } {
-        // Step 0: Verify MAC1 BEFORE expensive DH (anti-DoS gate)
+    pub fn handleInitiation(self: *WgDevice, msg: *const noise.HandshakeInitiation, src_ip: [4]u8) !InitiationResult {
+        // Step 0: Verify MAC1 BEFORE expensive DH (cheap, no lock).
         // MAC1 is keyed with our public key, so we can check without knowing the sender.
         if (!noise.verifyMac1(self.static_public, msg)) {
             return error.InvalidMac;
         }
+
+        // Step 0.5 (H4): rate-limit per source BEFORE the X25519 below. The MAC1
+        // key is public, so a flood of MAC1-valid inits would otherwise burn one
+        // X25519 each on this thread. Checked under the limiter's own lock so a
+        // flood does not even contend the device lock.
+        if (!self.hs_limiter.allow(src_ip, nowNs())) {
+            return error.HandshakeRateLimited;
+        }
+
+        return self.handleInitiationAdmitted(msg);
+    }
+
+    /// Process a handshake initiation that has ALREADY passed admission control
+    /// (MAC1 + rate limit). Used by the FFI auto-register path to retry after
+    /// registering the peer, WITHOUT charging the rate limiter a second time for
+    /// the same legitimate handshake (the first attempt already consumed a token
+    /// before failing with UnknownPeer).
+    pub fn handleInitiationAdmitted(self: *WgDevice, msg: *const noise.HandshakeInitiation) !InitiationResult {
+        // The expensive crypto + peer-table mutation below run under the
+        // exclusive device lock (H6).
+        self.lock.lockUncancelable(zio());
+        defer self.lock.unlock(zio());
 
         // Step 1: Perform the Noise IK preamble (e, es, decrypt static).
         // Returns NoisePreamble with intermediate state to avoid double DH.
@@ -429,6 +538,8 @@ pub const WgDevice = struct {
 
     /// Handle an incoming handshake response (we are initiator).
     pub fn handleResponse(self: *WgDevice, msg: *const noise.HandshakeResponse) !usize {
+        self.lock.lockUncancelable(zio()); // H6: exclusive — sets active_tunnel
+        defer self.lock.unlock(zio());
         // Look up by receiver_index (which is our sender_index)
         const recv_idx = std.mem.littleToNative(u32, msg.receiver_index);
         const peer_slot = self.index_map.get(recv_idx) orelse return error.UnknownIndex;
@@ -449,24 +560,42 @@ pub const WgDevice = struct {
 
     /// Encrypt an IP packet for a specific peer.
     pub fn encryptForPeer(self: *WgDevice, slot: usize, plaintext: []const u8, out: []u8) !usize {
+        self.lock.lockSharedUncancelable(zio()); // H6: shared — excludes removePeer
+        defer self.lock.unlockShared(zio());
         const peer = if (self.peers[slot]) |*p| p else return error.PeerNotFound;
         const tun = if (peer.active_tunnel) |*t| t else return error.NoTunnel;
         return tun.encrypt(plaintext, out);
     }
 
     /// Decrypt an incoming transport packet.
-    /// Returns: (peer_slot, decrypted_length)
-    pub fn decryptTransport(self: *WgDevice, packet: []const u8, out: []u8) !struct { slot: usize, len: usize } {
+    /// Returns: (peer_slot, decrypted_length, peer identity_key). The identity_key
+    /// is captured under the lock so callers never have to re-read peers[slot]
+    /// afterwards (which would race removePeer — see H6).
+    pub fn decryptTransport(self: *WgDevice, packet: []const u8, out: []u8) !struct { slot: usize, len: usize, identity_key: [32]u8 } {
         if (packet.len < 16) return error.PacketTooShort;
+
+        self.lock.lockSharedUncancelable(zio()); // H6: shared — excludes removePeer
+        defer self.lock.unlockShared(zio());
 
         // Look up peer by receiver_index (which is the index they assigned us)
         const recv_idx = std.mem.readInt(u32, packet[4..8], .little);
         const peer_slot = self.index_map.get(recv_idx) orelse return error.UnknownIndex;
         const peer = if (self.peers[peer_slot]) |*p| p else return error.PeerNotFound;
         const tun = if (peer.active_tunnel) |*t| t else return error.NoTunnel;
+        const identity_key = peer.identity_key;
 
         const len = try tun.decrypt(packet, out);
-        return .{ .slot = peer_slot, .len = len };
+
+        // SECURITY (H1): RX cryptokey routing. A decrypted transport packet must
+        // carry an inner SOURCE address that belongs to the peer it arrived from.
+        // The kernel WireGuard path enforces this via AllowedIPs; the userspace
+        // plane previously did not, letting any admitted peer spoof any mesh
+        // source IP (cross-tenant impersonation, ARP/conntrack poisoning, bypass
+        // of source-based service policy). Drop on mismatch.
+        if (!innerSourceAllowed(peer.mesh_ip, peer.mesh_ip6, out[0..len])) {
+            return error.SourceSpoofed;
+        }
+        return .{ .slot = peer_slot, .len = len, .identity_key = identity_key };
     }
 
     /// Find a peer slot by identity key.
@@ -502,6 +631,36 @@ pub const WgDevice = struct {
     }
 };
 
+/// SECURITY (H1): for a decrypted inner IPv4/IPv6 packet, returns true iff its
+/// SOURCE address belongs to the peer it arrived from (RX cryptokey routing).
+///
+/// Only IPv4 (version nibble 4) and IPv6 (6) packets are constrained — those are
+/// the ones routed onto the host IP stack, where a spoofed source matters. Empty
+/// keepalives and NON-IP plaintext pass through: the FFI tunnel API frames app
+/// payloads (leading-zero length header → version nibble 0) and delivers them to
+/// an inbox, not the IP stack, so the source-IP rule does not apply. A zero peer
+/// mesh IP means "unconstrained" (interop/test peers added without a derived
+/// address); production peers always carry a derived 10.99/16 address.
+fn innerSourceAllowed(peer_mesh_ip: [4]u8, peer_mesh_ip6: [16]u8, plaintext: []const u8) bool {
+    if (plaintext.len == 0) return true; // WireGuard keepalive
+    const version = plaintext[0] >> 4;
+    switch (version) {
+        4 => {
+            if (plaintext.len < 20) return false; // too short to hold an IPv4 header
+            const unset = (peer_mesh_ip[0] | peer_mesh_ip[1] | peer_mesh_ip[2] | peer_mesh_ip[3]) == 0;
+            if (unset) return true;
+            return std.mem.eql(u8, plaintext[12..16], &peer_mesh_ip);
+        },
+        6 => {
+            if (plaintext.len < 40) return false; // too short to hold an IPv6 header
+            const zero6 = [_]u8{0} ** 16;
+            if (std.mem.eql(u8, &peer_mesh_ip6, &zero6)) return true;
+            return std.mem.eql(u8, plaintext[8..24], &peer_mesh_ip6);
+        },
+        else => return true, // non-IP framed payload (FFI tunnel inbox) — not IP-routed
+    }
+}
+
 // ─── Tests ───
 
 test "WgDevice add/remove peer" {
@@ -526,6 +685,68 @@ test "WgDevice add/remove peer" {
     dev.removePeer(peer_pub);
     try std.testing.expectEqual(dev.peer_count, 0);
     try std.testing.expectEqual(dev.findByWgPubkey(peer_pub), null);
+}
+
+test "handshake rate limiter throttles a single-source flood (H4 regression)" {
+    var lim = HandshakeLimiter{};
+    const ip = [4]u8{ 203, 0, 113, 7 };
+    const t0: i128 = 1_000_000_000;
+
+    // A burst from one source is capped at PER_SRC_BURST; extras are denied.
+    var allowed: u32 = 0;
+    var i: usize = 0;
+    while (i < HandshakeLimiter.PER_SRC_BURST + 5) : (i += 1) {
+        if (lim.allow(ip, t0)) allowed += 1;
+    }
+    try std.testing.expectEqual(HandshakeLimiter.PER_SRC_BURST, allowed);
+
+    // Tokens refill over time — a later attempt succeeds again.
+    try std.testing.expect(lim.allow(ip, t0 + HandshakeLimiter.PER_SRC_REFILL_NS + 1));
+
+    // A different source has its own independent budget.
+    try std.testing.expect(lim.allow(.{ 198, 51, 100, 9 }, t0));
+}
+
+test "innerSourceAllowed enforces RX cryptokey routing (H1 regression)" {
+    const peer_ip = [4]u8{ 10, 99, 1, 2 };
+    const zero6 = [_]u8{0} ** 16;
+
+    // Valid IPv4 packet whose source is the peer's own mesh IP → allowed.
+    var pkt: [20]u8 = .{0} ** 20;
+    pkt[0] = 0x45; // IPv4, IHL=5
+    @memcpy(pkt[12..16], &peer_ip);
+    try std.testing.expect(innerSourceAllowed(peer_ip, zero6, &pkt));
+
+    // Spoofed inner source → rejected.
+    var spoof: [20]u8 = .{0} ** 20;
+    spoof[0] = 0x45;
+    spoof[12] = 10;
+    spoof[13] = 99;
+    spoof[14] = 9;
+    spoof[15] = 9;
+    try std.testing.expect(!innerSourceAllowed(peer_ip, zero6, &spoof));
+
+    // Empty keepalive → allowed.
+    try std.testing.expect(innerSourceAllowed(peer_ip, zero6, &[_]u8{}));
+
+    // Runt packet claiming IPv4 but too short → rejected (and no OOB read).
+    try std.testing.expect(!innerSourceAllowed(peer_ip, zero6, &[_]u8{ 0x45, 0, 0 }));
+
+    // Non-IP framed payload (e.g. FFI tunnel inbox, leading-zero header) → allowed:
+    // the source-IP rule only applies to IP-routed packets.
+    try std.testing.expect(innerSourceAllowed(peer_ip, zero6, &[_]u8{0x00} ** 20));
+
+    // Unconstrained peer (zero mesh IP, e.g. interop) → not enforced.
+    try std.testing.expect(innerSourceAllowed(.{ 0, 0, 0, 0 }, zero6, &spoof));
+
+    // IPv6: matching source allowed, tampered source rejected.
+    const peer6 = [16]u8{ 0xfd, 0x99, 0x6d, 0x67, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+    var p6: [40]u8 = .{0} ** 40;
+    p6[0] = 0x60; // IPv6
+    @memcpy(p6[8..24], &peer6);
+    try std.testing.expect(innerSourceAllowed(.{ 0, 0, 0, 0 }, peer6, &p6));
+    p6[23] = 0x02; // tamper the source address
+    try std.testing.expect(!innerSourceAllowed(.{ 0, 0, 0, 0 }, peer6, &p6));
 }
 
 test "IndexTable put/get/remove" {

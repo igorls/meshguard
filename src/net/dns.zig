@@ -135,9 +135,16 @@ pub fn resolveA(hostname: []const u8) ?[4]u8 {
 /// Query a specific nameserver for an A record.
 fn queryA(nameserver: [4]u8, hostname: []const u8) ?[4]u8 {
     var query_buf: [512]u8 = undefined;
-    const query_len = buildQuery(&query_buf, hostname, TYPE_A, 0xABCD) catch return null;
+    // SECURITY (H5): randomize the transaction ID per query (was a constant
+    // 0xABCD, trivially spoofable off-path).
+    const id = randomTxid();
+    const query_len = buildQuery(&query_buf, hostname, TYPE_A, id) catch return null;
 
     const response = sendQuery(nameserver, DNS_PORT, query_buf[0..query_len]) orelse return null;
+
+    // SECURITY (H5): reject responses that don't match our query (TXID, QR bit,
+    // and the echoed question). The connected socket already filters by source.
+    if (!responseMatchesQuery(response.data[0..response.len], id, hostname, TYPE_A)) return null;
 
     // Parse A record from response
     return parseAResponse(&response.data, response.len);
@@ -153,9 +160,12 @@ pub fn queryTXT(allocator: std.mem.Allocator, domain: []const u8) ![][]const u8 
 
     for (ns_buf[0..ns_count]) |ns| {
         var query_buf: [512]u8 = undefined;
-        const query_len = buildQuery(&query_buf, domain, TYPE_TXT, 0xCDEF) catch continue;
+        const id = randomTxid(); // SECURITY (H5): random TXID (was constant 0xCDEF)
+        const query_len = buildQuery(&query_buf, domain, TYPE_TXT, id) catch continue;
 
         const response = sendQuery(ns, DNS_PORT, query_buf[0..query_len]) orelse continue;
+        // SECURITY (H5): only accept a response that matches our query.
+        if (!responseMatchesQuery(response.data[0..response.len], id, domain, TYPE_TXT)) continue;
         return parseTXTResponse(allocator, &response.data, response.len);
     }
     return &.{};
@@ -447,6 +457,34 @@ fn recvFromSocket(fd: posix.socket_t, buf: []u8) ?usize {
     }
 }
 
+/// Random 16-bit DNS transaction ID. SECURITY (H5): unpredictable per query so
+/// off-path attackers cannot forge a matching response.
+fn randomTxid() u16 {
+    var b: [2]u8 = undefined;
+    zio().random(&b);
+    return (@as(u16, b[0]) << 8) | @as(u16, b[1]);
+}
+
+/// SECURITY (H5): validate that a unicast DNS response actually answers OUR
+/// query — matching transaction ID, the QR (response) bit set, exactly one
+/// echoed question, and that question's name (case-insensitive) and type equal
+/// what we asked. Combined with the connected socket (source filtering) this
+/// blocks off-path cache-poisoning of the bootstrap path. Not used for mDNS,
+/// whose responses legitimately carry id 0 and no echoed question.
+fn responseMatchesQuery(data: []const u8, expected_id: u16, domain: []const u8, qtype: u16) bool {
+    if (data.len < HEADER_LEN) return false;
+    if (readU16(data, 0) != expected_id) return false; // transaction ID
+    if ((readU16(data, 2) & 0x8000) == 0) return false; // QR bit must be set
+    if (readU16(data, 4) != 1) return false; // exactly one question echoed
+    var q_buf: [512]u8 = undefined;
+    const q_end = encodeDomainName(&q_buf, 0, domain) catch return false;
+    if (HEADER_LEN + q_end + 4 > data.len) return false;
+    if (!std.ascii.eqlIgnoreCase(data[HEADER_LEN .. HEADER_LEN + q_end], q_buf[0..q_end])) return false;
+    if (readU16(data, HEADER_LEN + q_end) != qtype) return false; // QTYPE echoed
+    if (readU16(data, HEADER_LEN + q_end + 2) != CLASS_IN) return false; // QCLASS echoed
+    return true;
+}
+
 /// Send a DNS query to a nameserver and wait for a response (2s timeout).
 fn sendQuery(nameserver: [4]u8, port: u16, query: []const u8) ?QueryResponse {
     const sock_fd = createDgramSocket() orelse return null;
@@ -459,11 +497,21 @@ fn sendQuery(nameserver: [4]u8, port: u16, query: []const u8) ?QueryResponse {
         .zero = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
     };
 
+    // SECURITY (H5): connect() the UDP socket so the kernel only delivers
+    // datagrams from THIS nameserver, dropping off-path spoofed responses. After
+    // connect we send with a null destination (the connected peer).
     if (comptime is_linux) {
-        const rc = linux.sendto(sock_fd, query.ptr, query.len, 0, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
+        const crc = linux.connect(sock_fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
+        if (posix.errno(crc) != .SUCCESS) return null;
+    } else {
+        if (std.c.connect(sock_fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) != 0) return null;
+    }
+
+    if (comptime is_linux) {
+        const rc = linux.sendto(sock_fd, query.ptr, query.len, 0, null, 0);
         if (posix.errno(rc) != .SUCCESS) return null;
     } else {
-        if (std.c.sendto(sock_fd, query.ptr, query.len, 0, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) < 0) return null;
+        if (std.c.sendto(sock_fd, query.ptr, query.len, 0, null, 0) < 0) return null;
     }
 
     // Wait for response with 2s timeout (cross-platform)
@@ -541,6 +589,49 @@ test "build query" {
     try std.testing.expectEqual(buf[1], 0x34);
     // Check QDCOUNT = 1
     try std.testing.expectEqual(readU16(&buf, 4), 1);
+}
+
+test "responseMatchesQuery rejects spoofed/mismatched responses (H5 regression)" {
+    const domain = "seed.example.com";
+    const id: u16 = 0x1234;
+
+    // Craft a well-formed response: header (QR=1, QDCOUNT=1) + echoed question.
+    var buf: [512]u8 = undefined;
+    buf[0] = 0x12;
+    buf[1] = 0x34; // id
+    buf[2] = 0x81;
+    buf[3] = 0x80; // flags: QR=1, RD, RA
+    buf[4] = 0x00;
+    buf[5] = 0x01; // QDCOUNT = 1
+    buf[6] = 0x00;
+    buf[7] = 0x01; // ANCOUNT = 1
+    buf[8] = 0;
+    buf[9] = 0;
+    buf[10] = 0;
+    buf[11] = 0;
+    var pos = try encodeDomainName(&buf, HEADER_LEN, domain);
+    buf[pos] = TYPE_A >> 8;
+    buf[pos + 1] = TYPE_A & 0xFF;
+    pos += 2;
+    buf[pos] = CLASS_IN >> 8;
+    buf[pos + 1] = CLASS_IN & 0xFF;
+    pos += 2;
+    const total = pos;
+
+    // Legitimate matching response is accepted.
+    try std.testing.expect(responseMatchesQuery(buf[0..total], id, domain, TYPE_A));
+
+    // Spoofed responses are all rejected:
+    try std.testing.expect(!responseMatchesQuery(buf[0..total], 0x9999, domain, TYPE_A)); // wrong TXID
+    try std.testing.expect(!responseMatchesQuery(buf[0..total], id, "evil.example.com", TYPE_A)); // wrong name
+    try std.testing.expect(!responseMatchesQuery(buf[0..total], id, domain, TYPE_TXT)); // wrong qtype
+
+    var as_query = buf;
+    as_query[2] = 0x01; // clear QR bit → looks like a query, not a response
+    try std.testing.expect(!responseMatchesQuery(as_query[0..total], id, domain, TYPE_A));
+
+    // Truncated response rejected (no OOB).
+    try std.testing.expect(!responseMatchesQuery(buf[0..5], id, domain, TYPE_A));
 }
 
 test "parse meshguard TXT" {

@@ -172,7 +172,7 @@ pub fn main(init: std.process.Init) !void {
                     .wg_handshake_init => {
                         if (recv.data.len >= @sizeOf(noise.HandshakeInitiation)) {
                             const msg: *const noise.HandshakeInitiation = @ptrCast(@alignCast(recv.data.ptr));
-                            if (wg_dev.handleInitiation(msg)) |hs| {
+                            if (wg_dev.handleInitiation(msg, recv.sender_addr)) |hs| {
                                 const resp = std.mem.asBytes(&hs.response);
                                 _ = udp.sendTo(resp, recv.sender_addr, recv.sender_port) catch 0;
                                 try stdout.writeStreamingAll(zio, "  << responded to initiation\n");
