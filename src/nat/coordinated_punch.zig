@@ -321,8 +321,15 @@ fn base64UrlDecode(input: []const u8, output: []u8) !usize {
         buf[len] = '=';
     }
 
-    try std.base64.standard.Decoder.decode(output, buf[0..len]);
-    return std.base64.standard.Decoder.calcSizeForSlice(buf[0..len]) catch return error.InvalidBase64;
+    // SECURITY: std.base64 Decoder.decode does NOT bound-check the destination
+    // (its tail loop writes dest[dest_idx] with no dest_idx < dest.len guard —
+    // std/base64.zig:275). With safety checks off in ReleaseFast an over-long
+    // token would silently smash the caller's stack buffer. Validate the decoded
+    // size against `output` BEFORE decoding.
+    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(buf[0..len]) catch return error.InvalidBase64;
+    if (decoded_len > output.len) return error.InputTooLong;
+    try std.base64.standard.Decoder.decode(output[0..decoded_len], buf[0..len]);
+    return decoded_len;
 }
 
 // ─── NTP client ───
@@ -685,6 +692,22 @@ test "token signature verification" {
     var tampered = token;
     tampered.stun_port = 9999;
     try std.testing.expect(!verifyToken(&tampered));
+}
+
+test "decodeTokenUri rejects over-long token without OOB write (C1 regression)" {
+    // An attacker-supplied mg:// token whose base64url body decodes to more than
+    // TOKEN_BINARY_SIZE bytes must be rejected with an error, never overflow the
+    // 106-byte stack buffer. Pre-fix this silently smashed the stack in ReleaseFast.
+    var buf: [300]u8 = undefined;
+    @memcpy(buf[0..5], "mg://");
+    // 251 'A' chars -> ~188 decoded bytes, far past the 106-byte target.
+    @memset(buf[5..256], 'A');
+    const uri = buf[0..256];
+    try std.testing.expectError(error.InvalidToken, decodeTokenUri(uri));
+
+    // base64UrlDecode itself must refuse to write past a small output buffer.
+    var small: [16]u8 = undefined;
+    try std.testing.expectError(error.InputTooLong, base64UrlDecode("AAAAAAAAAAAAAAAAAAAAAAAA", &small));
 }
 
 test "probe building and detection" {

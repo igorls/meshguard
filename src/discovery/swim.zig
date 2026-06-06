@@ -11,6 +11,7 @@ const std = @import("std");
 const Membership = @import("membership.zig");
 const messages = @import("../protocol/messages.zig");
 const codec = @import("../protocol/codec.zig");
+const keys = @import("../identity/keys.zig");
 const Udp = @import("../net/udp.zig");
 const Holepuncher = @import("../nat/holepunch.zig").Holepuncher;
 const log = std.log.scoped(.swim);
@@ -293,8 +294,9 @@ pub const SwimProtocol = struct {
         self.checkTimeouts();
 
         // 3. Expire suspected peers
-        const expired = self.membership.expireSuspected();
-        for (expired) |pubkey| {
+        var expired_buf: [256][32]u8 = undefined;
+        const expired_n = self.membership.expireSuspected(&expired_buf);
+        for (expired_buf[0..expired_n]) |pubkey| {
             // Log the expiration
             std.debug.print("  peer expired (suspect timeout): {x:0>2}{x:0>2}...\n", .{ pubkey[0], pubkey[1] });
 
@@ -352,8 +354,9 @@ pub const SwimProtocol = struct {
         const now_ns = nowNs();
 
         // 2. Expire suspected peers
-        const expired = self.membership.expireSuspected();
-        for (expired) |pubkey| {
+        var expired_buf: [256][32]u8 = undefined;
+        const expired_n = self.membership.expireSuspected(&expired_buf);
+        for (expired_buf[0..expired_n]) |pubkey| {
             std.debug.print("  peer expired (suspect timeout): {x:0>2}{x:0>2}...\n", .{ pubkey[0], pubkey[1] });
             if (self.handler) |h| {
                 h.onPeerDead(h.ctx, pubkey);
@@ -539,8 +542,26 @@ pub const SwimProtocol = struct {
         std.debug.print("  📨 APP msg relayed ({d}B) → {s}\n", .{ data.len, ep.format(&ep_buf) });
     }
 
+    /// Verify an org control message before acting on it.
+    ///
+    /// SECURITY (C2): org_cert_revoke/alias/vouch carry a 64-byte Ed25519
+    /// signature that the receiver previously decoded but NEVER verified, so a
+    /// single spoofed UDP datagram could revoke/evict any node or hijack an
+    /// alias. We now require BOTH that the issuing org is trusted AND that the
+    /// signature over the canonical payload verifies against the org pubkey.
+    fn orgSignatureValid(self: *const SwimProtocol, org_pubkey: [32]u8, payload: []const u8, signature: [64]u8) bool {
+        if (!self.isOrgAuthorizedPeer(org_pubkey)) return false;
+        const pk = std.crypto.sign.Ed25519.PublicKey.fromBytes(org_pubkey) catch return false;
+        return keys.verify(payload, signature, pk);
+    }
+
     /// Handle an OrgAliasAnnounce: register or update org alias, with Lamport conflict resolution.
     fn handleOrgAlias(self: *SwimProtocol, ann: messages.OrgAliasAnnounce) void {
+        const signed = codec.orgAliasSignedBytes(ann);
+        if (!self.orgSignatureValid(ann.org_pubkey, &signed, ann.signature)) {
+            log.warn("org alias rejected: invalid or untrusted org signature", .{});
+            return;
+        }
         const alias_name = std.mem.trimEnd(u8, &ann.alias, "\x00");
 
         // Check for existing alias with same name from a different org (conflict)
@@ -589,6 +610,11 @@ pub const SwimProtocol = struct {
 
     /// Handle an OrgCertRevoke: add the revoked node pubkey to the set.
     fn handleOrgRevoke(self: *SwimProtocol, rev: messages.OrgCertRevoke) void {
+        const signed = codec.orgRevokeSignedBytes(rev);
+        if (!self.orgSignatureValid(rev.org_pubkey, &signed, rev.signature)) {
+            log.warn("org revoke rejected: invalid or untrusted org signature", .{});
+            return;
+        }
         // Check if already revoked
         for (self.revoked_nodes[0..self.revoked_count]) |revoked| {
             if (std.mem.eql(u8, &revoked, &rev.node_pubkey)) return;
@@ -615,8 +641,12 @@ pub const SwimProtocol = struct {
     /// Handle an OrgTrustVouch: org admin vouches for an external standalone node.
     /// All nodes trusting this org will auto-accept the vouched node.
     fn handleOrgVouch(self: *SwimProtocol, vouch: messages.OrgTrustVouch) void {
-        // Only process vouches from trusted orgs
-        if (!self.isOrgAuthorizedPeer(vouch.org_pubkey)) return;
+        // Only process vouches from trusted orgs with a valid signature.
+        const signed = codec.orgVouchSignedBytes(vouch);
+        if (!self.orgSignatureValid(vouch.org_pubkey, &signed, vouch.signature)) {
+            log.warn("org vouch rejected: invalid or untrusted org signature", .{});
+            return;
+        }
 
         // Check if already vouched (same org + same node)
         for (0..self.vouched_count) |i| {
@@ -1023,6 +1053,21 @@ pub const SwimProtocol = struct {
         }
     }
 
+    /// React to an unauthenticated gossip claim that a third party is failing.
+    /// Marks the subject suspected locally and actively probes it, so OUR failure
+    /// detector — not a remote attacker — decides whether to evict. Only peers we
+    /// currently consider alive are probed, which bounds any reflected traffic to
+    /// endpoints already in our (capped) membership table.
+    fn suspectAndProbe(self: *SwimProtocol, subject: [32]u8) void {
+        const ep = blk: {
+            const peer = self.membership.peers.getPtr(subject) orelse return;
+            if (peer.state != .alive) return; // already suspected/dead, or unknown
+            break :blk peer.gossip_endpoint;
+        };
+        self.membership.suspect(subject);
+        if (ep) |e| self.sendPing(e, subject);
+    }
+
     fn applyGossip(self: *SwimProtocol, entry: messages.GossipEntry) void {
         // Self-suspicion refutation: if someone suspects/kills us, broadcast alive
         if (std.mem.eql(u8, &entry.subject_pubkey, &self.our_pubkey)) {
@@ -1043,22 +1088,22 @@ pub const SwimProtocol = struct {
 
         switch (entry.event) {
             .join, .alive => {
-                // Only use gossip endpoint for NEW peer registration.
-                // For existing peers, the real sender_addr from direct
-                // pings (set in handlePing/handleAck) is more reliable.
+                // The gossip endpoint is only used to LEARN about brand-new peers.
+                // For peers we already track, liveness is decided by our own
+                // failure detector (direct ping/ack → markAlive), never by
+                // unauthenticated gossip.
                 if (entry.endpoint) |ep| {
                     if (self.membership.peers.getPtr(entry.subject_pubkey) == null) {
                         self.registerOrUpdatePeerEndpoint(entry.subject_pubkey, ep);
-                    } else {
-                        // Peer exists — just refresh alive state without changing endpoint
-                        if (self.membership.peers.getPtr(entry.subject_pubkey)) |peer| {
-                            peer.state = .alive;
-                            peer.suspected_at_ns = null;
-                        }
                     }
                 }
 
-                // Update peer NAT info from gossip
+                // SECURITY (M6): do NOT let gossip clear local suspicion or
+                // resurrect a peer our detector has marked down. A replayed/forged
+                // `alive` used to reset suspected_at_ns, letting an attacker
+                // indefinitely postpone failure detection (or revive a dead peer).
+                // Only direct observation clears suspicion. We still absorb the
+                // additive NAT/WG discovery metadata below.
                 if (self.membership.peers.getPtr(entry.subject_pubkey)) |peer| {
                     // Update public endpoint if present
                     if (entry.public_endpoint) |pub_ep| {
@@ -1082,20 +1127,15 @@ pub const SwimProtocol = struct {
                     }
                 }
             },
-            .suspect => {
-                self.membership.suspect(entry.subject_pubkey);
-            },
-            .dead => {
-                self.membership.markDead(entry.subject_pubkey);
-                if (self.handler) |h| {
-                    h.onPeerDead(h.ctx, entry.subject_pubkey);
-                }
-            },
-            .leave => {
-                self.membership.markDead(entry.subject_pubkey);
-                if (self.handler) |h| {
-                    h.onPeerDead(h.ctx, entry.subject_pubkey);
-                }
+            // SECURITY (H2): gossip entries are unauthenticated and the sender gate
+            // is open by default, so a single packet could previously markDead any
+            // third party and tear down its WireGuard tunnel. We now only DOWNGRADE
+            // the claim to local suspicion and let our OWN failure detector confirm
+            // it before any eviction. A live peer answers our probe and stays alive;
+            // a genuinely dead/departed peer fails our probes and is reaped by
+            // expireSuspected.
+            .suspect, .dead, .leave => {
+                self.suspectAndProbe(entry.subject_pubkey);
             },
         }
     }
@@ -1141,4 +1181,87 @@ test "swim creates sequential pings" {
     try std.testing.expectEqual(@as(u64, 2), swim.seq);
     try std.testing.expectEqual(@as(usize, 2), swim.pending_count);
     try std.testing.expectEqual(@as(u64, 2), swim.pending[1].seq);
+}
+
+fn aliveTestPeer(pk: [32]u8) Membership.Peer {
+    return .{
+        .pubkey = pk,
+        .name = "",
+        .state = .alive,
+        .gossip_endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 40000),
+        .wg_pubkey = null,
+        .mesh_ip = .{ 10, 99, 0, 1 },
+        .wg_port = 51830,
+        .lamport = 1,
+        .last_seen_ns = 0,
+        .suspected_at_ns = null,
+        .last_rtt_ns = null,
+        .handshake_complete = false,
+    };
+}
+
+test "org revoke requires a valid trusted-org signature (C2 regression)" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+    var socket = Udp.UdpSocket.bind(0) catch return; // skip if no socket
+    defer socket.close();
+
+    var swim = SwimProtocol.init(&membership, socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+
+    const org_kp = keys.generate();
+    const org_pubkey = org_kp.public_key.toBytes();
+    swim.addTrustedOrg(org_pubkey);
+
+    const victim = [_]u8{0x77} ** 32;
+    try membership.upsert(aliveTestPeer(victim));
+
+    // (1) Forged: trusted org pubkey but an all-zero signature → rejected.
+    const forged = messages.OrgCertRevoke{ .org_pubkey = org_pubkey, .node_pubkey = victim, .reason = 2, .lamport = 5, .signature = [_]u8{0} ** 64 };
+    swim.handleOrgRevoke(forged);
+    try std.testing.expect(membership.peers.get(victim).?.state == .alive);
+    try std.testing.expectEqual(@as(usize, 0), swim.revoked_count);
+
+    // (2) Valid: correctly signed by the trusted org → revoked + marked dead.
+    var valid = messages.OrgCertRevoke{ .org_pubkey = org_pubkey, .node_pubkey = victim, .reason = 2, .lamport = 6, .signature = undefined };
+    const signed = codec.orgRevokeSignedBytes(valid);
+    valid.signature = keys.sign(&signed, org_kp.secret_key) catch unreachable;
+    swim.handleOrgRevoke(valid);
+    try std.testing.expect(membership.peers.get(victim).?.state == .dead);
+    try std.testing.expectEqual(@as(usize, 1), swim.revoked_count);
+
+    // (3) Untrusted org with a valid self-signature → rejected.
+    const evil_kp = keys.generate();
+    const evil_pub = evil_kp.public_key.toBytes();
+    const victim2 = [_]u8{0x88} ** 32;
+    try membership.upsert(aliveTestPeer(victim2));
+    var evil = messages.OrgCertRevoke{ .org_pubkey = evil_pub, .node_pubkey = victim2, .reason = 2, .lamport = 7, .signature = undefined };
+    const evil_signed = codec.orgRevokeSignedBytes(evil);
+    evil.signature = keys.sign(&evil_signed, evil_kp.secret_key) catch unreachable;
+    swim.handleOrgRevoke(evil);
+    try std.testing.expect(membership.peers.get(victim2).?.state == .alive);
+}
+
+test "gossiped dead does not instantly evict a third party (H2 regression)" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+    var socket = Udp.UdpSocket.bind(0) catch return;
+    defer socket.close();
+
+    var swim = SwimProtocol.init(&membership, socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+
+    const victim = [_]u8{0x55} ** 32;
+    try membership.upsert(aliveTestPeer(victim));
+
+    // An unauthenticated gossip "dead" about a third party must only DOWNGRADE
+    // to local suspicion (to be confirmed by our own probes), never instant-kill.
+    swim.applyGossip(.{ .subject_pubkey = victim, .event = .dead, .lamport = 99, .endpoint = null });
+    const p = membership.peers.get(victim).?;
+    try std.testing.expect(p.state != .dead);
+    try std.testing.expect(p.state == .suspected);
+
+    // A replayed "alive" from gossip must NOT clear our local suspicion (M6).
+    swim.applyGossip(.{ .subject_pubkey = victim, .event = .alive, .lamport = 100, .endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 40000) });
+    try std.testing.expect(membership.peers.get(victim).?.state == .suspected);
 }

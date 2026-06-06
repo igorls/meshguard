@@ -37,5 +37,9 @@ Instead, please report via one of:
 - **Decentralized trust** (no central authority)
 - **Org PKI** for fleet trust
 - **Key rotation** every 120 seconds
+- **RX cryptokey routing**: decrypted packets must carry an inner source IP belonging to the sending peer
+- **Authenticated org control plane**: revoke/alias/vouch messages require a verified org Ed25519 signature
+- **Confirmed failure detection**: gossiped death only suspects a peer locally; eviction requires our own probe to fail
+- **Inbound-handshake rate limiting**: per-source + global token bucket before the X25519
 
 See [docs/concepts/security.md](docs/concepts/security.md) for full security model documentation.
