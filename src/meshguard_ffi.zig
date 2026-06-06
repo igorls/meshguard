@@ -1165,8 +1165,11 @@ fn handleWgPacket(ctx: *MeshguardContext, data: []const u8, sender_addr: [4]u8, 
                     } else |_| {}
                 }
 
-                // Retry after auto-registration
-                break :blk dev.handleInitiation(msg, sender_addr) catch return;
+                // Retry after auto-registration. Use the "admitted" path so the
+                // rate limiter is not charged a second time for this one
+                // legitimate handshake (the first attempt already consumed a
+                // token before failing with UnknownPeer).
+                break :blk dev.handleInitiationAdmitted(msg) catch return;
             };
 
             // Send handshake response back to the initiator
@@ -1212,20 +1215,9 @@ fn handleWgPacket(ctx: *MeshguardContext, data: []const u8, sender_addr: [4]u8, 
             var plaintext: [1500]u8 = undefined;
             const result = dev.decryptTransport(data, &plaintext) catch return;
 
-            // Look up the peer's identity key for the sender field
-            var sender_identity: [32]u8 = .{0} ** 32;
-            if (dev.peers[result.slot]) |*peer| {
-                sender_identity = peer.identity_key;
-                // Finding #5 (v2): Only update endpoint if changed.
-                // Under shared lock, only safe for same-value writes.
-                if (!std.mem.eql(u8, &peer.endpoint_addr, &sender_addr) or
-                    peer.endpoint_port != sender_port)
-                {
-                    // Endpoint changed — defer update to avoid torn read.
-                    // The next handshake (exclusive lock) will pick up the new address
-                    // from the UDP source. For now, just use sender_identity.
-                }
-            }
+            // identity_key is captured inside decryptTransport under the device
+            // lock, so we never re-read peers[slot] here (avoids the removePeer race).
+            const sender_identity: [32]u8 = result.identity_key;
 
             // Strip the 4-byte length framing header.
             // Wire format: [2B reserved=0] [2B LE length] [payload]

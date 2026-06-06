@@ -2686,9 +2686,11 @@ fn decryptRxWorker(
         const pkt = decrypt_q.getPacket(result.idx);
         if (wg_dev.decryptTransport(pkt, &out_buf)) |dec| {
             // Service filter: check access before TUN write (IPv4 + IPv6, M5).
-            if (wg_dev.peers[dec.slot]) |peer| {
-                const org_pk = orgPubkeyLocked(membership, peer.identity_key);
-                if (!service_filter.allowPacket(peer.identity_key, org_pk, out_buf[0..dec.len])) continue;
+            {
+                // identity_key comes from decryptTransport (captured under the
+                // device lock) — no unlocked peers[] re-read (H6 race).
+                const org_pk = orgPubkeyLocked(membership, dec.identity_key);
+                if (!service_filter.allowPacket(dec.identity_key, org_pk, out_buf[0..dec.len])) continue;
             }
 
             // Write decrypted packet to TUN
@@ -2730,9 +2732,9 @@ fn processIncomingPacket(
         if (n_decrypted.* < 64) {
             if (wg_dev.decryptTransport(pkt, &decrypt_storage[n_decrypted.*])) |result| {
                 // Check service filter before buffering (IPv4 + IPv6, M5).
-                if (wg_dev.peers[result.slot]) |peer| {
-                    const org_pk = orgPubkeyLocked(swim.membership, peer.identity_key);
-                    if (!service_filter.allowPacket(peer.identity_key, org_pk, decrypt_storage[n_decrypted.*][0..result.len])) return;
+                {
+                    const org_pk = orgPubkeyLocked(swim.membership, result.identity_key);
+                    if (!service_filter.allowPacket(result.identity_key, org_pk, decrypt_storage[n_decrypted.*][0..result.len])) return;
                 }
                 decrypt_lens[n_decrypted.*] = result.len;
                 decrypt_slots[n_decrypted.*] = result.slot;
@@ -2811,9 +2813,9 @@ fn windowsEventLoop(
                 // Decrypt WG transport → write plaintext to Wintun
                 if (wg_dev.decryptTransport(pkt, &decrypt_buf)) |result| {
                     // Apply service filter before writing to TUN (IPv4 + IPv6, M5).
-                    if (wg_dev.peers[result.slot]) |peer| {
-                        const org_pk = orgPubkeyLocked(swim.membership, peer.identity_key);
-                        if (!service_filter.allowPacket(peer.identity_key, org_pk, decrypt_buf[0..result.len])) continue;
+                    {
+                        const org_pk = orgPubkeyLocked(swim.membership, result.identity_key);
+                        if (!service_filter.allowPacket(result.identity_key, org_pk, decrypt_buf[0..result.len])) continue;
                     }
                     tun_dev.write(decrypt_buf[0..result.len]) catch {};
                 } else |_| {}
@@ -2960,9 +2962,9 @@ fn macosEventLoop(
                 // Decrypt WG transport → write plaintext to utun
                 if (wg_dev.decryptTransport(pkt, &decrypt_buf)) |result| {
                     // Apply service filter before writing to TUN (IPv4 + IPv6, M5).
-                    if (wg_dev.peers[result.slot]) |peer| {
-                        const org_pk = orgPubkeyLocked(swim.membership, peer.identity_key);
-                        if (!service_filter.allowPacket(peer.identity_key, org_pk, decrypt_buf[0..result.len])) continue;
+                    {
+                        const org_pk = orgPubkeyLocked(swim.membership, result.identity_key);
+                        if (!service_filter.allowPacket(result.identity_key, org_pk, decrypt_buf[0..result.len])) continue;
                     }
                     tun_dev.write(decrypt_buf[0..result.len]) catch {};
                 } else |_| {}

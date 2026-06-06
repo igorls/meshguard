@@ -481,6 +481,7 @@ fn responseMatchesQuery(data: []const u8, expected_id: u16, domain: []const u8, 
     if (HEADER_LEN + q_end + 4 > data.len) return false;
     if (!std.ascii.eqlIgnoreCase(data[HEADER_LEN .. HEADER_LEN + q_end], q_buf[0..q_end])) return false;
     if (readU16(data, HEADER_LEN + q_end) != qtype) return false; // QTYPE echoed
+    if (readU16(data, HEADER_LEN + q_end + 2) != CLASS_IN) return false; // QCLASS echoed
     return true;
 }
 

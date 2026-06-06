@@ -119,6 +119,12 @@ pub const MembershipTable = struct {
         if (existing) |e| {
             // Only update if the incoming info is newer (higher Lamport timestamp)
             if (peer.lamport <= e.lamport) return;
+            // Free the previous name allocation we're about to overwrite, unless
+            // the caller is reusing the same buffer (avoids a leak and a later
+            // double-free; names are owned by self.allocator like remove/deinit).
+            if (e.name.len > 0 and e.name.ptr != peer.name.ptr) {
+                self.allocator.free(e.name);
+            }
             try self.peers.put(peer.pubkey, peer);
             return;
         }
