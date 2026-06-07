@@ -111,9 +111,9 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const arena = init.arena.allocator();
 
-    // Initialize libsodium (AVX2 ChaCha20-Poly1305 assembly) — Linux only
-    // macOS and Windows use std.crypto (no libsodium dependency)
-    if (comptime @import("builtin").os.tag == .linux) {
+    // Initialize libsodium (AVX2 ChaCha20-Poly1305 assembly) only when the
+    // resolved backend uses it. std.crypto path needs no init (meshguard#102).
+    if (comptime @import("build_options").use_libsodium) {
         @import("crypto/sodium.zig").init();
     }
 

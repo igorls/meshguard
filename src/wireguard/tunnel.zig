@@ -11,11 +11,12 @@
 const std = @import("std");
 const noise = @import("noise.zig");
 
-// Compile-time AEAD backend selection:
-// - Linux/native (non-Android): libsodium (AVX2 assembly, ~2× faster)
-// - Android/Windows/other: std.crypto (no libsodium dependency)
-const builtin = @import("builtin");
-const use_libsodium = (builtin.os.tag == .linux and builtin.target.abi != .android);
+// Compile-time AEAD backend selection, resolved in build.zig and passed in via
+// build_options so the source and the linker always agree (meshguard#102).
+// Default (auto): libsodium on Linux desktop (AVX2 assembly, ~2× faster at MTU/
+// bulk), std.crypto everywhere else. -Dcrypto-backend=std / -Dno-sodium forces
+// the std.crypto path on Linux too (no libsodium link required).
+const use_libsodium = @import("build_options").use_libsodium;
 
 /// Returns a blocking Io instance for synchronous operations.
 fn zio() std.Io {
