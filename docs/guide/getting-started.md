@@ -38,7 +38,7 @@ Alternatively, build from source with [Zig](https://ziglang.org/download/) 0.15+
 | Requirement     | Linux                                            | Windows                            |
 | --------------- | ------------------------------------------------ | ---------------------------------- |
 | **Zig**         | 0.15 or later                                    | 0.15 or later                      |
-| **libsodium**   | `libsodium-dev` for building                     | Not required                       |
+| **libsodium**   | _optional_ — `libsodium-dev` for the AVX2 accelerator (default); build `-Dno-sodium` to use `std.crypto` and skip it | Not required |
 | **OS**          | Kernel WireGuard module _or_ TUN support         | Windows 10+ with Wintun            |
 | **Permissions** | `sudo` or `CAP_NET_ADMIN` for interface creation | Administrator for `meshguard up`   |
 

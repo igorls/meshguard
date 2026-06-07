@@ -272,7 +272,10 @@ docker compose -f docker-compose.bench.yml up
 
 - **Zig 0.16+**
 - **Linux** (kernel WireGuard module _or_ TUN device support)
-- **libsodium** (`libsodium-dev` for building, `libsodium23` at runtime)
+- **libsodium** — _optional_ AVX2 accelerator, on by default on Linux
+  (`libsodium-dev` to build, `libsodium23` at runtime). Build with
+  `-Dno-sodium` / `-Dcrypto-backend=std` to use `std.crypto` instead and drop
+  the dependency entirely (see [Crypto backend](#crypto-backend)).
 - `sudo` or `CAP_NET_ADMIN` for interface creation
 
 ### macOS
@@ -335,6 +338,34 @@ zig build -Dtarget=aarch64-ios -Doptimize=ReleaseFast
 
 Windows builds automatically bundle `wintun.dll` alongside `meshguard.exe`.
 Android builds produce only `libmeshguard-ffi.so` — the CLI binary, static library, and unit tests are excluded.
+
+### Crypto backend
+
+MeshGuard's **required** crypto primitives — ChaCha20-Poly1305 (AEAD), Ed25519
+(signatures), X25519 (key exchange) — are always available via Zig's `std.crypto`.
+**libsodium is an optional implementation accelerator**, not a dependency: its
+hand-written AVX2 ChaCha20-Poly1305 is ~2× faster than `std.crypto` at MTU/bulk
+sizes on Linux x86_64, so it is auto-selected there. Everywhere else
+(macOS/FreeBSD/Windows/Android/iOS) `std.crypto` is used.
+
+Select the backend with `-Dcrypto-backend` (or the `-Dno-sodium` alias):
+
+| Build flag | Backend |
+|---|---|
+| _(default)_ / `-Dcrypto-backend=auto` | libsodium on Linux desktop, `std.crypto` elsewhere |
+| `-Dno-sodium` / `-Dcrypto-backend=std` | `std.crypto` everywhere — **no libsodium**, no `libsodium-dev` |
+| `-Dcrypto-backend=sodium` | force libsodium (link must be available for the target) |
+
+```bash
+# Build + test on Linux with zero libsodium dependency:
+zig build -Dno-sodium=true
+zig build test -Dno-sodium=true
+```
+
+The choice is resolved in `build.zig` and passed to the source via `build_options`,
+so the compiled code and the linker always agree. Downstream packages that embed
+MeshGuard from source can pass the same `use_libsodium` option through and never
+touch system libsodium.
 
 ## Status
 
