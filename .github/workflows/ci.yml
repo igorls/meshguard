@@ -50,3 +50,27 @@ jobs:
 
       - name: Test
         run: zig build test
+
+  no-sodium-linux:
+    name: Build + Test (ubuntu, std.crypto / no libsodium)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Deliberately do NOT install libsodium-dev — this lane proves the
+      # std.crypto path builds and tests on Linux with no libsodium present
+      # (regression guard for the optional-libsodium work, meshguard#102).
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build (std.crypto, no libsodium)
+        run: zig build -Dno-sodium=true
+
+      - name: Build ReleaseFast (std.crypto, no libsodium)
+        run: zig build -Dno-sodium=true -Doptimize=ReleaseFast
+
+      - name: Test (std.crypto, no libsodium)
+        run: zig build test -Dno-sodium=true
