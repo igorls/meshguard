@@ -274,7 +274,7 @@ docker compose -f docker-compose.bench.yml up
 - **Linux** (kernel WireGuard module _or_ TUN device support)
 - **libsodium** — _optional_ AVX2 accelerator, on by default on Linux
   (`libsodium-dev` to build, `libsodium23` at runtime). Build with
-  `-Dno-sodium` / `-Dcrypto-backend=std` to use `std.crypto` instead and drop
+  `-Dno-sodium=true` / `-Dcrypto-backend=std` to use `std.crypto` instead and drop
   the dependency entirely (see [Crypto backend](#crypto-backend)).
 - `sudo` or `CAP_NET_ADMIN` for interface creation
 
@@ -348,12 +348,12 @@ hand-written AVX2 ChaCha20-Poly1305 is ~2× faster than `std.crypto` at MTU/bulk
 sizes on Linux x86_64, so it is auto-selected there. Everywhere else
 (macOS/FreeBSD/Windows/Android/iOS) `std.crypto` is used.
 
-Select the backend with `-Dcrypto-backend` (or the `-Dno-sodium` alias):
+Select the backend with `-Dcrypto-backend` (or the `-Dno-sodium=true` alias):
 
 | Build flag | Backend |
 |---|---|
 | _(default)_ / `-Dcrypto-backend=auto` | libsodium on Linux desktop, `std.crypto` elsewhere |
-| `-Dno-sodium` / `-Dcrypto-backend=std` | `std.crypto` everywhere — **no libsodium**, no `libsodium-dev` |
+| `-Dno-sodium=true` / `-Dcrypto-backend=std` | `std.crypto` everywhere — **no libsodium**, no `libsodium-dev` |
 | `-Dcrypto-backend=sodium` | force libsodium (link must be available for the target) |
 
 ```bash

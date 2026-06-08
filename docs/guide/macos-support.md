@@ -28,7 +28,7 @@ macOS shares most of Linux's POSIX API surface. The gap is much smaller than Win
 ### Phase 1: AEAD Backend (Already Done)
 
 The `use_libsodium` flag already handles this. It is resolved in `build.zig`
-(from `-Dcrypto-backend` / `-Dno-sodium`) and read by the source via
+(from `-Dcrypto-backend` / `-Dno-sodium=true`) and read by the source via
 `build_options`:
 
 ```zig
@@ -37,8 +37,8 @@ const use_libsodium = @import("build_options").use_libsodium;
 ```
 
 For macOS this is `false` → uses `std.crypto.aead.chacha_poly.ChaCha20Poly1305`.
-No changes needed. (On Linux it defaults to `true`; `-Dno-sodium` forces `false`
-there too.)
+No changes needed. (On Linux it defaults to `true`; `-Dno-sodium=true` forces
+`false` there too.)
 
 ### Phase 2: utun Device
 
