@@ -246,12 +246,19 @@ pub const UdpSocket = struct {
         const addr = makeSockaddrIn(dest_addr, dest_port);
         if (comptime is_linux) {
             const rc = linux.sendto(self.fd, data.ptr, data.len, 0, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
-            // Raw syscall returns -errno; libc-mode posix.errno() misses it (only
-            // catches -1), so a failed send returned -errno AS the byte count
-            // (the bogus "ACK sent (-11 bytes)" logs). Check the sign directly:
-            // any error (EAGAIN/ENOBUFS/unreachable) is a clean drop for UDP.
+            // linux.sendto is a RAW syscall returning -errno. std.posix.errno is
+            // WRONG here: under libc it only classifies rv==-1 and reads the C
+            // errno global (which a raw syscall never sets), so -errno slipped
+            // through as a "byte count" — the OOB / "ACK sent (-11 bytes)" bug.
+            // Decode the errno from the negated raw return; map only true
+            // backpressure to WouldBlock and surface the rest as real failures.
             const sgn: isize = @bitCast(rc);
-            if (sgn < 0) return error.WouldBlock;
+            if (sgn < 0) {
+                switch (@as(posix.E, @enumFromInt(@as(u16, @intCast(-sgn))))) {
+                    .AGAIN, .NOBUFS, .INTR => return error.WouldBlock,
+                    else => |e| return posix.unexpectedErrno(e),
+                }
+            }
             return @intCast(rc);
         } else if (comptime is_windows) {
             const n = std.c.sendto(self.fd, data.ptr, data.len, 0, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
@@ -269,8 +276,13 @@ pub const UdpSocket = struct {
         const addr = makeSockaddrIn6(dest_addr, dest_port);
         if (comptime is_linux) {
             const rc = linux.sendto(self.fd, data.ptr, data.len, 0, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
-            const sgn: isize = @bitCast(rc); // raw -errno; check sign (see sendTo)
-            if (sgn < 0) return error.WouldBlock;
+            const sgn: isize = @bitCast(rc); // raw -errno; decode the errno (see sendTo)
+            if (sgn < 0) {
+                switch (@as(posix.E, @enumFromInt(@as(u16, @intCast(-sgn))))) {
+                    .AGAIN, .NOBUFS, .INTR => return error.WouldBlock,
+                    else => |e| return posix.unexpectedErrno(e),
+                }
+            }
             return @intCast(rc);
         } else {
             const n = std.c.sendto(self.fd, data.ptr, data.len, 0, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));

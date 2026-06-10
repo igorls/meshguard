@@ -250,12 +250,15 @@ export fn meshguard_init_ipv6(
 export fn meshguard_init_bind(
     identity_seed: ?[*]const u8,
     listen_port: u16,
-    bind_ip: [*]const u8,
+    bind_ip: ?[*]const u8,
 ) ?*MeshguardContext {
+    // C-ABI entrypoint: a caller can pass NULL. Null-check before any deref or
+    // allocation so a bad pointer fails cleanly instead of crashing in @memcpy.
+    const ip_ptr = bind_ip orelse return null;
     const ctx = meshguard_init(identity_seed, listen_port) orelse return null;
     if (ctx.socket) |*s| s.close();
     var addr: [4]u8 = undefined;
-    @memcpy(&addr, bind_ip[0..4]);
+    @memcpy(&addr, ip_ptr[0..4]);
     ctx.socket = Udp.UdpSocket.bindAddr(addr, listen_port) catch {
         ctx.alloc.destroy(ctx);
         return null;
