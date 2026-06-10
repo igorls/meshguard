@@ -58,6 +58,13 @@ const PendingPing = struct {
     escalated: bool, // whether we've already sent ping-req
 };
 
+/// Hard ceiling on SWIM control-plane send rate (packets/sec). Legitimate
+/// gossip needs only a handful of pps even in a large mesh; this is generous
+/// headroom while still bounding any flood to a level a router shrugs off.
+const SEND_RATE_PPS: f64 = 500.0;
+/// Token-bucket capacity (allowed short burst above the sustained rate).
+const SEND_BURST: f64 = 100.0;
+
 /// SWIM protocol state machine with event loop.
 pub const SwimProtocol = struct {
     config: SwimConfig,
@@ -123,11 +130,21 @@ pub const SwimProtocol = struct {
     // Node's own org certificate (if any, loaded at init)
     our_org_cert: ?[186]u8 = null,
 
+    // Control-plane send rate limiting (token bucket). A hard ceiling on
+    // SWIM/gossip packets/sec so a pathological inbound rate (e.g. a NAT
+    // retransmit storm) can never be amplified into a network-melting flood.
+    // Tunnel DATA does NOT pass through here — it uses the socket directly via
+    // the FFI layer — so egress throughput is unaffected by this cap.
+    send_tokens: f64 = SEND_BURST,
+    last_token_refill_ns: i128 = 0,
+
     // Debug counters
     pkts_sent: u32 = 0,
     pkts_recv: u32 = 0,
     raw_recv: u32 = 0,
     tick_count: u32 = 0,
+    acks_sent: u32 = 0,
+    sends_dropped_ratelimit: u32 = 0,
 
     // Liveness tracking: timestamp of last received packet (epoch nanoseconds, i64)
     last_recv_ns: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
@@ -267,7 +284,7 @@ pub const SwimProtocol = struct {
             const peer = entry.value_ptr;
             if (peer.state == .alive or peer.state == .suspected) {
                 if (peer.gossip_endpoint) |ep| {
-                    _ = self.socket.sendToEndpoint(buf[0..written], ep) catch {};
+                    self.gossipSend(buf[0..written], ep);
                 }
             }
         }
@@ -517,29 +534,18 @@ pub const SwimProtocol = struct {
                     cb(h.ctx, data);
                 }
             }
-            std.debug.print("  📨 APP msg delivered locally ({d}B)\n", .{data.len});
             return;
         }
 
-        // Not for us — relay to destination peer
+        // Not for us — relay to destination peer (rate-limited; no per-message
+        // logging in this hot path).
         var dest_key: [32]u8 = undefined;
         @memcpy(&dest_key, dest_pubkey);
-        const peer = self.membership.peers.get(dest_key) orelse {
-            std.debug.print("  📨 APP msg relay FAILED: unknown dest\n", .{});
-            return;
-        };
-        const ep = peer.gossip_endpoint orelse {
-            std.debug.print("  📨 APP msg relay FAILED: no endpoint\n", .{});
-            return;
-        };
+        const peer = self.membership.peers.get(dest_key) orelse return;
+        const ep = peer.gossip_endpoint orelse return;
 
         // Forward the entire message as-is (encrypted, we can't read it)
-        _ = self.socket.sendToEndpoint(data, ep) catch {
-            std.debug.print("  📨 APP msg relay FAILED: sendTo error\n", .{});
-            return;
-        };
-        var ep_buf: [64]u8 = undefined;
-        std.debug.print("  📨 APP msg relayed ({d}B) → {s}\n", .{ data.len, ep.format(&ep_buf) });
+        self.gossipSend(data, ep);
     }
 
     /// Verify an org control message before acting on it.
@@ -695,14 +701,12 @@ pub const SwimProtocol = struct {
 
         var buf: [1500]u8 = undefined;
         const written = codec.encodeAck(&buf, ack) catch return;
-        const send_result = self.socket.sendToEndpoint(buf[0..written], sender_endpoint);
-        if (send_result) |bytes| {
-            var ep_buf: [64]u8 = undefined;
-            std.debug.print("  ACK sent ({d}B) → {s}\n", .{ bytes, sender_endpoint.format(&ep_buf) });
-        } else |err| {
-            var ep_buf: [64]u8 = undefined;
-            std.debug.print("  ACK FAILED → {s} err={s}\n", .{ sender_endpoint.format(&ep_buf), @errorName(err) });
-        }
+        // Rate-limited send, no per-packet logging: an unconditional
+        // std.debug.print here (one stderr syscall per inbound PING) was the
+        // CPU sink that, under a NAT retransmit storm, pegged a core and helped
+        // melt the LAN. Count instead.
+        self.gossipSend(buf[0..written], sender_endpoint);
+        self.acks_sent +%= 1;
     }
 
     fn handleAck(self: *SwimProtocol, ack: *const codec.DecodedAck, sender_endpoint: messages.Endpoint) void {
@@ -746,7 +750,7 @@ pub const SwimProtocol = struct {
                 var buf: [128]u8 = undefined;
                 const written = codec.encodeHolepunchResponse(&buf, resp) catch return;
                 // Send response back through the rendezvous (sender)
-                _ = self.socket.sendToEndpoint(buf[0..written], sender_endpoint) catch {};
+                self.gossipSend(buf[0..written], sender_endpoint);
 
                 // Also start probing the initiator's endpoint
                 _ = self.holepuncher.initiate(self.our_pubkey, req.sender_pubkey, our_ep);
@@ -764,7 +768,7 @@ pub const SwimProtocol = struct {
                 if (target.gossip_endpoint) |ep| {
                     var buf: [128]u8 = undefined;
                     const written = codec.encodeHolepunchRequest(&buf, req) catch return;
-                    _ = self.socket.sendToEndpoint(buf[0..written], ep) catch {};
+                    self.gossipSend(buf[0..written], ep);
                 }
             }
         }
@@ -840,7 +844,7 @@ pub const SwimProtocol = struct {
                     std.debug.print("  [punch] initiating punch to {x:0>2}{x:0>2}... via rendezvous\n", .{ peer.pubkey[0], peer.pubkey[1] });
                     var buf: [128]u8 = undefined;
                     const written = codec.encodeHolepunchRequest(&buf, req) catch continue;
-                    _ = self.socket.sendToEndpoint(buf[0..written], rvz_ep) catch {};
+                    self.gossipSend(buf[0..written], rvz_ep);
                 }
             }
         }
@@ -919,6 +923,26 @@ pub const SwimProtocol = struct {
 
     // ─── PING/timeout management ───
 
+    /// Rate-limited control-plane send (token bucket). ALL SWIM gossip/ping/
+    /// ack/ping-req/holepunch/relay traffic goes through here so it can never
+    /// be amplified into a flood. Over-budget packets are dropped (counted),
+    /// which is correct for an unreliable gossip protocol. Tunnel DATA does not
+    /// use this path, so egress throughput is unaffected.
+    fn gossipSend(self: *SwimProtocol, data: []const u8, endpoint: messages.Endpoint) void {
+        const now = nowNs();
+        if (self.last_token_refill_ns == 0) self.last_token_refill_ns = now;
+        const elapsed_s: f64 = @as(f64, @floatFromInt(now - self.last_token_refill_ns)) / 1_000_000_000.0;
+        self.last_token_refill_ns = now;
+        self.send_tokens = @min(SEND_BURST, self.send_tokens + elapsed_s * SEND_RATE_PPS);
+        if (self.send_tokens < 1.0) {
+            self.sends_dropped_ratelimit +%= 1;
+            return; // over budget — drop to protect the network
+        }
+        self.send_tokens -= 1.0;
+        _ = self.socket.sendToEndpoint(data, endpoint) catch return;
+        self.pkts_sent +%= 1;
+    }
+
     fn sendPing(self: *SwimProtocol, endpoint: messages.Endpoint, target_pubkey: [32]u8) void {
         self.seq += 1;
         const gossip = self.collectGossip();
@@ -931,8 +955,7 @@ pub const SwimProtocol = struct {
 
         var buf: [1500]u8 = undefined;
         const written = codec.encodePing(&buf, ping) catch return;
-        _ = self.socket.sendToEndpoint(buf[0..written], endpoint) catch return;
-        self.pkts_sent += 1;
+        self.gossipSend(buf[0..written], endpoint);
 
         // Track pending
         if (self.pending_count < self.pending.len) {
@@ -1008,7 +1031,7 @@ pub const SwimProtocol = struct {
 
             var buf: [128]u8 = undefined;
             const written = codec.encodePingReq(&buf, req) catch continue;
-            _ = self.socket.sendToEndpoint(buf[0..written], ep) catch continue;
+            self.gossipSend(buf[0..written], ep);
             sent += 1;
         }
     }
