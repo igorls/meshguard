@@ -246,10 +246,12 @@ pub const UdpSocket = struct {
         const addr = makeSockaddrIn(dest_addr, dest_port);
         if (comptime is_linux) {
             const rc = linux.sendto(self.fd, data.ptr, data.len, 0, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
-            switch (posix.errno(rc)) {
-                .SUCCESS => {},
-                else => |err| return posix.unexpectedErrno(err),
-            }
+            // Raw syscall returns -errno; libc-mode posix.errno() misses it (only
+            // catches -1), so a failed send returned -errno AS the byte count
+            // (the bogus "ACK sent (-11 bytes)" logs). Check the sign directly:
+            // any error (EAGAIN/ENOBUFS/unreachable) is a clean drop for UDP.
+            const sgn: isize = @bitCast(rc);
+            if (sgn < 0) return error.WouldBlock;
             return @intCast(rc);
         } else if (comptime is_windows) {
             const n = std.c.sendto(self.fd, data.ptr, data.len, 0, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
@@ -267,10 +269,8 @@ pub const UdpSocket = struct {
         const addr = makeSockaddrIn6(dest_addr, dest_port);
         if (comptime is_linux) {
             const rc = linux.sendto(self.fd, data.ptr, data.len, 0, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
-            switch (posix.errno(rc)) {
-                .SUCCESS => {},
-                else => |err| return posix.unexpectedErrno(err),
-            }
+            const sgn: isize = @bitCast(rc); // raw -errno; check sign (see sendTo)
+            if (sgn < 0) return error.WouldBlock;
             return @intCast(rc);
         } else {
             const n = std.c.sendto(self.fd, data.ptr, data.len, 0, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
@@ -294,12 +294,17 @@ pub const UdpSocket = struct {
 
         if (comptime is_linux) {
             const rc = linux.recvfrom(self.fd, buf.ptr, buf.len, 0, @ptrCast(&src_addr), &addr_len);
-            switch (posix.errno(rc)) {
-                .SUCCESS => {},
-                .AGAIN => return null,
-                else => |err| return posix.unexpectedErrno(err),
-            }
+            // CRITICAL: linux.recvfrom is a RAW syscall that returns -errno on
+            // error (EAGAIN=-11, etc.). With libc linked, std.posix.errno() only
+            // classifies rv==-1, so every other -errno slipped through as
+            // .SUCCESS and got @intCast into a huge length → buf[0..huge] OOB
+            // (silent memory corruption in ReleaseFast → the 2026-06-10 segfault
+            // on debug builds and the CPU hang on the deploy host). Check the
+            // raw return's sign directly instead of trusting posix.errno.
+            const sgn: isize = @bitCast(rc);
+            if (sgn < 0) return null; // no datagram (EAGAIN) or transient error
             const n: usize = @intCast(rc);
+            if (n > buf.len) return null; // paranoia: never slice past the buffer
 
             // Extract sender IP and port
             const ip_bytes: [4]u8 = @bitCast(src_addr.addr);
@@ -332,12 +337,11 @@ pub const UdpSocket = struct {
 
         if (comptime is_linux) {
             const rc = linux.recvfrom(self.fd, buf.ptr, buf.len, 0, @ptrCast(&src_addr), &addr_len);
-            switch (posix.errno(rc)) {
-                .SUCCESS => {},
-                .AGAIN => return null,
-                else => |err| return posix.unexpectedErrno(err),
-            }
+            // Raw syscall returns -errno; check sign directly (see recvFrom).
+            const sgn: isize = @bitCast(rc);
+            if (sgn < 0) return null;
             const n: usize = @intCast(rc);
+            if (n > buf.len) return null;
             return RecvResult{
                 .data = buf[0..n],
                 .sender_addr = .{0} ** 4,
@@ -364,6 +368,8 @@ pub const UdpSocket = struct {
             // Use std.posix.poll — works on Linux, macOS, iOS, FreeBSD, and Android
             // without requiring C headers (critical for iOS cross-compilation).
             const POLLIN: i16 = 0x0001;
+            const POLLERR: i16 = 0x0008;
+            const POLLHUP: i16 = 0x0010;
             var fds = [1]std.posix.pollfd{.{
                 .fd = self.fd,
                 .events = POLLIN,
@@ -371,7 +377,12 @@ pub const UdpSocket = struct {
             }};
 
             _ = try std.posix.poll(&fds, timeout_ms);
-            return (fds[0].revents & POLLIN) != 0;
+            // Defensive: surface POLLERR/POLLHUP too, not just POLLIN. A pending
+            // socket error condition makes poll() return immediately and
+            // persistently; if we only checked POLLIN we'd return false forever,
+            // recvFrom would never run to drain the error, and a no-sleep event
+            // loop above could hot-spin. Returning true lets recvFrom consume it.
+            return (fds[0].revents & (POLLIN | POLLERR | POLLHUP)) != 0;
         } else if (comptime is_windows) {
             var fds = [1]win.pollfd{.{
                 .fd = self.fd,
