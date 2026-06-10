@@ -242,6 +242,27 @@ export fn meshguard_init_ipv6(
     return ctx;
 }
 
+/// Initialize, binding the UDP socket to a SPECIFIC local IPv4 address instead
+/// of INADDR_ANY. On a multi-homed / public-IP host this binds the daemon only
+/// to the intended interface, so it never listens on or sources traffic from
+/// LAN interfaces. `bind_ip`: 4 address bytes (e.g. {187,16,79,234}).
+/// Returns the context, or null on failure.
+export fn meshguard_init_bind(
+    identity_seed: ?[*]const u8,
+    listen_port: u16,
+    bind_ip: [*]const u8,
+) ?*MeshguardContext {
+    const ctx = meshguard_init(identity_seed, listen_port) orelse return null;
+    if (ctx.socket) |*s| s.close();
+    var addr: [4]u8 = undefined;
+    @memcpy(&addr, bind_ip[0..4]);
+    ctx.socket = Udp.UdpSocket.bindAddr(addr, listen_port) catch {
+        ctx.alloc.destroy(ctx);
+        return null;
+    };
+    return ctx;
+}
+
 /// Destroy a meshguard instance, stopping all networking.
 export fn meshguard_destroy(ctx: ?*MeshguardContext) void {
     const c = ctx orelse return;
@@ -982,10 +1003,36 @@ export fn meshguard_join_host(
 
 fn eventLoop(ctx: *MeshguardContext) void {
     var lan_beacon_counter: u32 = 0;
+    // Opt-in diagnostics (MESHGUARD_STATS=1): once-per-second counter deltas, so
+    // we can see WHICH path is hot (tick spin vs inbound flood vs rate-cap drops
+    // vs hole-punch) without per-packet logging. No-op unless the env var is set.
+    const stats_enabled = std.c.getenv("MESHGUARD_STATS") != null;
+    var last_stats_ns: i128 = 0;
+    var s_tick: u32 = 0;
+    var s_recv: u32 = 0;
+    var s_sent: u32 = 0;
+    var s_raw: u32 = 0;
+    var s_drop: u32 = 0;
     while (ctx.running.load(.acquire)) {
         const is_suspended = ctx.suspended.load(.acquire);
 
         if (ctx.swim) |*swim| {
+            if (stats_enabled) {
+                const now: i128 = @intCast(std.Io.Timestamp.now(zio(), .awake).toNanoseconds());
+                if (now - last_stats_ns >= 1_000_000_000) {
+                    last_stats_ns = now;
+                    std.debug.print("[stats] tick/s={d} recv/s={d} sent/s={d} raw/s={d} dropped/s={d} punches={d}\n", .{
+                        swim.tick_count -% s_tick,    swim.pkts_recv -% s_recv,
+                        swim.pkts_sent -% s_sent,     swim.raw_recv -% s_raw,
+                        swim.sends_dropped_ratelimit -% s_drop, swim.holepuncher.activeCount(),
+                    });
+                    s_tick = swim.tick_count;
+                    s_recv = swim.pkts_recv;
+                    s_sent = swim.pkts_sent;
+                    s_raw = swim.raw_recv;
+                    s_drop = swim.sends_dropped_ratelimit;
+                }
+            }
             if (is_suspended) {
                 // SUSPENDED: receive-only mode
                 // - Poll socket for incoming packets (messages, SOS, handshakes)
