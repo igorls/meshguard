@@ -58,6 +58,7 @@ const PendingPing = struct {
     seq: u64,
     sent_at_ns: i128,
     escalated: bool, // whether we've already sent ping-req
+    candidate_probe: bool, // unauthenticated candidate probes never PING-REQ
 };
 
 /// Hard ceiling on SWIM control-plane send rate (packets/sec). Legitimate
@@ -1037,14 +1038,14 @@ pub const SwimProtocol = struct {
     }
 
     fn sendPing(self: *SwimProtocol, endpoint: messages.Endpoint, target_pubkey: [32]u8) void {
-        self.sendPingWithGossip(endpoint, target_pubkey, true);
+        self.sendPingWithGossip(endpoint, target_pubkey, true, false);
     }
 
     fn sendCandidatePing(self: *SwimProtocol, endpoint: messages.Endpoint, target_pubkey: [32]u8) void {
-        self.sendPingWithGossip(endpoint, target_pubkey, false);
+        self.sendPingWithGossip(endpoint, target_pubkey, false, true);
     }
 
-    fn sendPingWithGossip(self: *SwimProtocol, endpoint: messages.Endpoint, target_pubkey: [32]u8, include_gossip: bool) void {
+    fn sendPingWithGossip(self: *SwimProtocol, endpoint: messages.Endpoint, target_pubkey: [32]u8, include_gossip: bool, candidate_probe: bool) void {
         self.seq += 1;
         const gossip: []const messages.GossipEntry = if (include_gossip) self.collectGossip() else &.{};
 
@@ -1068,6 +1069,7 @@ pub const SwimProtocol = struct {
                 .seq = self.seq,
                 .sent_at_ns = nowNs(),
                 .escalated = false,
+                .candidate_probe = candidate_probe,
             };
             self.pending_count += 1;
         }
@@ -1094,6 +1096,11 @@ pub const SwimProtocol = struct {
         while (i < self.pending_count) {
             const pending = &self.pending[i];
             if (now - pending.sent_at_ns > timeout_ns) {
+                if (pending.candidate_probe) {
+                    self.pending[i] = self.pending[self.pending_count - 1];
+                    self.pending_count -= 1;
+                    continue;
+                }
                 if (!pending.escalated) {
                     // Escalate: mark suspected + send PING-REQ
                     pending.escalated = true;
@@ -1567,6 +1574,39 @@ test "candidate probes do not drain queued gossip" {
     try std.testing.expectEqual(@as(usize, 1), swim.pending_count);
     try std.testing.expectEqual(@as(usize, 1), swim.gossip_count);
     try std.testing.expectEqual(remaining_before, swim.gossip_queue[0].remaining);
+}
+
+test "candidate probe timeout does not escalate to ping-req" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+    const socket = inertTestSocket();
+
+    var swim = SwimProtocol.init(&membership, socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    swim.enableTrust();
+    swim.addTrustedOrg([_]u8{0xA0} ** 32);
+    try membership.upsert(aliveTestPeer([_]u8{0x60} ** 32));
+
+    const candidate = [_]u8{0x36} ** 32;
+    swim.applyGossip(.{
+        .subject_pubkey = candidate,
+        .event = .join,
+        .lamport = 1,
+        .endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 41910),
+    });
+
+    swim.send_tokens = 0;
+    swim.last_token_refill_ns = nowNs();
+    swim.probeCandidatePeer(swim.last_token_refill_ns);
+    try std.testing.expectEqual(@as(usize, 1), swim.pending_count);
+    try std.testing.expect(swim.pending[0].candidate_probe);
+    const dropped_after_probe = swim.sends_dropped_ratelimit;
+
+    swim.pending[0].sent_at_ns = nowNs() - (@as(i128, swim.config.ping_timeout_ms) * 1_000_000) - 1;
+    swim.checkTimeouts();
+
+    try std.testing.expectEqual(@as(usize, 0), swim.pending_count);
+    try std.testing.expectEqual(dropped_after_probe, swim.sends_dropped_ratelimit);
 }
 
 test "candidate with invalid cert never graduates and is evicted" {
