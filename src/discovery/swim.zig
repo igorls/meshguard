@@ -1037,8 +1037,16 @@ pub const SwimProtocol = struct {
     }
 
     fn sendPing(self: *SwimProtocol, endpoint: messages.Endpoint, target_pubkey: [32]u8) void {
+        self.sendPingWithGossip(endpoint, target_pubkey, true);
+    }
+
+    fn sendCandidatePing(self: *SwimProtocol, endpoint: messages.Endpoint, target_pubkey: [32]u8) void {
+        self.sendPingWithGossip(endpoint, target_pubkey, false);
+    }
+
+    fn sendPingWithGossip(self: *SwimProtocol, endpoint: messages.Endpoint, target_pubkey: [32]u8, include_gossip: bool) void {
         self.seq += 1;
-        const gossip = self.collectGossip();
+        const gossip: []const messages.GossipEntry = if (include_gossip) self.collectGossip() else &.{};
 
         const ping = messages.Ping{
             .sender_pubkey = self.our_pubkey,
@@ -1215,7 +1223,7 @@ pub const SwimProtocol = struct {
             if (self.hasPendingPing(candidate.pubkey)) continue;
             if (candidate.last_probe_ns != 0 and now - candidate.last_probe_ns < CANDIDATE_PROBE_INTERVAL_NS) continue;
 
-            self.sendPing(candidate.endpoint, candidate.pubkey);
+            self.sendCandidatePing(candidate.endpoint, candidate.pubkey);
             candidate.last_probe_ns = now;
             candidate.probe_count += 1;
             return;
@@ -1523,6 +1531,42 @@ test "unauthorized gossip candidates are capped and probed one at a time" {
 
     try std.testing.expectEqual(dropped_before +% 1, swim.sends_dropped_ratelimit);
     try std.testing.expectEqual(@as(usize, 1), swim.pending_count);
+}
+
+test "candidate probes do not drain queued gossip" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+    const socket = inertTestSocket();
+
+    var swim = SwimProtocol.init(&membership, socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    swim.enableTrust();
+    swim.addTrustedOrg([_]u8{0xA0} ** 32);
+
+    const candidate = [_]u8{0x32} ** 32;
+    swim.applyGossip(.{
+        .subject_pubkey = candidate,
+        .event = .join,
+        .lamport = 1,
+        .endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 41900),
+    });
+    swim.enqueueGossip(.{
+        .subject_pubkey = [_]u8{0x99} ** 32,
+        .event = .alive,
+        .lamport = 2,
+        .endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 41901),
+    });
+    try std.testing.expectEqual(@as(usize, 1), swim.candidate_count);
+    try std.testing.expectEqual(@as(usize, 1), swim.gossip_count);
+    const remaining_before = swim.gossip_queue[0].remaining;
+
+    swim.send_tokens = 0;
+    swim.last_token_refill_ns = nowNs();
+    swim.probeCandidatePeer(swim.last_token_refill_ns);
+
+    try std.testing.expectEqual(@as(usize, 1), swim.pending_count);
+    try std.testing.expectEqual(@as(usize, 1), swim.gossip_count);
+    try std.testing.expectEqual(remaining_before, swim.gossip_queue[0].remaining);
 }
 
 test "candidate with invalid cert never graduates and is evicted" {
