@@ -5,6 +5,8 @@
 
 const std = @import("std");
 
+pub const ORG_CERT_WIRE_SIZE: usize = 186;
+
 /// Message type tag — first byte of every wire message.
 pub const MessageType = enum(u8) {
     // ─── SWIM protocol ───
@@ -48,6 +50,10 @@ pub const Ping = struct {
     seq: u64,
     /// Piggybacked gossip updates
     gossip: []const GossipEntry,
+    /// Org certificate extension appended after gossip, if present.
+    org_cert: [ORG_CERT_WIRE_SIZE]u8 = std.mem.zeroes([ORG_CERT_WIRE_SIZE]u8),
+    /// Whether org_cert contains a valid certificate.
+    has_org_cert: bool = false,
 };
 
 /// SWIM Ping-Req: ask another node to probe a target.
@@ -62,6 +68,10 @@ pub const Ack = struct {
     sender_pubkey: [32]u8,
     seq: u64,
     gossip: []const GossipEntry,
+    /// Org certificate extension appended after gossip, if present.
+    org_cert: [ORG_CERT_WIRE_SIZE]u8 = std.mem.zeroes([ORG_CERT_WIRE_SIZE]u8),
+    /// Whether org_cert contains a valid certificate.
+    has_org_cert: bool = false,
 };
 
 /// Handshake initiation: sent when two nodes first discover each other.
@@ -73,8 +83,8 @@ pub const HandshakeInit = struct {
     mesh_ip: [4]u8, // sender's deterministic mesh IP
     wg_port: u16, // sender's WireGuard listen port
     gossip_port: u16, // sender's gossip listen port
-    /// Org certificate (186 bytes), zeroes if none
-    org_cert: [186]u8 = std.mem.zeroes([186]u8),
+    /// Org certificate, zeroes if none
+    org_cert: [ORG_CERT_WIRE_SIZE]u8 = std.mem.zeroes([ORG_CERT_WIRE_SIZE]u8),
     /// Whether org_cert contains a valid certificate
     has_org_cert: bool = false,
 };
@@ -89,8 +99,8 @@ pub const HandshakeResp = struct {
     mesh_ip: [4]u8,
     wg_port: u16,
     gossip_port: u16,
-    /// Org certificate (186 bytes), zeroes if none
-    org_cert: [186]u8 = std.mem.zeroes([186]u8),
+    /// Org certificate, zeroes if none
+    org_cert: [ORG_CERT_WIRE_SIZE]u8 = std.mem.zeroes([ORG_CERT_WIRE_SIZE]u8),
     /// Whether org_cert contains a valid certificate
     has_org_cert: bool = false,
 };
@@ -151,8 +161,8 @@ pub const Endpoint = struct {
     pub fn format(self: Endpoint, buf: []u8) []const u8 {
         const result = if (self.addr6) |a6|
             std.fmt.bufPrint(buf, "[{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}]:{d}", .{
-                a6[0], a6[1], a6[2], a6[3], a6[4], a6[5], a6[6], a6[7],
-                a6[8], a6[9], a6[10], a6[11], a6[12], a6[13], a6[14], a6[15],
+                a6[0],     a6[1], a6[2],  a6[3],  a6[4],  a6[5],  a6[6],  a6[7],
+                a6[8],     a6[9], a6[10], a6[11], a6[12], a6[13], a6[14], a6[15],
                 self.port,
             })
         else
