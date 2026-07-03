@@ -117,6 +117,9 @@ pub const SwimProtocol = struct {
     // Ping rate limiting
     last_ping_sent_ns: i128 = 0,
 
+    // Handshake-retransmit rate limiting (re-initiate stalled/rejoining peers)
+    last_handshake_retransmit_ns: i128 = 0,
+
     // Pending pings awaiting ACK
     pending: [16]PendingPing = std.mem.zeroes([16]PendingPing),
     pending_count: usize = 0,
@@ -425,6 +428,8 @@ pub const SwimProtocol = struct {
         }
 
         // 5. Probe at most one unauthenticated candidate endpoint.
+        self.retransmitStalledHandshakes(now_ns);
+
         self.probeCandidatePeer(now_ns);
 
         // 6. Hole punch: send probes for active punches
@@ -484,6 +489,8 @@ pub const SwimProtocol = struct {
         }
 
         // 4. Probe at most one unauthenticated candidate endpoint.
+        self.retransmitStalledHandshakes(now_ns);
+
         self.probeCandidatePeer(now_ns);
 
         // 5. Hole punch: send probes for active punches
@@ -1352,6 +1359,27 @@ pub const SwimProtocol = struct {
         // init reaches the rejoiner before it has re-learned us.
         if (self.handler) |h| {
             h.onPeerDead(h.ctx, sender_pubkey);
+            h.onPeerJoin(h.ctx, peer);
+        }
+    }
+
+    /// Periodically re-drive handshakes for alive peers whose tunnel is not yet
+    /// up. Re-fires onPeerJoin, which the handler makes a no-op for peers with an
+    /// established session (WgDevice.hasActiveTunnel) and a (re)initiation for
+    /// stalled ones. Covers the post-restart init/ack race — our re-initiation
+    /// can reach the rejoiner before it has re-learned us — and any dropped
+    /// initial handshake. One pass per gossip interval.
+    fn retransmitStalledHandshakes(self: *SwimProtocol, now_ns: i128) void {
+        const interval_ns: i128 = @as(i128, self.config.gossip_interval_ms) * 1_000_000;
+        if (now_ns - self.last_handshake_retransmit_ns < interval_ns) return;
+        self.last_handshake_retransmit_ns = now_ns;
+        const h = self.handler orelse return;
+        var iter = self.membership.peers.iterator();
+        while (iter.next()) |entry| {
+            const peer = entry.value_ptr;
+            if (peer.state != .alive) continue;
+            if (peer.wg_pubkey == null) continue;
+            if (peer.gossip_endpoint == null and peer.public_endpoint == null) continue;
             h.onPeerJoin(h.ctx, peer);
         }
     }
