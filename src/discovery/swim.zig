@@ -8,6 +8,7 @@
 //!   5. Piggyback gossip entries on outgoing messages
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Membership = @import("membership.zig");
 const messages = @import("../protocol/messages.zig");
 const codec = @import("../protocol/codec.zig");
@@ -1177,6 +1178,8 @@ pub const SwimProtocol = struct {
 
         switch (entry.event) {
             .join, .alive => {
+                if (!self.isAuthorizedPeer(entry.subject_pubkey, null)) return;
+
                 // The gossip endpoint is only used to LEARN about brand-new peers.
                 // For peers we already track, liveness is decided by our own
                 // failure detector (direct ping/ack → markAlive), never by
@@ -1287,6 +1290,102 @@ fn aliveTestPeer(pk: [32]u8) Membership.Peer {
         .last_rtt_ns = null,
         .handshake_complete = false,
     };
+}
+
+const JoinCounter = struct {
+    count: usize = 0,
+    last_pubkey: ?[32]u8 = null,
+};
+
+fn countPeerJoin(ctx: *anyopaque, peer: *const Membership.Peer) void {
+    const counter: *JoinCounter = @ptrCast(@alignCast(ctx));
+    counter.count += 1;
+    counter.last_pubkey = peer.pubkey;
+}
+
+fn ignorePeerDead(_: *anyopaque, _: [32]u8) void {}
+
+fn inertTestSocket() Udp.UdpSocket {
+    const fd: std.posix.socket_t = if (builtin.os.tag == .windows)
+        @as(std.posix.socket_t, @ptrFromInt(1))
+    else
+        @as(std.posix.socket_t, -1);
+    return .{ .fd = fd, .port = 0 };
+}
+
+test "gossiped join cannot admit an unauthorized subject with wg key" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+    const socket = inertTestSocket();
+
+    var joins = JoinCounter{};
+    const handler = EventHandler{
+        .ctx = &joins,
+        .onPeerJoin = countPeerJoin,
+        .onPeerDead = ignorePeerDead,
+    };
+    var swim = SwimProtocol.init(&membership, socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, handler);
+    swim.enableTrust();
+    swim.addTrustedOrg([_]u8{0xA0} ** 32);
+
+    const fake_kp = keys.generate();
+    const fake_peer = fake_kp.public_key.toBytes();
+    swim.applyGossip(.{
+        .subject_pubkey = fake_peer,
+        .event = .join,
+        .lamport = 10,
+        .endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 40000),
+        .wg_pubkey = [_]u8{0x66} ** 32,
+    });
+
+    try std.testing.expect(membership.peers.get(fake_peer) == null);
+    try std.testing.expectEqual(@as(usize, 0), joins.count);
+
+    try membership.upsert(aliveTestPeer(fake_peer));
+    swim.applyGossip(.{
+        .subject_pubkey = fake_peer,
+        .event = .alive,
+        .lamport = 11,
+        .endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 40001),
+        .wg_pubkey = [_]u8{0x77} ** 32,
+    });
+
+    try std.testing.expect(membership.peers.get(fake_peer).?.wg_pubkey == null);
+    try std.testing.expectEqual(@as(usize, 0), joins.count);
+}
+
+test "gossiped join still admits an individually authorized subject" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+    const socket = inertTestSocket();
+
+    var joins = JoinCounter{};
+    const handler = EventHandler{
+        .ctx = &joins,
+        .onPeerJoin = countPeerJoin,
+        .onPeerDead = ignorePeerDead,
+    };
+    var swim = SwimProtocol.init(&membership, socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, handler);
+    swim.enableTrust();
+
+    const peer_kp = keys.generate();
+    const peer = peer_kp.public_key.toBytes();
+    const wg_key = [_]u8{0x44} ** 32;
+    swim.addAuthorizedKey(peer);
+    swim.applyGossip(.{
+        .subject_pubkey = peer,
+        .event = .join,
+        .lamport = 10,
+        .endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 40000),
+        .wg_pubkey = wg_key,
+    });
+
+    const recorded = membership.peers.get(peer).?;
+    try std.testing.expectEqualSlices(u8, &wg_key, &recorded.wg_pubkey.?);
+    try std.testing.expectEqual(@as(usize, 1), joins.count);
+    try std.testing.expectEqualSlices(u8, &peer, &joins.last_pubkey.?);
 }
 
 test "trusted org does not admit arbitrary peers without a cert" {

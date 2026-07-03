@@ -5,6 +5,15 @@ All notable changes to meshguard are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Fixed
+- **[P1]** SWIM gossip no longer admits untrusted subjects or binds their
+  WireGuard keys from `.join`/`.alive` entries unless the identity is already
+  authorized. Deployments that relied on the removed org-wide allow-all shortcut
+  must authorize peers with `org-sign` certificates or explicit per-node vouch
+  records before gossip can surface them as joined.
+
 ## [0.9.0] — 2026-04-28
 
 ### Added

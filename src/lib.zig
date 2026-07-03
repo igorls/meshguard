@@ -81,6 +81,7 @@ test {
     _ = wireguard.Noise;
     _ = wireguard.Crypto;
     _ = wireguard.Ip;
+    _ = discovery.Swim;
     if (is_linux) {
         _ = wireguard.Config;
         _ = wireguard.Netlink;
@@ -89,4 +90,3 @@ test {
     }
     _ = services.Policy;
 }
-
