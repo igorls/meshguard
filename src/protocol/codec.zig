@@ -13,12 +13,14 @@ const messages = @import("messages.zig");
 
 const ENDPOINT_SIZE = 1 + 1 + 16 + 2;
 const GOSSIP_ENTRY_SIZE = 32 + 1 + 8 + ENDPOINT_SIZE + 1 + 32 + ENDPOINT_SIZE + 1; // 115 bytes
+const ORG_CERT_EXTENSION_SIZE = 1 + messages.ORG_CERT_WIRE_SIZE;
 
 // ─── Encoding ───
 
 /// Encode a Ping message into a buffer. Returns bytes written.
 pub fn encodePing(buf: []u8, ping: messages.Ping) !usize {
-    const required = 1 + 32 + 8 + 1 + ping.gossip.len * GOSSIP_ENTRY_SIZE;
+    const required = 1 + 32 + 8 + 1 + ping.gossip.len * GOSSIP_ENTRY_SIZE +
+        if (ping.has_org_cert) ORG_CERT_EXTENSION_SIZE else 0;
     if (buf.len < required) return error.BufferTooShort;
 
     var pos: usize = 0;
@@ -44,12 +46,20 @@ pub fn encodePing(buf: []u8, ping: messages.Ping) !usize {
         pos += try encodeGossipEntry(buf[pos..], entry);
     }
 
+    if (ping.has_org_cert) {
+        buf[pos] = 1;
+        pos += 1;
+        @memcpy(buf[pos..][0..messages.ORG_CERT_WIRE_SIZE], &ping.org_cert);
+        pos += messages.ORG_CERT_WIRE_SIZE;
+    }
+
     return pos;
 }
 
 /// Encode an Ack message into a buffer. Returns bytes written.
 pub fn encodeAck(buf: []u8, ack: messages.Ack) !usize {
-    const required = 1 + 32 + 8 + 1 + ack.gossip.len * GOSSIP_ENTRY_SIZE;
+    const required = 1 + 32 + 8 + 1 + ack.gossip.len * GOSSIP_ENTRY_SIZE +
+        if (ack.has_org_cert) ORG_CERT_EXTENSION_SIZE else 0;
     if (buf.len < required) return error.BufferTooShort;
 
     var pos: usize = 0;
@@ -69,6 +79,13 @@ pub fn encodeAck(buf: []u8, ack: messages.Ack) !usize {
 
     for (ack.gossip[0..gossip_count]) |entry| {
         pos += try encodeGossipEntry(buf[pos..], entry);
+    }
+
+    if (ack.has_org_cert) {
+        buf[pos] = 1;
+        pos += 1;
+        @memcpy(buf[pos..][0..messages.ORG_CERT_WIRE_SIZE], &ack.org_cert);
+        pos += messages.ORG_CERT_WIRE_SIZE;
     }
 
     return pos;
@@ -331,6 +348,8 @@ pub const DecodedPing = struct {
     seq: u64,
     gossip_buf: [8]messages.GossipEntry = undefined,
     gossip_count: u8 = 0,
+    org_cert: [messages.ORG_CERT_WIRE_SIZE]u8 = std.mem.zeroes([messages.ORG_CERT_WIRE_SIZE]u8),
+    has_org_cert: bool = false,
 
     pub fn gossip(self: *const DecodedPing) []const messages.GossipEntry {
         return self.gossip_buf[0..self.gossip_count];
@@ -343,6 +362,8 @@ pub const DecodedAck = struct {
     seq: u64,
     gossip_buf: [8]messages.GossipEntry = undefined,
     gossip_count: u8 = 0,
+    org_cert: [messages.ORG_CERT_WIRE_SIZE]u8 = std.mem.zeroes([messages.ORG_CERT_WIRE_SIZE]u8),
+    has_org_cert: bool = false,
 
     pub fn gossip(self: *const DecodedAck) []const messages.GossipEntry {
         return self.gossip_buf[0..self.gossip_count];
@@ -381,15 +402,19 @@ fn decodePing(data: []const u8) DecodeError!DecodedPing {
     @memcpy(&result.sender_pubkey, data[0..32]);
     result.seq = std.mem.readInt(u64, data[32..40], .little);
 
-    const gossip_count = @min(data[40], 8);
-    result.gossip_count = gossip_count;
+    const advertised_gossip_count = @min(data[40], 8);
 
     var pos: usize = 41;
-    for (0..gossip_count) |i| {
+    var parsed_gossip_count: u8 = 0;
+    for (0..advertised_gossip_count) |i| {
         if (pos + GOSSIP_ENTRY_SIZE > data.len) break;
         result.gossip_buf[i] = decodeGossipEntry(data[pos..]) catch break;
         pos += GOSSIP_ENTRY_SIZE;
+        parsed_gossip_count += 1;
     }
+    result.gossip_count = parsed_gossip_count;
+
+    try decodeOrgCertExtension(data, pos, &result.org_cert, &result.has_org_cert);
 
     return result;
 }
@@ -405,17 +430,34 @@ fn decodeAck(data: []const u8) DecodeError!DecodedAck {
     @memcpy(&result.sender_pubkey, data[0..32]);
     result.seq = std.mem.readInt(u64, data[32..40], .little);
 
-    const gossip_count = @min(data[40], 8);
-    result.gossip_count = gossip_count;
+    const advertised_gossip_count = @min(data[40], 8);
 
     var pos: usize = 41;
-    for (0..gossip_count) |i| {
+    var parsed_gossip_count: u8 = 0;
+    for (0..advertised_gossip_count) |i| {
         if (pos + GOSSIP_ENTRY_SIZE > data.len) break;
         result.gossip_buf[i] = decodeGossipEntry(data[pos..]) catch break;
         pos += GOSSIP_ENTRY_SIZE;
+        parsed_gossip_count += 1;
     }
+    result.gossip_count = parsed_gossip_count;
+
+    try decodeOrgCertExtension(data, pos, &result.org_cert, &result.has_org_cert);
 
     return result;
+}
+
+fn decodeOrgCertExtension(
+    data: []const u8,
+    pos: usize,
+    cert: *[messages.ORG_CERT_WIRE_SIZE]u8,
+    has_cert: *bool,
+) DecodeError!void {
+    if (pos >= data.len) return;
+    if (data[pos] != 1) return;
+    if (pos + ORG_CERT_EXTENSION_SIZE > data.len) return error.BufferTooShort;
+    @memcpy(cert, data[pos + 1 ..][0..messages.ORG_CERT_WIRE_SIZE]);
+    has_cert.* = true;
 }
 
 fn decodePingReq(data: []const u8) DecodeError!messages.PingReq {
@@ -580,6 +622,54 @@ test "ack roundtrip" {
     switch (decoded) {
         .ack => |a| {
             try std.testing.expectEqual(a.seq, 99);
+        },
+        else => return error.InvalidMessageType,
+    }
+}
+
+test "ping optional org cert extension roundtrip" {
+    const pubkey = [_]u8{0x42} ** 32;
+    const cert = [_]u8{0xC7} ** messages.ORG_CERT_WIRE_SIZE;
+    const ping = messages.Ping{
+        .sender_pubkey = pubkey,
+        .seq = 12345,
+        .gossip = &.{},
+        .org_cert = cert,
+        .has_org_cert = true,
+    };
+
+    var buf: [512]u8 = undefined;
+    const written = try encodePing(&buf, ping);
+
+    const decoded = try decode(buf[0..written]);
+    switch (decoded) {
+        .ping => |p| {
+            try std.testing.expect(p.has_org_cert);
+            try std.testing.expectEqualSlices(u8, &cert, &p.org_cert);
+        },
+        else => return error.InvalidMessageType,
+    }
+}
+
+test "ack optional org cert extension roundtrip" {
+    const pubkey = [_]u8{0xAA} ** 32;
+    const cert = [_]u8{0xAC} ** messages.ORG_CERT_WIRE_SIZE;
+    const ack = messages.Ack{
+        .sender_pubkey = pubkey,
+        .seq = 99,
+        .gossip = &.{},
+        .org_cert = cert,
+        .has_org_cert = true,
+    };
+
+    var buf: [512]u8 = undefined;
+    const written = try encodeAck(&buf, ack);
+
+    const decoded = try decode(buf[0..written]);
+    switch (decoded) {
+        .ack => |a| {
+            try std.testing.expect(a.has_org_cert);
+            try std.testing.expectEqualSlices(u8, &cert, &a.org_cert);
         },
         else => return error.InvalidMessageType,
     }

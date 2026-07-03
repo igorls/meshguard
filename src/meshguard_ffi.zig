@@ -125,6 +125,54 @@ pub const MeshguardContext = struct {
     alloc: std.mem.Allocator,
 };
 
+fn initContextStorage(allocator: std.mem.Allocator) MeshguardContext {
+    return .{
+        .ed25519_seed = undefined,
+        .ed25519_public = undefined,
+        .x25519_private = undefined,
+        .x25519_public = undefined,
+        .membership = Membership.MembershipTable.init(allocator, 15000),
+        .swim = null,
+        .socket = null,
+        .lan_discovery = null,
+        .event_loop_thread = null,
+        .running = std.atomic.Value(bool).init(false),
+        .suspended = std.atomic.Value(bool).init(false),
+        .on_message_cb = null,
+        .on_peer_event_cb = null,
+        .on_undeliverable_cb = null,
+        .inbox = std.mem.zeroes([64]AppMessage),
+        .inbox_write = std.atomic.Value(u32).init(0),
+        .inbox_read = std.atomic.Value(u32).init(0),
+        .wg_device = null,
+        .wg_lock = .init,
+        .tunnel_inbox = std.mem.zeroes([256]TunnelMessage),
+        .tunnel_inbox_write = std.atomic.Value(u32).init(0),
+        .tunnel_inbox_read = std.atomic.Value(u32).init(0),
+        .alloc = allocator,
+    };
+}
+
+fn closeContextSocket(ctx: *MeshguardContext) void {
+    if (ctx.socket) |*s| {
+        s.close();
+    }
+    ctx.socket = null;
+}
+
+fn destroyContext(ctx: *MeshguardContext) void {
+    meshguard_leave(ctx);
+    closeContextSocket(ctx);
+    ctx.membership.deinit();
+    ctx.alloc.destroy(ctx);
+}
+
+fn tunnelFramePayloadLen(frame_len: usize, encoded_payload_len: u16) ?usize {
+    const payload_len: usize = @intCast(encoded_payload_len);
+    if (payload_len + 4 > frame_len) return null;
+    return payload_len;
+}
+
 /// Application-level encrypted message in the inbox.
 const AppMessage = struct {
     sender_pubkey: [32]u8,
@@ -162,31 +210,7 @@ export fn meshguard_init(
     };
 
     const ctx = allocator.create(MeshguardContext) catch return null;
-    ctx.* = .{
-        .ed25519_seed = undefined,
-        .ed25519_public = undefined,
-        .x25519_private = undefined,
-        .x25519_public = undefined,
-        .membership = Membership.MembershipTable.init(allocator, 15000),
-        .swim = null,
-        .socket = null,
-        .lan_discovery = null,
-        .event_loop_thread = null,
-        .running = std.atomic.Value(bool).init(false),
-        .suspended = std.atomic.Value(bool).init(false),
-        .on_message_cb = null,
-        .on_peer_event_cb = null,
-        .on_undeliverable_cb = null,
-        .inbox = std.mem.zeroes([64]AppMessage),
-        .inbox_write = std.atomic.Value(u32).init(0),
-        .inbox_read = std.atomic.Value(u32).init(0),
-        .wg_device = null, // Initialized after key derivation
-        .wg_lock = .init,
-        .tunnel_inbox = std.mem.zeroes([256]TunnelMessage),
-        .tunnel_inbox_write = std.atomic.Value(u32).init(0),
-        .tunnel_inbox_read = std.atomic.Value(u32).init(0),
-        .alloc = allocator,
-    };
+    ctx.* = initContextStorage(allocator);
 
     // Identity: use provided seed or generate.
     var identity_seed_bytes: [32]u8 = undefined;
@@ -197,7 +221,7 @@ export fn meshguard_init(
     }
 
     const kp = Ed25519.KeyPair.generateDeterministic(identity_seed_bytes) catch {
-        allocator.destroy(ctx);
+        destroyContext(ctx);
         return null;
     };
     const pub_bytes = kp.public_key.toBytes();
@@ -212,7 +236,7 @@ export fn meshguard_init(
     x_priv[31] |= 64;
     ctx.x25519_private = x_priv;
     ctx.x25519_public = X25519.recoverPublicKey(x_priv) catch {
-        allocator.destroy(ctx);
+        destroyContext(ctx);
         return null;
     };
 
@@ -221,7 +245,7 @@ export fn meshguard_init(
 
     // Bind UDP socket — use ephemeral port (0) on mobile for reliability
     ctx.socket = Udp.UdpSocket.bind(listen_port) catch {
-        allocator.destroy(ctx);
+        destroyContext(ctx);
         return null;
     };
 
@@ -234,9 +258,9 @@ export fn meshguard_init_ipv6(
     listen_port: u16,
 ) ?*MeshguardContext {
     const ctx = meshguard_init(identity_seed, listen_port) orelse return null;
-    if (ctx.socket) |*s| s.close();
+    closeContextSocket(ctx);
     ctx.socket = Udp.UdpSocket.bindAddr6(.{0} ** 16, listen_port) catch {
-        ctx.alloc.destroy(ctx);
+        destroyContext(ctx);
         return null;
     };
     return ctx;
@@ -256,11 +280,11 @@ export fn meshguard_init_bind(
     // allocation so a bad pointer fails cleanly instead of crashing in @memcpy.
     const ip_ptr = bind_ip orelse return null;
     const ctx = meshguard_init(identity_seed, listen_port) orelse return null;
-    if (ctx.socket) |*s| s.close();
+    closeContextSocket(ctx);
     var addr: [4]u8 = undefined;
     @memcpy(&addr, ip_ptr[0..4]);
     ctx.socket = Udp.UdpSocket.bindAddr(addr, listen_port) catch {
-        ctx.alloc.destroy(ctx);
+        destroyContext(ctx);
         return null;
     };
     return ctx;
@@ -269,13 +293,7 @@ export fn meshguard_init_bind(
 /// Destroy a meshguard instance, stopping all networking.
 export fn meshguard_destroy(ctx: ?*MeshguardContext) void {
     const c = ctx orelse return;
-    meshguard_leave(c);
-
-    if (c.socket) |*s| {
-        s.close();
-    }
-
-    c.alloc.destroy(c);
+    destroyContext(c);
 }
 
 /// Get our Ed25519 public key (32 bytes).
@@ -1025,8 +1043,8 @@ fn eventLoop(ctx: *MeshguardContext) void {
                 if (now - last_stats_ns >= 1_000_000_000) {
                     last_stats_ns = now;
                     std.debug.print("[stats] tick/s={d} recv/s={d} sent/s={d} raw/s={d} dropped/s={d} punches={d}\n", .{
-                        swim.tick_count -% s_tick,    swim.pkts_recv -% s_recv,
-                        swim.pkts_sent -% s_sent,     swim.raw_recv -% s_raw,
+                        swim.tick_count -% s_tick,              swim.pkts_recv -% s_recv,
+                        swim.pkts_sent -% s_sent,               swim.raw_recv -% s_raw,
                         swim.sends_dropped_ratelimit -% s_drop, swim.holepuncher.activeCount(),
                     });
                     s_tick = swim.tick_count;
@@ -1274,8 +1292,8 @@ fn handleWgPacket(ctx: *MeshguardContext, data: []const u8, sender_addr: [4]u8, 
             if (result.len < 4) return;
             if (plaintext[0] != 0 or plaintext[1] != 0) return; // Not our framing
             const payload_len = std.mem.readInt(u16, plaintext[2..4], .little);
-            if (payload_len + 4 > result.len) return; // Corrupt frame
-            enqueueTunnelMessage(ctx, sender_identity, plaintext[4..][0..payload_len]);
+            const payload_end = tunnelFramePayloadLen(result.len, payload_len) orelse return; // Corrupt frame
+            enqueueTunnelMessage(ctx, sender_identity, plaintext[4..][0..payload_end]);
         },
         else => {}, // Cookie (Type 3) not implemented yet
     }
@@ -1522,4 +1540,35 @@ export fn meshguard_tunnel_close(
             std.debug.print("  \xf0\x9f\x94\x91 Tunnel closed with {x:0>2}{x:0>2}...\n", .{ target_key[0], target_key[1] });
         }
     }
+}
+
+test "destroyContext releases FFI-owned membership allocations" {
+    const allocator = std.testing.allocator;
+    const ctx = try allocator.create(MeshguardContext);
+    ctx.* = initContextStorage(allocator);
+
+    const peer_name = try allocator.dupe(u8, "ffi-peer");
+    try ctx.membership.upsert(.{
+        .pubkey = [_]u8{0x42} ** 32,
+        .name = peer_name,
+        .state = .alive,
+        .gossip_endpoint = null,
+        .wg_pubkey = null,
+        .mesh_ip = .{ 10, 99, 0, 42 },
+        .wg_port = 51830,
+        .lamport = 1,
+        .last_seen_ns = 0,
+        .suspected_at_ns = null,
+        .last_rtt_ns = null,
+        .handshake_complete = false,
+    });
+
+    destroyContext(ctx);
+}
+
+test "tunnel frame payload length guard widens before adding header" {
+    try std.testing.expectEqual(@as(?usize, 0), tunnelFramePayloadLen(4, 0));
+    try std.testing.expectEqual(@as(?usize, 1496), tunnelFramePayloadLen(1500, 1496));
+    try std.testing.expectEqual(@as(?usize, null), tunnelFramePayloadLen(4, 65535));
+    try std.testing.expectEqual(@as(?usize, null), tunnelFramePayloadLen(1500, 65535));
 }

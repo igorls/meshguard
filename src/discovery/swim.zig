@@ -12,6 +12,7 @@ const Membership = @import("membership.zig");
 const messages = @import("../protocol/messages.zig");
 const codec = @import("../protocol/codec.zig");
 const keys = @import("../identity/keys.zig");
+const Org = @import("../identity/org.zig");
 const Udp = @import("../net/udp.zig");
 const Holepuncher = @import("../nat/holepunch.zig").Holepuncher;
 const log = std.log.scoped(.swim);
@@ -193,8 +194,50 @@ pub const SwimProtocol = struct {
         self.enforce_trust = true;
     }
 
+    fn nodeIsRevoked(self: *const SwimProtocol, pubkey: [32]u8) bool {
+        for (self.revoked_nodes[0..self.revoked_count]) |revoked| {
+            if (std.mem.eql(u8, &revoked, &pubkey)) return true;
+        }
+        return false;
+    }
+
+    fn certExpiryValid(expires_at: i64) bool {
+        if (expires_at == 0) return true;
+        return @as(i64, @intCast(std.Io.Timestamp.now(zio(), .real).toSeconds())) < expires_at;
+    }
+
+    fn certAuthorizesPeer(self: *const SwimProtocol, pubkey: [32]u8, cert_wire: [messages.ORG_CERT_WIRE_SIZE]u8) bool {
+        const cert = Org.NodeCertificate.deserialize(&cert_wire);
+        if (!std.mem.eql(u8, &cert.node_pubkey, &pubkey)) return false;
+        if (!Org.verifyCertificate(&cert)) return false;
+        if (!cert.isValid()) return false;
+        if (!self.isOrgAuthorizedPeer(cert.org_pubkey)) return false;
+        if (self.nodeIsRevoked(pubkey)) return false;
+        return true;
+    }
+
+    fn recordedCertAuthorizesPeer(self: *const SwimProtocol, pubkey: [32]u8) bool {
+        const peer = self.membership.peers.get(pubkey) orelse return false;
+        const org_pubkey = peer.org_pubkey orelse return false;
+        const expires_at = peer.cert_expires_at orelse return false;
+        if (!self.isOrgAuthorizedPeer(org_pubkey)) return false;
+        if (!certExpiryValid(expires_at)) return false;
+        if (self.nodeIsRevoked(pubkey)) return false;
+        return true;
+    }
+
+    fn recordPeerCertificate(self: *SwimProtocol, pubkey: [32]u8, cert_wire: [messages.ORG_CERT_WIRE_SIZE]u8) void {
+        if (!self.certAuthorizesPeer(pubkey, cert_wire)) return;
+        const cert = Org.NodeCertificate.deserialize(&cert_wire);
+        if (self.membership.peers.getPtr(pubkey)) |peer| {
+            peer.org_pubkey = cert.org_pubkey;
+            peer.org_node_name = cert.node_name;
+            peer.cert_expires_at = cert.expires_at;
+        }
+    }
+
     /// Check if a pubkey is authorized.
-    fn isAuthorizedPeer(self: *const SwimProtocol, pubkey: [32]u8) bool {
+    fn isAuthorizedPeer(self: *const SwimProtocol, pubkey: [32]u8, presented_cert: ?[messages.ORG_CERT_WIRE_SIZE]u8) bool {
         if (!self.enforce_trust) return true;
         // Always allow our own pubkey
         if (std.mem.eql(u8, &pubkey, &self.our_pubkey)) return true;
@@ -208,6 +251,12 @@ pub const SwimProtocol = struct {
         for (self.revoked_nodes[0..self.revoked_count]) |revoked| {
             if (std.mem.eql(u8, &revoked, &pubkey)) return false;
         }
+        // Check previously admitted org certificate
+        if (self.recordedCertAuthorizesPeer(pubkey)) return true;
+        // Check presented org certificate
+        if (presented_cert) |cert_wire| {
+            if (self.certAuthorizesPeer(pubkey, cert_wire)) return true;
+        }
         // Check if vouched by a trusted org
         for (0..self.vouched_count) |i| {
             if (std.mem.eql(u8, &self.vouched_node_keys[i], &pubkey)) {
@@ -215,10 +264,6 @@ pub const SwimProtocol = struct {
                 if (self.isOrgAuthorizedPeer(self.vouched_org_keys[i])) return true;
             }
         }
-        // If we have trusted orgs, allow unknown peers through to handshake
-        // where their org cert will be verified. Without this, org cert members
-        // get dropped at the SWIM layer before handshake can happen.
-        if (self.trusted_org_count > 0) return true;
         return false;
     }
 
@@ -273,6 +318,8 @@ pub const SwimProtocol = struct {
             .sender_pubkey = self.our_pubkey,
             .seq = self.seq +% 1,
             .gossip = &leave_gossip,
+            .org_cert = self.our_org_cert orelse std.mem.zeroes([messages.ORG_CERT_WIRE_SIZE]u8),
+            .has_org_cert = self.our_org_cert != null,
         };
 
         var buf: [1500]u8 = undefined;
@@ -503,7 +550,16 @@ pub const SwimProtocol = struct {
             .org_cert_revoke => |rev| rev.org_pubkey,
             .org_trust_vouch => |v| v.org_pubkey,
         };
-        if (!self.isAuthorizedPeer(sender_pubkey)) return;
+        const presented_cert: ?[messages.ORG_CERT_WIRE_SIZE]u8 = switch (decoded) {
+            .ping => |p| if (p.has_org_cert) p.org_cert else null,
+            .ack => |a| if (a.has_org_cert) a.org_cert else null,
+            else => null,
+        };
+        const org_control_message = switch (decoded) {
+            .org_alias_announce, .org_cert_revoke, .org_trust_vouch => true,
+            else => false,
+        };
+        if (!org_control_message and !self.isAuthorizedPeer(sender_pubkey, presented_cert)) return;
 
         switch (decoded) {
             .ping => |p| self.handlePing(&p, sender_endpoint),
@@ -684,6 +740,9 @@ pub const SwimProtocol = struct {
         // Register sender FIRST so gossip callbacks see the real network address
         if (!std.mem.eql(u8, &ping.sender_pubkey, &([_]u8{0} ** 32))) {
             self.registerOrUpdatePeerEndpoint(ping.sender_pubkey, sender_endpoint);
+            if (ping.has_org_cert) {
+                self.recordPeerCertificate(ping.sender_pubkey, ping.org_cert);
+            }
         }
 
         // Process piggybacked gossip (onPeerJoin may fire here)
@@ -697,6 +756,8 @@ pub const SwimProtocol = struct {
             .sender_pubkey = self.our_pubkey,
             .seq = ping.seq,
             .gossip = gossip,
+            .org_cert = self.our_org_cert orelse std.mem.zeroes([messages.ORG_CERT_WIRE_SIZE]u8),
+            .has_org_cert = self.our_org_cert != null,
         };
 
         var buf: [1500]u8 = undefined;
@@ -713,6 +774,9 @@ pub const SwimProtocol = struct {
         // Register sender FIRST so gossip callbacks see the real network address
         if (!std.mem.eql(u8, &ack.sender_pubkey, &([_]u8{0} ** 32))) {
             self.registerOrUpdatePeerEndpoint(ack.sender_pubkey, sender_endpoint);
+            if (ack.has_org_cert) {
+                self.recordPeerCertificate(ack.sender_pubkey, ack.org_cert);
+            }
         }
 
         // Process piggybacked gossip (onPeerJoin may fire here)
@@ -951,6 +1015,8 @@ pub const SwimProtocol = struct {
             .sender_pubkey = self.our_pubkey,
             .seq = self.seq,
             .gossip = gossip,
+            .org_cert = self.our_org_cert orelse std.mem.zeroes([messages.ORG_CERT_WIRE_SIZE]u8),
+            .has_org_cert = self.our_org_cert != null,
         };
 
         var buf: [1500]u8 = undefined;
@@ -1221,6 +1287,59 @@ fn aliveTestPeer(pk: [32]u8) Membership.Peer {
         .last_rtt_ns = null,
         .handshake_complete = false,
     };
+}
+
+test "trusted org does not admit arbitrary peers without a cert" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+    var socket = Udp.UdpSocket.bind(0) catch return;
+    defer socket.close();
+
+    var swim = SwimProtocol.init(&membership, socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    swim.enableTrust();
+    swim.addTrustedOrg([_]u8{0xA0} ** 32);
+
+    try std.testing.expect(!swim.isAuthorizedPeer([_]u8{0x55} ** 32, null));
+}
+
+test "valid trusted org cert admits and records peer until revoked" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+    var socket = Udp.UdpSocket.bind(0) catch return;
+    defer socket.close();
+
+    var swim = SwimProtocol.init(&membership, socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    swim.enableTrust();
+
+    const org_kp = Org.generateOrgKeyPair();
+    const org_pubkey = org_kp.public_key.toBytes();
+    swim.addTrustedOrg(org_pubkey);
+
+    const node_kp = keys.generate();
+    const node_pubkey = node_kp.public_key.toBytes();
+    var cert = try Org.issueCertificate(org_kp, node_pubkey, "node-1", 0);
+    var cert_wire: [messages.ORG_CERT_WIRE_SIZE]u8 = undefined;
+    cert.serialize(&cert_wire);
+
+    try std.testing.expect(swim.isAuthorizedPeer(node_pubkey, cert_wire));
+    try std.testing.expect(!swim.isAuthorizedPeer([_]u8{0x66} ** 32, cert_wire));
+
+    try membership.upsert(aliveTestPeer(node_pubkey));
+    swim.recordPeerCertificate(node_pubkey, cert_wire);
+
+    const recorded = membership.peers.get(node_pubkey).?;
+    try std.testing.expect(recorded.org_pubkey != null);
+    try std.testing.expectEqualSlices(u8, &org_pubkey, &recorded.org_pubkey.?);
+    try std.testing.expectEqualSlices(u8, &cert.node_name, &recorded.org_node_name);
+    try std.testing.expectEqual(@as(?i64, 0), recorded.cert_expires_at);
+    try std.testing.expect(swim.isAuthorizedPeer(node_pubkey, null));
+
+    swim.revoked_nodes[0] = node_pubkey;
+    swim.revoked_count = 1;
+    try std.testing.expect(!swim.isAuthorizedPeer(node_pubkey, null));
+    try std.testing.expect(!swim.isAuthorizedPeer(node_pubkey, cert_wire));
 }
 
 test "org revoke requires a valid trusted-org signature (C2 regression)" {

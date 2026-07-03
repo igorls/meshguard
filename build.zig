@@ -14,6 +14,7 @@ pub fn build(b: *std.Build) void {
     const is_windows = resolved_os == .windows;
     const is_macos = resolved_os == .macos;
     const is_freebsd = resolved_os == .freebsd;
+    var ffi_tests_step: ?*std.Build.Step = null;
 
     // ─── Crypto backend selection (meshguard#102) ───
     // libsodium is an OPTIONAL accelerator (AVX2 ChaCha20-Poly1305 on Linux),
@@ -75,6 +76,26 @@ pub fn build(b: *std.Build) void {
         }
 
         b.installArtifact(ffi_lib);
+
+        if (!is_android and !is_ios) {
+            const ffi_test_mod = b.createModule(.{
+                .root_source_file = b.path("src/meshguard_ffi.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            });
+            ffi_test_mod.addImport("build_options", build_options_mod);
+
+            const ffi_tests = b.addTest(.{
+                .root_module = ffi_test_mod,
+            });
+            if (use_libsodium) {
+                ffi_test_mod.linkSystemLibrary("sodium", .{});
+            }
+
+            const run_ffi_tests = b.addRunArtifact(ffi_tests);
+            ffi_tests_step = &run_ffi_tests.step;
+        }
     }
 
     // ─── Targets below only build for native (not Android/iOS) ───
@@ -174,5 +195,8 @@ pub fn build(b: *std.Build) void {
         const run_unit_tests = b.addRunArtifact(unit_tests);
         const test_step = b.step("test", "Run unit tests");
         test_step.dependOn(&run_unit_tests.step);
+        if (ffi_tests_step) |step| {
+            test_step.dependOn(step);
+        }
     }
 }
