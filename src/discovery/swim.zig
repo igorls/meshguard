@@ -8,6 +8,7 @@
 //!   5. Piggyback gossip entries on outgoing messages
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Membership = @import("membership.zig");
 const messages = @import("../protocol/messages.zig");
 const codec = @import("../protocol/codec.zig");
@@ -57,6 +58,7 @@ const PendingPing = struct {
     seq: u64,
     sent_at_ns: i128,
     escalated: bool, // whether we've already sent ping-req
+    candidate_probe: bool, // unauthenticated candidate probes never PING-REQ
 };
 
 /// Hard ceiling on SWIM control-plane send rate (packets/sec). Legitimate
@@ -65,6 +67,21 @@ const PendingPing = struct {
 const SEND_RATE_PPS: f64 = 500.0;
 /// Token-bucket capacity (allowed short burst above the sustained rate).
 const SEND_BURST: f64 = 100.0;
+// Bounded quarantine for unproven gossip hints. A sustained fake-candidate flood
+// can starve honest hints until SWIM re-gossips them, but the fixed cap is the
+// security boundary that prevents one packet from buying unbounded probe work.
+const MAX_CANDIDATE_PEERS: usize = 64;
+const CANDIDATE_PROBE_INTERVAL_NS: i128 = 1_000_000_000;
+const CANDIDATE_TTL_NS: i128 = 30_000_000_000;
+const CANDIDATE_MAX_PROBES: u8 = 3;
+
+const CandidatePeer = struct {
+    pubkey: [32]u8,
+    endpoint: messages.Endpoint,
+    first_seen_ns: i128,
+    last_probe_ns: i128 = 0,
+    probe_count: u8 = 0,
+};
 
 /// SWIM protocol state machine with event loop.
 pub const SwimProtocol = struct {
@@ -95,6 +112,11 @@ pub const SwimProtocol = struct {
     // Gossip queue with broadcast counters
     gossip_queue: [32]GossipSlot = std.mem.zeroes([32]GossipSlot),
     gossip_count: usize = 0,
+
+    // Unauthenticated gossip endpoint hints. These are never exposed as members,
+    // never re-gossiped, and only exist to trigger bounded direct certificate probes.
+    candidate_peers: [MAX_CANDIDATE_PEERS]CandidatePeer = std.mem.zeroes([MAX_CANDIDATE_PEERS]CandidatePeer),
+    candidate_count: usize = 0,
 
     // Snapshot buffer for encoding (avoids use-after-free on gossip_queue drain)
     gossip_snap: [8]messages.GossipEntry = std.mem.zeroes([8]messages.GossipEntry),
@@ -388,11 +410,14 @@ pub const SwimProtocol = struct {
             }
         }
 
-        // 5. Hole punch: send probes for active punches
+        // 5. Probe at most one unauthenticated candidate endpoint.
+        self.probeCandidatePeer(now_ns);
+
+        // 6. Hole punch: send probes for active punches
         _ = self.holepuncher.sendProbes(&self.socket);
         self.holepuncher.expireTimeouts();
 
-        // 6. Check for unreachable cone NAT peers (every 30s)
+        // 7. Check for unreachable cone NAT peers (every 30s)
         const punch_check_interval: i128 = 30_000_000_000; // 30s
         if (now_ns - self.last_punch_check_ns >= punch_check_interval) {
             self.last_punch_check_ns = now_ns;
@@ -444,11 +469,14 @@ pub const SwimProtocol = struct {
             }
         }
 
-        // 4. Hole punch: send probes for active punches
+        // 4. Probe at most one unauthenticated candidate endpoint.
+        self.probeCandidatePeer(now_ns);
+
+        // 5. Hole punch: send probes for active punches
         _ = self.holepuncher.sendProbes(&self.socket);
         self.holepuncher.expireTimeouts();
 
-        // 5. Check for unreachable cone NAT peers (every 30s)
+        // 6. Check for unreachable cone NAT peers (every 30s)
         const punch_check_interval: i128 = 30_000_000_000;
         if (now_ns - self.last_punch_check_ns >= punch_check_interval) {
             self.last_punch_check_ns = now_ns;
@@ -743,6 +771,7 @@ pub const SwimProtocol = struct {
             if (ping.has_org_cert) {
                 self.recordPeerCertificate(ping.sender_pubkey, ping.org_cert);
             }
+            self.removeCandidatePeer(ping.sender_pubkey);
         }
 
         // Process piggybacked gossip (onPeerJoin may fire here)
@@ -777,6 +806,7 @@ pub const SwimProtocol = struct {
             if (ack.has_org_cert) {
                 self.recordPeerCertificate(ack.sender_pubkey, ack.org_cert);
             }
+            self.removeCandidatePeer(ack.sender_pubkey);
         }
 
         // Process piggybacked gossip (onPeerJoin may fire here)
@@ -1008,8 +1038,16 @@ pub const SwimProtocol = struct {
     }
 
     fn sendPing(self: *SwimProtocol, endpoint: messages.Endpoint, target_pubkey: [32]u8) void {
+        self.sendPingWithGossip(endpoint, target_pubkey, true, false);
+    }
+
+    fn sendCandidatePing(self: *SwimProtocol, endpoint: messages.Endpoint, target_pubkey: [32]u8) void {
+        self.sendPingWithGossip(endpoint, target_pubkey, false, true);
+    }
+
+    fn sendPingWithGossip(self: *SwimProtocol, endpoint: messages.Endpoint, target_pubkey: [32]u8, include_gossip: bool, candidate_probe: bool) void {
         self.seq += 1;
-        const gossip = self.collectGossip();
+        const gossip: []const messages.GossipEntry = if (include_gossip) self.collectGossip() else &.{};
 
         const ping = messages.Ping{
             .sender_pubkey = self.our_pubkey,
@@ -1031,6 +1069,7 @@ pub const SwimProtocol = struct {
                 .seq = self.seq,
                 .sent_at_ns = nowNs(),
                 .escalated = false,
+                .candidate_probe = candidate_probe,
             };
             self.pending_count += 1;
         }
@@ -1057,6 +1096,11 @@ pub const SwimProtocol = struct {
         while (i < self.pending_count) {
             const pending = &self.pending[i];
             if (now - pending.sent_at_ns > timeout_ns) {
+                if (pending.candidate_probe) {
+                    self.pending[i] = self.pending[self.pending_count - 1];
+                    self.pending_count -= 1;
+                    continue;
+                }
                 if (!pending.escalated) {
                     // Escalate: mark suspected + send PING-REQ
                     pending.escalated = true;
@@ -1099,6 +1143,97 @@ pub const SwimProtocol = struct {
             const written = codec.encodePingReq(&buf, req) catch continue;
             self.gossipSend(buf[0..written], ep);
             sent += 1;
+        }
+    }
+
+    fn hasPendingPing(self: *const SwimProtocol, pubkey: [32]u8) bool {
+        for (self.pending[0..self.pending_count]) |pending| {
+            if (std.mem.eql(u8, &pending.target_pubkey, &pubkey)) return true;
+        }
+        return false;
+    }
+
+    fn removeCandidateAt(self: *SwimProtocol, index: usize) void {
+        self.candidate_peers[index] = self.candidate_peers[self.candidate_count - 1];
+        self.candidate_count -= 1;
+    }
+
+    fn removeCandidatePeer(self: *SwimProtocol, pubkey: [32]u8) void {
+        var i: usize = 0;
+        while (i < self.candidate_count) {
+            if (std.mem.eql(u8, &self.candidate_peers[i].pubkey, &pubkey)) {
+                self.removeCandidateAt(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    fn learnCandidatePeer(self: *SwimProtocol, pubkey: [32]u8, endpoint: messages.Endpoint) void {
+        if (self.membership.peers.getPtr(pubkey) != null) return;
+        if (self.nodeIsRevoked(pubkey)) return;
+
+        const now = nowNs();
+        for (self.candidate_peers[0..self.candidate_count]) |*candidate| {
+            if (std.mem.eql(u8, &candidate.pubkey, &pubkey)) {
+                if (!messages.Endpoint.eql(candidate.endpoint, endpoint)) {
+                    candidate.endpoint = endpoint;
+                    candidate.last_probe_ns = 0;
+                    candidate.probe_count = 0;
+                }
+                return;
+            }
+        }
+
+        if (self.candidate_count < self.candidate_peers.len) {
+            self.candidate_peers[self.candidate_count] = .{
+                .pubkey = pubkey,
+                .endpoint = endpoint,
+                .first_seen_ns = now,
+            };
+            self.candidate_count += 1;
+            return;
+        }
+
+        var oldest: usize = 0;
+        for (self.candidate_peers[1..], 1..) |candidate, i| {
+            if (candidate.first_seen_ns < self.candidate_peers[oldest].first_seen_ns) {
+                oldest = i;
+            }
+        }
+        self.candidate_peers[oldest] = .{
+            .pubkey = pubkey,
+            .endpoint = endpoint,
+            .first_seen_ns = now,
+        };
+    }
+
+    fn expireCandidatePeers(self: *SwimProtocol, now: i128) void {
+        var i: usize = 0;
+        while (i < self.candidate_count) {
+            const candidate = self.candidate_peers[i];
+            if (now - candidate.first_seen_ns > CANDIDATE_TTL_NS or candidate.probe_count >= CANDIDATE_MAX_PROBES) {
+                self.removeCandidateAt(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    fn probeCandidatePeer(self: *SwimProtocol, now: i128) void {
+        self.expireCandidatePeers(now);
+        if (self.pending_count >= self.pending.len) return;
+
+        var i: usize = 0;
+        while (i < self.candidate_count) : (i += 1) {
+            const candidate = &self.candidate_peers[i];
+            if (self.hasPendingPing(candidate.pubkey)) continue;
+            if (candidate.last_probe_ns != 0 and now - candidate.last_probe_ns < CANDIDATE_PROBE_INTERVAL_NS) continue;
+
+            self.sendCandidatePing(candidate.endpoint, candidate.pubkey);
+            candidate.last_probe_ns = now;
+            candidate.probe_count += 1;
+            return;
         }
     }
 
@@ -1177,6 +1312,13 @@ pub const SwimProtocol = struct {
 
         switch (entry.event) {
             .join, .alive => {
+                if (!self.isAuthorizedPeer(entry.subject_pubkey, null)) {
+                    if (entry.endpoint) |ep| {
+                        self.learnCandidatePeer(entry.subject_pubkey, ep);
+                    }
+                    return;
+                }
+
                 // The gossip endpoint is only used to LEARN about brand-new peers.
                 // For peers we already track, liveness is decided by our own
                 // failure detector (direct ping/ack → markAlive), never by
@@ -1287,6 +1429,389 @@ fn aliveTestPeer(pk: [32]u8) Membership.Peer {
         .last_rtt_ns = null,
         .handshake_complete = false,
     };
+}
+
+const JoinCounter = struct {
+    count: usize = 0,
+    last_pubkey: ?[32]u8 = null,
+};
+
+fn countPeerJoin(ctx: *anyopaque, peer: *const Membership.Peer) void {
+    const counter: *JoinCounter = @ptrCast(@alignCast(ctx));
+    counter.count += 1;
+    counter.last_pubkey = peer.pubkey;
+}
+
+fn ignorePeerDead(_: *anyopaque, _: [32]u8) void {}
+
+fn inertTestSocket() Udp.UdpSocket {
+    const fd: std.posix.socket_t = if (builtin.os.tag == .windows)
+        @as(std.posix.socket_t, @ptrFromInt(std.math.maxInt(usize)))
+    else
+        @as(std.posix.socket_t, -1);
+    return .{ .fd = fd, .port = 0 };
+}
+
+fn issueCertWire(org_kp: Org.OrgKeyPair, node_pubkey: [32]u8, name: []const u8) ![messages.ORG_CERT_WIRE_SIZE]u8 {
+    var cert = try Org.issueCertificate(org_kp, node_pubkey, name, 0);
+    var cert_wire: [messages.ORG_CERT_WIRE_SIZE]u8 = undefined;
+    cert.serialize(&cert_wire);
+    return cert_wire;
+}
+
+test "gossiped join cannot admit an unauthorized subject with wg key" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+    const socket = inertTestSocket();
+
+    var joins = JoinCounter{};
+    const handler = EventHandler{
+        .ctx = &joins,
+        .onPeerJoin = countPeerJoin,
+        .onPeerDead = ignorePeerDead,
+    };
+    var swim = SwimProtocol.init(&membership, socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, handler);
+    swim.enableTrust();
+    swim.addTrustedOrg([_]u8{0xA0} ** 32);
+
+    const fake_kp = keys.generate();
+    const fake_peer = fake_kp.public_key.toBytes();
+    swim.applyGossip(.{
+        .subject_pubkey = fake_peer,
+        .event = .join,
+        .lamport = 10,
+        .endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 40000),
+        .wg_pubkey = [_]u8{0x66} ** 32,
+    });
+
+    try std.testing.expect(membership.peers.get(fake_peer) == null);
+    try std.testing.expectEqual(@as(usize, 1), swim.candidate_count);
+    try std.testing.expectEqual(fake_peer, swim.candidate_peers[0].pubkey);
+    try std.testing.expectEqual(@as(usize, 0), joins.count);
+
+    try membership.upsert(aliveTestPeer(fake_peer));
+    swim.applyGossip(.{
+        .subject_pubkey = fake_peer,
+        .event = .alive,
+        .lamport = 11,
+        .endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 40001),
+        .wg_pubkey = [_]u8{0x77} ** 32,
+    });
+
+    try std.testing.expect(membership.peers.get(fake_peer).?.wg_pubkey == null);
+    try std.testing.expectEqual(@as(usize, 0), joins.count);
+}
+
+test "unauthorized gossip candidates are capped and probed one at a time" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+    const socket = inertTestSocket();
+
+    var swim = SwimProtocol.init(&membership, socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    swim.enableTrust();
+    swim.addTrustedOrg([_]u8{0xA0} ** 32);
+
+    var i: usize = 0;
+    while (i < MAX_CANDIDATE_PEERS + 8) : (i += 1) {
+        var subject = [_]u8{0x51} ** 32;
+        subject[0] = @intCast(i + 1);
+        subject[31] = @intCast(0xA0 + i);
+        swim.applyGossip(.{
+            .subject_pubkey = subject,
+            .event = .join,
+            .lamport = @intCast(i + 1),
+            .endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, @intCast(41000 + i)),
+            .wg_pubkey = [_]u8{0x66} ** 32,
+        });
+    }
+
+    try std.testing.expectEqual(MAX_CANDIDATE_PEERS, swim.candidate_count);
+    try std.testing.expectEqual(@as(usize, 0), membership.count());
+    try std.testing.expectEqual(@as(usize, 0), swim.gossip_count);
+
+    swim.send_tokens = 0;
+    swim.last_token_refill_ns = nowNs();
+    const dropped_before = swim.sends_dropped_ratelimit;
+    swim.probeCandidatePeer(swim.last_token_refill_ns);
+
+    try std.testing.expectEqual(dropped_before +% 1, swim.sends_dropped_ratelimit);
+    try std.testing.expectEqual(@as(usize, 1), swim.pending_count);
+}
+
+test "candidate probes do not drain queued gossip" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+    const socket = inertTestSocket();
+
+    var swim = SwimProtocol.init(&membership, socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    swim.enableTrust();
+    swim.addTrustedOrg([_]u8{0xA0} ** 32);
+
+    const candidate = [_]u8{0x32} ** 32;
+    swim.applyGossip(.{
+        .subject_pubkey = candidate,
+        .event = .join,
+        .lamport = 1,
+        .endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 41900),
+    });
+    swim.enqueueGossip(.{
+        .subject_pubkey = [_]u8{0x99} ** 32,
+        .event = .alive,
+        .lamport = 2,
+        .endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 41901),
+    });
+    try std.testing.expectEqual(@as(usize, 1), swim.candidate_count);
+    try std.testing.expectEqual(@as(usize, 1), swim.gossip_count);
+    const remaining_before = swim.gossip_queue[0].remaining;
+
+    swim.send_tokens = 0;
+    swim.last_token_refill_ns = nowNs();
+    swim.probeCandidatePeer(swim.last_token_refill_ns);
+
+    try std.testing.expectEqual(@as(usize, 1), swim.pending_count);
+    try std.testing.expectEqual(@as(usize, 1), swim.gossip_count);
+    try std.testing.expectEqual(remaining_before, swim.gossip_queue[0].remaining);
+}
+
+test "candidate probe timeout does not escalate to ping-req" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+    const socket = inertTestSocket();
+
+    var swim = SwimProtocol.init(&membership, socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    swim.enableTrust();
+    swim.addTrustedOrg([_]u8{0xA0} ** 32);
+    try membership.upsert(aliveTestPeer([_]u8{0x60} ** 32));
+
+    const candidate = [_]u8{0x36} ** 32;
+    swim.applyGossip(.{
+        .subject_pubkey = candidate,
+        .event = .join,
+        .lamport = 1,
+        .endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 41910),
+    });
+
+    swim.send_tokens = 0;
+    swim.last_token_refill_ns = nowNs();
+    swim.probeCandidatePeer(swim.last_token_refill_ns);
+    try std.testing.expectEqual(@as(usize, 1), swim.pending_count);
+    try std.testing.expect(swim.pending[0].candidate_probe);
+    const dropped_after_probe = swim.sends_dropped_ratelimit;
+
+    swim.pending[0].sent_at_ns = nowNs() - (@as(i128, swim.config.ping_timeout_ms) * 1_000_000) - 1;
+    swim.checkTimeouts();
+
+    try std.testing.expectEqual(@as(usize, 0), swim.pending_count);
+    try std.testing.expectEqual(dropped_after_probe, swim.sends_dropped_ratelimit);
+}
+
+test "candidate with invalid cert never graduates and is evicted" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+    const socket = inertTestSocket();
+
+    var swim = SwimProtocol.init(&membership, socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    swim.enableTrust();
+    swim.addTrustedOrg([_]u8{0xA0} ** 32);
+
+    const candidate = [_]u8{0x33} ** 32;
+    const endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 42000);
+    swim.applyGossip(.{
+        .subject_pubkey = candidate,
+        .event = .join,
+        .lamport = 1,
+        .endpoint = endpoint,
+        .wg_pubkey = [_]u8{0x44} ** 32,
+    });
+    try std.testing.expectEqual(@as(usize, 1), swim.candidate_count);
+
+    var ack_buf: [1500]u8 = undefined;
+    const invalid_cert = std.mem.zeroes([messages.ORG_CERT_WIRE_SIZE]u8);
+    const written = try codec.encodeAck(&ack_buf, .{
+        .sender_pubkey = candidate,
+        .seq = 1,
+        .gossip = &.{},
+        .org_cert = invalid_cert,
+        .has_org_cert = true,
+    });
+    swim.handleMessage(ack_buf[0..written], endpoint);
+
+    try std.testing.expectEqual(@as(usize, 0), membership.count());
+    try std.testing.expectEqual(@as(usize, 1), swim.candidate_count);
+
+    swim.candidate_peers[0].probe_count = CANDIDATE_MAX_PROBES;
+    swim.probeCandidatePeer(nowNs());
+    try std.testing.expectEqual(@as(usize, 0), swim.candidate_count);
+}
+
+test "candidate endpoint refresh resets probes but not lifetime" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+    const socket = inertTestSocket();
+
+    var swim = SwimProtocol.init(&membership, socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    swim.enableTrust();
+    swim.addTrustedOrg([_]u8{0xA0} ** 32);
+
+    const candidate = [_]u8{0x34} ** 32;
+    const stale_endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 42100);
+    const fresh_endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 42101);
+    swim.applyGossip(.{
+        .subject_pubkey = candidate,
+        .event = .join,
+        .lamport = 1,
+        .endpoint = stale_endpoint,
+    });
+    const first_seen = swim.candidate_peers[0].first_seen_ns;
+    swim.candidate_peers[0].probe_count = CANDIDATE_MAX_PROBES;
+    swim.candidate_peers[0].last_probe_ns = first_seen + 1;
+
+    swim.applyGossip(.{
+        .subject_pubkey = candidate,
+        .event = .alive,
+        .lamport = 2,
+        .endpoint = fresh_endpoint,
+    });
+
+    try std.testing.expect(messages.Endpoint.eql(swim.candidate_peers[0].endpoint, fresh_endpoint));
+    try std.testing.expectEqual(first_seen, swim.candidate_peers[0].first_seen_ns);
+    try std.testing.expectEqual(@as(u8, 0), swim.candidate_peers[0].probe_count);
+    try std.testing.expectEqual(@as(i128, 0), swim.candidate_peers[0].last_probe_ns);
+
+    const expiring_candidate = [_]u8{0x35} ** 32;
+    const endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 42102);
+    swim.applyGossip(.{
+        .subject_pubkey = expiring_candidate,
+        .event = .join,
+        .lamport = 3,
+        .endpoint = endpoint,
+    });
+    const expiring_index: usize = if (std.mem.eql(u8, &swim.candidate_peers[0].pubkey, &expiring_candidate)) 0 else 1;
+    const expired_start = nowNs() - CANDIDATE_TTL_NS - 1;
+    swim.candidate_peers[expiring_index].first_seen_ns = expired_start;
+    swim.candidate_peers[expiring_index].probe_count = CANDIDATE_MAX_PROBES - 1;
+    swim.applyGossip(.{
+        .subject_pubkey = expiring_candidate,
+        .event = .alive,
+        .lamport = 4,
+        .endpoint = endpoint,
+    });
+
+    try std.testing.expectEqual(expired_start, swim.candidate_peers[expiring_index].first_seen_ns);
+    try std.testing.expectEqual(CANDIDATE_MAX_PROBES - 1, swim.candidate_peers[expiring_index].probe_count);
+    swim.probeCandidatePeer(nowNs());
+    try std.testing.expectEqual(@as(usize, 1), swim.candidate_count);
+    try std.testing.expect(std.mem.eql(u8, &swim.candidate_peers[0].pubkey, &candidate));
+}
+
+test "cert-only gossip candidate is probed then graduates on direct cert" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+    const socket = inertTestSocket();
+
+    var joins = JoinCounter{};
+    const handler = EventHandler{
+        .ctx = &joins,
+        .onPeerJoin = countPeerJoin,
+        .onPeerDead = ignorePeerDead,
+    };
+    var swim = SwimProtocol.init(&membership, socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, handler);
+    swim.enableTrust();
+
+    const org_kp = Org.generateOrgKeyPair();
+    const org_pubkey = org_kp.public_key.toBytes();
+    swim.addTrustedOrg(org_pubkey);
+
+    const node_kp = keys.generate();
+    const node_pubkey = node_kp.public_key.toBytes();
+    const cert_wire = try issueCertWire(org_kp, node_pubkey, "node-1");
+    const endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 43000);
+    const wg_key = [_]u8{0x77} ** 32;
+
+    swim.applyGossip(.{
+        .subject_pubkey = node_pubkey,
+        .event = .join,
+        .lamport = 1,
+        .endpoint = endpoint,
+        .wg_pubkey = wg_key,
+    });
+
+    try std.testing.expectEqual(@as(usize, 0), membership.count());
+    try std.testing.expectEqual(@as(usize, 1), swim.candidate_count);
+    try std.testing.expectEqual(@as(usize, 0), joins.count);
+
+    swim.probeCandidatePeer(nowNs());
+    try std.testing.expectEqual(@as(usize, 1), swim.pending_count);
+    try std.testing.expectEqual(node_pubkey, swim.pending[0].target_pubkey);
+
+    var ack_buf: [1500]u8 = undefined;
+    const written = try codec.encodeAck(&ack_buf, .{
+        .sender_pubkey = node_pubkey,
+        .seq = swim.pending[0].seq,
+        .gossip = &.{},
+        .org_cert = cert_wire,
+        .has_org_cert = true,
+    });
+    swim.handleMessage(ack_buf[0..written], endpoint);
+
+    const recorded = membership.peers.get(node_pubkey).?;
+    try std.testing.expectEqualSlices(u8, &org_pubkey, &recorded.org_pubkey.?);
+    try std.testing.expectEqual(@as(usize, 0), swim.candidate_count);
+    try std.testing.expectEqual(@as(usize, 0), swim.pending_count);
+    try std.testing.expect(recorded.wg_pubkey == null);
+    try std.testing.expectEqual(@as(usize, 0), joins.count);
+
+    swim.applyGossip(.{
+        .subject_pubkey = node_pubkey,
+        .event = .alive,
+        .lamport = 2,
+        .endpoint = endpoint,
+        .wg_pubkey = wg_key,
+    });
+
+    try std.testing.expectEqualSlices(u8, &wg_key, &membership.peers.get(node_pubkey).?.wg_pubkey.?);
+    try std.testing.expectEqual(@as(usize, 1), joins.count);
+    try std.testing.expectEqualSlices(u8, &node_pubkey, &joins.last_pubkey.?);
+}
+
+test "gossiped join still admits an individually authorized subject" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+    const socket = inertTestSocket();
+
+    var joins = JoinCounter{};
+    const handler = EventHandler{
+        .ctx = &joins,
+        .onPeerJoin = countPeerJoin,
+        .onPeerDead = ignorePeerDead,
+    };
+    var swim = SwimProtocol.init(&membership, socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, handler);
+    swim.enableTrust();
+
+    const peer_kp = keys.generate();
+    const peer = peer_kp.public_key.toBytes();
+    const wg_key = [_]u8{0x44} ** 32;
+    swim.addAuthorizedKey(peer);
+    swim.applyGossip(.{
+        .subject_pubkey = peer,
+        .event = .join,
+        .lamport = 10,
+        .endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 40000),
+        .wg_pubkey = wg_key,
+    });
+
+    const recorded = membership.peers.get(peer).?;
+    try std.testing.expectEqualSlices(u8, &wg_key, &recorded.wg_pubkey.?);
+    try std.testing.expectEqual(@as(usize, 1), joins.count);
+    try std.testing.expectEqualSlices(u8, &peer, &joins.last_pubkey.?);
 }
 
 test "trusted org does not admit arbitrary peers without a cert" {
