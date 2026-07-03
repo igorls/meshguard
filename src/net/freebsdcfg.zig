@@ -4,19 +4,29 @@
 //! Analogous to darwincfg.zig for macOS.
 const std = @import("std");
 
-fn zio() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
-}
+// Absolute paths: std.process.spawn does not perform a PATH search, so a bare
+// "ifconfig"/"route" resolves to FileNotFound. These live in /sbin on FreeBSD.
+const IFCONFIG = "/sbin/ifconfig";
+const ROUTE = "/sbin/route";
 
-fn runCommand(argv: []const []const u8) !std.process.Child.Term {
-    var child = try std.process.spawn(zio(), .{
+fn runCommand(allocator: std.mem.Allocator, argv: []const []const u8) !std.process.Child.Term {
+    // process.spawn allocates (argv/env marshalling), so it needs a real
+    // allocator-backed Io. std.Io.Threaded.global_single_threaded is
+    // statically initialized with a FAILING allocator, which turns every
+    // spawn into error.OutOfMemory — the interface then never gets its IP,
+    // routes, or link state and the data plane stays dead. Build a local
+    // Threaded from the caller's allocator instead.
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var child = try std.process.spawn(io, .{
         .argv = argv,
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
     });
-    defer child.kill(zio());
-    return child.wait(zio());
+    defer child.kill(io);
+    return child.wait(io);
 }
 
 /// Set the IPv4 address on a tun interface.
@@ -28,8 +38,7 @@ pub fn setInterfaceIp(allocator: std.mem.Allocator, iface_name: []const u8, mesh
     var mask_buf: [15]u8 = undefined;
     const mask_str = formatNetmask(prefix_len, &mask_buf);
 
-    _ = allocator;
-    const term = try runCommand(&.{ "ifconfig", iface_name, "inet", ip_str, ip_str, "netmask", mask_str });
+    const term = try runCommand(allocator, &.{ IFCONFIG, iface_name, "inet", ip_str, ip_str, "netmask", mask_str });
     if (term != .exited or term.exited != 0) return error.ConfigFailed;
 }
 
@@ -41,15 +50,13 @@ pub fn setInterfaceIp6(allocator: std.mem.Allocator, iface_name: []const u8, mes
     var prefix_buf: [4]u8 = undefined;
     const prefix_str = std.fmt.bufPrint(&prefix_buf, "{d}", .{prefix_len}) catch return error.ConfigFailed;
 
-    _ = allocator;
-    const term = try runCommand(&.{ "ifconfig", iface_name, "inet6", ip_str, "prefixlen", prefix_str });
+    const term = try runCommand(allocator, &.{ IFCONFIG, iface_name, "inet6", ip_str, "prefixlen", prefix_str });
     if (term != .exited or term.exited != 0) return error.ConfigFailed;
 }
 
 /// Bring the interface up.
 pub fn setInterfaceUp(allocator: std.mem.Allocator, iface_name: []const u8) !void {
-    _ = allocator;
-    const term = try runCommand(&.{ "ifconfig", iface_name, "up" });
+    const term = try runCommand(allocator, &.{ IFCONFIG, iface_name, "up" });
     if (term != .exited or term.exited != 0) return error.ConfigFailed;
 }
 
@@ -58,8 +65,7 @@ pub fn setMtu(allocator: std.mem.Allocator, iface_name: []const u8, mtu: u32) !v
     var mtu_buf: [10]u8 = undefined;
     const mtu_str = std.fmt.bufPrint(&mtu_buf, "{d}", .{mtu}) catch return error.ConfigFailed;
 
-    _ = allocator;
-    const term = try runCommand(&.{ "ifconfig", iface_name, "mtu", mtu_str });
+    const term = try runCommand(allocator, &.{ IFCONFIG, iface_name, "mtu", mtu_str });
     if (term != .exited or term.exited != 0) return error.ConfigFailed;
 }
 
@@ -71,9 +77,8 @@ pub fn addRoute(allocator: std.mem.Allocator, iface_name: []const u8, network: [
     const ip_str = formatIp(network, &ip_buf);
     const net_str = std.fmt.bufPrint(&net_buf, "{s}/{d}", .{ ip_str, prefix_len }) catch return error.ConfigFailed;
 
-    _ = allocator;
     // Route may already exist — don't fail
-    _ = try runCommand(&.{ "route", "add", "-net", net_str, "-interface", iface_name });
+    _ = try runCommand(allocator, &.{ ROUTE, "add", "-net", net_str, "-interface", iface_name });
 }
 
 /// Add an IPv6 route via the interface.
@@ -84,14 +89,12 @@ pub fn addRoute6(allocator: std.mem.Allocator, iface_name: []const u8, network: 
     const ip_str = formatIpv6(network, &ip_buf);
     const net_str = std.fmt.bufPrint(&net_buf, "{s}/{d}", .{ ip_str, prefix_len }) catch return error.ConfigFailed;
 
-    _ = allocator;
-    _ = try runCommand(&.{ "route", "add", "-inet6", net_str, "-interface", iface_name });
+    _ = try runCommand(allocator, &.{ ROUTE, "add", "-inet6", net_str, "-interface", iface_name });
 }
 
 /// Bring the interface down.
 pub fn setInterfaceDown(allocator: std.mem.Allocator, iface_name: []const u8) !void {
-    _ = allocator;
-    _ = try runCommand(&.{ "ifconfig", iface_name, "down" });
+    _ = try runCommand(allocator, &.{ IFCONFIG, iface_name, "down" });
 }
 
 // ─── Helpers ───
@@ -114,7 +117,7 @@ fn formatNetmask(prefix_len: u8, buf: *[15]u8) []const u8 {
 
 fn formatIpv6(ip: [16]u8, buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, "{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}", .{
-        ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], ip[6], ip[7],
+        ip[0], ip[1], ip[2],  ip[3],  ip[4],  ip[5],  ip[6],  ip[7],
         ip[8], ip[9], ip[10], ip[11], ip[12], ip[13], ip[14], ip[15],
     }) catch "::";
 }
