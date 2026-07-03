@@ -1279,7 +1279,10 @@ pub const SwimProtocol = struct {
 
     fn collectGossip(self: *SwimProtocol) []const messages.GossipEntry {
         if (self.gossip_count == 0) return &.{};
-        const count = @min(self.gossip_count, self.config.max_gossip_per_message);
+        // Clamp to the snapshot buffer size as well: max_gossip_per_message is an
+        // operator-settable config value and could exceed gossip_snap.len, which
+        // would overflow the fixed buffer in the copy loop below.
+        const count = @min(@min(self.gossip_count, self.config.max_gossip_per_message), self.gossip_snap.len);
 
         // Copy entries into snapshot buffer
         for (0..count) |i| {
@@ -1290,8 +1293,9 @@ pub const SwimProtocol = struct {
         var write: usize = 0;
         for (0..self.gossip_count) |read| {
             if (read < count) {
-                // This entry was just sent — decrement
-                self.gossip_queue[read].remaining -= 1;
+                // This entry was just sent — decrement. Saturating: guards against a
+                // remaining==0 slot (max_gossip_broadcasts configured to 0) underflowing.
+                self.gossip_queue[read].remaining -|= 1;
             }
             if (self.gossip_queue[read].remaining > 0) {
                 if (write != read) {
@@ -1370,7 +1374,10 @@ pub const SwimProtocol = struct {
         // init reaches the rejoiner before it has re-learned us.
         if (self.handler) |h| {
             h.onPeerDead(h.ctx, sender_pubkey);
-            h.onPeerJoin(h.ctx, peer);
+            // Re-fetch: `peer` is a pointer into the membership hashmap. Per the
+            // handler contract onPeerDead may mutate membership (a rehash would
+            // dangle `peer`), so re-resolve before handing it to onPeerJoin.
+            if (self.membership.peers.getPtr(sender_pubkey)) |p| h.onPeerJoin(h.ctx, p);
         }
     }
 
@@ -1415,8 +1422,13 @@ pub const SwimProtocol = struct {
         // Self-suspicion refutation: if someone suspects/kills us, broadcast alive
         if (std.mem.eql(u8, &entry.subject_pubkey, &self.our_pubkey)) {
             if (entry.event == .suspect or entry.event == .dead) {
-                // Refute by broadcasting alive with higher Lamport clock
-                self.membership.lamport = @max(self.membership.lamport, entry.lamport) + 1;
+                // Refute by broadcasting alive with higher Lamport clock.
+                // SECURITY: entry.lamport is attacker-controlled (gossip is not
+                // per-entry authenticated, and the sender gate is open by default),
+                // so a single forged PING with lamport==u64 max would overflow this
+                // add — a panic (safe builds) or clock corruption (fast builds) from
+                // one packet. Saturate instead.
+                self.membership.lamport = @max(self.membership.lamport, entry.lamport) +| 1;
                 self.enqueueGossip(.{
                     .subject_pubkey = self.our_pubkey,
                     .event = .alive,
@@ -2104,4 +2116,37 @@ test "gossiped dead does not instantly evict a third party (H2 regression)" {
     // A replayed "alive" from gossip must NOT clear our local suspicion (M6).
     swim.applyGossip(.{ .subject_pubkey = victim, .event = .alive, .lamport = 100, .endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 40000) });
     try std.testing.expect(membership.peers.get(victim).?.state == .suspected);
+}
+
+test "forged self-dead gossip with max Lamport does not overflow (S1)" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+
+    // Attacker-forged gossip claiming WE are dead, with a maxed-out Lamport clock.
+    // Pre-fix: `@max(lamport, u64max) + 1` overflowed -> panic (safe builds) from one packet.
+    swim.applyGossip(.{ .subject_pubkey = swim.our_pubkey, .event = .dead, .lamport = std.math.maxInt(u64), .endpoint = null });
+
+    // Saturated instead of wrapping; no crash.
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), swim.membership.lamport);
+}
+
+test "collectGossip clamps to snapshot size and tolerates zero broadcasts (S3/S4)" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+
+    // Misconfiguration: per-message cap far above gossip_snap.len, and zero broadcasts.
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{ .max_gossip_per_message = 64, .max_gossip_broadcasts = 0 }, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+
+    var i: u8 = 0;
+    while (i < 20) : (i += 1) {
+        swim.enqueueGossip(.{ .subject_pubkey = [_]u8{i} ** 32, .event = .alive, .lamport = 1, .endpoint = null });
+    }
+
+    // Pre-fix: count == 20 overflowed gossip_snap[8..]; remaining==0 underflowed on decrement.
+    const out = swim.collectGossip();
+    try std.testing.expect(out.len <= swim.gossip_snap.len);
 }

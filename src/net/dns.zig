@@ -201,7 +201,7 @@ pub fn queryMDNS(allocator: std.mem.Allocator, service_name: []const u8) ![][]co
     };
     if (comptime is_linux) {
         const rc = linux.sendto(sock_fd, query_buf[0..query_len].ptr, query_len, 0, @ptrCast(&mdns_addr), @sizeOf(@TypeOf(mdns_addr)));
-        if (posix.errno(rc) != .SUCCESS) return &.{};
+        if (rawSyscallFailed(rc)) return &.{};
     } else {
         if (std.c.sendto(sock_fd, query_buf[0..query_len].ptr, query_len, 0, @ptrCast(&mdns_addr), @sizeOf(@TypeOf(mdns_addr))) < 0) {
             return &.{};
@@ -429,11 +429,20 @@ fn closeFd(fd: posix.socket_t) void {
     }
 }
 
+/// Raw std.os.linux.* syscalls return -errno as a usize on failure. std.posix.errno
+/// misclassifies that when libc is linked (it only handles rv == -1 and reads the C
+/// errno global, which a raw syscall never sets), so a -errno slips through as
+/// "success" — the same class as the recvfrom OOB fixed in udp.zig. Decode the sign
+/// of the raw return directly instead of trusting posix.errno.
+fn rawSyscallFailed(rc: usize) bool {
+    return @as(isize, @bitCast(rc)) < 0;
+}
+
 /// Create a DGRAM socket (cross-platform).
 fn createDgramSocket() ?posix.socket_t {
     if (comptime is_linux) {
         const rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM, 0);
-        if (posix.errno(rc) != .SUCCESS) return null;
+        if (rawSyscallFailed(rc)) return null;
         return @intCast(@as(i32, @bitCast(@as(u32, @truncate(rc)))));
     } else if (comptime is_windows) {
         const sock = std.c.socket(std.c.AF.INET, std.c.SOCK.DGRAM, 0);
@@ -450,7 +459,7 @@ fn createDgramSocket() ?posix.socket_t {
 fn recvFromSocket(fd: posix.socket_t, buf: []u8) ?usize {
     if (comptime is_linux) {
         const rc = linux.recvfrom(fd, buf.ptr, buf.len, 0, null, null);
-        if (posix.errno(rc) != .SUCCESS) return null;
+        if (rawSyscallFailed(rc)) return null;
         return @intCast(rc);
     } else {
         const rc = std.c.recvfrom(fd, buf.ptr, buf.len, 0, null, null);
@@ -504,14 +513,14 @@ fn sendQuery(nameserver: [4]u8, port: u16, query: []const u8) ?QueryResponse {
     // connect we send with a null destination (the connected peer).
     if (comptime is_linux) {
         const crc = linux.connect(sock_fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
-        if (posix.errno(crc) != .SUCCESS) return null;
+        if (rawSyscallFailed(crc)) return null;
     } else {
         if (std.c.connect(sock_fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) != 0) return null;
     }
 
     if (comptime is_linux) {
         const rc = linux.sendto(sock_fd, query.ptr, query.len, 0, null, 0);
-        if (posix.errno(rc) != .SUCCESS) return null;
+        if (rawSyscallFailed(rc)) return null;
     } else {
         if (std.c.sendto(sock_fd, query.ptr, query.len, 0, null, 0) < 0) return null;
     }
