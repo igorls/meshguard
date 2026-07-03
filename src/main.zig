@@ -117,6 +117,12 @@ pub fn main(init: std.process.Init) !void {
         @import("crypto/sodium.zig").init();
     }
 
+    // Initialize Winsock once for the whole process before any socket is created.
+    // On Windows every socket/bind call fails with WSANOTINITIALISED until WSAStartup
+    // runs; no-op on other platforms. Idempotent, so socket paths that also self-init
+    // (see net/udp.zig) stay correct regardless of ordering.
+    lib.net.Udp.ensureWinsockInit();
+
     const args = try init.minimal.args.toSlice(arena);
 
     if (args.len < 2) {

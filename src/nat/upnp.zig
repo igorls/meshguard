@@ -19,7 +19,9 @@ const is_ios = builtin.os.tag == .ios;
 const is_darwin = is_macos or is_ios;
 const linux = if (is_linux) std.os.linux else struct {};
 const win = if (is_windows) struct {
-    const POLLIN: i16 = 0x0001;
+    // Winsock WSAPoll: readable data is POLLRDNORM (0x0100), not 0x0001 (POLLERR,
+    // which makes WSAPoll fail with WSAEINVAL 10022). See net/udp.zig.
+    const POLLIN: i16 = 0x0100 | 0x0200; // POLLRDNORM | POLLRDBAND
     const pollfd = extern struct {
         fd: posix.socket_t,
         events: i16,
@@ -233,7 +235,7 @@ fn ssdpDiscover(gateway_ip: *[4]u8, location_buf: *[512]u8) ?[]const u8 {
                 continue;
             }
         } else if (comptime is_windows) {
-            const POLLIN: i16 = 0x0001;
+            const POLLIN: i16 = 0x0100 | 0x0200; // POLLRDNORM | POLLRDBAND (Winsock)
             var fds = [1]win.pollfd{.{ .fd = fd, .events = POLLIN, .revents = 0 }};
             const rc = win.WSAPoll(&fds, 1, 500);
             if (rc <= 0) {
@@ -381,7 +383,7 @@ fn httpRequest(
             _ = posix.poll(&fds, 2000) catch break;
             if ((fds[0].revents & POLLIN) == 0) break;
         } else if (comptime is_windows) {
-            const POLLIN: i16 = 0x0001;
+            const POLLIN: i16 = 0x0100 | 0x0200; // POLLRDNORM | POLLRDBAND (Winsock)
             var fds = [1]win.pollfd{.{ .fd = fd, .events = POLLIN, .revents = 0 }};
             const rc = win.WSAPoll(&fds, 1, 2000);
             if (rc <= 0) break;
