@@ -98,6 +98,10 @@ pub const MeshguardContext = struct {
     event_loop_thread: ?std.Thread,
     running: std.atomic.Value(bool),
     suspended: std.atomic.Value(bool), // low-power mode: recv only, no send
+    // Set by meshguard_resume() on the host thread; consumed by the event-loop
+    // thread, which owns SWIM/LAN state, to perform the post-resume re-announce
+    // without racing tick(). See meshguard_resume / eventLoop.
+    resume_requested: std.atomic.Value(bool),
 
     // Callbacks (set by host app)
     on_message_cb: ?*const fn ([*]const u8, usize, [*]const u8) callconv(.c) void,
@@ -138,6 +142,7 @@ fn initContextStorage(allocator: std.mem.Allocator) MeshguardContext {
         .event_loop_thread = null,
         .running = std.atomic.Value(bool).init(false),
         .suspended = std.atomic.Value(bool).init(false),
+        .resume_requested = std.atomic.Value(bool).init(false),
         .on_message_cb = null,
         .on_peer_event_cb = null,
         .on_undeliverable_cb = null,
@@ -752,14 +757,12 @@ export fn meshguard_resume(ctx: ?*MeshguardContext) void {
 
     if (was_suspended) {
         std.debug.print("  ▶️  meshguard resumed — re-pinging all peers\n", .{});
-        // Force immediate ping to all alive peers to refresh state
-        if (c.swim) |*swim| {
-            swim.pingAllAlive();
-        }
-        // Fire a LAN beacon immediately to re-discover nearby peers
-        if (c.lan_discovery) |*lan| {
-            lan.sendBeacon();
-        }
+        // Defer the actual re-announce (pingAllAlive + LAN beacon) to the event-loop
+        // thread. Those mutate SWIM/LAN state the loop owns — seq, pending[], the
+        // gossip queue, membership iteration — so running them here on the host thread
+        // races the loop's tick() (torn pending_count, iterator invalidation). Flip an
+        // atomic and let the loop do it next active tick, mirroring how suspend works.
+        c.resume_requested.store(true, .release);
     }
 }
 
@@ -1065,6 +1068,14 @@ fn eventLoop(ctx: *MeshguardContext) void {
             } else {
                 // ACTIVE: full gossip + discovery
                 swim.tick() catch {};
+
+                // Honor a pending resume() (requested from the host thread): do the
+                // immediate re-announce HERE, on the loop thread that owns SWIM/LAN
+                // state, so it can't race tick().
+                if (ctx.resume_requested.swap(false, .acq_rel)) {
+                    swim.pingAllAlive();
+                    if (ctx.lan_discovery) |*lan| lan.sendBeacon();
+                }
             }
 
             // LAN discovery: only in active mode
