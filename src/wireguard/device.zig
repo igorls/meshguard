@@ -431,7 +431,12 @@ pub const WgDevice = struct {
         defer self.lock.unlock(zio());
         if (self.static_map.get(wg_pubkey)) |slot| {
             if (self.peers[slot]) |*peer| {
-                return peer.active_tunnel != null;
+                // Honor session expiry: a non-null but expired (>= REJECT_AFTER_TIME)
+                // tunnel can no longer encrypt or decrypt, so it must NOT count as
+                // active — otherwise the periodic handshake retransmit and re-init
+                // gates skip it and the dead session is never re-established.
+                if (peer.active_tunnel) |*t| return t.isValid();
+                return false;
             }
         }
         return false;
