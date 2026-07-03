@@ -1566,6 +1566,60 @@ fn issueCertWire(org_kp: Org.OrgKeyPair, node_pubkey: [32]u8, name: []const u8) 
     return cert_wire;
 }
 
+test "peer restart is detected by incarnation and steady state is not" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+
+    var counter = JoinCounter{};
+    var swim = SwimProtocol.init(
+        &membership,
+        inertTestSocket(),
+        .{},
+        [_]u8{1} ** 32, // our_pubkey
+        [_]u8{2} ** 32, // our_wg_pubkey
+        .{ 127, 0, 0, 1 },
+        51821,
+        .{ .ctx = &counter, .onPeerJoin = countPeerJoin, .onPeerDead = ignorePeerDead },
+    );
+
+    const peer_pk = [_]u8{3} ** 32;
+    try membership.upsert(aliveTestPeer(peer_pk));
+
+    // First incarnation observed: recorded, NOT treated as a restart.
+    swim.handleSenderIncarnation(peer_pk, 100);
+    try std.testing.expectEqual(@as(u64, 100), membership.peers.get(peer_pk).?.incarnation);
+    try std.testing.expectEqual(@as(usize, 0), counter.count);
+
+    // Same incarnation (steady-state pings): no rejoin.
+    swim.handleSenderIncarnation(peer_pk, 100);
+    try std.testing.expectEqual(@as(usize, 0), counter.count);
+
+    // Lower incarnation (reordered/stale packet): no rejoin, no downgrade.
+    swim.handleSenderIncarnation(peer_pk, 50);
+    try std.testing.expectEqual(@as(usize, 0), counter.count);
+    try std.testing.expectEqual(@as(u64, 100), membership.peers.get(peer_pk).?.incarnation);
+
+    // Higher incarnation => the peer RESTARTED: rejoin (onPeerJoin re-fires) and
+    // the stored incarnation advances.
+    swim.handleSenderIncarnation(peer_pk, 200);
+    try std.testing.expectEqual(@as(usize, 1), counter.count);
+    try std.testing.expectEqual(peer_pk, counter.last_pubkey.?);
+    try std.testing.expectEqual(@as(u64, 200), membership.peers.get(peer_pk).?.incarnation);
+
+    // Incarnation 0 (peer predates the feature) is ignored.
+    swim.handleSenderIncarnation(peer_pk, 0);
+    try std.testing.expectEqual(@as(usize, 1), counter.count);
+
+    // Our own pubkey is ignored.
+    swim.handleSenderIncarnation([_]u8{1} ** 32, 999);
+    try std.testing.expectEqual(@as(usize, 1), counter.count);
+
+    // An unknown peer is ignored (no rejoin, no crash).
+    swim.handleSenderIncarnation([_]u8{9} ** 32, 999);
+    try std.testing.expectEqual(@as(usize, 1), counter.count);
+}
+
 test "gossiped join cannot admit an unauthorized subject with wg key" {
     const allocator = std.testing.allocator;
     var membership = Membership.MembershipTable.init(allocator, 5000);
