@@ -32,9 +32,10 @@ const Mmsghdr = extern struct {
     msg_len: u32,
 };
 
-// Syscall numbers (x86_64 Linux)
-const SYS_recvmmsg = 299;
-const SYS_sendmmsg = 307;
+// recvmmsg/sendmmsg/recvmsg/sendmsg syscall numbers are architecture-specific
+// (x86_64 differs from aarch64/arm/riscv). Use the target-correct std.os.linux.SYS
+// enum members below rather than hardcoded x86_64 integers, so non-x86_64 Linux
+// daemon builds invoke the right syscall instead of a wrong/nonexistent one.
 
 /// Pre-allocated batch receive state.
 /// After declaring, call `setupPointers()` to wire up internal self-references.
@@ -79,7 +80,7 @@ pub const BatchReceiver = struct {
         }
 
         const rc = linux.syscall6(
-            @enumFromInt(SYS_recvmmsg),
+            linux.SYS.recvmmsg,
             @as(usize, @intCast(fd)),
             @intFromPtr(&self.msgs),
             BATCH_SIZE,
@@ -149,7 +150,7 @@ pub const BatchSender = struct {
         if (self.count == 0) return 0;
 
         const rc = linux.syscall4(
-            @enumFromInt(SYS_sendmmsg),
+            linux.SYS.sendmmsg,
             @as(usize, @intCast(fd)),
             @intFromPtr(&self.msgs),
             self.count,
@@ -217,9 +218,8 @@ pub const GROReceiver = struct {
             .msg_flags = 0,
         };
 
-        // SYS_recvmsg = 47 on x86_64
         const rc = linux.syscall3(
-            @enumFromInt(47),
+            linux.SYS.recvmsg,
             @as(usize, @intCast(fd)),
             @intFromPtr(&hdr),
             @as(usize, linux.MSG.DONTWAIT),
@@ -335,9 +335,8 @@ pub const GSOSender = struct {
             .msg_flags = 0,
         };
 
-        // SYS_sendmsg = 46 on x86_64
         const rc = linux.syscall3(
-            @enumFromInt(46),
+            linux.SYS.sendmsg,
             @as(usize, @intCast(fd)),
             @intFromPtr(&hdr),
             @as(usize, linux.MSG.DONTWAIT),
@@ -424,7 +423,7 @@ pub const ZeroCopyGSOSender = struct {
         };
 
         const rc = linux.syscall3(
-            @enumFromInt(46), // SYS_sendmsg
+            linux.SYS.sendmsg,
             @as(usize, @intCast(fd)),
             @intFromPtr(&hdr),
             @as(usize, linux.MSG.DONTWAIT),
