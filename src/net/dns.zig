@@ -15,7 +15,9 @@ const is_windows = builtin.os.tag == .windows;
 const linux = if (is_linux) std.os.linux else struct {};
 const win = if (is_windows) struct {
     const SOCKET = posix.socket_t;
-    const POLLIN: i16 = 0x0001;
+    // Winsock WSAPoll: readable data is POLLRDNORM (0x0100), not 0x0001 — on Windows
+    // 0x0001 is POLLERR and makes WSAPoll fail with WSAEINVAL (10022). See net/udp.zig.
+    const POLLIN: i16 = 0x0100 | 0x0200; // POLLRDNORM | POLLRDBAND
     const pollfd = extern struct {
         fd: SOCKET,
         events: i16,

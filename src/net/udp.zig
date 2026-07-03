@@ -16,7 +16,14 @@ const messages = @import("../protocol/messages.zig");
 const linux = if (is_linux) std.os.linux else struct {};
 const win = if (is_windows) struct {
     const SOCKET = posix.socket_t;
-    const POLLIN: i16 = 0x0001;
+    // Winsock WSAPoll flags (winsock2.h) — these differ from Linux poll(2). On
+    // Windows 0x0001 is POLLERR, an output-only flag; requesting it as an input
+    // event makes WSAPoll fail with WSAEINVAL (10022). Readable data is POLLRDNORM.
+    const POLLRDNORM: i16 = 0x0100;
+    const POLLRDBAND: i16 = 0x0200;
+    const POLLIN: i16 = POLLRDNORM | POLLRDBAND; // 0x0300
+    const POLLERR: i16 = 0x0001;
+    const POLLHUP: i16 = 0x0002;
     const pollfd = extern struct {
         fd: SOCKET,
         events: i16,
@@ -25,7 +32,43 @@ const win = if (is_windows) struct {
 
     extern "ws2_32" fn WSAPoll(fds: [*]pollfd, nfds: u32, timeout: c_int) c_int;
     extern "ws2_32" fn closesocket(socket: SOCKET) c_int;
+    extern "ws2_32" fn WSAStartup(wVersionRequested: u16, lpWSAData: *anyopaque) c_int;
 } else struct {};
+
+// Winsock must be initialized once per process before any socket call; otherwise
+// every Winsock function (socket/bind/...) fails with WSANOTINITIALISED (10093).
+// std.c.socket does NOT do this for us, so a Windows meshguard build fails at the
+// very first UDP bind ("failed to bind gossip port 51821") even though the port is
+// free — the same reason a raw socket path fails while .NET's UdpClient (which calls
+// WSAStartup internally) binds fine. This lazy init closes that gap. No-op elsewhere.
+const WsaInitState = enum(u8) { uninitialized = 0, initializing = 1, ready = 2 };
+var wsa_state = std.atomic.Value(u8).init(@intFromEnum(WsaInitState.uninitialized));
+
+/// Ensure Winsock is initialized before any socket is created. Idempotent and
+/// thread-safe: WSAStartup runs exactly once; concurrent callers block until it
+/// completes. No-op on non-Windows targets.
+pub fn ensureWinsockInit() void {
+    if (comptime is_windows) {
+        if (wsa_state.load(.acquire) == @intFromEnum(WsaInitState.ready)) return;
+        if (wsa_state.cmpxchgStrong(
+            @intFromEnum(WsaInitState.uninitialized),
+            @intFromEnum(WsaInitState.initializing),
+            .acq_rel,
+            .acquire,
+        ) == null) {
+            // We won the race: perform the one-time startup. MAKEWORD(2, 2) = 0x0202.
+            // WSADATA is an out-param we never read; a byte buffer is layout-safe.
+            var data: [512]u8 = undefined;
+            _ = win.WSAStartup(0x0202, &data);
+            wsa_state.store(@intFromEnum(WsaInitState.ready), .release);
+            return;
+        }
+        // Another thread is initializing; wait for it to finish before returning.
+        while (wsa_state.load(.acquire) != @intFromEnum(WsaInitState.ready)) {
+            std.atomic.spinLoopHint();
+        }
+    }
+}
 
 /// Received datagram with sender info.
 pub const RecvResult = struct {
@@ -53,6 +96,7 @@ pub const UdpSocket = struct {
 
     /// Bind a UDP socket to a specific address and port.
     pub fn bindAddr(addr: [4]u8, port: u16) !UdpSocket {
+        ensureWinsockInit();
         const fd = blk: {
             if (comptime is_linux) {
                 const rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0);
@@ -123,6 +167,7 @@ pub const UdpSocket = struct {
 
     /// Bind an IPv6 UDP socket to a specific address and port.
     pub fn bindAddr6(addr: [16]u8, port: u16) !UdpSocket {
+        ensureWinsockInit();
         const fd = blk: {
             if (comptime is_linux) {
                 const rc = linux.socket(linux.AF.INET6, linux.SOCK.DGRAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0);
@@ -182,6 +227,7 @@ pub const UdpSocket = struct {
     /// Linux-only: Sets IP_PMTUDISC_PROBE and increases SO_SNDBUF.
     /// On Windows, creates a basic unbound UDP socket.
     pub fn createGSOSender() !UdpSocket {
+        ensureWinsockInit();
         const fd = blk: {
             if (comptime is_linux) {
                 const rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0);
@@ -403,7 +449,9 @@ pub const UdpSocket = struct {
             }};
             const rc = win.WSAPoll(&fds, 1, timeout_ms);
             if (rc < 0) return error.PollFailed;
-            return rc > 0 and (fds[0].revents & win.POLLIN) != 0;
+            // Mirror the POSIX path: surface POLLERR/POLLHUP too so a pending socket
+            // error gets drained by recvFrom instead of being ignored forever.
+            return rc > 0 and (fds[0].revents & (win.POLLIN | win.POLLERR | win.POLLHUP)) != 0;
         } else {
             @compileError("Unsupported OS for pollRead");
         }
@@ -451,4 +499,20 @@ fn makeSockaddrIn6(addr: [16]u8, port: u16) posix.sockaddr.in6 {
         .addr = addr,
         .scope_id = 0,
     };
+}
+
+test "UDP bind succeeds on all platforms (Winsock init regression)" {
+    // Regression guard for the Windows WSANOTINITIALISED (10093) bug: without a
+    // process-wide WSAStartup, socket()/bind() fail and `meshguard up --gossip-only`
+    // aborts with "failed to bind gossip port 51821" even though the port is free.
+    // Binding to an ephemeral port (0) on the wildcard address is the exact path the
+    // default gossip socket takes and must succeed on Linux, macOS, and Windows.
+    var sock = try UdpSocket.bind(0);
+    defer sock.close();
+    try std.testing.expect(sock.port != 0); // kernel resolved a real ephemeral port
+
+    // ensureWinsockInit must be idempotent: a second independent bind also succeeds.
+    var sock2 = try UdpSocket.bindAddr(.{ 127, 0, 0, 1 }, 0);
+    defer sock2.close();
+    try std.testing.expect(sock2.port != 0);
 }
