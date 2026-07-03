@@ -2,8 +2,8 @@
 //!
 //! Format: [1B type][payload...]
 //!
-//! Ping:     [0x01][32B pubkey][8B seq][1B gossip_count][N × gossip_entry]
-//! Ack:      [0x03][32B pubkey][8B seq][1B gossip_count][N × gossip_entry]
+//! Ping:     [0x01][32B pubkey][8B seq][8B incarnation][1B gossip_count][N × gossip_entry][opt org_cert ext]
+//! Ack:      [0x03][32B pubkey][8B seq][8B incarnation][1B gossip_count][N × gossip_entry][opt org_cert ext]
 //! PingReq:  [0x02][32B sender][32B target][8B seq]
 //!
 //! GossipEntry endpoints: [1B has_ep][1B family: 4/6][16B addr][2B port]

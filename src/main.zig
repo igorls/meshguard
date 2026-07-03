@@ -915,6 +915,9 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
             .onPeerPunched = &wgOnPeerPunched,
         },
     );
+    // SWIM-driven handshake retransmit is only needed for the userspace WG data
+    // plane; kernel WireGuard retransmits its own, and gossip-only has none.
+    swim.retransmit_handshakes = !use_kernel_wg and !gossip_only;
 
     // Load authorized keys and enable trust enforcement (unless --open)
     if (!open_mode) {

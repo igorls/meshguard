@@ -26,13 +26,19 @@ fn nowNs() i128 {
     return @intCast(std.Io.Timestamp.now(zio(), .awake).toNanoseconds());
 }
 
-/// Per-process incarnation: wall-clock seconds captured at startup. Increases
-/// on every restart, so a peer that already knows us can tell we RESTARTED
-/// (incarnation higher than it has stored) and re-integrate us — this is what
+/// Per-process incarnation: wall-clock NANOSECONDS captured at startup.
+/// Increases on every restart, so a peer that already knows us can tell we
+/// RESTARTED (incarnation higher than it has stored) and re-integrate us — this
 /// heals a WireGuard tunnel after one side restarts (the survivor otherwise
 /// treats the rejoiner as already-known and never re-advertises itself).
+///
+/// Nanosecond resolution avoids two restarts inside the same second colliding.
+/// CAVEAT: this is the REAL clock, so a large backwards wall-clock step (NTP or
+/// manual set) between two restarts could leave the newer incarnation below the
+/// stored one and miss the restart until the clock passes it again. Acceptable
+/// for restart healing; a persisted monotonic counter would be fully robust.
 fn incarnationNow() u64 {
-    return @intCast(std.Io.Timestamp.now(zio(), .real).toSeconds());
+    return @intCast(std.Io.Timestamp.now(zio(), .real).toNanoseconds());
 }
 
 pub const SwimConfig = struct {
@@ -119,6 +125,11 @@ pub const SwimProtocol = struct {
 
     // Handshake-retransmit rate limiting (re-initiate stalled/rejoining peers)
     last_handshake_retransmit_ns: i128 = 0,
+    // Only the userspace WG data plane needs SWIM to re-drive handshakes; the
+    // kernel WireGuard module retransmits its own (via keepalive), so enabling
+    // this in kernel/gossip-only modes would just churn peers + spam logs.
+    // Set true by the daemon only in userspace-TUN mode.
+    retransmit_handshakes: bool = false,
 
     // Pending pings awaiting ACK
     pending: [16]PendingPing = std.mem.zeroes([16]PendingPing),
@@ -1370,6 +1381,7 @@ pub const SwimProtocol = struct {
     /// can reach the rejoiner before it has re-learned us — and any dropped
     /// initial handshake. One pass per gossip interval.
     fn retransmitStalledHandshakes(self: *SwimProtocol, now_ns: i128) void {
+        if (!self.retransmit_handshakes) return; // userspace-TUN only (see field)
         const interval_ns: i128 = @as(i128, self.config.gossip_interval_ms) * 1_000_000;
         if (now_ns - self.last_handshake_retransmit_ns < interval_ns) return;
         self.last_handshake_retransmit_ns = now_ns;
