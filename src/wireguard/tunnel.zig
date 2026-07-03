@@ -218,7 +218,10 @@ pub const Tunnel = struct {
 
         const counter = std.mem.readInt(u64, packet[8..16], .little);
 
-        // Anti-replay check (mutex-protected for multi-thread)
+        // Early anti-replay reject (optimization: avoid decrypting an obvious
+        // replay). NOT authoritative — the counter is re-checked and marked
+        // atomically after authentication below, which is what actually prevents
+        // the TOCTOU replay across concurrent decrypt workers.
         {
             self.replay_lock.lockUncancelable(zio());
             defer self.replay_lock.unlock(zio());
@@ -247,8 +250,19 @@ pub const Tunnel = struct {
             self.keys.receiving_key,
         ) catch return error.DecryptionFailed;
 
-        // Update replay window
-        self.replay_window.update(counter);
+        // Authoritative anti-replay: re-check and mark the counter atomically under
+        // the lock, AFTER authentication succeeds. The early check() above released
+        // its lock before the decrypt, so two decrypt workers (the pipeline runs N)
+        // could both pass it for the same counter and both deliver the packet — a
+        // TOCTOU replay — while racing the window bitmap. Doing check()+update() as
+        // one locked step is the WireGuard-correct behavior: the second worker's
+        // check() now fails and it is rejected.
+        {
+            self.replay_lock.lockUncancelable(zio());
+            defer self.replay_lock.unlock(zio());
+            if (!self.replay_window.check(counter)) return error.ReplayedPacket;
+            self.replay_window.update(counter);
+        }
         self.last_recv_ns = nowNs();
 
         // Strip padding: parse IP header to get real packet length
@@ -273,7 +287,7 @@ pub const Tunnel = struct {
     pub fn isValid(self: *const Tunnel) bool {
         const elapsed = nowNs() - self.keys.birthdate_ns;
         return elapsed < REJECT_AFTER_TIME_NS and
-            self.send_counter < REJECT_AFTER_MESSAGES;
+            self.send_counter.load(.monotonic) < REJECT_AFTER_MESSAGES;
     }
 
     /// Check if a keepalive should be sent.
@@ -545,4 +559,57 @@ test "transport tunnel deinit zeros keys" {
         if (b != 0) all_zeros = false;
     }
     try std.testing.expect(all_zeros);
+}
+
+test "isValid honors session expiry (W3)" {
+    const fresh = Tunnel{ .keys = .{
+        .sending_key = .{0x11} ** 32,
+        .receiving_key = .{0x22} ** 32,
+        .sending_index = 1,
+        .receiving_index = 2,
+        .is_initiator = true,
+        .birthdate_ns = nowNs(),
+    } };
+    try std.testing.expect(fresh.isValid());
+
+    // A session past REJECT_AFTER_TIME can no longer en/decrypt; isValid must say so
+    // (this is what lets hasActiveTunnel report it inactive so it gets re-established).
+    const expired = Tunnel{ .keys = .{
+        .sending_key = .{0x11} ** 32,
+        .receiving_key = .{0x22} ** 32,
+        .sending_index = 1,
+        .receiving_index = 2,
+        .is_initiator = true,
+        .birthdate_ns = nowNs() - REJECT_AFTER_TIME_NS - std.time.ns_per_s,
+    } };
+    try std.testing.expect(!expired.isValid());
+}
+
+test "replayed transport packet is rejected (W1 atomic check+update)" {
+    const keys = noise.TransportKeys{
+        .sending_key = .{0x42} ** 32,
+        .receiving_key = .{0x99} ** 32,
+        .sending_index = 1,
+        .receiving_index = 2,
+        .is_initiator = true,
+        .birthdate_ns = nowNs(),
+    };
+    var sender = Tunnel{ .keys = keys };
+    var receiver = Tunnel{ .keys = .{
+        .sending_key = keys.receiving_key,
+        .receiving_key = keys.sending_key,
+        .sending_index = keys.receiving_index,
+        .receiving_index = keys.sending_index,
+        .is_initiator = false,
+        .birthdate_ns = keys.birthdate_ns,
+    } };
+
+    var pkt: [256]u8 = undefined;
+    var out: [256]u8 = undefined;
+    const n = try sender.encrypt("replay me", &pkt);
+
+    _ = try receiver.decrypt(pkt[0..n], &out); // first delivery accepted
+    // Same counter again -> rejected. Verifies the reordered check+update still marks
+    // the counter so a replay is caught (single-thread correctness of the W1 fix).
+    try std.testing.expectError(error.ReplayedPacket, receiver.decrypt(pkt[0..n], &out));
 }
