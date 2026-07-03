@@ -48,6 +48,11 @@ pub const Ping = struct {
     sender_pubkey: [32]u8,
     /// Monotonic sequence number
     seq: u64,
+    /// Sender's incarnation — a per-process startup epoch (seconds) that
+    /// increases every time the node restarts. Lets a peer that already knows
+    /// us detect that we RESTARTED (higher incarnation than it has stored) and
+    /// re-integrate us, healing the tunnel after a restart. 0 = not advertised.
+    incarnation: u64 = 0,
     /// Piggybacked gossip updates
     gossip: []const GossipEntry,
     /// Org certificate extension appended after gossip, if present.
@@ -67,6 +72,8 @@ pub const PingReq = struct {
 pub const Ack = struct {
     sender_pubkey: [32]u8,
     seq: u64,
+    /// Sender's incarnation (see Ping.incarnation). 0 = not advertised.
+    incarnation: u64 = 0,
     gossip: []const GossipEntry,
     /// Org certificate extension appended after gossip, if present.
     org_cert: [ORG_CERT_WIRE_SIZE]u8 = std.mem.zeroes([ORG_CERT_WIRE_SIZE]u8),

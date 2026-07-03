@@ -2,8 +2,8 @@
 //!
 //! Format: [1B type][payload...]
 //!
-//! Ping:     [0x01][32B pubkey][8B seq][1B gossip_count][N × gossip_entry]
-//! Ack:      [0x03][32B pubkey][8B seq][1B gossip_count][N × gossip_entry]
+//! Ping:     [0x01][32B pubkey][8B seq][8B incarnation][1B gossip_count][N × gossip_entry][opt org_cert ext]
+//! Ack:      [0x03][32B pubkey][8B seq][8B incarnation][1B gossip_count][N × gossip_entry][opt org_cert ext]
 //! PingReq:  [0x02][32B sender][32B target][8B seq]
 //!
 //! GossipEntry endpoints: [1B has_ep][1B family: 4/6][16B addr][2B port]
@@ -19,7 +19,7 @@ const ORG_CERT_EXTENSION_SIZE = 1 + messages.ORG_CERT_WIRE_SIZE;
 
 /// Encode a Ping message into a buffer. Returns bytes written.
 pub fn encodePing(buf: []u8, ping: messages.Ping) !usize {
-    const required = 1 + 32 + 8 + 1 + ping.gossip.len * GOSSIP_ENTRY_SIZE +
+    const required = 1 + 32 + 8 + 8 + 1 + ping.gossip.len * GOSSIP_ENTRY_SIZE +
         if (ping.has_org_cert) ORG_CERT_EXTENSION_SIZE else 0;
     if (buf.len < required) return error.BufferTooShort;
 
@@ -35,6 +35,10 @@ pub fn encodePing(buf: []u8, ping: messages.Ping) !usize {
 
     // Sequence
     std.mem.writeInt(u64, buf[pos..][0..8], ping.seq, .little);
+    pos += 8;
+
+    // Incarnation
+    std.mem.writeInt(u64, buf[pos..][0..8], ping.incarnation, .little);
     pos += 8;
 
     // Gossip entries
@@ -58,7 +62,7 @@ pub fn encodePing(buf: []u8, ping: messages.Ping) !usize {
 
 /// Encode an Ack message into a buffer. Returns bytes written.
 pub fn encodeAck(buf: []u8, ack: messages.Ack) !usize {
-    const required = 1 + 32 + 8 + 1 + ack.gossip.len * GOSSIP_ENTRY_SIZE +
+    const required = 1 + 32 + 8 + 8 + 1 + ack.gossip.len * GOSSIP_ENTRY_SIZE +
         if (ack.has_org_cert) ORG_CERT_EXTENSION_SIZE else 0;
     if (buf.len < required) return error.BufferTooShort;
 
@@ -71,6 +75,10 @@ pub fn encodeAck(buf: []u8, ack: messages.Ack) !usize {
     pos += 32;
 
     std.mem.writeInt(u64, buf[pos..][0..8], ack.seq, .little);
+    pos += 8;
+
+    // Incarnation
+    std.mem.writeInt(u64, buf[pos..][0..8], ack.incarnation, .little);
     pos += 8;
 
     const gossip_count: u8 = @intCast(@min(ack.gossip.len, 255));
@@ -346,6 +354,7 @@ pub const DecodedMessage = union(enum) {
 pub const DecodedPing = struct {
     sender_pubkey: [32]u8,
     seq: u64,
+    incarnation: u64 = 0,
     gossip_buf: [8]messages.GossipEntry = undefined,
     gossip_count: u8 = 0,
     org_cert: [messages.ORG_CERT_WIRE_SIZE]u8 = std.mem.zeroes([messages.ORG_CERT_WIRE_SIZE]u8),
@@ -360,6 +369,7 @@ pub const DecodedPing = struct {
 pub const DecodedAck = struct {
     sender_pubkey: [32]u8,
     seq: u64,
+    incarnation: u64 = 0,
     gossip_buf: [8]messages.GossipEntry = undefined,
     gossip_count: u8 = 0,
     org_cert: [messages.ORG_CERT_WIRE_SIZE]u8 = std.mem.zeroes([messages.ORG_CERT_WIRE_SIZE]u8),
@@ -392,7 +402,7 @@ pub fn decode(data: []const u8) DecodeError!DecodedMessage {
 }
 
 fn decodePing(data: []const u8) DecodeError!DecodedPing {
-    if (data.len < 32 + 8 + 1) return error.BufferTooShort;
+    if (data.len < 32 + 8 + 8 + 1) return error.BufferTooShort;
 
     var result = DecodedPing{
         .sender_pubkey = undefined,
@@ -401,10 +411,11 @@ fn decodePing(data: []const u8) DecodeError!DecodedPing {
 
     @memcpy(&result.sender_pubkey, data[0..32]);
     result.seq = std.mem.readInt(u64, data[32..40], .little);
+    result.incarnation = std.mem.readInt(u64, data[40..48], .little);
 
-    const advertised_gossip_count = @min(data[40], 8);
+    const advertised_gossip_count = @min(data[48], 8);
 
-    var pos: usize = 41;
+    var pos: usize = 49;
     var parsed_gossip_count: u8 = 0;
     for (0..advertised_gossip_count) |i| {
         if (pos + GOSSIP_ENTRY_SIZE > data.len) break;
@@ -420,7 +431,7 @@ fn decodePing(data: []const u8) DecodeError!DecodedPing {
 }
 
 fn decodeAck(data: []const u8) DecodeError!DecodedAck {
-    if (data.len < 32 + 8 + 1) return error.BufferTooShort;
+    if (data.len < 32 + 8 + 8 + 1) return error.BufferTooShort;
 
     var result = DecodedAck{
         .sender_pubkey = undefined,
@@ -429,10 +440,11 @@ fn decodeAck(data: []const u8) DecodeError!DecodedAck {
 
     @memcpy(&result.sender_pubkey, data[0..32]);
     result.seq = std.mem.readInt(u64, data[32..40], .little);
+    result.incarnation = std.mem.readInt(u64, data[40..48], .little);
 
-    const advertised_gossip_count = @min(data[40], 8);
+    const advertised_gossip_count = @min(data[48], 8);
 
-    var pos: usize = 41;
+    var pos: usize = 49;
     var parsed_gossip_count: u8 = 0;
     for (0..advertised_gossip_count) |i| {
         if (pos + GOSSIP_ENTRY_SIZE > data.len) break;

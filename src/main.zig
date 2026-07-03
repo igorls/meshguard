@@ -921,6 +921,9 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
             .onPeerPunched = &wgOnPeerPunched,
         },
     );
+    // SWIM-driven handshake retransmit is only needed for the userspace WG data
+    // plane; kernel WireGuard retransmits its own, and gossip-only has none.
+    swim.retransmit_handshakes = !use_kernel_wg and !gossip_only;
 
     // Load authorized keys and enable trust enforcement (unless --open)
     if (!open_mode) {
@@ -1752,6 +1755,11 @@ fn wgOnPeerJoin(ctx: *anyopaque, peer: *const lib.discovery.Membership.Peer) voi
                 };
             }
         } else if (handler.wg_device) |dev| {
+            // Already-established tunnel: this call is a periodic handshake
+            // retransmit for a peer that is already up — leave it untouched (do
+            // not re-add or rekey). Fresh joins and post-restart rejoins tear the
+            // peer down first (onPeerDead), so they are never established here.
+            if (dev.hasActiveTunnel(wg_key)) return;
             // Userspace mode: register peer in WgDevice
             const peer_endpoint: ?Endpoint = if (peer.gossip_endpoint) |ep| ep else if (peer.public_endpoint) |pub_ep| pub_ep else null;
 

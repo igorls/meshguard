@@ -423,6 +423,20 @@ pub const WgDevice = struct {
         return error.TooManyPeers;
     }
 
+    /// True if we hold an established transport session (a completed handshake)
+    /// for this peer. Lets the periodic handshake retransmit skip peers whose
+    /// tunnel is already up, so only stalled/rejoining peers are re-initiated.
+    pub fn hasActiveTunnel(self: *WgDevice, wg_pubkey: [32]u8) bool {
+        self.lock.lockUncancelable(zio());
+        defer self.lock.unlock(zio());
+        if (self.static_map.get(wg_pubkey)) |slot| {
+            if (self.peers[slot]) |*peer| {
+                return peer.active_tunnel != null;
+            }
+        }
+        return false;
+    }
+
     /// Remove a peer by WG public key.
     pub fn removePeer(self: *WgDevice, wg_pubkey: [32]u8) void {
         self.lock.lockUncancelable(zio()); // H6: exclusive — zeroes keys + nils the slot

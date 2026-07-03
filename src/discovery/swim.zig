@@ -26,6 +26,21 @@ fn nowNs() i128 {
     return @intCast(std.Io.Timestamp.now(zio(), .awake).toNanoseconds());
 }
 
+/// Per-process incarnation: wall-clock NANOSECONDS captured at startup.
+/// Increases on every restart, so a peer that already knows us can tell we
+/// RESTARTED (incarnation higher than it has stored) and re-integrate us — this
+/// heals a WireGuard tunnel after one side restarts (the survivor otherwise
+/// treats the rejoiner as already-known and never re-advertises itself).
+///
+/// Nanosecond resolution avoids two restarts inside the same second colliding.
+/// CAVEAT: this is the REAL clock, so a large backwards wall-clock step (NTP or
+/// manual set) between two restarts could leave the newer incarnation below the
+/// stored one and miss the restart until the clock passes it again. Acceptable
+/// for restart healing; a persisted monotonic counter would be fully robust.
+fn incarnationNow() u64 {
+    return @intCast(std.Io.Timestamp.now(zio(), .real).toNanoseconds());
+}
+
 pub const SwimConfig = struct {
     gossip_port: u16 = 51821,
     gossip_interval_ms: u32 = 5000, // 5s — reasonable for WAN
@@ -93,6 +108,9 @@ pub const SwimProtocol = struct {
     our_mesh_ip: [4]u8,
     our_mesh_ip6: [16]u8,
     our_wg_port: u16,
+    /// Our startup incarnation (see incarnationNow). Advertised in every
+    /// ping/ack so peers can detect our restarts.
+    our_incarnation: u64,
     socket: Udp.UdpSocket,
     handler: ?EventHandler,
     running: std.atomic.Value(bool),
@@ -104,6 +122,14 @@ pub const SwimProtocol = struct {
 
     // Ping rate limiting
     last_ping_sent_ns: i128 = 0,
+
+    // Handshake-retransmit rate limiting (re-initiate stalled/rejoining peers)
+    last_handshake_retransmit_ns: i128 = 0,
+    // Only the userspace WG data plane needs SWIM to re-drive handshakes; the
+    // kernel WireGuard module retransmits its own (via keepalive), so enabling
+    // this in kernel/gossip-only modes would just churn peers + spam logs.
+    // Set true by the daemon only in userspace-TUN mode.
+    retransmit_handshakes: bool = false,
 
     // Pending pings awaiting ACK
     pending: [16]PendingPing = std.mem.zeroes([16]PendingPing),
@@ -191,6 +217,7 @@ pub const SwimProtocol = struct {
             .our_mesh_ip = our_mesh_ip,
             .our_mesh_ip6 = @import("../wireguard/ip.zig").deriveIpv6FromPubkeyBytes(our_pubkey),
             .our_wg_port = our_wg_port,
+            .our_incarnation = incarnationNow(),
             .socket = socket,
             .handler = handler,
             .running = std.atomic.Value(bool).init(true),
@@ -339,6 +366,7 @@ pub const SwimProtocol = struct {
         const ping = messages.Ping{
             .sender_pubkey = self.our_pubkey,
             .seq = self.seq +% 1,
+            .incarnation = self.our_incarnation,
             .gossip = &leave_gossip,
             .org_cert = self.our_org_cert orelse std.mem.zeroes([messages.ORG_CERT_WIRE_SIZE]u8),
             .has_org_cert = self.our_org_cert != null,
@@ -411,6 +439,8 @@ pub const SwimProtocol = struct {
         }
 
         // 5. Probe at most one unauthenticated candidate endpoint.
+        self.retransmitStalledHandshakes(now_ns);
+
         self.probeCandidatePeer(now_ns);
 
         // 6. Hole punch: send probes for active punches
@@ -470,6 +500,8 @@ pub const SwimProtocol = struct {
         }
 
         // 4. Probe at most one unauthenticated candidate endpoint.
+        self.retransmitStalledHandshakes(now_ns);
+
         self.probeCandidatePeer(now_ns);
 
         // 5. Hole punch: send probes for active punches
@@ -772,6 +804,8 @@ pub const SwimProtocol = struct {
                 self.recordPeerCertificate(ping.sender_pubkey, ping.org_cert);
             }
             self.removeCandidatePeer(ping.sender_pubkey);
+            // Authenticated contact: detect + heal a peer restart.
+            self.handleSenderIncarnation(ping.sender_pubkey, ping.incarnation);
         }
 
         // Process piggybacked gossip (onPeerJoin may fire here)
@@ -784,6 +818,7 @@ pub const SwimProtocol = struct {
         const ack = messages.Ack{
             .sender_pubkey = self.our_pubkey,
             .seq = ping.seq,
+            .incarnation = self.our_incarnation,
             .gossip = gossip,
             .org_cert = self.our_org_cert orelse std.mem.zeroes([messages.ORG_CERT_WIRE_SIZE]u8),
             .has_org_cert = self.our_org_cert != null,
@@ -807,6 +842,8 @@ pub const SwimProtocol = struct {
                 self.recordPeerCertificate(ack.sender_pubkey, ack.org_cert);
             }
             self.removeCandidatePeer(ack.sender_pubkey);
+            // Authenticated contact: detect + heal a peer restart.
+            self.handleSenderIncarnation(ack.sender_pubkey, ack.incarnation);
         }
 
         // Process piggybacked gossip (onPeerJoin may fire here)
@@ -1052,6 +1089,7 @@ pub const SwimProtocol = struct {
         const ping = messages.Ping{
             .sender_pubkey = self.our_pubkey,
             .seq = self.seq,
+            .incarnation = self.our_incarnation,
             .gossip = gossip,
             .org_cert = self.our_org_cert orelse std.mem.zeroes([messages.ORG_CERT_WIRE_SIZE]u8),
             .has_org_cert = self.our_org_cert != null,
@@ -1277,6 +1315,87 @@ pub const SwimProtocol = struct {
         }
     }
 
+    /// Enqueue a fresh advertisement of ourselves (identity + wg_pubkey +
+    /// endpoint). Used both for the initial join and to re-advertise after a
+    /// peer restarts, so the rejoiner re-learns us and can complete the WG
+    /// handshake. Bounded and queued (max_gossip_broadcasts), unlike a
+    /// per-packet injection.
+    fn enqueueSelfGossip(self: *SwimProtocol) void {
+        self.enqueueGossip(.{
+            .subject_pubkey = self.our_pubkey,
+            .event = .alive,
+            .lamport = self.membership.lamport,
+            .endpoint = self.our_public_endpoint orelse messages.Endpoint.initV6(self.our_mesh_ip6, self.config.gossip_port),
+            .wg_pubkey = self.our_wg_pubkey,
+            .public_endpoint = self.our_public_endpoint,
+            .nat_type = self.our_nat_type,
+        });
+    }
+
+    /// Detect and heal a peer restart from an AUTHENTICATED ping/ack. If the
+    /// sender's incarnation exceeds what we have stored, it restarted with the
+    /// same identity: the survivor otherwise keeps it as already-known and never
+    /// re-advertises itself, so the rejoiner (which lost all state) never
+    /// re-learns us and the WG tunnel never re-forms. We re-advertise ourselves
+    /// (rejoiner re-learns us -> re-initiates the handshake, which our WG
+    /// responder services with a fresh session) and drop our stale
+    /// handshake_complete flag so we also re-initiate.
+    ///
+    /// SECURITY: only ever called from the ping/ack handlers, which have already
+    /// passed isAuthorizedPeer, and it acts only on the AUTHENTICATED sender's
+    /// own entry — never from gossip. A forged gossip "rejoin" for a third party
+    /// cannot reach this path, so it cannot rebind or tear down a trusted peer's
+    /// session.
+    fn handleSenderIncarnation(self: *SwimProtocol, sender_pubkey: [32]u8, incarnation: u64) void {
+        if (incarnation == 0) return; // peer predates incarnation support
+        if (std.mem.eql(u8, &sender_pubkey, &self.our_pubkey)) return;
+        const peer = self.membership.peers.getPtr(sender_pubkey) orelse return;
+        if (peer.incarnation == 0) {
+            // First incarnation seen for this peer — record it (not a restart).
+            peer.incarnation = incarnation;
+            return;
+        }
+        if (incarnation <= peer.incarnation) return; // steady state
+        // Higher incarnation => the peer RESTARTED. Re-integrate it.
+        peer.incarnation = incarnation;
+        peer.handshake_complete = false;
+        // Re-advertise ourselves so the rejoiner (which lost all state)
+        // re-learns our identity + wg_pubkey.
+        self.enqueueSelfGossip();
+        // Rebuild the WG session for the peer: onPeerDead removes the stale peer
+        // (addPeerWithEndpoint would otherwise reuse the old completed handshake
+        // slot and the re-init runs on stale state), then onPeerJoin re-adds it
+        // fresh and the deterministic initiator re-sends a handshake initiation.
+        // The periodic retransmit in tick() covers the init/ack race where our
+        // init reaches the rejoiner before it has re-learned us.
+        if (self.handler) |h| {
+            h.onPeerDead(h.ctx, sender_pubkey);
+            h.onPeerJoin(h.ctx, peer);
+        }
+    }
+
+    /// Periodically re-drive handshakes for alive peers whose tunnel is not yet
+    /// up. Re-fires onPeerJoin, which the handler makes a no-op for peers with an
+    /// established session (WgDevice.hasActiveTunnel) and a (re)initiation for
+    /// stalled ones. Covers the post-restart init/ack race — our re-initiation
+    /// can reach the rejoiner before it has re-learned us — and any dropped
+    /// initial handshake. One pass per gossip interval.
+    fn retransmitStalledHandshakes(self: *SwimProtocol, now_ns: i128) void {
+        if (!self.retransmit_handshakes) return; // userspace-TUN only (see field)
+        const interval_ns: i128 = @as(i128, self.config.gossip_interval_ms) * 1_000_000;
+        if (now_ns - self.last_handshake_retransmit_ns < interval_ns) return;
+        self.last_handshake_retransmit_ns = now_ns;
+        const h = self.handler orelse return;
+        var iter = self.membership.peers.iterator();
+        while (iter.next()) |entry| {
+            const peer = entry.value_ptr;
+            if (peer.state != .alive) continue;
+            if (peer.wg_pubkey == null) continue;
+            if (peer.gossip_endpoint == null and peer.public_endpoint == null) continue;
+            h.onPeerJoin(h.ctx, peer);
+        }
+    }
+
     /// React to an unauthenticated gossip claim that a third party is failing.
     /// Marks the subject suspected locally and actively probes it, so OUR failure
     /// detector — not a remote attacker — decides whether to evict. Only peers we
@@ -1457,6 +1576,60 @@ fn issueCertWire(org_kp: Org.OrgKeyPair, node_pubkey: [32]u8, name: []const u8) 
     var cert_wire: [messages.ORG_CERT_WIRE_SIZE]u8 = undefined;
     cert.serialize(&cert_wire);
     return cert_wire;
+}
+
+test "peer restart is detected by incarnation and steady state is not" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+
+    var counter = JoinCounter{};
+    var swim = SwimProtocol.init(
+        &membership,
+        inertTestSocket(),
+        .{},
+        [_]u8{1} ** 32, // our_pubkey
+        [_]u8{2} ** 32, // our_wg_pubkey
+        .{ 127, 0, 0, 1 },
+        51821,
+        .{ .ctx = &counter, .onPeerJoin = countPeerJoin, .onPeerDead = ignorePeerDead },
+    );
+
+    const peer_pk = [_]u8{3} ** 32;
+    try membership.upsert(aliveTestPeer(peer_pk));
+
+    // First incarnation observed: recorded, NOT treated as a restart.
+    swim.handleSenderIncarnation(peer_pk, 100);
+    try std.testing.expectEqual(@as(u64, 100), membership.peers.get(peer_pk).?.incarnation);
+    try std.testing.expectEqual(@as(usize, 0), counter.count);
+
+    // Same incarnation (steady-state pings): no rejoin.
+    swim.handleSenderIncarnation(peer_pk, 100);
+    try std.testing.expectEqual(@as(usize, 0), counter.count);
+
+    // Lower incarnation (reordered/stale packet): no rejoin, no downgrade.
+    swim.handleSenderIncarnation(peer_pk, 50);
+    try std.testing.expectEqual(@as(usize, 0), counter.count);
+    try std.testing.expectEqual(@as(u64, 100), membership.peers.get(peer_pk).?.incarnation);
+
+    // Higher incarnation => the peer RESTARTED: rejoin (onPeerJoin re-fires) and
+    // the stored incarnation advances.
+    swim.handleSenderIncarnation(peer_pk, 200);
+    try std.testing.expectEqual(@as(usize, 1), counter.count);
+    try std.testing.expectEqual(peer_pk, counter.last_pubkey.?);
+    try std.testing.expectEqual(@as(u64, 200), membership.peers.get(peer_pk).?.incarnation);
+
+    // Incarnation 0 (peer predates the feature) is ignored.
+    swim.handleSenderIncarnation(peer_pk, 0);
+    try std.testing.expectEqual(@as(usize, 1), counter.count);
+
+    // Our own pubkey is ignored.
+    swim.handleSenderIncarnation([_]u8{1} ** 32, 999);
+    try std.testing.expectEqual(@as(usize, 1), counter.count);
+
+    // An unknown peer is ignored (no rejoin, no crash).
+    swim.handleSenderIncarnation([_]u8{9} ** 32, 999);
+    try std.testing.expectEqual(@as(usize, 1), counter.count);
 }
 
 test "gossiped join cannot admit an unauthorized subject with wg key" {

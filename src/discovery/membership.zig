@@ -53,6 +53,10 @@ pub const Peer = struct {
     last_rtt_ns: ?u64,
     /// Whether handshake has been completed
     handshake_complete: bool,
+    /// Peer's advertised incarnation (startup epoch). When a ping/ack arrives
+    /// with a higher incarnation than this, the peer has restarted and must be
+    /// re-integrated. 0 = not yet known.
+    incarnation: u64 = 0,
     /// STUN-discovered public endpoint (NAT traversal)
     public_endpoint: ?messages.Endpoint = null,
     /// NAT type classification
