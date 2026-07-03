@@ -467,7 +467,11 @@ fn decodeOrgCertExtension(
 ) DecodeError!void {
     if (pos >= data.len) return;
     if (data[pos] != 1) return;
-    if (pos + ORG_CERT_EXTENSION_SIZE > data.len) return error.BufferTooShort;
+    // A truncated/malformed trailing extension must not nullify an otherwise-valid
+    // SWIM packet (its liveness + gossip already parsed). Treat a short cert as "no
+    // cert present", mirroring the lenient gossip-entry loop, rather than failing the
+    // whole ping/ack decode.
+    if (pos + ORG_CERT_EXTENSION_SIZE > data.len) return;
     @memcpy(cert, data[pos + 1 ..][0..messages.ORG_CERT_WIRE_SIZE]);
     has_cert.* = true;
 }
@@ -859,6 +863,24 @@ test "org trust vouch roundtrip" {
             try std.testing.expectEqual(v.lamport, 777);
             try std.testing.expectEqualSlices(u8, &sig, &v.signature);
         },
+        else => return error.InvalidMessageType,
+    }
+}
+
+test "truncated trailing org-cert flag does not drop the whole packet (C4)" {
+    const pubkey = [_]u8{0x01} ** 32;
+    const ping = messages.Ping{ .sender_pubkey = pubkey, .seq = 7, .gossip = &.{} };
+
+    var buf: [600]u8 = undefined;
+    const written = try encodePing(&buf, ping);
+
+    // Append a stray cert-present flag (0x01) with no room for the 186-byte cert.
+    // Pre-fix this returned error.BufferTooShort and failed the ENTIRE decode,
+    // discarding otherwise-valid SWIM liveness + gossip.
+    buf[written] = 1;
+    const decoded = try decode(buf[0 .. written + 1]);
+    switch (decoded) {
+        .ping => |p| try std.testing.expect(!p.has_org_cert),
         else => return error.InvalidMessageType,
     }
 }
