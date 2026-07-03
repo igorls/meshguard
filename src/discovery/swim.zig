@@ -66,6 +66,9 @@ const PendingPing = struct {
 const SEND_RATE_PPS: f64 = 500.0;
 /// Token-bucket capacity (allowed short burst above the sustained rate).
 const SEND_BURST: f64 = 100.0;
+// Bounded quarantine for unproven gossip hints. A sustained fake-candidate flood
+// can starve honest hints until SWIM re-gossips them, but the fixed cap is the
+// security boundary that prevents one packet from buying unbounded probe work.
 const MAX_CANDIDATE_PEERS: usize = 64;
 const CANDIDATE_PROBE_INTERVAL_NS: i128 = 1_000_000_000;
 const CANDIDATE_TTL_NS: i128 = 30_000_000_000;
@@ -1158,7 +1161,11 @@ pub const SwimProtocol = struct {
         const now = nowNs();
         for (self.candidate_peers[0..self.candidate_count]) |*candidate| {
             if (std.mem.eql(u8, &candidate.pubkey, &pubkey)) {
-                candidate.endpoint = endpoint;
+                if (!messages.Endpoint.eql(candidate.endpoint, endpoint)) {
+                    candidate.endpoint = endpoint;
+                    candidate.last_probe_ns = 0;
+                    candidate.probe_count = 0;
+                }
                 return;
             }
         }
@@ -1556,6 +1563,67 @@ test "candidate with invalid cert never graduates and is evicted" {
     swim.candidate_peers[0].probe_count = CANDIDATE_MAX_PROBES;
     swim.probeCandidatePeer(nowNs());
     try std.testing.expectEqual(@as(usize, 0), swim.candidate_count);
+}
+
+test "candidate endpoint refresh resets probes but not lifetime" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+    const socket = inertTestSocket();
+
+    var swim = SwimProtocol.init(&membership, socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    swim.enableTrust();
+    swim.addTrustedOrg([_]u8{0xA0} ** 32);
+
+    const candidate = [_]u8{0x34} ** 32;
+    const stale_endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 42100);
+    const fresh_endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 42101);
+    swim.applyGossip(.{
+        .subject_pubkey = candidate,
+        .event = .join,
+        .lamport = 1,
+        .endpoint = stale_endpoint,
+    });
+    const first_seen = swim.candidate_peers[0].first_seen_ns;
+    swim.candidate_peers[0].probe_count = CANDIDATE_MAX_PROBES;
+    swim.candidate_peers[0].last_probe_ns = first_seen + 1;
+
+    swim.applyGossip(.{
+        .subject_pubkey = candidate,
+        .event = .alive,
+        .lamport = 2,
+        .endpoint = fresh_endpoint,
+    });
+
+    try std.testing.expect(messages.Endpoint.eql(swim.candidate_peers[0].endpoint, fresh_endpoint));
+    try std.testing.expectEqual(first_seen, swim.candidate_peers[0].first_seen_ns);
+    try std.testing.expectEqual(@as(u8, 0), swim.candidate_peers[0].probe_count);
+    try std.testing.expectEqual(@as(i128, 0), swim.candidate_peers[0].last_probe_ns);
+
+    const expiring_candidate = [_]u8{0x35} ** 32;
+    const endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 42102);
+    swim.applyGossip(.{
+        .subject_pubkey = expiring_candidate,
+        .event = .join,
+        .lamport = 3,
+        .endpoint = endpoint,
+    });
+    const expiring_index: usize = if (std.mem.eql(u8, &swim.candidate_peers[0].pubkey, &expiring_candidate)) 0 else 1;
+    const expired_start = nowNs() - CANDIDATE_TTL_NS - 1;
+    swim.candidate_peers[expiring_index].first_seen_ns = expired_start;
+    swim.candidate_peers[expiring_index].probe_count = CANDIDATE_MAX_PROBES - 1;
+    swim.applyGossip(.{
+        .subject_pubkey = expiring_candidate,
+        .event = .alive,
+        .lamport = 4,
+        .endpoint = endpoint,
+    });
+
+    try std.testing.expectEqual(expired_start, swim.candidate_peers[expiring_index].first_seen_ns);
+    try std.testing.expectEqual(CANDIDATE_MAX_PROBES - 1, swim.candidate_peers[expiring_index].probe_count);
+    swim.probeCandidatePeer(nowNs());
+    try std.testing.expectEqual(@as(usize, 1), swim.candidate_count);
+    try std.testing.expect(std.mem.eql(u8, &swim.candidate_peers[0].pubkey, &candidate));
 }
 
 test "cert-only gossip candidate is probed then graduates on direct cert" {
