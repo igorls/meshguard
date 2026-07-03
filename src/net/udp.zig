@@ -41,31 +41,25 @@ const win = if (is_windows) struct {
 // very first UDP bind ("failed to bind gossip port 51821") even though the port is
 // free — the same reason a raw socket path fails while .NET's UdpClient (which calls
 // WSAStartup internally) binds fine. This lazy init closes that gap. No-op elsewhere.
-const WsaInitState = enum(u8) { uninitialized = 0, initializing = 1, ready = 2 };
-var wsa_state = std.atomic.Value(u8).init(@intFromEnum(WsaInitState.uninitialized));
+var wsa_ready = std.atomic.Value(bool).init(false);
 
-/// Ensure Winsock is initialized before any socket is created. Idempotent and
-/// thread-safe: WSAStartup runs exactly once; concurrent callers block until it
-/// completes. No-op on non-Windows targets.
+/// Ensure Winsock is initialized before any socket is created. No-op on non-Windows.
+/// WSAStartup is itself thread-safe and reference-counted, so the rare concurrent
+/// double-call this may allow is harmless (we intentionally hold Winsock for the
+/// process lifetime and never WSACleanup); the atomic flag only avoids repeating it on
+/// every socket. Each caller proceeds solely on its OWN successful startup, so no
+/// socket call can run before Winsock is up. Only success publishes the flag: if
+/// WSAStartup fails we leave it clear so the caller's socket() surfaces the real error
+/// and a later attempt retries, rather than masking the failure.
 pub fn ensureWinsockInit() void {
     if (comptime is_windows) {
-        if (wsa_state.load(.acquire) == @intFromEnum(WsaInitState.ready)) return;
-        if (wsa_state.cmpxchgStrong(
-            @intFromEnum(WsaInitState.uninitialized),
-            @intFromEnum(WsaInitState.initializing),
-            .acq_rel,
-            .acquire,
-        ) == null) {
-            // We won the race: perform the one-time startup. MAKEWORD(2, 2) = 0x0202.
-            // WSADATA is an out-param we never read; a byte buffer is layout-safe.
-            var data: [512]u8 = undefined;
-            _ = win.WSAStartup(0x0202, &data);
-            wsa_state.store(@intFromEnum(WsaInitState.ready), .release);
-            return;
-        }
-        // Another thread is initializing; wait for it to finish before returning.
-        while (wsa_state.load(.acquire) != @intFromEnum(WsaInitState.ready)) {
-            std.atomic.spinLoopHint();
+        if (wsa_ready.load(.acquire)) return;
+        // WSADATA is an out-param we never read; a buffer that is large enough and
+        // pointer-aligned (its strictest field) keeps Winsock's writes aligned even on
+        // ARM64. MAKEWORD(2, 2) = 0x0202.
+        var data: [512]u8 align(@alignOf(*anyopaque)) = undefined;
+        if (win.WSAStartup(0x0202, &data) == 0) {
+            wsa_ready.store(true, .release);
         }
     }
 }
