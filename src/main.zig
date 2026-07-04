@@ -919,6 +919,8 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
             .onPeerJoin = &wgOnPeerJoin,
             .onPeerDead = &wgOnPeerDead,
             .onPeerPunched = &wgOnPeerPunched,
+            .hasActiveTunnel = &wgHasActiveTunnel,
+            .reinitiateHandshake = &wgReinitiate,
         },
     );
     // SWIM-driven handshake retransmit is only needed for the userspace WG data
@@ -1722,6 +1724,34 @@ const WgHandlerCtx = struct {
     socket: ?*lib.net.Udp.UdpSocket = null,
     use_kernel: bool = true,
 };
+
+/// S2: report whether we hold a live userspace WG tunnel to `wg_pubkey`. Kernel WG
+/// tracks its own sessions, so this returns false there (liveness unknown) and the
+/// incarnation restart path proceeds as before.
+fn wgHasActiveTunnel(ctx: *anyopaque, wg_pubkey: [32]u8) bool {
+    const handler: *WgHandlerCtx = @ptrCast(@alignCast(ctx));
+    const dev = handler.wg_device orelse return false;
+    return dev.hasActiveTunnel(wg_pubkey);
+}
+
+/// S2 heal: re-initiate a WG handshake to a peer whose restart we detected while
+/// still holding a (stale) live session — only when WE are the deterministic
+/// tie-break initiator (mirrors wgOnPeerJoin), so we never race the peer into a
+/// simultaneous initiation. A handshake refresh, not a teardown; the device applies
+/// its own 5s rate limit. No-op in kernel/gossip-only mode.
+fn wgReinitiate(ctx: *anyopaque, peer: *const lib.discovery.Membership.Peer) void {
+    const handler: *WgHandlerCtx = @ptrCast(@alignCast(ctx));
+    const dev = handler.wg_device orelse return;
+    const wg_key = peer.wg_pubkey orelse return;
+    if (std.mem.order(u8, &dev.static_public, &wg_key) != .lt) return; // only the initiator
+    const Endpoint = @import("protocol/messages.zig").Endpoint;
+    const ep: Endpoint = if (peer.gossip_endpoint) |e| e else if (peer.public_endpoint) |pe| pe else return;
+    if (dev.reinitiate(wg_key)) |init_msg| {
+        if (handler.socket) |sock| {
+            _ = sock.sendToEndpoint(std.mem.asBytes(&init_msg), ep) catch 0;
+        }
+    } else |_| {} // peer not registered / rate-limited
+}
 
 fn wgOnPeerJoin(ctx: *anyopaque, peer: *const lib.discovery.Membership.Peer) void {
     const handler: *WgHandlerCtx = @ptrCast(@alignCast(ctx));

@@ -426,6 +426,15 @@ pub const WgDevice = struct {
     /// True if we hold an established transport session (a completed handshake)
     /// for this peer. Lets the periodic handshake retransmit skip peers whose
     /// tunnel is already up, so only stalled/rejoining peers are re-initiated.
+    /// Force a fresh handshake initiation to an already-registered peer, bypassing
+    /// the "already established" short-circuit — used by the S2 restart-heal path to
+    /// refresh a stale-but-unexpired session without tearing it down. initiateHandshake
+    /// applies its own 5s rate limit and returns error.HandshakeRateLimited when hot.
+    pub fn reinitiate(self: *WgDevice, wg_pubkey: [32]u8) !noise.HandshakeInitiation {
+        const slot = self.static_map.get(wg_pubkey) orelse return error.PeerNotFound;
+        return self.initiateHandshake(slot);
+    }
+
     pub fn hasActiveTunnel(self: *WgDevice, wg_pubkey: [32]u8) bool {
         self.lock.lockUncancelable(zio());
         defer self.lock.unlock(zio());

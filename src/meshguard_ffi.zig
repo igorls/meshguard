@@ -358,6 +358,8 @@ export fn meshguard_join(
         .onPeerPunched = null,
         .onAppMessage = &onAppMessageCallback,
         .onWgPacket = &onWgPacketCallback,
+        .hasActiveTunnel = &hasActiveTunnelCallback,
+        .reinitiateHandshake = &reinitiateHandshakeCallback,
     };
 
     // Initialize SWIM protocol — use OUR port, not the seed's port
@@ -415,6 +417,8 @@ export fn meshguard_join_ipv6(
         .onPeerPunched = null,
         .onAppMessage = &onAppMessageCallback,
         .onWgPacket = &onWgPacketCallback,
+        .hasActiveTunnel = &hasActiveTunnelCallback,
+        .reinitiateHandshake = &reinitiateHandshakeCallback,
     };
 
     c.swim = SwimProtocol.init(
@@ -474,6 +478,8 @@ export fn meshguard_join_lan(
         .onPeerPunched = null,
         .onAppMessage = &onAppMessageCallback,
         .onWgPacket = &onWgPacketCallback,
+        .hasActiveTunnel = &hasActiveTunnelCallback,
+        .reinitiateHandshake = &reinitiateHandshakeCallback,
     };
 
     // Initialize SWIM protocol
@@ -1187,6 +1193,33 @@ fn onAppMessageCallback(raw_ctx: *anyopaque, data: []const u8) void {
 // ─── Internal: WireGuard tunnel packet handling ───
 
 /// Callback adapter: SWIM → FFI WG packet dispatch
+/// S2: report whether we hold a live userspace WG tunnel to `wg_pubkey`, so SWIM's
+/// incarnation restart detection can use it as an origin-authentication signal (a
+/// spoofer cannot forge a live WG session). False when no device exists yet.
+fn hasActiveTunnelCallback(raw_ctx: *anyopaque, wg_pubkey: [32]u8) bool {
+    const ctx: *MeshguardContext = @ptrCast(@alignCast(raw_ctx));
+    if (ctx.wg_device) |*dev| return dev.hasActiveTunnel(wg_pubkey);
+    return false;
+}
+
+/// S2 heal: re-initiate a WG handshake to a restarted peer whose stale session we
+/// still hold — only when we are the tie-break initiator, so we don't race a
+/// simultaneous init. A refresh, not a teardown; device-rate-limited. No-op if the
+/// peer isn't registered in our device.
+fn reinitiateHandshakeCallback(raw_ctx: *anyopaque, peer: *const Membership.Peer) void {
+    const ctx: *MeshguardContext = @ptrCast(@alignCast(raw_ctx));
+    if (ctx.wg_device) |*dev| {
+        const wg_key = peer.wg_pubkey orelse return;
+        if (std.mem.order(u8, &dev.static_public, &wg_key) != .lt) return; // only the initiator
+        const ep: messages.Endpoint = if (peer.gossip_endpoint) |e| e else if (peer.public_endpoint) |pe| pe else return;
+        if (dev.reinitiate(wg_key)) |init_msg| {
+            if (ctx.socket) |*sock| {
+                _ = sock.sendToEndpoint(std.mem.asBytes(&init_msg), ep) catch 0;
+            }
+        } else |_| {}
+    }
+}
+
 fn onWgPacketCallback(raw_ctx: *anyopaque, data: []const u8, sender_addr: [4]u8, sender_port: u16) void {
     const ctx: *MeshguardContext = @ptrCast(@alignCast(raw_ctx));
     handleWgPacket(ctx, data, sender_addr, sender_port);

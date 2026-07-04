@@ -47,6 +47,13 @@ fn incarnationNow() u64 {
     return @intCast(std.Io.Timestamp.now(zio(), .real).toNanoseconds());
 }
 
+// Max clock skew we tolerate when validating a peer's incarnation (its startup
+// wall-clock, ns). An incarnation beyond our own clock by more than this is forged
+// (a node cannot have started in the future); rejecting it bounds how far a spoofed
+// value can advance our stored incarnation, so it can never be pushed to the u64
+// ceiling nor ahead of a genuine future restart's (later) startup time.
+const INCARNATION_SKEW_NS: u64 = 300 * std.time.ns_per_s; // 5 minutes
+
 pub const SwimConfig = struct {
     gossip_port: u16 = 51821,
     gossip_interval_ms: u32 = 5000, // 5s — reasonable for WAN
@@ -68,6 +75,17 @@ pub const EventHandler = struct {
     onPeerPunched: ?*const fn (ctx: *anyopaque, peer: *const Membership.Peer, endpoint: messages.Endpoint) void = null,
     onAppMessage: ?*const fn (ctx: *anyopaque, data: []const u8) void = null,
     onWgPacket: ?*const fn (ctx: *anyopaque, data: []const u8, addr: [4]u8, port: u16) void = null,
+    /// Query whether a live WireGuard session currently exists for `wg_pubkey`.
+    /// Used as an origin-authentication signal for restart detection (S2): SWIM
+    /// ping/ack are not origin-authenticated, but holding a live tunnel proves the
+    /// peer possesses its WG private key, which a spoofer cannot forge. Returns
+    /// false when liveness is unknown (kernel WG / gossip-only / no device).
+    hasActiveTunnel: ?*const fn (ctx: *anyopaque, wg_pubkey: [32]u8) bool = null,
+    /// Re-initiate a WG handshake to a peer we still hold a (stale) session for,
+    /// used by the S2 restart-heal path. The implementation must only act when it is
+    /// the deterministic tie-break initiator toward the peer (to avoid a
+    /// simultaneous-init race), and it is a handshake refresh — never a teardown.
+    reinitiateHandshake: ?*const fn (ctx: *anyopaque, peer: *const Membership.Peer) void = null,
 };
 
 /// Gossip entry with broadcast remaining counter.
@@ -1370,23 +1388,34 @@ pub const SwimProtocol = struct {
         self.enqueueSelfGossip();
     }
 
-    /// Detect and heal a peer restart from an AUTHENTICATED ping/ack. If the
-    /// sender's incarnation exceeds what we have stored, it restarted with the
-    /// same identity: the survivor otherwise keeps it as already-known and never
-    /// re-advertises itself, so the rejoiner (which lost all state) never
-    /// re-learns us and the WG tunnel never re-forms. We re-advertise ourselves
-    /// (rejoiner re-learns us -> re-initiates the handshake, which our WG
-    /// responder services with a fresh session) and drop our stale
-    /// handshake_complete flag so we also re-initiate.
+    /// Detect and heal a peer restart signalled by a ping/ack. A higher incarnation
+    /// than we have stored means the sender restarted with the same identity.
     ///
-    /// SECURITY: only ever called from the ping/ack handlers, which have already
-    /// passed isAuthorizedPeer, and it acts only on the AUTHENTICATED sender's
-    /// own entry — never from gossip. A forged gossip "rejoin" for a third party
-    /// cannot reach this path, so it cannot rebind or tear down a trusted peer's
-    /// session.
+    /// SECURITY: called only from the ping/ack handlers (past isAuthorizedPeer), but
+    /// that authenticates the CLAIMED identity, NOT the packet origin — SWIM ping/ack
+    /// are unsigned, so a spoofer who knows a peer's public pubkey can forge a restart
+    /// claim. Two guards defang that (see S2):
+    ///   1. We reject an implausibly-future incarnation (a node cannot have started in
+    ///      the future). This bounds how far a forged value can advance our stored
+    ///      incarnation, so pinning it can never blind us to a genuine later restart
+    ///      (which carries a still-later startup time) — and it can't reach the u64
+    ///      ceiling. Because the pin is thus bounded, we pin unconditionally, which
+    ///      also stops steady-state pings from re-entering the heal branch (no churn).
+    ///   2. If we currently hold a LIVE WireGuard tunnel to the peer — which a spoofer
+    ///      cannot forge (needs the peer's WG private key) — we do NOT tear it down.
+    ///      To still heal a genuine restart of a tie-break LOSER (which won't
+    ///      re-initiate itself, and whose survivor is the initiator), we re-initiate
+    ///      the handshake ourselves via reinitiateHandshake — a refresh, not a
+    ///      teardown (WG supersedes the stale session; a spoof costs at most one
+    ///      device-rate-limited rekey). Verified: heal ~1 interval in both tie-break
+    ///      directions.
+    /// A forged GOSSIP rejoin still cannot reach this path at all (never called from
+    /// applyGossip).
     fn handleSenderIncarnation(self: *SwimProtocol, sender_pubkey: [32]u8, incarnation: u64) void {
         if (incarnation == 0) return; // peer predates incarnation support
         if (std.mem.eql(u8, &sender_pubkey, &self.our_pubkey)) return;
+        // Guard 1: reject an implausibly-future incarnation (bounds any pin to ~now).
+        if (incarnation > incarnationNow() +| INCARNATION_SKEW_NS) return;
         const peer = self.membership.peers.getPtr(sender_pubkey) orelse return;
         if (peer.incarnation == 0) {
             // First incarnation seen for this peer — record it (not a restart).
@@ -1394,23 +1423,38 @@ pub const SwimProtocol = struct {
             return;
         }
         if (incarnation <= peer.incarnation) return; // steady state
-        // Higher incarnation => the peer RESTARTED. Re-integrate it.
+
+        // Higher (and plausibly-timed) incarnation => the peer restarted. Pin it now
+        // — safe because it is bounded to ~now above, so steady-state pings stop
+        // re-entering this branch while a genuine later restart is still detected.
         peer.incarnation = incarnation;
         peer.handshake_complete = false;
-        // Re-advertise ourselves so the rejoiner (which lost all state)
-        // re-learns our identity + wg_pubkey.
+
+        // Guard 2: if we hold a live tunnel to the peer, do NOT tear it down (a
+        // spoofer cannot forge it; a real restart's stale session heals below without
+        // a teardown). Re-initiate the handshake ourselves so a restarted tie-break
+        // LOSER (which won't initiate) still heals; the handler restricts this to when
+        // we are the initiator and the WG device rate-limits it.
+        if (peer.wg_pubkey) |wg| {
+            if (self.handler) |h| {
+                if (h.hasActiveTunnel) |hasTunnel| {
+                    if (hasTunnel(h.ctx, wg)) {
+                        if (h.reinitiateHandshake) |reinit| reinit(h.ctx, peer);
+                        return;
+                    }
+                }
+            }
+        }
+
+        // No live tunnel — safe to fully rebuild: re-advertise ourselves so the
+        // rejoiner re-learns our identity + wg_pubkey, then tear down the stale WG
+        // peer (addPeerWithEndpoint would otherwise reuse the old completed slot) and
+        // re-add it fresh so the deterministic initiator re-sends a handshake
+        // initiation. The tick() retransmit covers the init/ack race.
         self.enqueueSelfGossip();
-        // Rebuild the WG session for the peer: onPeerDead removes the stale peer
-        // (addPeerWithEndpoint would otherwise reuse the old completed handshake
-        // slot and the re-init runs on stale state), then onPeerJoin re-adds it
-        // fresh and the deterministic initiator re-sends a handshake initiation.
-        // The periodic retransmit in tick() covers the init/ack race where our
-        // init reaches the rejoiner before it has re-learned us.
         if (self.handler) |h| {
             h.onPeerDead(h.ctx, sender_pubkey);
-            // Re-fetch: `peer` is a pointer into the membership hashmap. Per the
-            // handler contract onPeerDead may mutate membership (a rehash would
-            // dangle `peer`), so re-resolve before handing it to onPeerJoin.
+            // Re-fetch: onPeerDead may mutate membership (rehash) and dangle `peer`.
             if (self.membership.peers.getPtr(sender_pubkey)) |p| h.onPeerJoin(h.ctx, p);
         }
     }
@@ -2255,4 +2299,119 @@ test "Lamport increments saturate and never overflow (P1)" {
     try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), membership.lamport);
     membership.markDead(pk);
     try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), membership.lamport);
+}
+
+const S2TestCtx = struct {
+    join_count: usize = 0,
+    dead_count: usize = 0,
+    reinit_count: usize = 0,
+    tunnel_live: bool = false,
+};
+fn s2OnJoin(ctx: *anyopaque, _: *const Membership.Peer) void {
+    const c: *S2TestCtx = @ptrCast(@alignCast(ctx));
+    c.join_count += 1;
+}
+fn s2OnDead(ctx: *anyopaque, _: [32]u8) void {
+    const c: *S2TestCtx = @ptrCast(@alignCast(ctx));
+    c.dead_count += 1;
+}
+fn s2HasTunnel(ctx: *anyopaque, _: [32]u8) bool {
+    const c: *S2TestCtx = @ptrCast(@alignCast(ctx));
+    return c.tunnel_live;
+}
+fn s2Reinit(ctx: *anyopaque, _: *const Membership.Peer) void {
+    const c: *S2TestCtx = @ptrCast(@alignCast(ctx));
+    c.reinit_count += 1;
+}
+
+test "S2: live-tunnel restart claim never tears down; heals via re-init" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+
+    var tctx = S2TestCtx{ .tunnel_live = true };
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, .{
+        .ctx = &tctx,
+        .onPeerJoin = s2OnJoin,
+        .onPeerDead = s2OnDead,
+        .hasActiveTunnel = s2HasTunnel,
+        .reinitiateHandshake = s2Reinit,
+    });
+
+    const v = [_]u8{0x77} ** 32;
+    var p = aliveTestPeer(v);
+    p.wg_pubkey = [_]u8{0x88} ** 32; // we hold V's WG key — a live tunnel is possible
+    p.incarnation = 100;
+    try membership.upsert(p);
+
+    // Higher (plausible) incarnation while our tunnel to V is live. A spoofer cannot
+    // forge V's live WG session, so we must NOT tear the tunnel down; we heal via a
+    // handshake RE-INIT (covers a restarted tie-break loser), never a teardown.
+    swim.handleSenderIncarnation(v, 12345);
+
+    try std.testing.expectEqual(@as(usize, 0), tctx.dead_count); // never tears the tunnel down
+    try std.testing.expectEqual(@as(usize, 0), tctx.join_count); // no rebuild
+    try std.testing.expectEqual(@as(usize, 1), tctx.reinit_count); // heals via re-init instead
+    // Incarnation is pinned (safe: it is bounded below the future clamp), so
+    // steady-state pings won't re-enter this branch and churn re-inits.
+    try std.testing.expectEqual(@as(u64, 12345), membership.peers.get(v).?.incarnation);
+}
+
+test "S2: implausibly-future incarnation is rejected (pin cannot be poisoned)" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+
+    var tctx = S2TestCtx{ .tunnel_live = true };
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, .{
+        .ctx = &tctx,
+        .onPeerJoin = s2OnJoin,
+        .onPeerDead = s2OnDead,
+        .hasActiveTunnel = s2HasTunnel,
+        .reinitiateHandshake = s2Reinit,
+    });
+
+    const v = [_]u8{0x77} ** 32;
+    var p = aliveTestPeer(v);
+    p.wg_pubkey = [_]u8{0x88} ** 32;
+    p.incarnation = 100;
+    try membership.upsert(p);
+
+    // A node cannot have started in the future: maxInt(u64) is implausible -> rejected
+    // outright, so a forged value can't pin our incarnation near the ceiling and blind
+    // us to V's real restarts.
+    swim.handleSenderIncarnation(v, std.math.maxInt(u64));
+    try std.testing.expectEqual(@as(u64, 100), membership.peers.get(v).?.incarnation); // unchanged
+    try std.testing.expectEqual(@as(usize, 0), tctx.reinit_count);
+    try std.testing.expectEqual(@as(usize, 0), tctx.dead_count);
+}
+
+test "S2: genuine rejoin proceeds when no live tunnel (not over-gated)" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+
+    var tctx = S2TestCtx{ .tunnel_live = false }; // tunnel down/expired (e.g. past REJECT_AFTER_TIME)
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, .{
+        .ctx = &tctx,
+        .onPeerJoin = s2OnJoin,
+        .onPeerDead = s2OnDead,
+        .hasActiveTunnel = s2HasTunnel,
+        .reinitiateHandshake = s2Reinit,
+    });
+
+    const v = [_]u8{0x77} ** 32;
+    var p = aliveTestPeer(v);
+    p.wg_pubkey = [_]u8{0x88} ** 32;
+    p.incarnation = 100;
+    try membership.upsert(p);
+
+    swim.handleSenderIncarnation(v, 200);
+
+    // No live tunnel to protect -> full rebuild (teardown + re-add) and the incarnation
+    // advances. Proves the gate doesn't over-suppress recovery.
+    try std.testing.expectEqual(@as(usize, 1), tctx.dead_count);
+    try std.testing.expectEqual(@as(usize, 1), tctx.join_count);
+    try std.testing.expectEqual(@as(usize, 0), tctx.reinit_count); // rebuild path, not re-init
+    try std.testing.expectEqual(@as(u64, 200), membership.peers.get(v).?.incarnation);
 }
