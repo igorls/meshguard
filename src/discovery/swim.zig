@@ -2241,12 +2241,18 @@ test "Lamport increments saturate and never overflow (P1)" {
     var membership = Membership.MembershipTable.init(allocator, 5000);
     defer membership.deinit();
 
-    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    const pk = [_]u8{3} ** 32;
+    try membership.upsert(aliveTestPeer(pk));
 
-    // Even if the clock somehow sits at the ceiling, a membership transition that
-    // bumps the Lamport clock must saturate rather than panic (safe builds) / wrap.
-    swim.membership.lamport = std.math.maxInt(u64);
-    swim.broadcastLeave(); // does membership.lamport +|= 1
-    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), swim.membership.lamport);
-    membership.markAlive([_]u8{3} ** 32, null); // no-op peer, must not overflow either
+    // Drive the clock to the ceiling, then exercise every membership transition that
+    // bumps it — suspect / markAlive / markDead each did `lamport += 1` (now `+|=`).
+    // On an EXISTING peer these actually reach the increment, so a plain += would
+    // overflow here (panic in safe builds). All must saturate at maxInt.
+    membership.lamport = std.math.maxInt(u64);
+    membership.suspect(pk);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), membership.lamport);
+    membership.markAlive(pk, null);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), membership.lamport);
+    membership.markDead(pk);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), membership.lamport);
 }
