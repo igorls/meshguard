@@ -18,6 +18,12 @@ const Udp = @import("../net/udp.zig");
 const Holepuncher = @import("../nat/holepunch.zig").Holepuncher;
 const log = std.log.scoped(.swim);
 
+// Max amount a single (possibly forged, unauthenticated) gossip entry may advance
+// our Lamport clock. Prevents a maxInt(u64) entry from rocketing the clock to the
+// ceiling (which breaks ordering and would overflow later increments); ~1B is far
+// beyond any legitimate peer's lead.
+const LAMPORT_MAX_REMOTE_JUMP: u64 = 1 << 30;
+
 fn zio() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
 }
@@ -359,7 +365,7 @@ pub const SwimProtocol = struct {
     /// Best-effort: sends a PING with piggybacked leave gossip to every
     /// alive peer so they remove us immediately (no suspicion timeout).
     pub fn broadcastLeave(self: *SwimProtocol) void {
-        self.membership.lamport += 1;
+        self.membership.lamport +|= 1;
 
         const leave_gossip = [1]messages.GossipEntry{.{
             .subject_pubkey = self.our_pubkey,
@@ -1007,7 +1013,7 @@ pub const SwimProtocol = struct {
             self.membership.markAlive(pubkey, null);
         } else {
             // New peer — add to membership table
-            self.membership.lamport += 1;
+            self.membership.lamport +|= 1;
 
             // For now, derive mesh IP from pubkey (same as our derivation)
             const ip_mod = @import("../wireguard/ip.zig");
@@ -1456,7 +1462,11 @@ pub const SwimProtocol = struct {
                 // so a single forged PING with lamport==u64 max would overflow this
                 // add — a panic (safe builds) or clock corruption (fast builds) from
                 // one packet. Saturate instead.
-                self.membership.lamport = @max(self.membership.lamport, entry.lamport) +| 1;
+                // Absorb the remote clock for causality, but bound how far one
+                // attacker-controlled entry can advance ours so a forged maxInt(u64)
+                // can't pin our Lamport clock at the ceiling.
+                const cap = self.membership.lamport +| LAMPORT_MAX_REMOTE_JUMP;
+                self.membership.lamport = @max(self.membership.lamport, @min(entry.lamport, cap)) +| 1;
                 self.enqueueGossip(.{
                     .subject_pubkey = self.our_pubkey,
                     .event = .alive,
@@ -2157,8 +2167,11 @@ test "forged self-dead gossip with max Lamport does not overflow (S1)" {
     // Pre-fix: `@max(lamport, u64max) + 1` overflowed -> panic (safe builds) from one packet.
     swim.applyGossip(.{ .subject_pubkey = swim.our_pubkey, .event = .dead, .lamport = std.math.maxInt(u64), .endpoint = null });
 
-    // Saturated instead of wrapping; no crash.
-    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), swim.membership.lamport);
+    // Bounded advance instead of wrapping, and no crash. (The original S1 fix
+    // saturated the store at maxInt; the P1 follow-up now clamps the absorbed
+    // remote value so it never reaches the ceiling and later increments are safe.)
+    try std.testing.expect(swim.membership.lamport > 0);
+    try std.testing.expect(swim.membership.lamport < std.math.maxInt(u64));
 }
 
 test "collectGossip clamps to snapshot size and tolerates zero broadcasts (S3/S4)" {
@@ -2204,4 +2217,36 @@ test "periodic self re-advertise re-offers our wg_pubkey (heals #114)" {
     const before = swim.gossip_count;
     swim.readvertiseSelf(5_000_000_500); // 500ns later, far inside the 1s (1000ms) interval
     try std.testing.expectEqual(before, swim.gossip_count);
+}
+
+test "forged max Lamport gossip is clamped, not absorbed to the u64 ceiling (P1)" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    swim.membership.lamport = 100;
+
+    // Forged self-dead with an attacker-maxed Lamport clock.
+    swim.applyGossip(.{ .subject_pubkey = swim.our_pubkey, .event = .dead, .lamport = std.math.maxInt(u64), .endpoint = null });
+
+    // Bounded advance, NOT pinned at the ceiling — so later increments can't overflow.
+    try std.testing.expect(swim.membership.lamport > 100);
+    try std.testing.expect(swim.membership.lamport <= 100 +| LAMPORT_MAX_REMOTE_JUMP +| 1);
+    try std.testing.expect(swim.membership.lamport < std.math.maxInt(u64));
+}
+
+test "Lamport increments saturate and never overflow (P1)" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+
+    // Even if the clock somehow sits at the ceiling, a membership transition that
+    // bumps the Lamport clock must saturate rather than panic (safe builds) / wrap.
+    swim.membership.lamport = std.math.maxInt(u64);
+    swim.broadcastLeave(); // does membership.lamport +|= 1
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), swim.membership.lamport);
+    membership.markAlive([_]u8{3} ** 32, null); // no-op peer, must not overflow either
 }

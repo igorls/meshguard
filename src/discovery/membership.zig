@@ -175,7 +175,7 @@ pub const MembershipTable = struct {
         defer self.lock.unlock(zio());
         if (self.peers.getPtr(pubkey)) |peer| {
             if (peer.state == .alive) {
-                self.lamport += 1;
+                self.lamport +|= 1;
                 peer.state = .suspected;
                 peer.suspected_at_ns = nowNs();
                 peer.lamport = self.lamport;
