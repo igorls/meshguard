@@ -1376,7 +1376,7 @@ pub const SwimProtocol = struct {
         self.enqueueSelfGossip();
     }
 
-    /// Detect and heal a peer restart from an AUTHENTICATED ping/ack. If the
+    /// Detect and heal a peer restart signalled by a ping/ack. If the
     /// sender's incarnation exceeds what we have stored, it restarted with the
     /// same identity: the survivor otherwise keeps it as already-known and never
     /// re-advertises itself, so the rejoiner (which lost all state) never
@@ -1385,11 +1385,15 @@ pub const SwimProtocol = struct {
     /// responder services with a fresh session) and drop our stale
     /// handshake_complete flag so we also re-initiate.
     ///
-    /// SECURITY: only ever called from the ping/ack handlers, which have already
-    /// passed isAuthorizedPeer, and it acts only on the AUTHENTICATED sender's
-    /// own entry — never from gossip. A forged gossip "rejoin" for a third party
-    /// cannot reach this path, so it cannot rebind or tear down a trusted peer's
-    /// session.
+    /// SECURITY: called only from the ping/ack handlers, which have passed
+    /// isAuthorizedPeer — but that authenticates the CLAIMED sender identity, NOT
+    /// the packet origin (SWIM ping/ack carry no per-packet signature), so a
+    /// spoofer who knows a peer's public pubkey can forge a ping as that peer.
+    /// This path is therefore identity-authenticated, not origin-authenticated;
+    /// the S2 gate below uses a live WireGuard tunnel — which a spoofer cannot
+    /// forge — as the missing origin signal before acting on a restart claim. A
+    /// forged GOSSIP "rejoin" still cannot reach this path at all (it is never
+    /// called from applyGossip).
     fn handleSenderIncarnation(self: *SwimProtocol, sender_pubkey: [32]u8, incarnation: u64) void {
         if (incarnation == 0) return; // peer predates incarnation support
         if (std.mem.eql(u8, &sender_pubkey, &self.our_pubkey)) return;
