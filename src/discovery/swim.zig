@@ -68,6 +68,12 @@ pub const EventHandler = struct {
     onPeerPunched: ?*const fn (ctx: *anyopaque, peer: *const Membership.Peer, endpoint: messages.Endpoint) void = null,
     onAppMessage: ?*const fn (ctx: *anyopaque, data: []const u8) void = null,
     onWgPacket: ?*const fn (ctx: *anyopaque, data: []const u8, addr: [4]u8, port: u16) void = null,
+    /// Query whether a live WireGuard session currently exists for `wg_pubkey`.
+    /// Used as an origin-authentication signal for restart detection (S2): SWIM
+    /// ping/ack are not origin-authenticated, but holding a live tunnel proves the
+    /// peer possesses its WG private key, which a spoofer cannot forge. Returns
+    /// false when liveness is unknown (kernel WG / gossip-only / no device).
+    hasActiveTunnel: ?*const fn (ctx: *anyopaque, wg_pubkey: [32]u8) bool = null,
 };
 
 /// Gossip entry with broadcast remaining counter.
@@ -1394,6 +1400,31 @@ pub const SwimProtocol = struct {
             return;
         }
         if (incarnation <= peer.incarnation) return; // steady state
+
+        // S2 SECURITY GATE: a higher incarnation CLAIMS the peer restarted, but
+        // SWIM ping/ack are origin-unauthenticated — isAuthorizedPeer checks the
+        // CLAIMED identity, not the packet source — so a spoofer who knows V's
+        // (public) pubkey can forge this claim. A spoofer CANNOT forge a live
+        // WireGuard session for V (that needs V's WG private key). So if we
+        // currently hold a live tunnel to V, treat it as origin proof and IGNORE
+        // the claim ENTIRELY: acting would tear down a working tunnel AND poison
+        // peer.incarnation with the attacker's value, after which V's real future
+        // restart (a lower incarnation) is never detected — a persistent 1-packet
+        // DoS. A genuine restart still heals: V re-initiates a handshake that
+        // supersedes our stale session, and once that session passes
+        // REJECT_AFTER_TIME hasActiveTunnel reports inactive (WgDevice.isValid, W3),
+        // freeing this path to rebuild. RESIDUAL: this trusts the live-tunnel
+        // signal, not the packet; when liveness is unknown the hook returns false
+        // and we proceed as before.
+        if (peer.wg_pubkey) |wg| {
+            if (self.handler) |h| {
+                if (h.hasActiveTunnel) |hasTunnel| {
+                    if (hasTunnel(h.ctx, wg)) return;
+                }
+            }
+        }
+
+        // No proof of a live tunnel — treat this as a genuine rejoin.
         // Higher incarnation => the peer RESTARTED. Re-integrate it.
         peer.incarnation = incarnation;
         peer.handshake_complete = false;
@@ -2255,4 +2286,80 @@ test "Lamport increments saturate and never overflow (P1)" {
     try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), membership.lamport);
     membership.markDead(pk);
     try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), membership.lamport);
+}
+
+const S2TestCtx = struct {
+    join_count: usize = 0,
+    dead_count: usize = 0,
+    tunnel_live: bool = false,
+};
+fn s2OnJoin(ctx: *anyopaque, _: *const Membership.Peer) void {
+    const c: *S2TestCtx = @ptrCast(@alignCast(ctx));
+    c.join_count += 1;
+}
+fn s2OnDead(ctx: *anyopaque, _: [32]u8) void {
+    const c: *S2TestCtx = @ptrCast(@alignCast(ctx));
+    c.dead_count += 1;
+}
+fn s2HasTunnel(ctx: *anyopaque, _: [32]u8) bool {
+    const c: *S2TestCtx = @ptrCast(@alignCast(ctx));
+    return c.tunnel_live;
+}
+
+test "S2: spoofed incarnation is ignored while a live tunnel exists (no teardown, no pin)" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+
+    var tctx = S2TestCtx{ .tunnel_live = true };
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, .{
+        .ctx = &tctx,
+        .onPeerJoin = s2OnJoin,
+        .onPeerDead = s2OnDead,
+        .hasActiveTunnel = s2HasTunnel,
+    });
+
+    const v = [_]u8{0x77} ** 32;
+    var p = aliveTestPeer(v);
+    p.wg_pubkey = [_]u8{0x88} ** 32; // we hold V's WG key — a live tunnel is possible
+    p.incarnation = 100;
+    try membership.upsert(p);
+
+    // Spoofed PING claiming V restarted (attacker-huge incarnation) while our tunnel
+    // to V is live. A spoofer can't forge V's WG session, so the claim must be ignored.
+    swim.handleSenderIncarnation(v, 999);
+
+    // No teardown, no rejoin, and — crucially — incarnation NOT poisoned to the
+    // attacker's value (else V's real future restart would never be detected).
+    try std.testing.expectEqual(@as(usize, 0), tctx.dead_count);
+    try std.testing.expectEqual(@as(usize, 0), tctx.join_count);
+    try std.testing.expectEqual(@as(u64, 100), membership.peers.get(v).?.incarnation);
+}
+
+test "S2: genuine rejoin proceeds when no live tunnel (not over-gated)" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+
+    var tctx = S2TestCtx{ .tunnel_live = false }; // tunnel down/expired (e.g. past REJECT_AFTER_TIME)
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, .{
+        .ctx = &tctx,
+        .onPeerJoin = s2OnJoin,
+        .onPeerDead = s2OnDead,
+        .hasActiveTunnel = s2HasTunnel,
+    });
+
+    const v = [_]u8{0x77} ** 32;
+    var p = aliveTestPeer(v);
+    p.wg_pubkey = [_]u8{0x88} ** 32;
+    p.incarnation = 100;
+    try membership.upsert(p);
+
+    swim.handleSenderIncarnation(v, 200);
+
+    // With no live tunnel to protect, a real rejoin heals: teardown + re-add fire and
+    // the incarnation advances. Proves the gate doesn't over-suppress recovery.
+    try std.testing.expectEqual(@as(usize, 1), tctx.dead_count);
+    try std.testing.expectEqual(@as(usize, 1), tctx.join_count);
+    try std.testing.expectEqual(@as(u64, 200), membership.peers.get(v).?.incarnation);
 }

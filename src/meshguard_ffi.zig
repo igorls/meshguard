@@ -358,6 +358,7 @@ export fn meshguard_join(
         .onPeerPunched = null,
         .onAppMessage = &onAppMessageCallback,
         .onWgPacket = &onWgPacketCallback,
+        .hasActiveTunnel = &hasActiveTunnelCallback,
     };
 
     // Initialize SWIM protocol — use OUR port, not the seed's port
@@ -415,6 +416,7 @@ export fn meshguard_join_ipv6(
         .onPeerPunched = null,
         .onAppMessage = &onAppMessageCallback,
         .onWgPacket = &onWgPacketCallback,
+        .hasActiveTunnel = &hasActiveTunnelCallback,
     };
 
     c.swim = SwimProtocol.init(
@@ -474,6 +476,7 @@ export fn meshguard_join_lan(
         .onPeerPunched = null,
         .onAppMessage = &onAppMessageCallback,
         .onWgPacket = &onWgPacketCallback,
+        .hasActiveTunnel = &hasActiveTunnelCallback,
     };
 
     // Initialize SWIM protocol
@@ -1187,6 +1190,15 @@ fn onAppMessageCallback(raw_ctx: *anyopaque, data: []const u8) void {
 // ─── Internal: WireGuard tunnel packet handling ───
 
 /// Callback adapter: SWIM → FFI WG packet dispatch
+/// S2: report whether we hold a live userspace WG tunnel to `wg_pubkey`, so SWIM's
+/// incarnation restart detection can use it as an origin-authentication signal (a
+/// spoofer cannot forge a live WG session). False when no device exists yet.
+fn hasActiveTunnelCallback(raw_ctx: *anyopaque, wg_pubkey: [32]u8) bool {
+    const ctx: *MeshguardContext = @ptrCast(@alignCast(raw_ctx));
+    if (ctx.wg_device) |*dev| return dev.hasActiveTunnel(wg_pubkey);
+    return false;
+}
+
 fn onWgPacketCallback(raw_ctx: *anyopaque, data: []const u8, sender_addr: [4]u8, sender_port: u16) void {
     const ctx: *MeshguardContext = @ptrCast(@alignCast(raw_ctx));
     handleWgPacket(ctx, data, sender_addr, sender_port);

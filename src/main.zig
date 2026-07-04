@@ -919,6 +919,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
             .onPeerJoin = &wgOnPeerJoin,
             .onPeerDead = &wgOnPeerDead,
             .onPeerPunched = &wgOnPeerPunched,
+            .hasActiveTunnel = &wgHasActiveTunnel,
         },
     );
     // SWIM-driven handshake retransmit is only needed for the userspace WG data
@@ -1722,6 +1723,15 @@ const WgHandlerCtx = struct {
     socket: ?*lib.net.Udp.UdpSocket = null,
     use_kernel: bool = true,
 };
+
+/// S2: report whether we hold a live userspace WG tunnel to `wg_pubkey`. Kernel WG
+/// tracks its own sessions, so this returns false there (liveness unknown) and the
+/// incarnation restart path proceeds as before.
+fn wgHasActiveTunnel(ctx: *anyopaque, wg_pubkey: [32]u8) bool {
+    const handler: *WgHandlerCtx = @ptrCast(@alignCast(ctx));
+    const dev = handler.wg_device orelse return false;
+    return dev.hasActiveTunnel(wg_pubkey);
+}
 
 fn wgOnPeerJoin(ctx: *anyopaque, peer: *const lib.discovery.Membership.Peer) void {
     const handler: *WgHandlerCtx = @ptrCast(@alignCast(ctx));
