@@ -445,6 +445,7 @@ pub const SwimProtocol = struct {
 
         // 5. Probe at most one unauthenticated candidate endpoint.
         self.retransmitStalledHandshakes(now_ns);
+        self.readvertiseSelf(now_ns);
 
         self.probeCandidatePeer(now_ns);
 
@@ -1355,6 +1356,10 @@ pub const SwimProtocol = struct {
         if (self.config.self_readvertise_interval_ms == 0) return; // disabled
         const interval_ns: i128 = @as(i128, self.config.self_readvertise_interval_ms) * 1_000_000;
         if (self.last_self_readvertise_ns != 0 and now_ns - self.last_self_readvertise_ns < interval_ns) return;
+        // Only advance the timer if we can actually enqueue — a full gossip queue
+        // would otherwise suppress the re-advertisement for a whole interval without
+        // having queued anything (enqueueGossip is a silent no-op when full).
+        if (self.gossip_count >= self.gossip_queue.len) return;
         self.last_self_readvertise_ns = now_ns;
         self.enqueueSelfGossip();
     }
@@ -2197,6 +2202,6 @@ test "periodic self re-advertise re-offers our wg_pubkey (heals #114)" {
 
     // Rate-limited: a second call within the interval does NOT enqueue again.
     const before = swim.gossip_count;
-    swim.readvertiseSelf(5_000_000_500); // 500ns later, far inside the 1ms interval
+    swim.readvertiseSelf(5_000_000_500); // 500ns later, far inside the 1s (1000ms) interval
     try std.testing.expectEqual(before, swim.gossip_count);
 }
