@@ -175,7 +175,7 @@ pub const MembershipTable = struct {
         defer self.lock.unlock(zio());
         if (self.peers.getPtr(pubkey)) |peer| {
             if (peer.state == .alive) {
-                self.lamport += 1;
+                self.lamport +|= 1;
                 peer.state = .suspected;
                 peer.suspected_at_ns = nowNs();
                 peer.lamport = self.lamport;
@@ -188,7 +188,7 @@ pub const MembershipTable = struct {
         self.lock.lockUncancelable(zio());
         defer self.lock.unlock(zio());
         if (self.peers.getPtr(pubkey)) |peer| {
-            self.lamport += 1;
+            self.lamport +|= 1;
             peer.state = .alive;
             peer.last_seen_ns = nowNs();
             peer.suspected_at_ns = null;
@@ -207,7 +207,7 @@ pub const MembershipTable = struct {
     /// markDead body without locking — caller must hold the write lock.
     fn markDeadLocked(self: *MembershipTable, pubkey: [32]u8) void {
         if (self.peers.getPtr(pubkey)) |peer| {
-            self.lamport += 1;
+            self.lamport +|= 1;
             peer.state = .dead;
             peer.lamport = self.lamport;
         }
