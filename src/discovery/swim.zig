@@ -48,6 +48,10 @@ pub const SwimConfig = struct {
     ping_req_count: u32 = 3,
     max_gossip_per_message: u32 = 8,
     max_gossip_broadcasts: u32 = 6, // how many times to broadcast each gossip entry
+    // How often to re-advertise our own identity + wg_pubkey into gossip so a peer
+    // that missed the one-shot registration-time advertisement still learns our WG
+    // key (issue #114). 0 disables. Default 30s.
+    self_readvertise_interval_ms: u32 = 30000,
 };
 
 /// Callback interface for SWIM events (e.g. WireGuard peer management).
@@ -125,6 +129,7 @@ pub const SwimProtocol = struct {
 
     // Handshake-retransmit rate limiting (re-initiate stalled/rejoining peers)
     last_handshake_retransmit_ns: i128 = 0,
+    last_self_readvertise_ns: i128 = 0,
     // Only the userspace WG data plane needs SWIM to re-drive handshakes; the
     // kernel WireGuard module retransmits its own (via keepalive), so enabling
     // this in kernel/gossip-only modes would just churn peers + spam logs.
@@ -501,6 +506,7 @@ pub const SwimProtocol = struct {
 
         // 4. Probe at most one unauthenticated candidate endpoint.
         self.retransmitStalledHandshakes(now_ns);
+        self.readvertiseSelf(now_ns);
 
         self.probeCandidatePeer(now_ns);
 
@@ -1336,6 +1342,23 @@ pub const SwimProtocol = struct {
         });
     }
 
+    /// Periodically re-advertise our own identity + wg_pubkey into gossip (issue
+    /// #114). wg_pubkey is otherwise offered only at one-shot registration time, so a
+    /// peer that missed it — a dropped advertisement, a staggered join, or a
+    /// gossip-only -> userspace-WG transition where we had no key to give — never
+    /// learns it and, in a 2-node mesh, has no third party to re-gossip it, so the
+    /// tunnel never forms despite healthy SWIM. This is bounded/queued
+    /// (enqueueSelfGossip -> max_gossip_broadcasts) and a no-op at the receiver for
+    /// peers that already hold our key (applyGossip binds wg_pubkey set-once), so it
+    /// heals the gap without disturbing established tunnels. One re-advert per interval.
+    fn readvertiseSelf(self: *SwimProtocol, now_ns: i128) void {
+        if (self.config.self_readvertise_interval_ms == 0) return; // disabled
+        const interval_ns: i128 = @as(i128, self.config.self_readvertise_interval_ms) * 1_000_000;
+        if (self.last_self_readvertise_ns != 0 and now_ns - self.last_self_readvertise_ns < interval_ns) return;
+        self.last_self_readvertise_ns = now_ns;
+        self.enqueueSelfGossip();
+    }
+
     /// Detect and heal a peer restart from an AUTHENTICATED ping/ack. If the
     /// sender's incarnation exceeds what we have stored, it restarted with the
     /// same identity: the survivor otherwise keeps it as already-known and never
@@ -2149,4 +2172,31 @@ test "collectGossip clamps to snapshot size and tolerates zero broadcasts (S3/S4
     // Pre-fix: count == 20 overflowed gossip_snap[8..]; remaining==0 underflowed on decrement.
     const out = swim.collectGossip();
     try std.testing.expect(out.len <= swim.gossip_snap.len);
+}
+
+test "periodic self re-advertise re-offers our wg_pubkey (heals #114)" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+
+    const our_wg = [_]u8{0xAB} ** 32;
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{ .self_readvertise_interval_ms = 1000 }, [_]u8{1} ** 32, our_wg, .{ 127, 0, 0, 1 }, 51821, null);
+
+    // Steady state: the one-shot registration-time advertisement has already drained.
+    swim.gossip_count = 0;
+
+    // Interval elapsed -> we re-offer our identity + wg_pubkey (exactly what a peer
+    // stuck with a null wg_pubkey for us needs to initiate the handshake). Pre-fix
+    // this never happened, so #114's 2-node tunnel never formed.
+    swim.readvertiseSelf(5_000_000_000);
+    try std.testing.expect(swim.gossip_count >= 1);
+    const e = swim.gossip_queue[0].entry;
+    try std.testing.expectEqual(swim.our_pubkey, e.subject_pubkey);
+    try std.testing.expect(e.wg_pubkey != null);
+    try std.testing.expectEqual(our_wg, e.wg_pubkey.?);
+
+    // Rate-limited: a second call within the interval does NOT enqueue again.
+    const before = swim.gossip_count;
+    swim.readvertiseSelf(5_000_000_500); // 500ns later, far inside the 1ms interval
+    try std.testing.expectEqual(before, swim.gossip_count);
 }
