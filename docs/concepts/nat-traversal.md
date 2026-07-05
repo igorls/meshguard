@@ -29,16 +29,17 @@ The discovered public endpoint is then shared via gossip, so other peers know ho
 
 ### STUN Servers
 
-The runtime STUN client currently uses embedded IPv4 endpoints in
-`nat/stun.zig` for these services:
+The runtime STUN client resolves the configured `host:port` entries from
+`Config.stun_servers`:
 
-| Server                | IP               | Port  |
-| --------------------- | ---------------- | ----- |
-| `stun.l.google.com`   | `74.125.250.129` | 19302 |
-| `stun.cloudflare.com` | `104.18.32.7`    | 3478  |
+| Server                | Port  |
+| --------------------- | ----- |
+| `stun.l.google.com`   | 19302 |
+| `stun.cloudflare.com` | 3478  |
 
-The higher-level `Config` struct also records the hostname form. If either
-provider changes addresses, update `nat/stun.zig` before cutting a release.
+If no configured server resolves, meshguard falls back to deterministic IPv4
+endpoints for the same services so environments without working DNS still have a
+stable startup path.
 
 ## Tier 2: UDP Hole Punching
 

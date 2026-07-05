@@ -82,6 +82,7 @@ test {
     _ = wireguard.Crypto;
     _ = wireguard.Ip;
     _ = discovery.Swim;
+    @import("std").testing.refAllDecls(nat.Stun);
     if (is_linux) {
         _ = wireguard.Config;
         _ = wireguard.Netlink;

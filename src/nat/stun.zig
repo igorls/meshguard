@@ -11,6 +11,7 @@
 //!     XOR-MAPPED-ADDRESS (0x0020): [2B reserved][1B family][2B xport][4B xaddr]
 
 const std = @import("std");
+const Dns = @import("../net/dns.zig");
 const Udp = @import("../net/udp.zig");
 const messages = @import("../protocol/messages.zig");
 
@@ -47,16 +48,72 @@ pub const StunResult = struct {
     nat_type: NatType,
 };
 
-/// Default STUN servers to try.
+/// Numeric fallback STUN servers used when configured hostnames cannot be resolved.
 pub const DEFAULT_STUN_SERVERS = [_]StunServer{
     .{ .host = .{ 74, 125, 250, 129 }, .port = 19302 }, // stun.l.google.com
     .{ .host = .{ 104, 18, 32, 7 }, .port = 3478 }, // stun.cloudflare.com
 };
 
+pub const MAX_CONFIGURED_STUN_SERVERS: usize = 8;
+
 pub const StunServer = struct {
     host: [4]u8,
     port: u16,
 };
+
+pub const StunServerSpec = struct {
+    host: []const u8,
+    port: u16,
+};
+
+pub fn parseServerSpec(spec: []const u8) ?StunServerSpec {
+    const trimmed = std.mem.trim(u8, spec, " \t\r\n");
+    const colon_idx = std.mem.lastIndexOfScalar(u8, trimmed, ':') orelse return null;
+    const host = std.mem.trim(u8, trimmed[0..colon_idx], " \t");
+    const port_str = std.mem.trim(u8, trimmed[colon_idx + 1 ..], " \t");
+    if (host.len == 0 or port_str.len == 0) return null;
+
+    const port = std.fmt.parseInt(u16, port_str, 10) catch return null;
+    if (port == 0) return null;
+    return .{ .host = host, .port = port };
+}
+
+pub fn resolveServerSpec(spec: []const u8) ?StunServer {
+    const parsed = parseServerSpec(spec) orelse return null;
+    const host = parseIpv4(parsed.host) orelse Dns.resolveA(parsed.host) orelse return null;
+    return .{ .host = host, .port = parsed.port };
+}
+
+pub fn resolveConfiguredServers(configured: []const []const u8, out: []StunServer) []const StunServer {
+    var count: usize = 0;
+    for (configured) |spec| {
+        if (count >= out.len) break;
+        if (resolveServerSpec(spec)) |server| {
+            out[count] = server;
+            count += 1;
+        }
+    }
+    return out[0..count];
+}
+
+pub fn configuredOrDefault(configured: []const []const u8, out: []StunServer) []const StunServer {
+    const resolved = resolveConfiguredServers(configured, out);
+    if (resolved.len > 0) return resolved;
+    return &DEFAULT_STUN_SERVERS;
+}
+
+fn parseIpv4(s: []const u8) ?[4]u8 {
+    var addr: [4]u8 = undefined;
+    var octets = std.mem.splitScalar(u8, s, '.');
+    var i: usize = 0;
+    while (octets.next()) |octet| {
+        if (i >= 4 or octet.len == 0) return null;
+        addr[i] = std.fmt.parseInt(u8, octet, 10) catch return null;
+        i += 1;
+    }
+    if (i != 4) return null;
+    return addr;
+}
 
 // ─── Encoding ───
 
@@ -311,4 +368,39 @@ test "decode rejects wrong txn_id" {
     @memcpy(resp[8..20], &wrong_txn);
 
     try std.testing.expectError(error.TransactionIdMismatch, decodeBindingResponse(&resp, txn_id));
+}
+
+test "parse STUN server specs" {
+    const parsed = parseServerSpec(" stun.example.com:3478 ").?;
+    try std.testing.expectEqualStrings("stun.example.com", parsed.host);
+    try std.testing.expectEqual(@as(u16, 3478), parsed.port);
+
+    try std.testing.expect(parseServerSpec("stun.example.com") == null);
+    try std.testing.expect(parseServerSpec(":3478") == null);
+    try std.testing.expect(parseServerSpec("stun.example.com:0") == null);
+    try std.testing.expect(parseServerSpec("stun.example.com:not-a-port") == null);
+}
+
+test "resolve configured STUN server IP literals" {
+    var out: [MAX_CONFIGURED_STUN_SERVERS]StunServer = undefined;
+    const resolved = resolveConfiguredServers(&.{
+        "203.0.113.10:3478",
+        "bad-entry",
+        "198.51.100.20:19302",
+    }, &out);
+
+    try std.testing.expectEqual(@as(usize, 2), resolved.len);
+    try std.testing.expectEqual([4]u8{ 203, 0, 113, 10 }, resolved[0].host);
+    try std.testing.expectEqual(@as(u16, 3478), resolved[0].port);
+    try std.testing.expectEqual([4]u8{ 198, 51, 100, 20 }, resolved[1].host);
+    try std.testing.expectEqual(@as(u16, 19302), resolved[1].port);
+}
+
+test "configured STUN servers fall back when none resolve" {
+    var out: [MAX_CONFIGURED_STUN_SERVERS]StunServer = undefined;
+    const resolved = configuredOrDefault(&.{ "bad-entry", "also-bad" }, &out);
+
+    try std.testing.expectEqual(@as(usize, DEFAULT_STUN_SERVERS.len), resolved.len);
+    try std.testing.expectEqual(DEFAULT_STUN_SERVERS[0].host, resolved[0].host);
+    try std.testing.expectEqual(DEFAULT_STUN_SERVERS[0].port, resolved[0].port);
 }

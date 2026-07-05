@@ -108,13 +108,14 @@ $MESHGUARD_CONFIG_DIR/
 
 ## STUN Servers
 
-meshguard uses built-in STUN servers for public endpoint discovery:
+meshguard resolves configured STUN server hostnames at runtime for public endpoint discovery:
 
 | Server                | Port  |
 | --------------------- | ----- |
 | `stun.l.google.com`   | 19302 |
 | `stun.cloudflare.com` | 3478  |
 
-The default `Config` stores these as `host:port` strings. The current runtime
-path calls `nat/stun.zig`'s embedded IPv4 defaults for these services, so update
-that module if the providers change addresses before a release.
+The default `Config` stores these as `host:port` strings and the runtime STUN
+client consumes that list. If no configured server can be resolved, meshguard
+falls back to deterministic IPv4 endpoints for the same services so startup can
+still proceed in DNS-constrained environments.
