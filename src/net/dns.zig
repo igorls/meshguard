@@ -71,18 +71,16 @@ const DnsHeader = struct {
 
 // ─── Public API ───
 
-/// Get nameserver IPv4 addresses. On Linux, parses /etc/resolv.conf.
+/// Get nameserver IPv4 addresses. On POSIX, parses /etc/resolv.conf.
 /// On Windows, uses well-known public DNS servers as fallback.
 pub fn getNameservers(buf: *[3][4]u8) usize {
-    if (comptime is_linux) {
-        return getNameserversLinux(buf);
-    } else if (comptime is_windows) {
+    if (comptime is_windows) {
         return getNameserversWindows(buf);
     }
-    return 0;
+    return getNameserversResolvConf(buf);
 }
 
-fn getNameserversLinux(buf: *[3][4]u8) usize {
+fn getNameserversResolvConf(buf: *[3][4]u8) usize {
     const z = zio();
     const file = std.Io.Dir.openFileAbsolute(z, "/etc/resolv.conf", .{}) catch return 0;
     defer file.close(z);
