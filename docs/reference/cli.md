@@ -99,14 +99,17 @@ meshguard up [options]
 
 ## `meshguard down`
 
-Stop the daemon and remove the `mg0` interface.
+Stop the daemon.
 
 ```bash
 meshguard down
 ```
 
-> **Platform:** Linux only. The current implementation uses `RTM_DELLINK` via
-> RTNETLINK to remove the interface.
+When a userspace daemon is running, this sends a graceful stop request through
+the control socket (`/run/meshguard/meshguard.sock`, the per-user config socket
+fallback, or `\\.\pipe\meshguard` on Windows). On Linux, if no control socket
+answers, `meshguard down` falls back to RTNETLINK teardown for the kernel `mg0`
+interface.
 
 ---
 
@@ -118,8 +121,10 @@ Display the current mesh state.
 meshguard status
 ```
 
-> **Platform:** Linux only. The current implementation queries `mg0` through
-> RTNETLINK and kernel WireGuard Genetlink where available.
+When a userspace daemon is running, this queries the control socket and reports
+the node public key, mesh IP, and membership counts. On Linux, if no control
+socket answers, `meshguard status` falls back to RTNETLINK and kernel WireGuard
+Genetlink for `mg0` where available.
 
 ---
 

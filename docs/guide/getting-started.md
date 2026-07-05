@@ -150,8 +150,9 @@ meshguard will:
 meshguard down
 ```
 
-This tears down the `mg0` interface. In the current CLI this command is
-Linux-only; on other platforms stop the running process or service.
+When a userspace daemon is running, this requests a graceful shutdown through
+the control socket. On Linux, if no daemon control socket answers, it falls back
+to removing the kernel `mg0` interface.
 
 ### 6. Check status
 
@@ -159,7 +160,9 @@ Linux-only; on other platforms stop the running process or service.
 meshguard status
 ```
 
-In the current CLI, `status` is Linux-only.
+When a userspace daemon is running, this reports the node public key, mesh IP,
+and membership counts from the control socket. On Linux, if no control socket
+answers, it falls back to kernel `mg0` status where available.
 
 ## Run as a service
 
