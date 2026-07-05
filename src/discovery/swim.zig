@@ -179,6 +179,11 @@ pub const SwimProtocol = struct {
     org_control_queue: [MAX_ORG_CONTROL_QUEUE]OrgControlSlot = std.mem.zeroes([MAX_ORG_CONTROL_QUEUE]OrgControlSlot),
     org_control_count: usize = 0,
 
+    // Verified/signed revocations retained for periodic re-broadcast.
+    org_revokes: [Org.MAX_ORG_REVOKES]messages.OrgCertRevoke = std.mem.zeroes([Org.MAX_ORG_REVOKES]messages.OrgCertRevoke),
+    org_revoke_count: usize = 0,
+    last_org_revoke_readvertise_ns: i128 = 0,
+
     // Unauthenticated gossip endpoint hints. These are never exposed as members,
     // never re-gossiped, and only exist to trigger bounded direct certificate probes.
     candidate_peers: [MAX_CANDIDATE_PEERS]CandidatePeer = std.mem.zeroes([MAX_CANDIDATE_PEERS]CandidatePeer),
@@ -481,6 +486,7 @@ pub const SwimProtocol = struct {
         // 5. Probe at most one unauthenticated candidate endpoint.
         self.retransmitStalledHandshakes(now_ns);
         self.readvertiseSelf(now_ns);
+        self.readvertiseOrgRevokes(now_ns);
         self.broadcastOrgControlQueue();
 
         self.probeCandidatePeer(now_ns);
@@ -508,11 +514,10 @@ pub const SwimProtocol = struct {
 
     /// Queue a signed org revocation for local application and peer broadcast.
     pub fn queueOrgCertRevoke(self: *SwimProtocol, rev: messages.OrgCertRevoke) void {
-        var buf: [Org.ORG_REVOKE_WIRE_SIZE]u8 = undefined;
-        const written = codec.encodeOrgCertRevoke(&buf, rev) catch return;
-        self.enqueueOrgControl(buf[0..written]);
+        self.rememberOrgRevoke(rev);
+        self.enqueueOrgRevokeBroadcast(rev);
         if (self.isOrgAuthorizedPeer(rev.org_pubkey)) {
-            self.handleOrgRevoke(rev);
+            self.applyOrgRevoke(rev, false);
         }
     }
 
@@ -554,6 +559,7 @@ pub const SwimProtocol = struct {
         // 4. Probe at most one unauthenticated candidate endpoint.
         self.retransmitStalledHandshakes(now_ns);
         self.readvertiseSelf(now_ns);
+        self.readvertiseOrgRevokes(now_ns);
         self.broadcastOrgControlQueue();
 
         self.probeCandidatePeer(now_ns);
@@ -786,10 +792,17 @@ pub const SwimProtocol = struct {
 
     /// Handle an OrgCertRevoke: add the revoked node pubkey to the set.
     fn handleOrgRevoke(self: *SwimProtocol, rev: messages.OrgCertRevoke) void {
+        self.applyOrgRevoke(rev, true);
+    }
+
+    fn applyOrgRevoke(self: *SwimProtocol, rev: messages.OrgCertRevoke, rebroadcast: bool) void {
         const signed = codec.orgRevokeSignedBytes(rev);
         if (!self.orgSignatureValid(rev.org_pubkey, &signed, rev.signature)) {
             log.warn("org revoke rejected: invalid or untrusted org signature", .{});
             return;
+        }
+        if (rebroadcast) {
+            self.rememberOrgRevoke(rev);
         }
         // Check if already revoked
         for (self.revoked_nodes[0..self.revoked_count]) |revoked| {
@@ -811,6 +824,9 @@ pub const SwimProtocol = struct {
                     }
                 }
             }
+        }
+        if (rebroadcast) {
+            self.enqueueOrgRevokeBroadcast(rev);
         }
     }
 
@@ -1373,8 +1389,38 @@ pub const SwimProtocol = struct {
         }
     }
 
+    fn orgRevokeKnown(self: *const SwimProtocol, rev: messages.OrgCertRevoke) bool {
+        for (self.org_revokes[0..self.org_revoke_count]) |known| {
+            if (std.mem.eql(u8, &known.org_pubkey, &rev.org_pubkey) and
+                std.mem.eql(u8, &known.node_pubkey, &rev.node_pubkey) and
+                known.reason == rev.reason and
+                known.lamport == rev.lamport and
+                std.mem.eql(u8, &known.signature, &rev.signature))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn rememberOrgRevoke(self: *SwimProtocol, rev: messages.OrgCertRevoke) void {
+        if (self.orgRevokeKnown(rev)) return;
+        if (self.org_revoke_count >= self.org_revokes.len) return;
+        self.org_revokes[self.org_revoke_count] = rev;
+        self.org_revoke_count += 1;
+    }
+
+    fn enqueueOrgRevokeBroadcast(self: *SwimProtocol, rev: messages.OrgCertRevoke) void {
+        var buf: [Org.ORG_REVOKE_WIRE_SIZE]u8 = undefined;
+        const written = codec.encodeOrgCertRevoke(&buf, rev) catch return;
+        self.enqueueOrgControl(buf[0..written]);
+    }
+
     fn enqueueOrgControl(self: *SwimProtocol, data: []const u8) void {
         if (data.len > Org.ORG_REVOKE_WIRE_SIZE) return;
+        for (self.org_control_queue[0..self.org_control_count]) |slot| {
+            if (slot.len == data.len and std.mem.eql(u8, slot.data[0..slot.len], data)) return;
+        }
         if (self.org_control_count >= self.org_control_queue.len) return;
 
         var slot = OrgControlSlot{
@@ -1409,6 +1455,18 @@ pub const SwimProtocol = struct {
             }
         }
         self.org_control_count = write;
+    }
+
+    fn readvertiseOrgRevokes(self: *SwimProtocol, now: i128) void {
+        if (self.org_revoke_count == 0) return;
+        const interval_ns: i128 = @as(i128, self.config.self_readvertise_interval_ms) * 1_000_000;
+        if (interval_ns <= 0) return;
+        if (now - self.last_org_revoke_readvertise_ns < interval_ns) return;
+        self.last_org_revoke_readvertise_ns = now;
+
+        for (self.org_revokes[0..self.org_revoke_count]) |rev| {
+            self.enqueueOrgRevokeBroadcast(rev);
+        }
     }
 
     /// Enqueue a fresh advertisement of ourselves (identity + wg_pubkey +
@@ -2224,6 +2282,8 @@ test "org revoke requires a valid trusted-org signature (C2 regression)" {
     swim.handleOrgRevoke(valid);
     try std.testing.expect(membership.peers.get(victim).?.state == .dead);
     try std.testing.expectEqual(@as(usize, 1), swim.revoked_count);
+    try std.testing.expectEqual(@as(usize, 1), swim.org_revoke_count);
+    try std.testing.expectEqual(@as(usize, 1), swim.org_control_count);
 
     // (3) Untrusted org with a valid self-signature → rejected.
     const evil_kp = keys.generate();
@@ -2255,8 +2315,33 @@ test "queued org revoke is applied locally and retained for broadcast" {
     swim.queueOrgCertRevoke(rev);
 
     try std.testing.expectEqual(@as(usize, 1), swim.org_control_count);
+    try std.testing.expectEqual(@as(usize, 1), swim.org_revoke_count);
     try std.testing.expectEqual(@as(usize, 1), swim.revoked_count);
     try std.testing.expect(membership.peers.get(victim).?.state == .dead);
+}
+
+test "retained org revoke can be re-advertised without duplicate queue entries" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{ .self_readvertise_interval_ms = 1 }, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+
+    const org_kp = Org.generateOrgKeyPair();
+    const victim = [_]u8{0x7a} ** 32;
+    const rev = try Org.issueOrgRevoke(org_kp, victim, 2, 11);
+
+    swim.queueOrgCertRevoke(rev);
+    try std.testing.expectEqual(@as(usize, 1), swim.org_revoke_count);
+    try std.testing.expectEqual(@as(usize, 1), swim.org_control_count);
+
+    swim.readvertiseOrgRevokes(2_000_000);
+    try std.testing.expectEqual(@as(usize, 1), swim.org_control_count);
+
+    swim.org_control_count = 0;
+    swim.last_org_revoke_readvertise_ns = 0;
+    swim.readvertiseOrgRevokes(2_000_000);
+    try std.testing.expectEqual(@as(usize, 1), swim.org_control_count);
 }
 
 test "gossiped dead does not instantly evict a third party (H2 regression)" {
