@@ -57,27 +57,28 @@ Gossip entries are **piggybacked** on Ping and Ack messages — no dedicated gos
 | `subject_pubkey`  | 32 B | The node this entry is about                     |
 | `event`           | 1 B  | join / alive / suspect / dead / leave            |
 | `lamport`         | 8 B  | Lamport timestamp                                |
-| `endpoint`        | 7 B  | Optional IPv4:port (1B flag + 4B addr + 2B port) |
+| `endpoint`        | 20 B | Optional IPv4/IPv6 endpoint                      |
 | `wg_pubkey`       | 33 B | Optional X25519 public key for WireGuard         |
-| `public_endpoint` | 7 B  | Optional STUN-discovered public endpoint         |
+| `public_endpoint` | 20 B | Optional STUN-discovered public endpoint         |
 | `nat_type`        | 1 B  | public / cone / symmetric / unknown              |
 
-**Total per entry: 89 bytes.** A fully-loaded Ping with 8 gossip entries is ~755 bytes — well under typical MTU limits.
+**Total per entry: 115 bytes.** Ping and Ack also carry an 8-byte incarnation
+after the sequence number so peers can detect restarts. A fully-loaded Ping
+with 8 gossip entries is 970 bytes before the optional 187-byte org certificate
+extension, still under the default 1420-byte MTU.
 
 ## Handshake Flow
 
-When two nodes first discover each other through gossip, they perform a signed handshake before establishing a WireGuard tunnel:
+When two nodes first discover each other through trusted gossip, meshguard
+connects that membership data to the WireGuard engine:
 
-1. **Initiator** sends `HandshakeInit`:
-   - Ed25519 pubkey, random nonce, signature over nonce
-   - X25519 WG pubkey, mesh IP, WG port, gossip port
-
-2. **Responder** checks authorization (`authorized_keys/`), then sends `HandshakeResp`:
-   - Ed25519 pubkey, own nonce, echo of initiator's nonce
-   - Signature over both nonces
-   - X25519 WG pubkey, mesh IP, WG port, gossip port
-
-3. Both sides configure their WireGuard peer with the exchanged X25519 key and endpoint.
+1. SWIM receives a join/alive gossip entry with the peer identity, WireGuard
+   public key, endpoint, NAT type, and optional org certificate extension.
+2. Trust is checked against individual keys, org certificates, org vouches, and
+   revocations.
+3. The peer is added or refreshed in the userspace `WgDevice` or kernel
+   WireGuard configuration.
+4. Standard WireGuard Noise IK initiation/response packets establish the tunnel.
 
 ## Hole Punch Integration
 

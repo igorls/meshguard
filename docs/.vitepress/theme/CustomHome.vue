@@ -117,7 +117,7 @@ const terminalLines = [
   { type: "comment", text: "# 4. join the mesh" },
   { type: "command", text: "sudo meshguard up --seed 1.2.3.4:51821" },
   { type: "output", text: "meshguard is running (userspace WG mode)." },
-  { type: "highlight", text: "  mesh IP: 10.99.189.145" },
+  { type: "highlight", text: "  mesh IPs: 10.99.189.145, fd99:6d67::bd91" },
   {
     type: "highlight",
     text: "  public endpoint: 203.0.113.42:8591 (behind NAT, cone)",
@@ -133,18 +133,18 @@ const terminalLines = [
 const features = [
   {
     label: "// trust",
-    title: "Serverless & Trustless",
-    desc: "No control plane, no coordinator. Each node holds its own Ed25519 identity. The mesh is self-organizing.",
+    title: "Serverless Trust",
+    desc: "No coordinator or control plane. Local authorized keys, org certificates, and vouches decide who can join.",
   },
   {
     label: "// discovery",
     title: "SWIM Gossip",
-    desc: "O(log N) convergence with failure detection. Membership propagates in seconds via epidemic protocol.",
+    desc: "O(log N) convergence with failure detection, signed org control messages, and restart-aware tunnel healing.",
   },
   {
     label: "// crypto",
-    title: "WireGuard Tunnels",
-    desc: "Noise_IKpsk2 handshake, end-to-end encryption. Kernel or userspace mode with zero-copy data plane.",
+    title: "WireGuard Data Plane",
+    desc: "Noise_IKpsk2 handshake, ChaCha20-Poly1305 transport, kernel mode on Linux or portable userspace mode.",
   },
   {
     label: "// nat",
@@ -153,13 +153,13 @@ const features = [
   },
   {
     label: "// identity",
-    title: "Deterministic IPs",
-    desc: "Mesh IP derived from Ed25519 public key via Blake3. No DHCP, no conflicts, no coordination needed.",
+    title: "Dual-stack Identity",
+    desc: "IPv4 and IPv6 mesh addresses are derived from each node identity. No DHCP, no allocation service.",
   },
   {
-    label: "// perf",
-    title: "Zero Overhead",
-    desc: "Built in Zig. Single static binary, io_uring event loop, multi-queue TUN, GSO/GRO offloads.",
+    label: "// platforms",
+    title: "Cross-platform Core",
+    desc: "Linux, macOS, FreeBSD, Windows, Android, and iOS targets share the same Zig implementation.",
   },
 ];
 </script>
@@ -172,13 +172,13 @@ const features = [
       <div class="hero-content">
         <div class="hero-badge">
           <span class="dot" />
-          v0.3.1 · MIT License · Linux
+          v0.10.0 · MIT License · 6 release targets
         </div>
         <h1 class="hero-title">meshguard</h1>
         <p class="hero-tagline">
-          Decentralized WireGuard mesh VPN.<br />
-          Zero central authority. Trust-agnostic.<br />
-          Single static binary.
+          Decentralized WireGuard-compatible mesh VPN.<br />
+          Trust-gated gossip, NAT traversal, dual-stack IPs.<br />
+          One Zig codebase from servers to mobile embedding.
         </p>
         <div class="hero-actions">
           <a href="/meshguard/guide/getting-started" class="btn-primary"
@@ -258,20 +258,20 @@ const features = [
     <section class="stats-section">
       <div class="stats-grid">
         <div class="stat-card">
-          <div class="stat-value">4.8+</div>
-          <div class="stat-label">Gbps throughput</div>
+          <div class="stat-value">3.9+</div>
+          <div class="stat-label">Gbps userspace</div>
         </div>
         <div class="stat-card">
-          <div class="stat-value">~6k</div>
+          <div class="stat-value">20k+</div>
           <div class="stat-label">Lines of Zig</div>
         </div>
         <div class="stat-card">
-          <div class="stat-value">0</div>
-          <div class="stat-label">Dependencies</div>
+          <div class="stat-value">6</div>
+          <div class="stat-label">Release targets</div>
         </div>
         <div class="stat-card">
-          <div class="stat-value">1</div>
-          <div class="stat-label">Binary</div>
+          <div class="stat-value">0</div>
+          <div class="stat-label">Central services</div>
         </div>
       </div>
     </section>

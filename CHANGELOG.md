@@ -7,12 +7,55 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## Unreleased
 
+## [0.10.0] — 2026-07-05
+
+### Added
+- Optional crypto backend selection with `-Dcrypto-backend=auto|std|sodium`
+  and the `-Dno-sodium=true` alias. Linux desktop builds still use libsodium
+  as an accelerator by default; other targets use Zig `std.crypto`.
+- No-libsodium Linux CI coverage and a Linux ARM64 release artifact built with
+  `std.crypto`, matching the installer-supported `meshguard-linux-arm64` asset.
+- `meshguard up --gossip-only` / `--no-tun` for discovery and rendezvous nodes
+  that should not create a TUN/WireGuard interface.
+- FFI support for explicit local binds via `meshguard_init_bind` plus opt-in
+  `MESHGUARD_STATS=1` diagnostic counters.
+- io_uring UDP receive path groundwork and macOS gossip-only relay support.
+- Networking adversarial review documentation for the June 2026 hardening pass.
+
+### Changed
+- Release validation now checks `src/version.zig`, semantic version constants,
+  and `build.zig.zon` before publishing tag artifacts.
+- Zig package paths now include the bundled Wintun files needed for Windows
+  builds, along with release/security metadata.
+- Linux ARM64 install no longer installs libsodium unnecessarily because the
+  release artifact is built against the portable `std.crypto` backend.
+
 ### Fixed
-- **[P1]** SWIM gossip no longer admits untrusted subjects or binds their
-  WireGuard keys from `.join`/`.alive` entries unless the identity is already
-  authorized. Deployments that relied on the removed org-wide allow-all shortcut
-  must authorize peers with `org-sign` certificates or explicit per-node vouch
-  records before gossip can surface them as joined.
+- SWIM trust admission now rejects untrusted gossip subjects, quarantines
+  gossip-discovered certificate peers, and keeps candidate probes direct-only.
+- Org certificate admission and org control-plane messages are authenticated
+  before they can admit, vouch, alias, or revoke peers.
+- WireGuard restart healing now re-advertises peer WG keys, detects peer
+  incarnation changes, and avoids spoofed restart teardown while a tunnel is
+  still active.
+- Lamport clocks saturate safely and remote Lamport absorption is bounded.
+- WireGuard anti-replay check/update is atomic, and active tunnel checks honor
+  session expiry.
+- UDP and DNS paths no longer treat raw syscall `-errno` values as lengths.
+- Decoder and FFI receive paths tolerate malformed or truncated packets without
+  out-of-bounds reads.
+- Windows sockets initialize Winsock before bind/poll and use the correct
+  `WSAPoll` flags.
+- macOS and FreeBSD interface configuration no longer reports false
+  `OutOfMemory` failures from command execution.
+- Outdated internal `.jules` prompt/journal files were removed from the
+  published tree.
+
+### Security
+- Hardened the networking control plane against unauthenticated gossip
+  admission, forged org revocations/vouches/aliases, replay-window races,
+  packet parsing OOBs, and several DoS-prone edge cases found in the
+  adversarial review.
 
 ## [0.9.0] — 2026-04-28
 
@@ -136,6 +179,8 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Install script (`install.sh`).
 - GitHub release workflow.
 
+[Unreleased]: https://github.com/igorls/meshguard/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/igorls/meshguard/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/igorls/meshguard/compare/v0.8.2...v0.9.0
 [0.8.2]: https://github.com/igorls/meshguard/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/igorls/meshguard/compare/v0.8.0...v0.8.1

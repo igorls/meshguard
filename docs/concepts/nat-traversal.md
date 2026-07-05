@@ -29,16 +29,21 @@ The discovered public endpoint is then shared via gossip, so other peers know ho
 
 ### STUN Servers
 
-meshguard uses hardcoded STUN servers:
+The runtime STUN client currently uses embedded IPv4 endpoints in
+`nat/stun.zig` for these services:
 
 | Server                | IP               | Port  |
 | --------------------- | ---------------- | ----- |
 | `stun.l.google.com`   | `74.125.250.129` | 19302 |
 | `stun.cloudflare.com` | `104.18.32.7`    | 3478  |
 
+The higher-level `Config` struct also records the hostname form. If either
+provider changes addresses, update `nat/stun.zig` before cutting a release.
+
 ## Tier 2: UDP Hole Punching
 
-When both peers are behind cone NATs, meshguard performs **rendezvous-mediated hole punching**:
+When both peers are behind cone NATs, meshguard performs **rendezvous-mediated
+hole punching** from SWIM membership:
 
 ### Protocol
 
@@ -67,6 +72,10 @@ Node A (NATed)          Rendezvous (Public)         Node B (NATed)
 - **Probe timing**: Every 200ms, up to 25 probes (5-second timeout)
 - **Concurrency**: Up to 4 concurrent hole punch attempts
 - **Token verification**: Random 16-byte nonce prevents spoofing
+
+The `meshguard connect` token-exchange command uses a separate coordinated
+punch path in `coordinated_punch.zig`. Its raw probe magic is `MGCP` and the
+probe includes an 8-byte nonce from the signed token.
 
 ### When Hole Punching Fails
 

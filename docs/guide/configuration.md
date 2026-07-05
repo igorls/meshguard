@@ -4,12 +4,23 @@ meshguard is configured entirely through CLI flags and environment variables. Th
 
 ## Config Directory
 
-The default config directory is `~/.config/meshguard/`. Override it with the `MESHGUARD_CONFIG_DIR` environment variable:
+meshguard does not read a monolithic configuration file. It uses CLI flags,
+environment variables, and small files under the config directory. Override the
+directory with the `MESHGUARD_CONFIG_DIR` environment variable:
 
 ```bash
 export MESHGUARD_CONFIG_DIR=/etc/meshguard
 meshguard up --seed 1.2.3.4:51821
 ```
+
+Without the override, defaults are platform-specific:
+
+| Platform / user | Default |
+| ---------------- | ------- |
+| Windows | `%APPDATA%\meshguard\` |
+| POSIX as root | `/etc/meshguard` |
+| POSIX non-root with `XDG_CONFIG_HOME` | `$XDG_CONFIG_HOME/meshguard` |
+| POSIX non-root fallback | `~/.config/meshguard` |
 
 ### Directory Layout
 
@@ -17,11 +28,17 @@ meshguard up --seed 1.2.3.4:51821
 $MESHGUARD_CONFIG_DIR/
 ├── identity.key           # Ed25519 secret key (permissions: 0600)
 ├── identity.pub           # Ed25519 public key
+├── node.cert              # Optional org-signed node certificate
 ├── authorized_keys/       # Trusted peer keys
 │   ├── peer-a.pub
 │   └── peer-b.pub
 ├── trusted_orgs/          # Org trust (auto-accept org members)
 │   └── eosrio.org
+├── org/                   # Org admin keypair, if this node signs certs
+│   ├── org.key
+│   └── org.pub
+├── vouched/               # Org vouches learned or created locally
+├── seeds/                 # Saved peer seeds from token-based connect
 └── services/              # Service access control (optional)
     ├── default            # Default action: "allow" or "deny"
     ├── global.policy      # Global rules applied to all peers
@@ -42,6 +59,8 @@ $MESHGUARD_CONFIG_DIR/
 | `--mdns`            | `false`  | Discover seeds via mDNS on LAN                   |
 | `--announce`        | _(auto)_ | Manually announce this IP to peers               |
 | `--kernel`          | `false`  | Use kernel WireGuard module instead of userspace |
+| `--gossip-only`     | `false`  | Run discovery/rendezvous only, without TUN/WG    |
+| `--no-tun`          | `false`  | Alias for `--gossip-only`                        |
 | `--encrypt-workers` | `0`      | Number of encryption threads (0 = serial)        |
 | `--open`            | `false`  | Accept all peers (skip trust enforcement)        |
 
@@ -89,9 +108,13 @@ $MESHGUARD_CONFIG_DIR/
 
 ## STUN Servers
 
-meshguard uses hardcoded STUN servers for public endpoint discovery:
+meshguard uses built-in STUN servers for public endpoint discovery:
 
-| Server                | IP               | Port  |
-| --------------------- | ---------------- | ----- |
-| `stun.l.google.com`   | `74.125.250.129` | 19302 |
-| `stun.cloudflare.com` | `104.18.32.7`    | 3478  |
+| Server                | Port  |
+| --------------------- | ----- |
+| `stun.l.google.com`   | 19302 |
+| `stun.cloudflare.com` | 3478  |
+
+The default `Config` stores these as `host:port` strings. The current runtime
+path calls `nat/stun.zig`'s embedded IPv4 defaults for these services, so update
+that module if the providers change addresses before a release.

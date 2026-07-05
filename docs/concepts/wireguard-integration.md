@@ -119,10 +119,13 @@ Sender indices start from a **random seed** (drawn from CSPRNG at device init) a
 | Interface creation | `RTM_NEWLINK` with kind `wireguard` | `TunDevice.open("mg0")`            |
 | Peer management    | `WG_CMD_SET_DEVICE` via Genetlink   | `WgDevice.addPeer()` in memory     |
 | Encryption         | Kernel crypto API                   | `ChaCha20Poly1305` from Zig stdlib |
-| IP assignment      | `RTM_NEWADDR` via RTNETLINK         | `RTM_NEWADDR` via RTNETLINK        |
-| Route setup        | `RTM_NEWROUTE` via RTNETLINK        | `RTM_NEWROUTE` via RTNETLINK       |
-| MTU                | Set via `SIOCSIFMTU` ioctl          | `TunDevice.setMtu(1420)`           |
+| IP assignment      | `RTM_NEWADDR` via RTNETLINK         | Platform helper                    |
+| Route setup        | `RTM_NEWROUTE` via RTNETLINK        | Platform helper                    |
+| MTU                | Set via ioctl/netlink               | Platform helper / TUN API          |
 | Packet I/O         | Direct kernel path                  | TUN read/write + UDP send/recv     |
+
+Userspace platform helpers are RTNETLINK on Linux, `ifconfig`/`route` on macOS
+and FreeBSD, and `netsh` on Windows.
 
 ## Benchmarking
 

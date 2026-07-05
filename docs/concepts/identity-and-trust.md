@@ -38,7 +38,7 @@ meshguard keygen --force
 Every node's mesh IP address is **deterministically derived** from its Ed25519 public key. This means:
 
 - No DHCP server needed
-- No IP conflicts are possible
+- No central allocator needed
 - No coordination between nodes required
 - Any node can compute any other node's IP from its public key
 
@@ -51,15 +51,20 @@ Blake3(public_key) → 32 bytes → take bytes [0..1] → 10.99.{byte0}.{byte1}
 1. Hash the 32-byte Ed25519 public key with **Blake3**
 2. Take the first 2 bytes of the hash output
 3. Map to the mesh prefix: `10.99.{hash[0]}.{hash[1]}`
+4. Adjust reserved octets: third octet `0` becomes `1`; last octet `0` becomes `1`, and `255` becomes `254`
 
-The mesh uses a `/16` prefix (`10.99.0.0/16`), providing 65,534 unique addresses.
+The mesh uses a `/16` prefix (`10.99.0.0/16`). Because the IPv4 host portion is
+derived from 16 hash bits, collisions are possible in large meshes and should be
+treated operationally the same way as any deterministic-address collision.
 
 ### Collision Resistance
 
 Blake3 provides strong uniformity across the 16-bit hash space. With 64K possible addresses, the birthday paradox suggests a 50% collision probability at ~256 nodes. For meshes larger than ~100 nodes, the prefix width should be extended (future work).
 
 ::: info
-The `10.99.0.0/16` prefix and derivation algorithm are defined in `wireguard/ip.zig`. The `0.0` and `0.1` addresses are reserved (network and broadcast-adjacent), so the effective range is `10.99.0.2` – `10.99.255.254`.
+The `10.99.0.0/16` prefix and derivation algorithm are defined in
+`wireguard/ip.zig`. Generated IPv4 addresses avoid `10.99.0.x`, `.0`, and
+`.255`; the address space is deterministic but not collision-proof.
 :::
 
 ## Dual Key System
@@ -76,10 +81,10 @@ The X25519 WireGuard keypair is derived or generated at runtime. The Ed25519 ide
 
 When two nodes discover each other:
 
-1. They authenticate using Ed25519 signatures in the meshguard handshake
-2. If individual trust fails, org certificate is verified (signature, expiry, org trust)
-3. They exchange X25519 public keys for WireGuard tunnel setup
-4. The Noise IK handshake establishes transport keys
+1. SWIM gossip advertises Ed25519 identity, WireGuard public key, endpoint, and optional org certificate data
+2. If individual trust fails, org certificate or vouch trust is verified
+3. The peer is added to the userspace or kernel WireGuard configuration
+4. The standard WireGuard Noise IK handshake establishes transport keys
 
 ## Org Trust & Certificates
 

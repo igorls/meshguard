@@ -5,7 +5,7 @@
 
 **Decentralized, serverless, WireGuard®-compatible mesh VPN daemon.**
 
-Zero central authority. Trust-agnostic. Dual-stack IPv4/IPv6. Single static binary.
+Zero central authority. Trust-agnostic. Dual-stack IPv4/IPv6. Portable Zig release artifacts.
 
 ## The Problem
 
@@ -58,10 +58,10 @@ Building a secure mesh network between N nodes (blockchain validators, edge serv
 | **Ed25519 identity keys**    | Separate from WireGuard X25519 — rotate transport keys without changing identity                                                      |
 | **Single-port multiplexing** | WireGuard, SWIM gossip, STUN, and hole punching share one UDP port (51821). Packet type classified by first 4 bytes                   |
 | **SWIM gossip protocol**     | O(log N) convergence, built-in failure detection, no coordinator                                                                      |
-| **Dual WireGuard modes**     | Kernel module (fastest) or full userspace (portable, zero dependencies)                                                               |
+| **Dual WireGuard modes**     | Kernel module (fastest) or full userspace (portable `std.crypto`, optional libsodium acceleration on Linux amd64)                    |
 | **Trust-agnostic**           | `authorized_keys/` directory — you decide how keys get there                                                                          |
 | **Org trust (hierarchical)** | Trust one org key → auto-accept all nodes signed by that org                                                                          |
-| **Deterministic mesh IPs**   | Blake3(pubkey) → `10.99.X.Y` (IPv4) + `fd99:6d67::X:Y` (IPv6 ULA). No DHCP, no conflicts, no coordination                            |
+| **Deterministic mesh IPs**   | Blake3(pubkey) → `10.99.X.Y` (IPv4) + `fd99:6d67::X:Y` (IPv6 ULA). No DHCP or central allocator; large meshes should still monitor for hash collisions |
 | **Deterministic mesh DNS**   | Blake3(org_pubkey) → `*.a1b2c3.mesh`. Per-org deterministic subdomains                                                                |
 | **Cross-platform**           | Linux, macOS, FreeBSD, Windows, Android, iOS — same Zig codebase, platform-specific TUN + ifconfig/netlink                            |
 | **Android/iOS FFI**          | C-ABI shared/static library — SWIM gossip + encrypted messaging without TUN. Build with `zig build -Dtarget=aarch64-linux-android`    |
@@ -100,9 +100,11 @@ meshguard up --seed 1.2.3.4:51821
 meshguard up --seed 1.2.3.4:51821 --kernel
 
 # Check status
+# Linux only in the current CLI
 meshguard status
 
 # Stop
+# Linux only in the current CLI
 meshguard down
 ```
 
@@ -197,7 +199,7 @@ Trust authorization order:
 
 - Gossip-based failure detection with ping / ack / ping-req
 - Lamport timestamps for crdt-like conflict resolution
-- Membership events piggybacked on SWIM messages (up to 8 per packet, 89 bytes each)
+- Membership events piggybacked on SWIM messages (up to 8 per packet, 115 bytes each)
 - Peer states: alive → suspected → dead, with configurable timeout
 
 ### WireGuard Engine
@@ -316,8 +318,8 @@ zig build -Doptimize=ReleaseFast
 # Run tests
 zig build test
 
-# Cross-compile for aarch64 Linux
-zig build -Dtarget=aarch64-linux-gnu -Doptimize=ReleaseFast
+# Cross-compile for aarch64 Linux without libsodium
+zig build -Dtarget=aarch64-linux-gnu -Doptimize=ReleaseFast -Dno-sodium=true
 
 # macOS (native or cross-compile)
 zig build -Dtarget=aarch64-macos -Doptimize=ReleaseFast
@@ -374,7 +376,7 @@ Core functionality is implemented and under active benchmarking:
 - [x] Ed25519 keygen, save/load, sign/verify
 - [x] Authorized keys directory management
 - [x] Deterministic mesh IP derivation (Blake3)
-- [x] CLI: `keygen`, `trust`, `revoke`, `export`, `up`, `down`, `status`, `version`
+- [x] CLI: `keygen`, `trust`, `revoke`, `export`, `up`, `down`, `status`, `version` (`down`/`status` are Linux-only today)
 - [x] SWIM gossip protocol with Lamport clocks
 - [x] Binary wire protocol codec
 - [x] Kernel WireGuard via netlink (RTM_NEWLINK + Genetlink)
@@ -395,7 +397,7 @@ Core functionality is implemented and under active benchmarking:
 - [x] UDP GRO on control-plane socket
 - [x] NAPI busy-poll + GRO drain loop
 - [x] Android FFI shared library (`libmeshguard-ffi.so`)
-- [x] App-level encrypted messaging (wire type `0x50`)
+- [x] FFI app-level encrypted messaging (wire type `0x50`)
 - [x] LAN multicast discovery
 - [x] UPnP-IGD port forwarding
 - [x] Coordinated punch (token-based direct connect)

@@ -12,7 +12,7 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  # ─── Validate that the tag matches src/version.zig ───
+  # ─── Validate that the tag matches source/package release metadata ───
   validate:
     runs-on: [self-hosted, zig]
     steps:
@@ -28,6 +28,24 @@ jobs:
             exit 1
           fi
           echo "✓ Tag v$TAG matches src/version.zig"
+
+          ZON=$(grep '^[[:space:]]*\.version' build.zig.zon | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$TAG" != "$ZON" ]; then
+            echo "::error::Tag v$TAG does not match build.zig.zon ($ZON)"
+            echo "  Update build.zig.zon before tagging."
+            exit 1
+          fi
+          echo "✓ Tag v$TAG matches build.zig.zon"
+
+          MAJOR=$(grep 'pub const major' src/version.zig | sed 's/.*= \([0-9]*\);/\1/')
+          MINOR=$(grep 'pub const minor' src/version.zig | sed 's/.*= \([0-9]*\);/\1/')
+          PATCH=$(grep 'pub const patch' src/version.zig | sed 's/.*= \([0-9]*\);/\1/')
+          COMPONENTS="$MAJOR.$MINOR.$PATCH"
+          if [ "$TAG" != "$COMPONENTS" ]; then
+            echo "::error::Tag v$TAG does not match src/version.zig components ($COMPONENTS)"
+            exit 1
+          fi
+          echo "✓ Tag v$TAG matches semantic version components"
 
       - name: Check CHANGELOG entry
         run: |
@@ -47,20 +65,27 @@ jobs:
           - target: ""
             artifact: meshguard-linux-amd64
             ext: ""
+            build_args: ""
+          - target: aarch64-linux-gnu
+            artifact: meshguard-linux-arm64
+            ext: ""
+            build_args: "-Dno-sodium=true"
           - target: x86_64-windows
             artifact: meshguard-windows-amd64
             ext: ".exe"
+            build_args: ""
           - target: x86_64-freebsd
             artifact: meshguard-freebsd-amd64
             ext: ""
+            build_args: ""
           - target: x86_64-macos
             artifact: meshguard-macos-amd64
             ext: ""
+            build_args: ""
           - target: aarch64-macos
             artifact: meshguard-macos-arm64
             ext: ""
-          # NOTE: aarch64-linux-gnu excluded — batch_udp.zig uses hardcoded
-          # x86_64 syscall numbers. Track fix separately.
+            build_args: ""
 
     steps:
       - uses: actions/checkout@v4
@@ -68,9 +93,9 @@ jobs:
       - name: Build
         run: |
           if [ -n "${{ matrix.target }}" ]; then
-            zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
+            zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast ${{ matrix.build_args }}
           else
-            zig build -Doptimize=ReleaseFast
+            zig build -Doptimize=ReleaseFast ${{ matrix.build_args }}
           fi
 
       - name: Rename artifact

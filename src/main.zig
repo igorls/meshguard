@@ -40,7 +40,6 @@ const usage =
     \\  version     Print version
     \\
     \\OPTIONS:
-    \\  --config <path>     Path to config file
     \\  --seed <host:port>   Seed peer (IP or hostname, can be repeated)
     \\  --dns <domain>       Discover seeds via DNS TXT records
     \\  --mdns               Discover seeds via mDNS on LAN

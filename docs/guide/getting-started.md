@@ -11,7 +11,7 @@ curl -fsSL https://raw.githubusercontent.com/igorls/meshguard/main/install.sh | 
 This will:
 
 - Detect your architecture (x86_64 / arm64)
-- Install **libsodium** if not present
+- Install **libsodium** if needed by the selected release artifact
 - Download the latest release from [GitHub Releases](https://github.com/igorls/meshguard/releases/latest)
 - Install to `/usr/local/bin/meshguard`
 
@@ -35,12 +35,13 @@ You can also download binaries directly from the [releases page](https://github.
 
 Alternatively, build from source with [Zig](https://ziglang.org/download/) 0.16+:
 
-| Requirement     | Linux                                            | Windows                            |
-| --------------- | ------------------------------------------------ | ---------------------------------- |
-| **Zig**         | 0.16 or later                                    | 0.16 or later                      |
-| **libsodium**   | _optional_ — `libsodium-dev` for the AVX2 accelerator (default); build `-Dno-sodium=true` to use `std.crypto` and skip it | Not required |
-| **OS**          | Kernel WireGuard module _or_ TUN support         | Windows 10+ with Wintun            |
-| **Permissions** | `sudo` or `CAP_NET_ADMIN` for interface creation | Administrator for `meshguard up`   |
+| Target | Notes |
+|---|---|
+| Linux | Kernel or userspace mode; libsodium is an optional AVX2 accelerator on amd64 |
+| macOS | Userspace mode via `utun`; uses `std.crypto` |
+| FreeBSD | Userspace mode via `tun(4)`; uses `std.crypto` |
+| Windows | Userspace mode via Wintun; requires Administrator for `meshguard up` |
+| Android / iOS | FFI library only; no TUN interface from the CLI |
 
 ```bash
 # Debug build
@@ -49,8 +50,13 @@ zig build
 # Optimized static binary
 zig build -Doptimize=ReleaseFast
 
-# Cross-compile for aarch64
-zig build -Dtarget=aarch64-linux-gnu -Doptimize=ReleaseFast
+# Linux arm64 without libsodium
+zig build -Dtarget=aarch64-linux-gnu -Doptimize=ReleaseFast -Dno-sodium=true
+
+# macOS, FreeBSD, and Windows release targets
+zig build -Dtarget=aarch64-macos -Doptimize=ReleaseFast
+zig build -Dtarget=x86_64-freebsd -Doptimize=ReleaseFast
+zig build -Dtarget=x86_64-windows -Doptimize=ReleaseFast
 
 # Run test suite
 zig build test
@@ -124,13 +130,16 @@ meshguard up --seed 1.2.3.4:51821 --announce 203.0.113.42
 
 # Kernel WireGuard mode (default is userspace)
 meshguard up --seed 1.2.3.4:51821 --kernel
+
+# Discovery/rendezvous only, no TUN interface
+meshguard up --gossip-only --seed 1.2.3.4:51821
 ```
 
 meshguard will:
 
 1. Load your identity from `~/.config/meshguard/`
 2. Derive your deterministic mesh IP (`10.99.X.Y`)
-3. Create the `mg0` WireGuard interface
+3. Create the `mg0` WireGuard interface unless `--gossip-only` is used
 4. Run STUN to discover your public endpoint
 5. Begin gossiping with seed peers via the SWIM protocol
 6. Automatically configure WireGuard tunnels as peers are discovered
@@ -141,13 +150,16 @@ meshguard will:
 meshguard down
 ```
 
-This tears down the `mg0` interface.
+This tears down the `mg0` interface. In the current CLI this command is
+Linux-only; on other platforms stop the running process or service.
 
 ### 6. Check status
 
 ```bash
 meshguard status
 ```
+
+In the current CLI, `status` is Linux-only.
 
 ## Run as a service
 

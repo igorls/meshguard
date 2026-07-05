@@ -6,7 +6,9 @@
 
 **Independent verification:** Both CRITICAL findings (C1 base64 stack OOB, C2 unsigned org-revoke) were re-checked line-by-line by the lead against the live source and the Zig 0.16.0 std base64 decoder; both confirmed exactly as described.
 
-> ⚠️ This document describes vulnerabilities, most now REMEDIATED in the working tree (see status below). Treat as sensitive until released.
+> Historical security review. This document preserves the original findings and
+> remediation status for auditability; do not treat deferred items as fixed
+> unless the status table or current source says so.
 
 ## Remediation status (applied 2026-06-06)
 

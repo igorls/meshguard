@@ -16,37 +16,40 @@ SWIM messages use a **1-byte type tag**:
 [1B type][payload...]
 ```
 
-## Message Types
+## SWIM / Protocol Codec Tags
 
-| Tag    | Name                | Category  | Direction       |
-| ------ | ------------------- | --------- | --------------- |
-| `0x01` | Ping                | SWIM      | A → B           |
-| `0x02` | PingReq             | SWIM      | A → C (probe B) |
-| `0x03` | Ack                 | SWIM      | B → A           |
-| `0x01` | HandshakeInitiation | WireGuard | A → B           |
-| `0x02` | HandshakeResponse   | WireGuard | B → A           |
-| `0x03` | CookieReply         | WireGuard | B → A           |
-| `0x04` | TransportData       | WireGuard | A ↔ B           |
-| `0x33` | HolepunchRequest    | NAT       | A → Rendezvous  |
-| `0x34` | HolepunchResponse   | NAT       | B → Rendezvous  |
-| `0x40` | OrgCertPresent      | Org Trust | A → B           |
-| `0x41` | OrgAliasAnnounce    | Org Trust | Gossip          |
-| `0x42` | OrgCertRevoke       | Org Trust | Gossip          |
-| `0x43` | OrgTrustVouch       | Org Trust | Gossip          |
-| `0x50` | AppMessage          | App       | A → B (relayed) |
+The 1-byte tags below are handled by `protocol/codec.zig` after packet
+classification has ruled out WireGuard and STUN:
+
+| Tag    | Name              | Category  | Direction       |
+| ------ | ----------------- | --------- | --------------- |
+| `0x01` | Ping              | SWIM      | A → B           |
+| `0x02` | PingReq           | SWIM      | A → C (probe B) |
+| `0x03` | Ack               | SWIM      | B → A           |
+| `0x33` | HolepunchRequest  | NAT       | A → Rendezvous  |
+| `0x34` | HolepunchResponse | NAT       | B → Rendezvous  |
+| `0x41` | OrgAliasAnnounce  | Org Trust | Gossip          |
+| `0x42` | OrgCertRevoke     | Org Trust | Gossip          |
+| `0x43` | OrgTrustVouch     | Org Trust | Gossip          |
+
+`messages.zig` reserves additional enum values for future protocol messages,
+but the codec currently decodes the tags listed above. WireGuard handshake,
+cookie, and transport packets are classified by their 4-byte WireGuard type
+(`1`-`4`), not by this 1-byte table. The FFI app-message path uses `0x50`
+outside this codec.
 
 ## Ping
 
 ```
-[0x01][32B sender_pubkey][8B seq (LE)][1B gossip_count][N × gossip_entry]
+[0x01][32B sender_pubkey][8B seq (LE)][8B incarnation (LE)][1B gossip_count][N × gossip_entry][optional org cert extension]
 ```
 
-Minimum size: **42 bytes** (no gossip).
+Minimum size: **50 bytes** (no gossip, no org cert extension).
 
 ## Ack
 
 ```
-[0x03][32B sender_pubkey][8B seq (LE)][1B gossip_count][N × gossip_entry]
+[0x03][32B sender_pubkey][8B seq (LE)][8B incarnation (LE)][1B gossip_count][N × gossip_entry][optional org cert extension]
 ```
 
 Same format as Ping. The `seq` echoes the Ping's sequence number.
@@ -67,13 +70,21 @@ Piggybacked on Ping and Ack messages:
 [32B subject_pubkey]
 [1B event]               # join=0, alive=1, suspect=2, dead=3, leave=4
 [8B lamport (LE)]
-[1B has_endpoint][4B addr][2B port (LE)]
+[1B has_endpoint][1B family][16B addr][2B port (LE)]
 [1B has_wg_pubkey][32B wg_pubkey]
-[1B has_public_endpoint][4B addr][2B port (LE)]
+[1B has_public_endpoint][1B family][16B addr][2B port (LE)]
 [1B nat_type]            # public=0, cone=1, symmetric=2, unknown=3
 ```
 
-Fixed size: **89 bytes** per entry. Up to 8 entries per message.
+Fixed size: **115 bytes** per entry. Up to 8 entries are decoded per message.
+A fully loaded Ping/Ack with 8 gossip entries is 970 bytes before the optional
+org certificate extension.
+
+The optional org certificate extension is appended to Ping/Ack after gossip as:
+
+```
+[1B present=1][186B NodeCertificate]
+```
 
 ## HandshakeInitiation (Type 1)
 
@@ -107,18 +118,18 @@ Total: **92 bytes**.
 ## HolepunchRequest
 
 ```
-[0x33][32B sender_pubkey][32B target_pubkey][4B addr][2B port (LE)][16B token]
+[0x33][32B sender_pubkey][32B target_pubkey][20B public_endpoint][16B token]
 ```
 
-Total: **87 bytes**.
+Total: **101 bytes**.
 
 ## HolepunchResponse
 
 ```
-[0x34][32B sender_pubkey][4B addr][2B port (LE)][16B token_echo]
+[0x34][32B sender_pubkey][20B public_endpoint][16B token_echo]
 ```
 
-Total: **55 bytes**.
+Total: **69 bytes**.
 
 ## OrgAliasAnnounce
 
@@ -150,9 +161,11 @@ Propagated via gossip. Org admin vouches for an external standalone node — all
 
 Total: **137 bytes**. Signature covers `vouched_pubkey ‖ lamport`. Revocable via OrgCertRevoke.
 
-## AppMessage
+## FFI AppMessage
 
-End-to-end encrypted application-level message, relayed through the mesh.
+The FFI application-message path uses `0x50` for end-to-end encrypted
+application-level messages. This is documented here because it shares the UDP
+port, but it is not decoded by `protocol/codec.zig`.
 
 ```
 [0x50][32B dest_pubkey][32B sender_pubkey][12B nonce][N ciphertext][16B tag]
@@ -167,17 +180,17 @@ Minimum size: **93 bytes** (empty payload). Maximum payload: 1024 bytes.
 
 ## Endpoint Encoding
 
-All IPv4 endpoints are encoded as:
+All protocol-codec endpoints are fixed-width and can carry IPv4 or IPv6:
 
 ```
-[4B addr][2B port (LE)]
+[1B present][1B family][16B addr][2B port (LE)]
 ```
 
-With a **1-byte presence flag** when optional:
-
-- `0x00` = absent (6 zero bytes follow)
-- `0x01` = present (4B addr + 2B port follow)
+- `present=0` = absent; remaining bytes are zero
+- `family=4` = IPv4 stored in the first 4 bytes of the 16-byte address field
+- `family=6` = IPv6 stored in all 16 address bytes
 
 ## Byte Order
 
-All multi-byte integers use **little-endian** encoding, matching the WireGuard wire format.
+Protocol-codec integers use **little-endian** encoding. WireGuard packets follow
+the WireGuard wire format, and STUN packets follow RFC 5389.

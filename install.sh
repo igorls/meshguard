@@ -31,8 +31,9 @@ echo "meshguard installer"
 echo "  arch: $ARCH → $ARTIFACT"
 echo ""
 
-# Check for libsodium
-if ! /sbin/ldconfig -p 2>/dev/null | grep libsodium >/dev/null 2>&1; then
+# Check for libsodium. The Linux amd64 release uses libsodium as its AVX2
+# accelerator; the Linux arm64 release is built with std.crypto/no-sodium.
+if [ "$ARTIFACT" = "meshguard-linux-amd64" ] && ! /sbin/ldconfig -p 2>/dev/null | grep libsodium >/dev/null 2>&1; then
   echo "⚠ libsodium not found. Installing..."
   if command -v apt-get &>/dev/null; then
     sudo apt-get update -qq && sudo apt-get install -y -qq libsodium23 2>/dev/null || sudo apt-get install -y -qq libsodium26 2>/dev/null

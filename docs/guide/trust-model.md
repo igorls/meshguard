@@ -119,13 +119,13 @@ meshguard org-vouch <solo-node-pubkey>
 
 ### Revocation
 
-Org admins can revoke certificates, which are propagated via gossip:
+The wire protocol supports signed `OrgCertRevoke` messages, which are
+propagated via gossip and enforced by peers that receive them. The receive-side
+verification signs the revoked node key, reason, and Lamport timestamp.
 
-```bash
-meshguard org-revoke <node-pubkey>
-```
-
-Revoked nodes are disconnected immediately by peers that receive the revocation.
+The current CLI does not expose an `org-revoke` command yet. Until signer
+tooling is added, operational revocation is still done by removing individual
+trust files or rotating/reissuing org trust material.
 
 ### Org Vouch (External Peers)
 
@@ -141,7 +141,7 @@ All nodes trusting the vouching org will auto-accept the standalone node. This i
 
 - Cross-org peering without full membership
 - Onboarding partners to a fleet
-- Temporary trust grants (revocable via `org-revoke`)
+- Temporary trust grants (revocable once signed revocation tooling is exposed)
 
 ### Authorization Flow
 

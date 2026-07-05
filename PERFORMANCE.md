@@ -67,22 +67,27 @@ This document captures the current performance profile, what has been tried, wha
 
 ### Tier 1: High Impact (Architectural)
 
-#### 1. `io_uring` for UDP Receive
+#### 1. Enable `io_uring` UDP Receive/Send Path
 
 **Expected impact**: +15-30% download  
 **Complexity**: Medium  
 **Risk**: Low (fallback to poll+recvmsg)
 
-Replace the `poll()` → `recvGRO()` double-syscall with `io_uring` completion-based async I/O. Currently 5.5% of CPU is in syscall overhead (`entry_SYSRETQ` + kernel copies). `io_uring` eliminates the poll() syscall entirely and can submit multiple recvmsg operations in one batch.
+`src/net/io_uring.zig` already contains a `UdpRing` implementation for
+`IORING_OP_RECVMSG`/`IORING_OP_SENDMSG`, and `main.zig` has the integration path.
+Runtime availability is still gated off by `IoUring.isAvailable()` because the
+older TUN reader path needs bare-metal validation. The remaining work is to
+split/relax that gate for UDP after validation, while preserving fallback to
+`poll()` + `recvmsg`.
 
 **Implementation plan**:
 
-1. Create `io_uring` instance with `IORING_SETUP_SQPOLL` for kernel-side polling
-2. Submit `IORING_OP_RECVMSG` with `IOSQE_BUFFER_SELECT` for zero-copy receive
+1. Validate the existing `UdpRing` path on bare-metal Linux and containerized Linux
+2. Separate UDP availability from the disabled TUN-reader availability check
 3. Process completions in the control loop instead of poll+recvmsg
-4. Fallback to current GRO path if `io_uring` unavailable (kernel < 5.6)
+4. Keep fallback to the current GRO path if `io_uring` is unavailable
 
-**Files to modify**: `src/main.zig` (userspaceEventLoop), `src/net/io_uring.zig` (already has `IoUringReader`)
+**Files to modify**: `src/main.zig` (userspaceEventLoop), `src/net/io_uring.zig` (`UdpRing`, availability gate)
 
 #### 2. Parallel RX with Per-Worker TUN Queues
 

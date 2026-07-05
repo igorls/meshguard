@@ -1,6 +1,8 @@
 # Windows Support
 
-> **Status**: Full support — daemon, CLI, WireGuard data plane, and control socket all functional.
+> **Status**: Supported for userspace daemon operation with Wintun. Key management
+> and `meshguard up` work on Windows; `status` and `down` are still Linux-only in
+> the current CLI.
 
 ## Install
 
@@ -52,7 +54,8 @@ meshguard up --announce 203.0.113.42
 | `meshguard version` | ✅ | |
 | `meshguard config show` | ✅ | |
 | `meshguard up` | ✅ | Requires Admin + wintun.dll |
-| `meshguard status` | ✅ | Via named pipe `\\.\pipe\meshguard` |
+| `meshguard status` | Linux-only | Windows control socket plumbing exists, but the CLI command is not wired yet |
+| `meshguard down` | Linux-only | Stop the running process or service manually |
 
 ## Architecture
 
@@ -87,7 +90,7 @@ meshguard up --announce 203.0.113.42
 | TUN driver | `/dev/net/tun` | Wintun (`wintun.dll`) |
 | WG mode | Kernel or userspace | Userspace only |
 | Crypto | libsodium (AVX2) | `std.crypto` |
-| Control socket | Unix domain socket | Named pipe (`\\.\pipe\meshguard`) |
+| Control socket | Unix domain socket | Named pipe plumbing (`\\.\pipe\meshguard`) |
 | Signal handling | `sigaction` | `SetConsoleCtrlHandler` |
 | Interface config | Netlink / `ip` | `netsh` |
 | Config directory | `/etc/meshguard/` or `~/.config/meshguard/` | `%APPDATA%\meshguard\` |

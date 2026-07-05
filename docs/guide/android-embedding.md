@@ -8,10 +8,10 @@ meshguard provides a **C-ABI shared library** (`libmeshguard-ffi.so`) for embedd
 | ------------------------ | ----------------- | --------------------------- |
 | SWIM gossip discovery    | ✅                | ✅                          |
 | LAN multicast discovery  | ✅                | ✅                          |
-| Encrypted app messages   | ✅                | ✅                          |
+| Encrypted app messages   | Relay path       | ✅                          |
 | Peer events (join/leave) | ✅                | ✅                          |
 | WireGuard data tunnels   | ✅ (TUN)          | ✅ (ring buffer)            |
-| Kernel WireGuard         | ✅                | ❌                          |
+| Kernel WireGuard         | ✅ (Linux only)   | ❌                          |
 | Trust enforcement        | ✅                | Open by default             |
 | libsodium dependency     | ✅ (AVX2 accel)   | ❌ (`std.crypto` only)      |
 
@@ -50,20 +50,29 @@ object MeshGuardFFI {
 
     // Lifecycle
     external fun meshguard_init(identitySeed: ByteArray?, listenPort: Int): Long
+    external fun meshguard_init_ipv6(identitySeed: ByteArray?, listenPort: Int): Long
+    external fun meshguard_init_bind(identitySeed: ByteArray?, listenPort: Int, bindIp: ByteArray): Long
     external fun meshguard_destroy(ctx: Long)
 
     // Mesh join/leave
     external fun meshguard_join(ctx: Long, seedIp: ByteArray, seedPort: Int): Int
+    external fun meshguard_join_ipv6(ctx: Long, seedIp: ByteArray, seedPort: Int): Int
+    external fun meshguard_join_host(ctx: Long, host: String, seedPort: Int): Int
     external fun meshguard_join_lan(ctx: Long): Int
     external fun meshguard_leave(ctx: Long)
 
     // Messaging
     external fun meshguard_send(ctx: Long, peerPubkey: ByteArray, data: ByteArray, len: Int): Int
     external fun meshguard_recv(ctx: Long, outData: ByteArray, outLen: IntArray, outSender: ByteArray): Int
+    external fun meshguard_set_on_undeliverable(ctx: Long, callback: Long)
 
     // Query
     external fun meshguard_peer_count(ctx: Long): Int
     external fun meshguard_is_running(ctx: Long): Boolean
+    external fun meshguard_suspend(ctx: Long)
+    external fun meshguard_resume(ctx: Long)
+    external fun meshguard_is_suspended(ctx: Long): Boolean
+    external fun meshguard_last_recv_time(ctx: Long): Long
     external fun meshguard_get_bound_port(ctx: Long): Int
     external fun meshguard_get_pubkey_b64(ctx: Long, out: ByteArray)
 }
@@ -152,6 +161,8 @@ MeshGuardFFI.meshguard_tunnel_close(ctx, peerPubkey)
 | Function                   | Signature                           | Description                                                                          |
 | -------------------------- | ----------------------------------- | ------------------------------------------------------------------------------------ |
 | `meshguard_init`           | `(seed: ?[*]u8, port: u16) → ?*ctx` | Create instance. Pass `null` seed to auto-generate identity. Port `0` for ephemeral. |
+| `meshguard_init_ipv6`      | `(seed: ?[*]u8, port: u16) → ?*ctx` | Create instance bound to an IPv6 UDP socket. |
+| `meshguard_init_bind`      | `(seed: ?[*]u8, port: u16, ip4) → ?*ctx` | Create instance bound to a specific local IPv4 address. |
 | `meshguard_destroy`        | `(ctx) → void`                      | Stop networking and free all resources.                                              |
 | `meshguard_get_pubkey`     | `(ctx, out: [*]u8) → void`          | Write 32-byte Ed25519 public key.                                                    |
 | `meshguard_get_pubkey_b64` | `(ctx, out: [*]u8) → void`          | Write 44-byte base64 public key + null terminator.                                   |
@@ -162,6 +173,8 @@ MeshGuardFFI.meshguard_tunnel_close(ctx, peerPubkey)
 | Function                                  | Returns                                       | Description                           |
 | ----------------------------------------- | --------------------------------------------- | ------------------------------------- |
 | `meshguard_join(ctx, seed_ip, seed_port)` | `0` success, `-1` error, `-2` already running | Join via seed peer.                   |
+| `meshguard_join_ipv6(ctx, seed_ip6, seed_port)` | `0` success, `-1` error, `-2` already running | Join via IPv6 seed peer. |
+| `meshguard_join_host(ctx, host, seed_port)` | `0` success, `-1` error, `-2` already running | Resolve DNS A record, then join. |
 | `meshguard_join_lan(ctx)`                 | `0` success, `-1` error                       | Join via LAN multicast (239.99.99.1). |
 | `meshguard_leave(ctx)`                    | `void`                                        | Broadcast leave and stop event loop.  |
 
@@ -173,6 +186,7 @@ MeshGuardFFI.meshguard_tunnel_close(ctx, peerPubkey)
 | `meshguard_recv(ctx, out_data, out_len, out_sender)` | `0` received, `1` empty, `-1` error | Poll inbox for next message.                     |
 | `meshguard_set_on_message(ctx, callback)`            | `void`                              | Set push callback for incoming messages.         |
 | `meshguard_set_on_peer_event(ctx, callback)`         | `void`                              | Set push callback for peer join (1) / leave (2). |
+| `meshguard_set_on_undeliverable(ctx, callback)`      | `void`                              | Set callback for messages that cannot be routed. |
 
 ### Query
 
@@ -180,6 +194,10 @@ MeshGuardFFI.meshguard_tunnel_close(ctx, peerPubkey)
 | --------------------------------------- | ----------- | ------------------------------------------- |
 | `meshguard_peer_count(ctx)`             | `u32`       | Number of alive peers.                      |
 | `meshguard_is_running(ctx)`             | `bool`      | Whether the event loop is active.           |
+| `meshguard_suspend(ctx)`                | `void`      | Pause network activity for mobile lifecycle handling. |
+| `meshguard_resume(ctx)`                 | `void`      | Resume network activity after suspension.   |
+| `meshguard_is_suspended(ctx)`           | `bool`      | Whether the context is currently suspended. |
+| `meshguard_last_recv_time(ctx)`         | `u64`       | Epoch-millisecond timestamp of the last received SWIM packet, or `0`. |
 | `meshguard_get_bound_port(ctx)`         | `u16`       | Actual UDP port (useful when binding to 0). |
 | `meshguard_get_peers(ctx, out, max)`    | `u32` count | Write alive peer pubkeys (32B each).        |
 | `meshguard_get_peer_info(ctx, pk, out)` | `0` or `-1` | Peer endpoint, mesh IP, state, WG pubkey.   |
@@ -214,3 +232,4 @@ Messages are encrypted end-to-end using X25519 key agreement + ChaCha20-Poly1305
 - **Ephemeral ports** — pass port `0` to `meshguard_init` for OS-assigned port (recommended on mobile)
 - **Identity persistence** — use `meshguard_get_seed` to export the 32-byte seed, store in Android Keystore, and pass back to `meshguard_init` on restart
 - **Tunnel ring buffer** — the tunnel inbox holds 256 messages (1500 bytes each). At 50 fps audio (20ms frames), this gives ~5 seconds of buffer before dropping. Poll `meshguard_tunnel_recv` from a dedicated thread.
+- **Diagnostics** — set `MESHGUARD_STATS=1` to emit once-per-second counter deltas from the FFI event loop.

@@ -26,7 +26,7 @@ Reference map of all source modules and their responsibilities.
 | ---------------- | ------------------------------------------------------------------------------------------------------------- |
 | `swim.zig`       | SWIM protocol engine: ping/ack loop, gossip propagation, handshake coordination, hole punch triggers          |
 | `membership.zig` | Membership table: peer states (alive/suspected/dead), Lamport clocks, suspicion expiry, random peer selection |
-| `seed.zig`       | Seed peer resolution: static IP parsing, DNS/mDNS placeholders                                                |
+| `seed.zig`       | Seed peer resolution: static IP/hostname parsing, DNS TXT lookup, mDNS lookup                                 |
 | `lan.zig`        | LAN multicast discovery: UDP beacon broadcast/receive on `239.99.99.1`, app ID filtering                      |
 
 ## `wireguard/`
@@ -58,7 +58,7 @@ Reference map of all source modules and their responsibilities.
 | File           | Purpose                                                                                                                                          |
 | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `messages.zig` | Wire message type definitions: `Ping`, `Ack`, `PingReq`, `HandshakeInit/Resp`, `GossipEntry`, `HolepunchRequest/Response`, `NatType`, `Endpoint` |
-| `codec.zig`    | Binary codec: encode/decode for all message types, gossip entry serialization (89 bytes each)                                                    |
+| `codec.zig`    | Binary codec: encode/decode for active protocol messages, 115-byte gossip entries, IPv4/IPv6 endpoints, org cert extensions |
 
 ## `services/`
 
@@ -81,8 +81,10 @@ Reference map of all source modules and their responsibilities.
 | `batch_udp.zig`  | Batched UDP I/O: `sendmmsg`/`recvmmsg` for high-throughput packet processing               |
 | `tun.zig`        | Linux TUN device: open, read/write packets, `setMtu`, `setNonBlocking`, multi-queue        |
 | `utun.zig`       | macOS utun device: `PF_SYSTEM` socket creation, 4-byte AF header handling                  |
+| `fbsdtun.zig`    | FreeBSD tun(4) device: clone open, read/write packets, MTU, polling                        |
 | `wintun.zig`     | Windows Wintun adapter: DLL loading, ring buffer read/write                                |
 | `darwincfg.zig`  | macOS interface configuration: `ifconfig`/`route` for IP assignment, MTU, routes            |
+| `freebsdcfg.zig` | FreeBSD interface configuration: `ifconfig`/`route` for IP assignment, MTU, routes          |
 | `wincfg.zig`     | Windows interface configuration: `netsh` for IP assignment, routes                          |
 | `dns.zig`        | DNS resolver: seed peer discovery via DNS TXT records                                      |
 | `offload.zig`    | GSO/GRO offload: `IFF_VNET_HDR`, segmentation offload for high-throughput paths            |

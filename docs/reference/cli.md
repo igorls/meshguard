@@ -12,7 +12,7 @@ meshguard keygen [--force]
 | --------- | ------------------------------------- |
 | `--force` | Overwrite existing keys (destructive) |
 
-**Output files** (in `$MESHGUARD_CONFIG_DIR`, default `~/.config/meshguard/`):
+**Output files** (in `$MESHGUARD_CONFIG_DIR`, or the platform default config directory):
 
 - `identity.key` — secret key (permissions `0600`)
 - `identity.pub` — public key
@@ -81,17 +81,19 @@ meshguard up [options]
 | `--announce`        | _(auto)_ | Manually specify public IP for announcement |
 | `--encrypt-workers` | `0`      | Number of encryption threads (0 = serial)   |
 | `--kernel`          | `false`  | Use kernel WireGuard instead of userspace   |
+| `--gossip-only`     | `false`  | Run discovery/rendezvous only, no TUN/WG    |
+| `--no-tun`          | `false`  | Alias for `--gossip-only`                   |
 | `--open`            | `false`  | Accept all peers (skip trust enforcement)   |
 
 **Startup sequence**:
 
 1. Load identity from config directory
 2. Derive mesh IP from public key
-3. Create `mg0` interface (kernel: RTM_NEWLINK, userspace: TUN)
-4. Assign mesh IP and set MTU (1420)
+3. Create `mg0` interface unless running `--gossip-only`
+4. Assign mesh IPv4/IPv6 and set MTU (1420)
 5. Run STUN to discover public endpoint
 6. Connect to seed peers
-7. Enter SWIM gossip + WireGuard event loop
+7. Enter SWIM gossip plus WireGuard event loop, or gossip-only loop
 
 ---
 
@@ -103,7 +105,8 @@ Stop the daemon and remove the `mg0` interface.
 meshguard down
 ```
 
-Uses `RTM_DELLINK` via RTNETLINK to remove the interface.
+> **Platform:** Linux only. The current implementation uses `RTM_DELLINK` via
+> RTNETLINK to remove the interface.
 
 ---
 
@@ -114,6 +117,9 @@ Display the current mesh state.
 ```bash
 meshguard status
 ```
+
+> **Platform:** Linux only. The current implementation queries `mg0` through
+> RTNETLINK and kernel WireGuard Genetlink where available.
 
 ---
 
@@ -243,6 +249,10 @@ meshguard connect --join mg://...
 | Variable               | Description                                                |
 | ---------------------- | ---------------------------------------------------------- |
 | `MESHGUARD_CONFIG_DIR` | Override config directory (default: `~/.config/meshguard`) |
+
+Default config directories are `%APPDATA%\meshguard\` on Windows,
+`/etc/meshguard` when running as root on POSIX systems, otherwise
+`$XDG_CONFIG_HOME/meshguard` or `~/.config/meshguard`.
 
 ---
 

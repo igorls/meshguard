@@ -13,7 +13,7 @@ meshguard's security model is built on three pillars: **cryptographic identity**
 | **Replay attacks** | 2048-bit sliding window + TAI64N timestamps in handshake |
 | **Key compromise** | Transport keys rotate every 120s; identity keys never transmitted |
 | **Unauthorized peers** | `authorized_keys/` directory gates membership |
-| **NAT traversal attacks** | Hole punch uses 16-byte random tokens, not predictable patterns |
+| **NAT traversal attacks** | Hole punch requests use 16-byte random tokens; coordinated punch probes use signed tokens plus nonces |
 
 ### What meshguard does NOT protect against
 
@@ -42,7 +42,7 @@ meshguard's security model is built on three pillars: **cryptographic identity**
 
 - **Org admins hold signing keys** — treat like root CA keys
 - **Node certificates** — 186 bytes, stored at `~/.config/meshguard/node.cert`
-- **Revocation** — use `org-revoke` immediately if a node is compromised
+- **Revocation** — remove individual trust files immediately; signed org revocation messages are receive-side supported, but a public `org-revoke` CLI is not exposed yet
 
 ## Attack Surface
 

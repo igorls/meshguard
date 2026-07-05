@@ -47,7 +47,7 @@ meshguard is organized into six top-level modules, each with a focused responsib
 
 - **`swim.zig`** — SWIM gossip protocol: ping/ack, ping-req indirect probing, gossip dissemination, hole punch coordination
 - **`membership.zig`** — Membership table: peer states (alive/suspected/dead), Lamport timestamps, suspicion expiry
-- **`seed.zig`** — Seed peer resolution (static IPs, DNS, mDNS placeholders)
+- **`seed.zig`** — Seed peer resolution (static IP/hostname seeds, DNS TXT, mDNS)
 
 ### `wireguard/` — Tunnel management
 
@@ -75,6 +75,8 @@ meshguard is organized into six top-level modules, each with a focused responsib
 
 - **`udp.zig`** — Non-blocking UDP socket with `sendTo`, `recvFrom`, `pollRead`
 - **`tun.zig`** — Linux TUN device: open, read/write IP packets, `setMtu`, `setNonBlocking`
+- **`utun.zig`** / **`fbsdtun.zig`** / **`wintun.zig`** — macOS, FreeBSD, and Windows userspace tunnel devices
+- **`darwincfg.zig`** / **`freebsdcfg.zig`** / **`wincfg.zig`** — platform interface configuration helpers
 - **`io.zig`** — Event loop abstraction layer
 - **`io_uring.zig`** — Linux io_uring integration for async I/O
 - **`pipeline.zig`** — Packet processing pipeline with batched encrypt/decrypt
@@ -127,5 +129,8 @@ meshguard supports two operation modes:
 | Performance  | Kernel-speed crypto     | User-space ChaCha20        |
 | Setup        | `ip link add` + netlink | TUN + UDP socket           |
 | Dependencies | `wireguard` kmod loaded | None                       |
-| Portability  | Linux only              | Any Linux with TUN         |
+| Portability  | Linux only              | Linux, macOS, FreeBSD, Windows |
 | Debugging    | Harder                  | Easier (all in user space) |
+
+Linux userspace configures addresses and routes with RTNETLINK. macOS and
+FreeBSD use `ifconfig`/`route`, and Windows uses `netsh`.
