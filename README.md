@@ -100,11 +100,9 @@ meshguard up --seed 1.2.3.4:51821
 meshguard up --seed 1.2.3.4:51821 --kernel
 
 # Check status
-# Linux only in the current CLI
 meshguard status
 
 # Stop
-# Linux only in the current CLI
 meshguard down
 ```
 
@@ -376,7 +374,7 @@ Core functionality is implemented and under active benchmarking:
 - [x] Ed25519 keygen, save/load, sign/verify
 - [x] Authorized keys directory management
 - [x] Deterministic mesh IP derivation (Blake3)
-- [x] CLI: `keygen`, `trust`, `revoke`, `export`, `up`, `down`, `status`, `version` (`down`/`status` are Linux-only today)
+- [x] CLI: `keygen`, `trust`, `revoke`, `export`, `up`, `down`, `status`, `version`
 - [x] SWIM gossip protocol with Lamport clocks
 - [x] Binary wire protocol codec
 - [x] Kernel WireGuard via netlink (RTM_NEWLINK + Genetlink)

@@ -925,6 +925,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     // SWIM-driven handshake retransmit is only needed for the userspace WG data
     // plane; kernel WireGuard retransmits its own, and gossip-only has none.
     swim.retransmit_handshakes = !use_kernel_wg and !gossip_only;
+    control.setStopFlag(&swim.running);
 
     // Load authorized keys and enable trust enforcement (unless --open)
     if (!open_mode) {
@@ -3524,23 +3525,32 @@ fn parseIpv6Endpoint(s: []const u8, port: u16) ?@import("protocol/messages.zig")
 }
 
 fn cmdDown(allocator: std.mem.Allocator) !void {
-    _ = allocator;
     const stdout = getStdOut();
     const stderr = getStdErr();
 
-    if (comptime @import("builtin").os.tag != .linux) {
-        try stderr.writeStreamingAll(zio(), "error: 'meshguard down' is only supported on Linux (requires netlink)\n");
+    var response_buf: [1024]u8 = undefined;
+    if (lib.services.Control.request(allocator, "STOP", &response_buf)) |n| {
+        if (std.mem.indexOf(u8, response_buf[0..n], "\"ok\":true") != null) {
+            try stdout.writeStreamingAll(zio(), "meshguard stop requested via control socket.\n");
+            return;
+        }
+        try writeFormatted(stderr, "error: daemon rejected stop request: {s}", .{response_buf[0..n]});
         std.process.exit(1);
-    } else {
-        lib.wireguard.Config.teardown(lib.wireguard.Config.DEFAULT_IFNAME) catch |err| {
-            switch (err) {
-                error.SocketCreateFailed => try stderr.writeStreamingAll(zio(), "error: permission denied. Run with sudo.\n"),
-                error.NetlinkError => try stderr.writeStreamingAll(zio(), "error: interface mg0 not found.\n"),
-                else => try writeFormatted(stderr, "error: {s}\n", .{@errorName(err)}),
-            }
+    } else |_| {
+        if (comptime @import("builtin").os.tag != .linux) {
+            try stderr.writeStreamingAll(zio(), "meshguard is not running (control socket unavailable).\n");
             std.process.exit(1);
-        };
+        }
     }
+
+    lib.wireguard.Config.teardown(lib.wireguard.Config.DEFAULT_IFNAME) catch |err| {
+        switch (err) {
+            error.SocketCreateFailed => try stderr.writeStreamingAll(zio(), "error: permission denied. Run with sudo.\n"),
+            error.NetlinkError => try stderr.writeStreamingAll(zio(), "error: interface mg0 not found.\n"),
+            else => try writeFormatted(stderr, "error: {s}\n", .{@errorName(err)}),
+        }
+        std.process.exit(1);
+    };
 
     try stdout.writeStreamingAll(zio(), "meshguard stopped. Interface mg0 removed.\n");
 }
@@ -3549,9 +3559,15 @@ fn cmdStatus(allocator: std.mem.Allocator) !void {
     const stdout = getStdOut();
     const stderr = getStdErr();
 
-    if (comptime @import("builtin").os.tag != .linux) {
-        try stderr.writeStreamingAll(zio(), "error: 'meshguard status' is only supported on Linux (requires netlink)\n");
-        std.process.exit(1);
+    var response_buf: [4096]u8 = undefined;
+    if (lib.services.Control.request(allocator, "STATUS", &response_buf)) |n| {
+        try printControlStatus(allocator, stdout, response_buf[0..n]);
+        return;
+    } else |_| {
+        if (comptime @import("builtin").os.tag != .linux) {
+            try stderr.writeStreamingAll(zio(), "meshguard is not running (control socket unavailable).\n");
+            std.process.exit(1);
+        }
     }
 
     const Netlink = lib.wireguard.Netlink;
@@ -3731,6 +3747,62 @@ fn cmdStatus(allocator: std.mem.Allocator) !void {
             rx.whole, rx.frac, rx.unit, tx.whole, tx.frac, tx.unit,
         });
     }
+}
+
+fn jsonStringField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const value = obj.get(key) orelse return null;
+    return switch (value) {
+        .string => |s| s,
+        else => null,
+    };
+}
+
+fn jsonIntField(obj: std.json.ObjectMap, key: []const u8) ?i64 {
+    const value = obj.get(key) orelse return null;
+    return switch (value) {
+        .integer => |i| i,
+        else => null,
+    };
+}
+
+fn printControlStatus(allocator: std.mem.Allocator, stdout: std.Io.File, response: []const u8) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, response, .{}) catch {
+        try stdout.writeStreamingAll(zio(), "meshguard is running.\n");
+        try writeFormatted(stdout, "  control response: {s}", .{response});
+        return;
+    };
+    defer parsed.deinit();
+
+    const root = switch (parsed.value) {
+        .object => |obj| obj,
+        else => {
+            try stdout.writeStreamingAll(zio(), "meshguard is running.\n");
+            try writeFormatted(stdout, "  control response: {s}", .{response});
+            return;
+        },
+    };
+
+    try stdout.writeStreamingAll(zio(), "meshguard is running.\n");
+    if (jsonStringField(root, "pubkey")) |pubkey| {
+        if (pubkey.len >= 12) {
+            try writeFormatted(stdout, "  public key: {s}...{s}\n", .{ pubkey[0..8], pubkey[pubkey.len - 4 ..] });
+        } else {
+            try writeFormatted(stdout, "  public key: {s}\n", .{pubkey});
+        }
+    }
+    if (jsonStringField(root, "mesh_ip")) |mesh_ip| {
+        try writeFormatted(stdout, "  mesh IP: {s}\n", .{mesh_ip});
+    }
+
+    if (root.get("peers")) |peers_value| switch (peers_value) {
+        .object => |peers| {
+            const alive = jsonIntField(peers, "alive") orelse 0;
+            const suspected = jsonIntField(peers, "suspected") orelse 0;
+            const dead = jsonIntField(peers, "dead") orelse 0;
+            try writeFormatted(stdout, "  peers: {d} alive, {d} suspected, {d} dead\n", .{ alive, suspected, dead });
+        },
+        else => {},
+    };
 }
 
 const FormattedBytes = struct {

@@ -36,5 +36,6 @@ sudo meshguard up --seed 1.2.3.4:51821
 ## Notes
 
 - Kernel WireGuard mode is Linux-only; FreeBSD uses the portable userspace data plane.
+- `meshguard status` and `meshguard down` use the Unix control socket while the userspace daemon is running.
 - GSO/GRO and io_uring paths are Linux-specific and are not used on FreeBSD.
 - The default config directory follows the POSIX rules: `/etc/meshguard` as root, otherwise `$XDG_CONFIG_HOME/meshguard` or `~/.config/meshguard`.

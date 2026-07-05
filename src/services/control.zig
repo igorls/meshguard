@@ -8,6 +8,7 @@
 //! Commands:
 //!   PEERS\n     → JSON array of alive peers with mesh IPs
 //!   STATUS\n    → JSON object with daemon status summary
+//!   STOP\n      → request graceful daemon shutdown
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -79,6 +80,14 @@ fn writeSocket(fd: posix.socket_t, data: []const u8) void {
     _ = std.c.write(fd, data.ptr, data.len);
 }
 
+fn readSocket(fd: posix.socket_t, out: []u8) !usize {
+    const n = std.c.read(fd, out.ptr, out.len);
+    return switch (std.posix.errno(n)) {
+        .SUCCESS => @intCast(n),
+        else => |err| std.posix.unexpectedErrno(err),
+    };
+}
+
 // ─── Windows-only imports ───
 const win = if (is_windows) struct {
     const windows = std.os.windows;
@@ -97,6 +106,8 @@ const win = if (is_windows) struct {
     extern "kernel32" fn ReadFile(hFile: HANDLE, lpBuffer: ?*anyopaque, nNumberOfBytesToRead: DWORD, lpNumberOfBytesRead: ?*DWORD, lpOverlapped: ?*anyopaque) callconv(.winapi) BOOL;
     extern "kernel32" fn WriteFile(hFile: HANDLE, lpBuffer: ?*const anyopaque, nNumberOfBytesToWrite: DWORD, lpNumberOfBytesWritten: ?*DWORD, lpOverlapped: ?*anyopaque) callconv(.winapi) BOOL;
     extern "kernel32" fn FlushFileBuffers(hFile: HANDLE) callconv(.winapi) BOOL;
+    extern "kernel32" fn CreateFileW(lpFileName: LPCWSTR, dwDesiredAccess: DWORD, dwShareMode: DWORD, lpSecurityAttributes: ?*anyopaque, dwCreationDisposition: DWORD, dwFlagsAndAttributes: DWORD, hTemplateFile: ?HANDLE) callconv(.winapi) HANDLE;
+    extern "kernel32" fn WaitNamedPipeW(lpNamedPipeName: LPCWSTR, nTimeOut: DWORD) callconv(.winapi) BOOL;
 } else struct {};
 
 pub const DEFAULT_SOCKET_PATH = if (is_windows) "\\\\.\\pipe\\meshguard" else "/run/meshguard/meshguard.sock";
@@ -110,6 +121,7 @@ pub const ControlSocket = struct {
     membership: *Membership.MembershipTable,
     our_pubkey: [32]u8,
     our_mesh_ip: [4]u8,
+    stop_flag: ?*std.atomic.Value(bool),
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -141,6 +153,7 @@ pub const ControlSocket = struct {
                         .membership = membership,
                         .our_pubkey = our_pubkey,
                         .our_mesh_ip = our_mesh_ip,
+                        .stop_flag = null,
                     };
                 }
             }
@@ -153,7 +166,12 @@ pub const ControlSocket = struct {
             .membership = membership,
             .our_pubkey = our_pubkey,
             .our_mesh_ip = our_mesh_ip,
+            .stop_flag = null,
         };
+    }
+
+    pub fn setStopFlag(self: *ControlSocket, stop_flag: *std.atomic.Value(bool)) void {
+        self.stop_flag = stop_flag;
     }
 
     pub fn listen(self: *ControlSocket) !void {
@@ -205,7 +223,7 @@ pub const ControlSocket = struct {
         const pipe_handle = win.CreateNamedPipeW(
             pipe_name,
             0x00000003 | 0x00080000, // PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE
-            0x00000000 | 0x00000000, // PIPE_TYPE_BYTE | PIPE_READMODE_BYTE
+            0x00000000 | 0x00000000 | 0x00000001, // PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT
             1, // max instances
             4096, // out buffer
             4096, // in buffer
@@ -253,10 +271,12 @@ pub const ControlSocket = struct {
             const err = win.GetLastError();
             // ERROR_PIPE_CONNECTED (535) means client already connected
             if (err != @as(win.windows.Win32Error, @enumFromInt(535)) and
-                err != @as(win.windows.Win32Error, @enumFromInt(232)))
-            { // ERROR_NO_DATA (232)
+                err != @as(win.windows.Win32Error, @enumFromInt(232)) and // ERROR_NO_DATA
+                err != @as(win.windows.Win32Error, @enumFromInt(536))) // ERROR_PIPE_LISTENING
+            {
                 return false;
             }
+            if (err == @as(win.windows.Win32Error, @enumFromInt(536))) return false;
         }
 
         // Read command from pipe
@@ -264,6 +284,9 @@ pub const ControlSocket = struct {
         var bytes_read: win.DWORD = 0;
         const read_ok = win.ReadFile(pipe, @ptrCast(&buf), buf.len, &bytes_read, null);
         if (read_ok == @as(win.BOOL, @enumFromInt(0)) or bytes_read == 0) {
+            if (win.GetLastError() == @as(win.windows.Win32Error, @enumFromInt(232))) {
+                return false;
+            }
             _ = win.DisconnectNamedPipe(pipe);
             return false;
         }
@@ -272,19 +295,7 @@ pub const ControlSocket = struct {
 
         // Generate response
         var resp_buf: [8192]u8 = undefined;
-        var resp_len: usize = 0;
-
-        if (std.mem.eql(u8, cmd, "PEERS")) {
-            resp_len = self.formatPeers(&resp_buf);
-        } else if (std.mem.eql(u8, cmd, "STATUS")) {
-            var status_buf: [512]u8 = undefined;
-            resp_len = self.formatStatus(&status_buf);
-            if (resp_len > 0) @memcpy(resp_buf[0..resp_len], status_buf[0..resp_len]);
-        } else {
-            const err_msg = "{\"error\":\"unknown command\"}\n";
-            @memcpy(resp_buf[0..err_msg.len], err_msg);
-            resp_len = err_msg.len;
-        }
+        const resp_len = self.formatCommandResponse(cmd, &resp_buf);
 
         // Write response
         if (resp_len > 0) {
@@ -304,25 +315,38 @@ pub const ControlSocket = struct {
         if (n == 0) return;
 
         const cmd = std.mem.trimEnd(u8, buf[0..n], "\r\n \t");
-
-        if (std.mem.eql(u8, cmd, "PEERS")) {
-            var resp_buf: [8192]u8 = undefined;
-            const resp_len = self.formatPeers(&resp_buf);
-            if (resp_len > 0) {
-                writeSocket(client, resp_buf[0..resp_len]);
-            }
-        } else if (std.mem.eql(u8, cmd, "STATUS")) {
-            var resp_buf: [512]u8 = undefined;
-            const resp_len = self.formatStatus(&resp_buf);
-            if (resp_len > 0) {
-                writeSocket(client, resp_buf[0..resp_len]);
-            }
-        } else {
-            writeSocket(client, "{\"error\":\"unknown command\"}\n");
+        var resp_buf: [8192]u8 = undefined;
+        const resp_len = self.formatCommandResponse(cmd, &resp_buf);
+        if (resp_len > 0) {
+            writeSocket(client, resp_buf[0..resp_len]);
         }
     }
 
     // ─── Shared response formatters ───
+
+    fn formatCommandResponse(self: *ControlSocket, cmd: []const u8, buf: *[8192]u8) usize {
+        if (std.mem.eql(u8, cmd, "PEERS")) {
+            return self.formatPeers(buf);
+        }
+        if (std.mem.eql(u8, cmd, "STATUS")) {
+            return self.formatStatus(buf);
+        }
+        if (std.mem.eql(u8, cmd, "STOP")) {
+            if (self.stop_flag) |flag| {
+                flag.store(false, .release);
+                const msg = "{\"ok\":true,\"stopping\":true}\n";
+                @memcpy(buf[0..msg.len], msg);
+                return msg.len;
+            }
+            const msg = "{\"ok\":false,\"error\":\"stop not supported\"}\n";
+            @memcpy(buf[0..msg.len], msg);
+            return msg.len;
+        }
+
+        const err_msg = "{\"error\":\"unknown command\"}\n";
+        @memcpy(buf[0..err_msg.len], err_msg);
+        return err_msg.len;
+    }
 
     fn formatPeers(self: *ControlSocket, buf: *[8192]u8) usize {
         var pos: usize = 0;
@@ -361,7 +385,7 @@ pub const ControlSocket = struct {
         return pos;
     }
 
-    fn formatStatus(self: *ControlSocket, buf: *[512]u8) usize {
+    fn formatStatus(self: *ControlSocket, buf: []u8) usize {
         var alive: usize = 0;
         var suspected: usize = 0;
         var dead: usize = 0;
@@ -410,3 +434,124 @@ pub const ControlSocket = struct {
         }
     }
 };
+
+pub fn request(allocator: std.mem.Allocator, command: []const u8, out: []u8) !usize {
+    if (command.len == 0 or std.mem.indexOfAny(u8, command, "\r\n") != null) {
+        return error.InvalidCommand;
+    }
+
+    if (comptime is_windows) {
+        return requestWindows(command, out);
+    } else {
+        return requestUnixDefault(allocator, command, out);
+    }
+}
+
+fn requestUnixDefault(allocator: std.mem.Allocator, command: []const u8, out: []u8) !usize {
+    if (requestUnixPath(DEFAULT_SOCKET_PATH, command, out)) |n| {
+        return n;
+    } else |_| {}
+
+    const config_dir = Config.defaultConfigDir(allocator) catch return error.ControlSocketUnavailable;
+    defer allocator.free(config_dir);
+    const fallback_path = try std.fs.path.join(allocator, &.{ config_dir, "meshguard.sock" });
+    defer allocator.free(fallback_path);
+
+    return requestUnixPath(fallback_path, command, out) catch error.ControlSocketUnavailable;
+}
+
+fn requestUnixPath(path: []const u8, command: []const u8, out: []u8) !usize {
+    const addr = initUnixSocketAddress(path) catch return error.ControlSocketUnavailable;
+    const sock = try linuxSocket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer closeSocket(sock);
+
+    if (std.c.connect(sock, @ptrCast(&addr.addr), addr.len) != 0) {
+        return error.ControlSocketUnavailable;
+    }
+
+    writeSocket(sock, command);
+    writeSocket(sock, "\n");
+
+    var fds = [_]posix.pollfd{.{
+        .fd = sock,
+        .events = posix.POLL.IN,
+        .revents = 0,
+    }};
+    const ready = posix.poll(&fds, 1000) catch return error.ControlSocketUnavailable;
+    if (ready == 0 or (fds[0].revents & posix.POLL.IN) == 0) {
+        return error.ControlSocketUnavailable;
+    }
+
+    const n = readSocket(sock, out) catch return error.ReadFailed;
+    if (n == out.len) return error.ResponseTooLarge;
+    return n;
+}
+
+fn requestWindows(command: []const u8, out: []u8) !usize {
+    if (comptime !is_windows) unreachable;
+
+    const pipe_name = std.unicode.utf8ToUtf16LeStringLiteral("\\\\.\\pipe\\meshguard");
+    const waited = win.WaitNamedPipeW(pipe_name, 1000);
+    if (waited == @as(win.BOOL, @enumFromInt(0))) {
+        return error.ControlSocketUnavailable;
+    }
+
+    const handle = win.CreateFileW(
+        pipe_name,
+        0x80000000 | 0x40000000, // GENERIC_READ | GENERIC_WRITE
+        0,
+        null,
+        3, // OPEN_EXISTING
+        0x00000080, // FILE_ATTRIBUTE_NORMAL
+        null,
+    );
+    if (handle == win.windows.INVALID_HANDLE_VALUE) {
+        return error.ControlSocketUnavailable;
+    }
+    defer _ = win.CloseHandle(handle);
+
+    var bytes_written: win.DWORD = 0;
+    if (win.WriteFile(handle, @ptrCast(command.ptr), @intCast(command.len), &bytes_written, null) == @as(win.BOOL, @enumFromInt(0))) {
+        return error.WriteFailed;
+    }
+    if (win.WriteFile(handle, @ptrCast("\n".ptr), 1, &bytes_written, null) == @as(win.BOOL, @enumFromInt(0))) {
+        return error.WriteFailed;
+    }
+
+    var bytes_read: win.DWORD = 0;
+    if (win.ReadFile(handle, @ptrCast(out.ptr), @intCast(out.len), &bytes_read, null) == @as(win.BOOL, @enumFromInt(0))) {
+        return error.ReadFailed;
+    }
+    if (bytes_read == out.len) return error.ResponseTooLarge;
+    return @intCast(bytes_read);
+}
+
+test "control STOP response toggles stop flag" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+
+    var control = ControlSocket.init(allocator, &membership, [_]u8{0x42} ** 32, .{ 10, 99, 1, 2 }, "test.sock");
+
+    var running = std.atomic.Value(bool).init(true);
+    control.setStopFlag(&running);
+
+    var buf: [8192]u8 = undefined;
+    const n = control.formatCommandResponse("STOP", &buf);
+    try std.testing.expectEqualStrings("{\"ok\":true,\"stopping\":true}\n", buf[0..n]);
+    try std.testing.expect(!running.load(.acquire));
+}
+
+test "control STATUS response includes peer counts" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+
+    var control = ControlSocket.init(allocator, &membership, [_]u8{0x24} ** 32, .{ 10, 99, 3, 4 }, "test.sock");
+
+    var buf: [8192]u8 = undefined;
+    const n = control.formatCommandResponse("STATUS", &buf);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "\"running\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "\"mesh_ip\":\"10.99.3.4\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "\"alive\":0") != null);
+}
