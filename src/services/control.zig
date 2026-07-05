@@ -14,10 +14,15 @@ const std = @import("std");
 const builtin = @import("builtin");
 const is_windows = builtin.os.tag == .windows;
 const is_linux = builtin.os.tag == .linux;
+const has_getpeereid = builtin.os.tag == .macos or builtin.os.tag == .freebsd;
 const posix = std.posix;
 const Config = @import("../config.zig").Config;
 const Membership = @import("../discovery/membership.zig");
 const Ip = @import("../wireguard/ip.zig");
+
+const unix_peer = if (has_getpeereid) struct {
+    extern "c" fn getpeereid(socket: c_int, euid: *std.c.uid_t, egid: *std.c.gid_t) c_int;
+} else struct {};
 
 fn linuxSocket(domain: u32, sock_type: u32, protocol: u32) !std.posix.socket_t {
     const fd = std.c.socket(@intCast(domain), @intCast(sock_type), @intCast(protocol));
@@ -264,19 +269,20 @@ pub const ControlSocket = struct {
         if (comptime !is_windows) return false;
 
         const pipe = self.server orelse return false;
+        const error_pipe_connected = @as(win.windows.Win32Error, @enumFromInt(535));
+        const error_no_data = @as(win.windows.Win32Error, @enumFromInt(232));
+        const error_pipe_listening = @as(win.windows.Win32Error, @enumFromInt(536));
 
         // Try to connect a client (non-blocking)
         const connected = win.ConnectNamedPipe(pipe, null);
         if (connected == @as(win.BOOL, @enumFromInt(0))) {
             const err = win.GetLastError();
-            // ERROR_PIPE_CONNECTED (535) means client already connected
-            if (err != @as(win.windows.Win32Error, @enumFromInt(535)) and
-                err != @as(win.windows.Win32Error, @enumFromInt(232)) and // ERROR_NO_DATA
-                err != @as(win.windows.Win32Error, @enumFromInt(536))) // ERROR_PIPE_LISTENING
-            {
+            if (err == error_no_data) {
+                _ = win.DisconnectNamedPipe(pipe);
                 return false;
             }
-            if (err == @as(win.windows.Win32Error, @enumFromInt(536))) return false;
+            if (err != error_pipe_connected and err != error_pipe_listening) return false;
+            if (err == error_pipe_listening) return false;
         }
 
         // Read command from pipe
@@ -295,7 +301,7 @@ pub const ControlSocket = struct {
 
         // Generate response
         var resp_buf: [8192]u8 = undefined;
-        const resp_len = self.formatCommandResponse(cmd, &resp_buf);
+        const resp_len = self.formatCommandResponse(cmd, &resp_buf, true);
 
         // Write response
         if (resp_len > 0) {
@@ -316,7 +322,8 @@ pub const ControlSocket = struct {
 
         const cmd = std.mem.trimEnd(u8, buf[0..n], "\r\n \t");
         var resp_buf: [8192]u8 = undefined;
-        const resp_len = self.formatCommandResponse(cmd, &resp_buf);
+        const stop_authorized = std.mem.eql(u8, cmd, "STOP") and stopAuthorizedUnix(client);
+        const resp_len = self.formatCommandResponse(cmd, &resp_buf, stop_authorized);
         if (resp_len > 0) {
             writeSocket(client, resp_buf[0..resp_len]);
         }
@@ -324,7 +331,7 @@ pub const ControlSocket = struct {
 
     // ─── Shared response formatters ───
 
-    fn formatCommandResponse(self: *ControlSocket, cmd: []const u8, buf: *[8192]u8) usize {
+    fn formatCommandResponse(self: *ControlSocket, cmd: []const u8, buf: *[8192]u8, stop_authorized: bool) usize {
         if (std.mem.eql(u8, cmd, "PEERS")) {
             return self.formatPeers(buf);
         }
@@ -332,6 +339,11 @@ pub const ControlSocket = struct {
             return self.formatStatus(buf);
         }
         if (std.mem.eql(u8, cmd, "STOP")) {
+            if (!stop_authorized) {
+                const msg = "{\"ok\":false,\"error\":\"unauthorized\"}\n";
+                @memcpy(buf[0..msg.len], msg);
+                return msg.len;
+            }
             if (self.stop_flag) |flag| {
                 flag.store(false, .release);
                 const msg = "{\"ok\":true,\"stopping\":true}\n";
@@ -435,6 +447,41 @@ pub const ControlSocket = struct {
     }
 };
 
+fn peerUidCanStop(peer_uid: std.c.uid_t, daemon_uid: std.c.uid_t) bool {
+    return peer_uid == 0 or peer_uid == daemon_uid;
+}
+
+fn stopAuthorizedUnix(client: posix.socket_t) bool {
+    if (comptime is_windows) return false;
+
+    if (comptime is_linux) {
+        const LinuxPeerCred = extern struct {
+            pid: std.c.pid_t,
+            uid: std.c.uid_t,
+            gid: std.c.gid_t,
+        };
+
+        var cred: LinuxPeerCred = undefined;
+        var len: std.c.socklen_t = @sizeOf(LinuxPeerCred);
+        if (std.c.getsockopt(client, std.os.linux.SOL.SOCKET, std.os.linux.SO.PEERCRED, &cred, &len) != 0) {
+            return false;
+        }
+        if (len < @sizeOf(LinuxPeerCred)) return false;
+        return peerUidCanStop(cred.uid, std.c.geteuid());
+    }
+
+    if (comptime has_getpeereid) {
+        var uid: std.c.uid_t = undefined;
+        var gid: std.c.gid_t = undefined;
+        if (unix_peer.getpeereid(@intCast(client), &uid, &gid) != 0) {
+            return false;
+        }
+        return peerUidCanStop(uid, std.c.geteuid());
+    }
+
+    return false;
+}
+
 pub fn request(allocator: std.mem.Allocator, command: []const u8, out: []u8) !usize {
     if (command.len == 0 or std.mem.indexOfAny(u8, command, "\r\n") != null) {
         return error.InvalidCommand;
@@ -450,14 +497,20 @@ pub fn request(allocator: std.mem.Allocator, command: []const u8, out: []u8) !us
 fn requestUnixDefault(allocator: std.mem.Allocator, command: []const u8, out: []u8) !usize {
     if (requestUnixPath(DEFAULT_SOCKET_PATH, command, out)) |n| {
         return n;
-    } else |_| {}
+    } else |err| switch (err) {
+        error.ControlSocketUnavailable => {},
+        else => return err,
+    }
 
     const config_dir = Config.defaultConfigDir(allocator) catch return error.ControlSocketUnavailable;
     defer allocator.free(config_dir);
     const fallback_path = try std.fs.path.join(allocator, &.{ config_dir, "meshguard.sock" });
     defer allocator.free(fallback_path);
 
-    return requestUnixPath(fallback_path, command, out) catch error.ControlSocketUnavailable;
+    return requestUnixPath(fallback_path, command, out) catch |err| switch (err) {
+        error.ControlSocketUnavailable => error.ControlSocketUnavailable,
+        else => err,
+    };
 }
 
 fn requestUnixPath(path: []const u8, command: []const u8, out: []u8) !usize {
@@ -483,6 +536,7 @@ fn requestUnixPath(path: []const u8, command: []const u8, out: []u8) !usize {
     }
 
     const n = readSocket(sock, out) catch return error.ReadFailed;
+    if (n == 0) return error.ReadFailed;
     if (n == out.len) return error.ResponseTooLarge;
     return n;
 }
@@ -522,6 +576,7 @@ fn requestWindows(command: []const u8, out: []u8) !usize {
     if (win.ReadFile(handle, @ptrCast(out.ptr), @intCast(out.len), &bytes_read, null) == @as(win.BOOL, @enumFromInt(0))) {
         return error.ReadFailed;
     }
+    if (bytes_read == 0) return error.ReadFailed;
     if (bytes_read == out.len) return error.ResponseTooLarge;
     return @intCast(bytes_read);
 }
@@ -537,9 +592,31 @@ test "control STOP response toggles stop flag" {
     control.setStopFlag(&running);
 
     var buf: [8192]u8 = undefined;
-    const n = control.formatCommandResponse("STOP", &buf);
+    const n = control.formatCommandResponse("STOP", &buf, true);
     try std.testing.expectEqualStrings("{\"ok\":true,\"stopping\":true}\n", buf[0..n]);
     try std.testing.expect(!running.load(.acquire));
+}
+
+test "control STOP rejects unauthorized peers" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+
+    var control = ControlSocket.init(allocator, &membership, [_]u8{0x42} ** 32, .{ 10, 99, 1, 2 }, "test.sock");
+
+    var running = std.atomic.Value(bool).init(true);
+    control.setStopFlag(&running);
+
+    var buf: [8192]u8 = undefined;
+    const n = control.formatCommandResponse("STOP", &buf, false);
+    try std.testing.expectEqualStrings("{\"ok\":false,\"error\":\"unauthorized\"}\n", buf[0..n]);
+    try std.testing.expect(running.load(.acquire));
+}
+
+test "control STOP allows same uid or root" {
+    try std.testing.expect(peerUidCanStop(1000, 1000));
+    try std.testing.expect(peerUidCanStop(0, 1000));
+    try std.testing.expect(!peerUidCanStop(1001, 1000));
 }
 
 test "control STATUS response includes peer counts" {
@@ -550,7 +627,7 @@ test "control STATUS response includes peer counts" {
     var control = ControlSocket.init(allocator, &membership, [_]u8{0x24} ** 32, .{ 10, 99, 3, 4 }, "test.sock");
 
     var buf: [8192]u8 = undefined;
-    const n = control.formatCommandResponse("STATUS", &buf);
+    const n = control.formatCommandResponse("STATUS", &buf, false);
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "\"running\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "\"mesh_ip\":\"10.99.3.4\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "\"alive\":0") != null);

@@ -3536,11 +3536,17 @@ fn cmdDown(allocator: std.mem.Allocator) !void {
         }
         try writeFormatted(stderr, "error: daemon rejected stop request: {s}", .{response_buf[0..n]});
         std.process.exit(1);
-    } else |_| {
-        if (comptime @import("builtin").os.tag != .linux) {
-            try stderr.writeStreamingAll(zio(), "meshguard is not running (control socket unavailable).\n");
+    } else |err| switch (err) {
+        error.ControlSocketUnavailable => {
+            if (comptime @import("builtin").os.tag != .linux) {
+                try stderr.writeStreamingAll(zio(), "meshguard is not running (control socket unavailable).\n");
+                std.process.exit(1);
+            }
+        },
+        else => {
+            try writeFormatted(stderr, "error: control socket stop failed: {s}\n", .{@errorName(err)});
             std.process.exit(1);
-        }
+        },
     }
 
     lib.wireguard.Config.teardown(lib.wireguard.Config.DEFAULT_IFNAME) catch |err| {
@@ -3563,11 +3569,17 @@ fn cmdStatus(allocator: std.mem.Allocator) !void {
     if (lib.services.Control.request(allocator, "STATUS", &response_buf)) |n| {
         try printControlStatus(allocator, stdout, response_buf[0..n]);
         return;
-    } else |_| {
-        if (comptime @import("builtin").os.tag != .linux) {
-            try stderr.writeStreamingAll(zio(), "meshguard is not running (control socket unavailable).\n");
+    } else |err| switch (err) {
+        error.ControlSocketUnavailable => {
+            if (comptime @import("builtin").os.tag != .linux) {
+                try stderr.writeStreamingAll(zio(), "meshguard is not running (control socket unavailable).\n");
+                std.process.exit(1);
+            }
+        },
+        else => {
+            try writeFormatted(stderr, "error: control socket status failed: {s}\n", .{@errorName(err)});
             std.process.exit(1);
-        }
+        },
     }
 
     const Netlink = lib.wireguard.Netlink;
@@ -3765,10 +3777,17 @@ fn jsonIntField(obj: std.json.ObjectMap, key: []const u8) ?i64 {
     };
 }
 
+fn printRawControlResponse(stdout: std.Io.File, response: []const u8) !void {
+    try writeFormatted(stdout, "  control response: {s}", .{response});
+    if (response.len == 0 or response[response.len - 1] != '\n') {
+        try stdout.writeStreamingAll(zio(), "\n");
+    }
+}
+
 fn printControlStatus(allocator: std.mem.Allocator, stdout: std.Io.File, response: []const u8) !void {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, response, .{}) catch {
         try stdout.writeStreamingAll(zio(), "meshguard is running.\n");
-        try writeFormatted(stdout, "  control response: {s}", .{response});
+        try printRawControlResponse(stdout, response);
         return;
     };
     defer parsed.deinit();
@@ -3777,7 +3796,7 @@ fn printControlStatus(allocator: std.mem.Allocator, stdout: std.Io.File, respons
         .object => |obj| obj,
         else => {
             try stdout.writeStreamingAll(zio(), "meshguard is running.\n");
-            try writeFormatted(stdout, "  control response: {s}", .{response});
+            try printRawControlResponse(stdout, response);
             return;
         },
     };
