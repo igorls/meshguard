@@ -99,6 +99,7 @@ const OrgControlSlot = struct {
     len: u16,
     remaining: u32,
 };
+const MAX_ORG_CONTROL_QUEUE: usize = Org.MAX_ORG_REVOKES;
 
 /// Pending ping tracking.
 const PendingPing = struct {
@@ -175,7 +176,7 @@ pub const SwimProtocol = struct {
     gossip_count: usize = 0,
 
     // Signed org control messages queued for best-effort broadcast to peers.
-    org_control_queue: [16]OrgControlSlot = std.mem.zeroes([16]OrgControlSlot),
+    org_control_queue: [MAX_ORG_CONTROL_QUEUE]OrgControlSlot = std.mem.zeroes([MAX_ORG_CONTROL_QUEUE]OrgControlSlot),
     org_control_count: usize = 0,
 
     // Unauthenticated gossip endpoint hints. These are never exposed as members,

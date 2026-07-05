@@ -42,6 +42,7 @@ pub const OrgKeyPair = struct {
 };
 
 pub const ORG_REVOKE_WIRE_SIZE: usize = 1 + 32 + 32 + 1 + 8 + 64;
+pub const MAX_ORG_REVOKES: usize = 64;
 
 /// Fixed-size node certificate signed by an org key.
 /// Total: 186 bytes on the wire.
@@ -384,6 +385,7 @@ pub fn saveOrgRevoke(allocator: std.mem.Allocator, config_dir: []const u8, rev: 
     const filename = try std.fmt.allocPrint(allocator, "{s}.revoke", .{hex});
     defer allocator.free(filename);
     const path = try std.fs.path.join(allocator, &.{ revoke_dir, filename });
+    errdefer allocator.free(path);
 
     var wire: [ORG_REVOKE_WIRE_SIZE]u8 = undefined;
     const written = try codec.encodeOrgCertRevoke(&wire, rev);
@@ -415,7 +417,7 @@ pub fn loadOrgRevocations(allocator: std.mem.Allocator, config_dir: []const u8) 
     const revoke_dir = try std.fs.path.join(allocator, &.{ config_dir, "revoked" });
     defer allocator.free(revoke_dir);
 
-    var temp: [64]messages.OrgCertRevoke = undefined;
+    var temp: [MAX_ORG_REVOKES]messages.OrgCertRevoke = undefined;
     var count: usize = 0;
 
     const dir = std.Io.Dir.openDirAbsolute(zio(), revoke_dir, .{ .iterate = true }) catch |err| {

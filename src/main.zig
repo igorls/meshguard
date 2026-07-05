@@ -4484,24 +4484,14 @@ fn cmdConfigShow(allocator: std.mem.Allocator) !void {
     }
 
     // ─── Org Revocations ───
-    const revoke_dir = std.fs.path.join(allocator, &.{ config_dir, "revoked" }) catch null;
-    defer if (revoke_dir) |rd| allocator.free(rd);
-
-    if (revoke_dir) |rd| {
-        if (std.Io.Dir.openDirAbsolute(zio(), rd, .{ .iterate = true })) |dir| {
-            defer dir.close(zio());
-            var revoke_count: usize = 0;
-            var iter = dir.iterate();
-            while (iter.next(zio()) catch null) |entry| {
-                if (std.mem.endsWith(u8, entry.name, ".revoke")) revoke_count += 1;
-            }
-            if (revoke_count > 0) {
-                try stdout.writeStreamingAll(zio(), "\n");
-                try writeFormatted(stdout, "\x1b[1m─── Org Revocations ({d}) ───────────────────────\x1b[0m\n", .{revoke_count});
-                try writeFormatted(stdout, "  {d} pending revocation(s)\n", .{revoke_count});
-            }
-        } else |_| {}
-    }
+    if (lib.identity.Org.loadOrgRevocations(allocator, config_dir)) |revocations| {
+        defer allocator.free(revocations);
+        if (revocations.len > 0) {
+            try stdout.writeStreamingAll(zio(), "\n");
+            try writeFormatted(stdout, "\x1b[1m─── Org Revocations ({d}) ───────────────────────\x1b[0m\n", .{revocations.len});
+            try writeFormatted(stdout, "  {d} pending revocation(s)\n", .{revocations.len});
+        }
+    } else |_| {}
 
     try stdout.writeStreamingAll(zio(), "\n");
 }
