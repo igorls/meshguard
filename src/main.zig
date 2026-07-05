@@ -1434,7 +1434,7 @@ fn cmdConnect(allocator: std.mem.Allocator, extra_args: []const []const u8) !voi
     const ntp_time = CoordinatedPunch.currentTimeSecs();
 
     // Pick STUN server used (for token)
-    const stun_server = stun_servers[0];
+    const stun_server = stun_result.server orelse stun_servers[0];
 
     switch (mode) {
         .generate => {

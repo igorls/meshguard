@@ -46,6 +46,7 @@ pub const NatType = messages.NatType;
 pub const StunResult = struct {
     external: ExternalAddress,
     nat_type: NatType,
+    server: ?StunServer = null,
 };
 
 /// Numeric fallback STUN servers used when configured hostnames cannot be resolved.
@@ -80,7 +81,10 @@ pub fn parseServerSpec(spec: []const u8) ?StunServerSpec {
 
 pub fn resolveServerSpec(spec: []const u8) ?StunServer {
     const parsed = parseServerSpec(spec) orelse return null;
-    const host = parseIpv4(parsed.host) orelse Dns.resolveA(parsed.host) orelse return null;
+    const host = parseIpv4(parsed.host) orelse blk: {
+        if (!shouldResolveHostname(parsed.host)) return null;
+        break :blk Dns.resolveA(parsed.host) orelse return null;
+    };
     return .{ .host = host, .port = parsed.port };
 }
 
@@ -113,6 +117,25 @@ fn parseIpv4(s: []const u8) ?[4]u8 {
     }
     if (i != 4) return null;
     return addr;
+}
+
+fn shouldResolveHostname(host: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, host, ':') != null) return false;
+    if (looksLikeIpv4Literal(host)) return false;
+    return true;
+}
+
+fn looksLikeIpv4Literal(host: []const u8) bool {
+    if (host.len == 0) return false;
+    var saw_dot = false;
+    for (host) |ch| {
+        switch (ch) {
+            '0'...'9' => {},
+            '.' => saw_dot = true,
+            else => return false,
+        }
+    }
+    return saw_dot;
 }
 
 // ─── Encoding ───
@@ -259,13 +282,14 @@ pub fn discover(socket: *Udp.UdpSocket, local_port: u16, servers: []const StunSe
         else
             .cone; // different port → some NAT present
 
-        return .{ .external = ext, .nat_type = nat_type };
+        return .{ .external = ext, .nat_type = nat_type, .server = server };
     }
 
     // All servers failed
     return .{
         .external = .{ .addr = .{ 0, 0, 0, 0 }, .port = 0 },
         .nat_type = .unknown,
+        .server = null,
     };
 }
 
@@ -379,6 +403,12 @@ test "parse STUN server specs" {
     try std.testing.expect(parseServerSpec(":3478") == null);
     try std.testing.expect(parseServerSpec("stun.example.com:0") == null);
     try std.testing.expect(parseServerSpec("stun.example.com:not-a-port") == null);
+}
+
+test "reject malformed STUN host specs before DNS" {
+    try std.testing.expect(resolveServerSpec("1.2.3.999:3478") == null);
+    try std.testing.expect(resolveServerSpec("1.2.3.4.5:3478") == null);
+    try std.testing.expect(resolveServerSpec("[2001:db8::1]:3478") == null);
 }
 
 test "resolve configured STUN server IP literals" {
