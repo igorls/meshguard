@@ -306,6 +306,25 @@ meshguard org-vouch <node-key-or-path>
 
 ---
 
+## `meshguard org-revoke`
+
+Sign an organization certificate revocation for a node key.
+
+```bash
+meshguard org-revoke <node-key-or-path> [--reason <reason>]
+```
+
+| Argument | Description |
+| -------- | ----------- |
+| `<node-key-or-path>` | Base64 public key string _or_ path to a `.pub` file |
+| `--reason` | `unspecified`, `key-compromised`, or `admin-removed` (default) |
+
+The command loads `$MESHGUARD_CONFIG_DIR/org/org.key`, writes a signed
+`OrgCertRevoke` wire message to `$MESHGUARD_CONFIG_DIR/revoked/*.revoke`, and
+queues that revocation for broadcast the next time `meshguard up` runs.
+
+---
+
 ## `meshguard upgrade`
 
 Upgrade meshguard to the latest release from GitHub.

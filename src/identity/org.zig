@@ -10,7 +10,8 @@
 const std = @import("std");
 const Ed25519 = std.crypto.sign.Ed25519;
 const Blake3 = std.crypto.hash.Blake3;
-
+const messages = @import("../protocol/messages.zig");
+const codec = @import("../protocol/codec.zig");
 
 /// Read all available bytes from an Io.File into buf. Returns bytes read.
 fn readFileBytes(f: std.Io.File, buf: []u8) !usize {
@@ -33,13 +34,14 @@ fn nowUnixSecs() i64 {
     return @intCast(std.Io.Timestamp.now(zio(), .real).toSeconds());
 }
 
-
 // ─── Types ───
 
 pub const OrgKeyPair = struct {
     public_key: Ed25519.PublicKey,
     secret_key: Ed25519.SecretKey,
 };
+
+pub const ORG_REVOKE_WIRE_SIZE: usize = 1 + 32 + 32 + 1 + 8 + 64;
 
 /// Fixed-size node certificate signed by an org key.
 /// Total: 186 bytes on the wire.
@@ -269,6 +271,55 @@ pub fn issueCertificate(
     return cert;
 }
 
+pub fn parseRevokeReason(reason: []const u8) ?u8 {
+    if (std.mem.eql(u8, reason, "0") or std.mem.eql(u8, reason, "unspecified")) return 0;
+    if (std.mem.eql(u8, reason, "1") or
+        std.mem.eql(u8, reason, "key-compromised") or
+        std.mem.eql(u8, reason, "key_compromised") or
+        std.mem.eql(u8, reason, "compromised"))
+    {
+        return 1;
+    }
+    if (std.mem.eql(u8, reason, "2") or
+        std.mem.eql(u8, reason, "admin-removed") or
+        std.mem.eql(u8, reason, "admin_removed") or
+        std.mem.eql(u8, reason, "removed"))
+    {
+        return 2;
+    }
+    return null;
+}
+
+pub fn revokeReasonName(reason: u8) []const u8 {
+    return switch (reason) {
+        0 => "unspecified",
+        1 => "key-compromised",
+        2 => "admin-removed",
+        else => "unknown",
+    };
+}
+
+/// Create and sign an OrgCertRevoke for a node.
+pub fn issueOrgRevoke(
+    org_kp: OrgKeyPair,
+    node_pubkey: [32]u8,
+    reason: u8,
+    lamport: u64,
+) !messages.OrgCertRevoke {
+    var rev = messages.OrgCertRevoke{
+        .org_pubkey = org_kp.public_key.toBytes(),
+        .node_pubkey = node_pubkey,
+        .reason = reason,
+        .lamport = lamport,
+        .signature = undefined,
+    };
+    const signed = codec.orgRevokeSignedBytes(rev);
+    const kp = try Ed25519.KeyPair.fromSecretKey(org_kp.secret_key);
+    const sig = try kp.sign(&signed, null);
+    rev.signature = sig.toBytes();
+    return rev;
+}
+
 // ─── Deterministic Mesh DNS ───
 
 /// Derive a deterministic org domain from its public key.
@@ -311,6 +362,82 @@ pub fn loadCertificate(allocator: std.mem.Allocator, path: []const u8) !NodeCert
     const n = try readFileBytes(file, &wire);
     if (n < NodeCertificate.WIRE_SIZE) return error.InvalidCertificate;
     return NodeCertificate.deserialize(&wire);
+}
+
+fn keyPrefixHex(pubkey: [32]u8, out: *[16]u8) []const u8 {
+    return std.fmt.bufPrint(out, "{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{
+        pubkey[0], pubkey[1], pubkey[2], pubkey[3],
+        pubkey[4], pubkey[5], pubkey[6], pubkey[7],
+    }) catch "revoke";
+}
+
+/// Save a revocation as a full encoded 0x42 wire message under config_dir/revoked/.
+pub fn saveOrgRevoke(allocator: std.mem.Allocator, config_dir: []const u8, rev: messages.OrgCertRevoke) ![]const u8 {
+    const revoke_dir = try std.fs.path.join(allocator, &.{ config_dir, "revoked" });
+    defer allocator.free(revoke_dir);
+    std.Io.Dir.cwd().createDirPath(zio(), revoke_dir) catch |err| {
+        if (err != error.PathAlreadyExists) return err;
+    };
+
+    var hex_buf: [16]u8 = undefined;
+    const hex = keyPrefixHex(rev.node_pubkey, &hex_buf);
+    const filename = try std.fmt.allocPrint(allocator, "{s}.revoke", .{hex});
+    defer allocator.free(filename);
+    const path = try std.fs.path.join(allocator, &.{ revoke_dir, filename });
+
+    var wire: [ORG_REVOKE_WIRE_SIZE]u8 = undefined;
+    const written = try codec.encodeOrgCertRevoke(&wire, rev);
+    if (written != ORG_REVOKE_WIRE_SIZE) return error.InvalidRevocation;
+
+    const file = try std.Io.Dir.createFileAbsolute(zio(), path, .{});
+    defer file.close(zio());
+    try file.writeStreamingAll(zio(), &wire);
+    return path;
+}
+
+pub fn loadOrgRevoke(allocator: std.mem.Allocator, path: []const u8) !messages.OrgCertRevoke {
+    _ = allocator;
+    const file = try std.Io.Dir.openFileAbsolute(zio(), path, .{});
+    defer file.close(zio());
+
+    var wire: [ORG_REVOKE_WIRE_SIZE]u8 = undefined;
+    const n = try readFileBytes(file, &wire);
+    if (n != ORG_REVOKE_WIRE_SIZE) return error.InvalidRevocation;
+
+    const decoded = try codec.decode(&wire);
+    return switch (decoded) {
+        .org_cert_revoke => |rev| rev,
+        else => error.InvalidRevocation,
+    };
+}
+
+pub fn loadOrgRevocations(allocator: std.mem.Allocator, config_dir: []const u8) ![]messages.OrgCertRevoke {
+    const revoke_dir = try std.fs.path.join(allocator, &.{ config_dir, "revoked" });
+    defer allocator.free(revoke_dir);
+
+    var temp: [64]messages.OrgCertRevoke = undefined;
+    var count: usize = 0;
+
+    const dir = std.Io.Dir.openDirAbsolute(zio(), revoke_dir, .{ .iterate = true }) catch |err| {
+        if (err == error.FileNotFound) return try allocator.alloc(messages.OrgCertRevoke, 0);
+        return err;
+    };
+    defer dir.close(zio());
+
+    var iter = dir.iterate();
+    while (try iter.next(zio())) |entry| {
+        if (!std.mem.endsWith(u8, entry.name, ".revoke")) continue;
+        if (count >= temp.len) break;
+
+        const path = try std.fs.path.join(allocator, &.{ revoke_dir, entry.name });
+        defer allocator.free(path);
+        temp[count] = loadOrgRevoke(allocator, path) catch continue;
+        count += 1;
+    }
+
+    const result = try allocator.alloc(messages.OrgCertRevoke, count);
+    @memcpy(result, temp[0..count]);
+    return result;
 }
 
 // ─── Tests ───
@@ -373,4 +500,63 @@ test "format mesh domain" {
     var buf: [64]u8 = undefined;
     const result = formatMeshDomain("node-1", .{ 'a', '1', 'b', '2', 'c', '3' }, &buf);
     try std.testing.expectEqualStrings("node-1.a1b2c3.mesh", result);
+}
+
+test "org revoke signing uses canonical payload" {
+    const org_kp = generateOrgKeyPair();
+    const node_pubkey = [_]u8{0x42} ** 32;
+    const lamport: u64 = 0x0102030405060708;
+
+    const rev = try issueOrgRevoke(org_kp, node_pubkey, 1, lamport);
+    const signed = codec.orgRevokeSignedBytes(rev);
+
+    try std.testing.expectEqualSlices(u8, &node_pubkey, signed[0..32]);
+    try std.testing.expectEqual(@as(u8, 1), signed[32]);
+    try std.testing.expectEqual(@as(u8, 0x08), signed[33]);
+    try std.testing.expectEqual(@as(u8, 0x07), signed[34]);
+    try std.testing.expectEqual(@as(u8, 0x06), signed[35]);
+    try std.testing.expectEqual(@as(u8, 0x05), signed[36]);
+    try std.testing.expectEqual(@as(u8, 0x04), signed[37]);
+    try std.testing.expectEqual(@as(u8, 0x03), signed[38]);
+    try std.testing.expectEqual(@as(u8, 0x02), signed[39]);
+    try std.testing.expectEqual(@as(u8, 0x01), signed[40]);
+
+    const sig = Ed25519.Signature.fromBytes(rev.signature);
+    try sig.verify(&signed, org_kp.public_key);
+}
+
+test "org revoke save and load round-trip" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(zio(), ".", allocator);
+    defer allocator.free(tmp_path);
+
+    const org_kp = generateOrgKeyPair();
+    const node_pubkey = [_]u8{0x24} ** 32;
+    const rev = try issueOrgRevoke(org_kp, node_pubkey, 2, 123);
+
+    const saved_path = try saveOrgRevoke(allocator, tmp_path, rev);
+    defer allocator.free(saved_path);
+
+    const loaded = try loadOrgRevoke(allocator, saved_path);
+    try std.testing.expectEqualSlices(u8, &rev.org_pubkey, &loaded.org_pubkey);
+    try std.testing.expectEqualSlices(u8, &rev.node_pubkey, &loaded.node_pubkey);
+    try std.testing.expectEqual(rev.reason, loaded.reason);
+    try std.testing.expectEqual(rev.lamport, loaded.lamport);
+    try std.testing.expectEqualSlices(u8, &rev.signature, &loaded.signature);
+
+    const all = try loadOrgRevocations(allocator, tmp_path);
+    defer allocator.free(all);
+    try std.testing.expectEqual(@as(usize, 1), all.len);
+    try std.testing.expectEqualSlices(u8, &rev.node_pubkey, &all[0].node_pubkey);
+}
+
+test "org revoke reason parser" {
+    try std.testing.expectEqual(@as(?u8, 0), parseRevokeReason("unspecified"));
+    try std.testing.expectEqual(@as(?u8, 1), parseRevokeReason("key-compromised"));
+    try std.testing.expectEqual(@as(?u8, 1), parseRevokeReason("1"));
+    try std.testing.expectEqual(@as(?u8, 2), parseRevokeReason("admin_removed"));
+    try std.testing.expectEqual(@as(?u8, null), parseRevokeReason("mystery"));
 }

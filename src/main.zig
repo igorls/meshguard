@@ -34,6 +34,7 @@ const usage =
     \\  org-keygen  Generate a new org keypair
     \\  org-sign    Sign a node's key with org key (--name <label>)
     \\  org-vouch   Vouch for an external node (auto-propagates to org members)
+    \\  org-revoke  Sign an org certificate revocation
     \\  config show Show local node configuration (works offline)
     \\  service     Manage service access policies
     \\  upgrade     Upgrade to the latest release from GitHub
@@ -219,6 +220,15 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         }
         try cmdOrgVouch(allocator, args[2]);
+        return;
+    }
+
+    if (std.mem.eql(u8, command, "org-revoke")) {
+        if (args.len < 3) {
+            try getStdErr().writeStreamingAll(zio(), "error: 'org-revoke' requires a node public key or .pub file\n");
+            std.process.exit(1);
+        }
+        try cmdOrgRevoke(allocator, args[2], args[3..]);
         return;
     }
 
@@ -648,6 +658,83 @@ fn cmdOrgVouch(allocator: std.mem.Allocator, node_key_arg: []const u8) !void {
     try stdout.writeStreamingAll(zio(), "All nodes trusting this org will auto-accept the vouched node.\n");
 }
 
+fn cmdOrgRevoke(allocator: std.mem.Allocator, node_key_arg: []const u8, extra_args: []const []const u8) !void {
+    const config_dir = try Config.ensureConfigDir(allocator);
+    defer allocator.free(config_dir);
+
+    const stdout = getStdOut();
+    const stderr = getStdErr();
+    const Org = lib.identity.Org;
+
+    var reason: u8 = 2; // admin-removed
+    var i: usize = 0;
+    while (i < extra_args.len) : (i += 1) {
+        if (std.mem.eql(u8, extra_args[i], "--reason")) {
+            if (i + 1 >= extra_args.len) {
+                try stderr.writeStreamingAll(zio(), "error: --reason requires a value\n");
+                std.process.exit(1);
+            }
+            reason = Org.parseRevokeReason(extra_args[i + 1]) orelse {
+                try stderr.writeStreamingAll(zio(), "error: invalid revocation reason (use unspecified, key-compromised, or admin-removed)\n");
+                std.process.exit(1);
+            };
+            i += 1;
+        } else {
+            try writeFormatted(stderr, "error: unknown org-revoke option '{s}'\n", .{extra_args[i]});
+            std.process.exit(1);
+        }
+    }
+
+    const org_kp = Org.loadOrgKeyPair(allocator, config_dir) catch {
+        try stderr.writeStreamingAll(zio(), "error: no org keypair found. Run 'meshguard org-keygen' first.\n");
+        std.process.exit(1);
+    };
+
+    var key_b64_buf: [44]u8 = undefined;
+    var node_pk_bytes: [32]u8 = undefined;
+    if (lib.identity.Trust.validateKey(node_key_arg, &key_b64_buf, &node_pk_bytes)) |err_msg| {
+        try writeFormatted(stderr, "error: {s}\n", .{err_msg});
+        std.process.exit(1);
+    }
+
+    const lamport: u64 = @intCast(@max(nowUnixSecs(), 0));
+    const revoke = Org.issueOrgRevoke(org_kp, node_pk_bytes, reason, lamport) catch {
+        try stderr.writeStreamingAll(zio(), "error: failed to sign revocation\n");
+        std.process.exit(1);
+    };
+
+    const revoke_path = try Org.saveOrgRevoke(allocator, config_dir, revoke);
+    defer allocator.free(revoke_path);
+
+    var node_b64: [44]u8 = undefined;
+    _ = std.base64.standard.Encoder.encode(&node_b64, &node_pk_bytes);
+
+    try stdout.writeStreamingAll(zio(), "Org revocation signed.\n");
+    try writeFormatted(stdout, "  node pubkey: {s}\n", .{node_b64});
+    try writeFormatted(stdout, "  reason:      {s} ({d})\n", .{ Org.revokeReasonName(reason), reason });
+    try writeFormatted(stdout, "  lamport:     {d}\n", .{lamport});
+    try writeFormatted(stdout, "  saved to:    {s}\n", .{revoke_path});
+    try stdout.writeStreamingAll(zio(), "\nThis revocation will be broadcast to known peers on next 'meshguard up'.\n");
+}
+
+fn loadPendingOrgRevocations(
+    allocator: std.mem.Allocator,
+    config_dir: []const u8,
+    swim: *lib.discovery.Swim.SwimProtocol,
+    stdout: std.Io.File,
+) !void {
+    const revokes = try lib.identity.Org.loadOrgRevocations(allocator, config_dir);
+    defer allocator.free(revokes);
+
+    for (revokes) |rev| {
+        swim.queueOrgCertRevoke(rev);
+    }
+
+    if (revokes.len > 0) {
+        try writeFormatted(stdout, "  org revocations: {d} pending broadcast(s)\n", .{revokes.len});
+    }
+}
+
 fn cmdRevoke(allocator: std.mem.Allocator, key_or_name: []const u8) !void {
     const config_dir = try Config.ensureConfigDir(allocator);
     defer allocator.free(config_dir);
@@ -992,6 +1079,8 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
         swim.setOrgCert(cert_wire);
         try writeFormatted(stdout, "  org cert: {s} (org member)\n", .{cert.getName()});
     } else |_| {}
+
+    try loadPendingOrgRevocations(allocator, config_dir, &swim, stdout);
 
     // Determine public endpoint: --announce overrides STUN
     if (announce_addr) |addr| {
@@ -4390,6 +4479,26 @@ fn cmdConfigShow(allocator: std.mem.Allocator) !void {
                 try stdout.writeStreamingAll(zio(), "\n");
                 try writeFormatted(stdout, "\x1b[1m─── Vouched Nodes ({d}) ──────────────────────────\x1b[0m\n", .{vouch_count});
                 try writeFormatted(stdout, "  {d} pending vouch(es)\n", .{vouch_count});
+            }
+        } else |_| {}
+    }
+
+    // ─── Org Revocations ───
+    const revoke_dir = std.fs.path.join(allocator, &.{ config_dir, "revoked" }) catch null;
+    defer if (revoke_dir) |rd| allocator.free(rd);
+
+    if (revoke_dir) |rd| {
+        if (std.Io.Dir.openDirAbsolute(zio(), rd, .{ .iterate = true })) |dir| {
+            defer dir.close(zio());
+            var revoke_count: usize = 0;
+            var iter = dir.iterate();
+            while (iter.next(zio()) catch null) |entry| {
+                if (std.mem.endsWith(u8, entry.name, ".revoke")) revoke_count += 1;
+            }
+            if (revoke_count > 0) {
+                try stdout.writeStreamingAll(zio(), "\n");
+                try writeFormatted(stdout, "\x1b[1m─── Org Revocations ({d}) ───────────────────────\x1b[0m\n", .{revoke_count});
+                try writeFormatted(stdout, "  {d} pending revocation(s)\n", .{revoke_count});
             }
         } else |_| {}
     }
