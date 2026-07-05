@@ -102,6 +102,11 @@ const OrgControlSlot = struct {
 };
 const MAX_ORG_CONTROL_QUEUE: usize = Org.MAX_ORG_REVOKES;
 
+const OrgRevokedNode = struct {
+    org_pubkey: [32]u8,
+    node_pubkey: [32]u8,
+};
+
 /// Pending ping tracking.
 const PendingPing = struct {
     target_pubkey: [32]u8,
@@ -213,8 +218,8 @@ pub const SwimProtocol = struct {
     alias_lamports: [16]u64 = std.mem.zeroes([16]u64),
     alias_count: usize = 0,
 
-    // Revoked node pubkeys (propagated via gossip)
-    revoked_nodes: [64][32]u8 = std.mem.zeroes([64][32]u8),
+    // Org-scoped revoked node pubkeys (propagated via gossip)
+    revoked_nodes: [64]OrgRevokedNode = std.mem.zeroes([64]OrgRevokedNode),
     revoked_count: usize = 0,
 
     // Vouched external nodes: org admin vouches for standalone nodes (propagated via gossip)
@@ -289,9 +294,13 @@ pub const SwimProtocol = struct {
         self.enforce_trust = true;
     }
 
-    fn nodeIsRevoked(self: *const SwimProtocol, pubkey: [32]u8) bool {
+    fn orgRevokesNode(self: *const SwimProtocol, org_pubkey: [32]u8, node_pubkey: [32]u8) bool {
         for (self.revoked_nodes[0..self.revoked_count]) |revoked| {
-            if (std.mem.eql(u8, &revoked, &pubkey)) return true;
+            if (std.mem.eql(u8, &revoked.org_pubkey, &org_pubkey) and
+                std.mem.eql(u8, &revoked.node_pubkey, &node_pubkey))
+            {
+                return true;
+            }
         }
         return false;
     }
@@ -307,7 +316,7 @@ pub const SwimProtocol = struct {
         if (!Org.verifyCertificate(&cert)) return false;
         if (!cert.isValid()) return false;
         if (!self.isOrgAuthorizedPeer(cert.org_pubkey)) return false;
-        if (self.nodeIsRevoked(pubkey)) return false;
+        if (self.orgRevokesNode(cert.org_pubkey, pubkey)) return false;
         return true;
     }
 
@@ -317,7 +326,7 @@ pub const SwimProtocol = struct {
         const expires_at = peer.cert_expires_at orelse return false;
         if (!self.isOrgAuthorizedPeer(org_pubkey)) return false;
         if (!certExpiryValid(expires_at)) return false;
-        if (self.nodeIsRevoked(pubkey)) return false;
+        if (self.orgRevokesNode(org_pubkey, pubkey)) return false;
         return true;
     }
 
@@ -342,10 +351,6 @@ pub const SwimProtocol = struct {
         for (self.authorized_keys[0..self.authorized_count]) |key| {
             if (std.mem.eql(u8, &key, &pubkey)) return true;
         }
-        // Check if revoked
-        for (self.revoked_nodes[0..self.revoked_count]) |revoked| {
-            if (std.mem.eql(u8, &revoked, &pubkey)) return false;
-        }
         // Check previously admitted org certificate
         if (self.recordedCertAuthorizesPeer(pubkey)) return true;
         // Check presented org certificate
@@ -356,7 +361,11 @@ pub const SwimProtocol = struct {
         for (0..self.vouched_count) |i| {
             if (std.mem.eql(u8, &self.vouched_node_keys[i], &pubkey)) {
                 // Verify the vouching org is trusted
-                if (self.isOrgAuthorizedPeer(self.vouched_org_keys[i])) return true;
+                if (self.isOrgAuthorizedPeer(self.vouched_org_keys[i]) and
+                    !self.orgRevokesNode(self.vouched_org_keys[i], pubkey))
+                {
+                    return true;
+                }
             }
         }
         return false;
@@ -805,20 +814,24 @@ pub const SwimProtocol = struct {
         if (rebroadcast) {
             self.rememberOrgRevoke(rev);
         }
-        // Check if already revoked
-        for (self.revoked_nodes[0..self.revoked_count]) |revoked| {
-            if (std.mem.eql(u8, &revoked, &rev.node_pubkey)) return;
-        }
+        if (self.orgRevokesNode(rev.org_pubkey, rev.node_pubkey)) return;
 
         // Add to revocation set
         if (self.revoked_count < self.revoked_nodes.len) {
-            self.revoked_nodes[self.revoked_count] = rev.node_pubkey;
+            self.revoked_nodes[self.revoked_count] = .{
+                .org_pubkey = rev.org_pubkey,
+                .node_pubkey = rev.node_pubkey,
+            };
             self.revoked_count += 1;
             log.warn("node revoked by org (reason={d})", .{rev.reason});
 
-            // If the revoked node is currently a peer, mark as dead
+            // If the revoked node is currently authorized only by this org's
+            // cert/vouch, mark it dead. Other orgs or explicit key trust are
+            // independent authorization boundaries.
             if (self.membership.peers.getPtr(rev.node_pubkey)) |peer| {
-                if (peer.state == .alive or peer.state == .suspected) {
+                if ((peer.state == .alive or peer.state == .suspected) and
+                    !self.isAuthorizedPeer(rev.node_pubkey, null))
+                {
                     self.membership.markDead(rev.node_pubkey);
                     if (self.handler) |h| {
                         h.onPeerDead(h.ctx, rev.node_pubkey);
@@ -850,12 +863,11 @@ pub const SwimProtocol = struct {
             }
         }
 
-        // Don't vouch for revoked nodes
-        for (self.revoked_nodes[0..self.revoked_count]) |revoked| {
-            if (std.mem.eql(u8, &revoked, &vouch.vouched_pubkey)) {
-                log.warn("org vouch rejected: node is revoked", .{});
-                return;
-            }
+        // Don't re-vouch a node already revoked by this same org. A different
+        // trusted org's revocation does not cancel this org's authority.
+        if (self.orgRevokesNode(vouch.org_pubkey, vouch.vouched_pubkey)) {
+            log.warn("org vouch rejected: node is revoked", .{});
+            return;
         }
 
         // Register the vouch
@@ -1285,7 +1297,6 @@ pub const SwimProtocol = struct {
 
     fn learnCandidatePeer(self: *SwimProtocol, pubkey: [32]u8, endpoint: messages.Endpoint) void {
         if (self.membership.peers.getPtr(pubkey) != null) return;
-        if (self.nodeIsRevoked(pubkey)) return;
 
         const now = nowNs();
         for (self.candidate_peers[0..self.candidate_count]) |*candidate| {
@@ -1829,6 +1840,18 @@ fn issueCertWire(org_kp: Org.OrgKeyPair, node_pubkey: [32]u8, name: []const u8) 
     return cert_wire;
 }
 
+fn issueVouch(org_kp: Org.OrgKeyPair, node_pubkey: [32]u8, lamport: u64) messages.OrgTrustVouch {
+    var vouch = messages.OrgTrustVouch{
+        .org_pubkey = org_kp.public_key.toBytes(),
+        .vouched_pubkey = node_pubkey,
+        .lamport = lamport,
+        .signature = undefined,
+    };
+    const signed = codec.orgVouchSignedBytes(vouch);
+    vouch.signature = keys.sign(&signed, org_kp.secret_key) catch unreachable;
+    return vouch;
+}
+
 test "peer restart is detected by incarnation and steady state is not" {
     const allocator = std.testing.allocator;
     var membership = Membership.MembershipTable.init(allocator, 5000);
@@ -2285,7 +2308,10 @@ test "valid trusted org cert admits and records peer until revoked" {
     try std.testing.expectEqual(@as(?i64, 0), recorded.cert_expires_at);
     try std.testing.expect(swim.isAuthorizedPeer(node_pubkey, null));
 
-    swim.revoked_nodes[0] = node_pubkey;
+    swim.revoked_nodes[0] = .{
+        .org_pubkey = org_pubkey,
+        .node_pubkey = node_pubkey,
+    };
     swim.revoked_count = 1;
     try std.testing.expect(!swim.isAuthorizedPeer(node_pubkey, null));
     try std.testing.expect(!swim.isAuthorizedPeer(node_pubkey, cert_wire));
@@ -2299,6 +2325,7 @@ test "org revoke requires a valid trusted-org signature (C2 regression)" {
     defer socket.close();
 
     var swim = SwimProtocol.init(&membership, socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    swim.enableTrust();
 
     const org_kp = keys.generate();
     const org_pubkey = org_kp.public_key.toBytes();
@@ -2306,6 +2333,11 @@ test "org revoke requires a valid trusted-org signature (C2 regression)" {
 
     const victim = [_]u8{0x77} ** 32;
     try membership.upsert(aliveTestPeer(victim));
+    const victim_cert = try issueCertWire(.{
+        .public_key = org_kp.public_key,
+        .secret_key = org_kp.secret_key,
+    }, victim, "victim");
+    swim.recordPeerCertificate(victim, victim_cert);
 
     // (1) Forged: trusted org pubkey but an all-zero signature → rejected.
     const forged = messages.OrgCertRevoke{ .org_pubkey = org_pubkey, .node_pubkey = victim, .reason = 2, .lamport = 5, .signature = [_]u8{0} ** 64 };
@@ -2335,12 +2367,90 @@ test "org revoke requires a valid trusted-org signature (C2 regression)" {
     try std.testing.expect(membership.peers.get(victim2).?.state == .alive);
 }
 
+test "org revokes are scoped to certificate issuer" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    swim.enableTrust();
+
+    const org_a = Org.generateOrgKeyPair();
+    const org_b = Org.generateOrgKeyPair();
+    const org_a_pub = org_a.public_key.toBytes();
+    const org_b_pub = org_b.public_key.toBytes();
+    swim.addTrustedOrg(org_a_pub);
+    swim.addTrustedOrg(org_b_pub);
+
+    const node = [_]u8{0x89} ** 32;
+    const cert_b = try issueCertWire(org_b, node, "node-b");
+    try membership.upsert(aliveTestPeer(node));
+    swim.recordPeerCertificate(node, cert_b);
+    try std.testing.expect(swim.isAuthorizedPeer(node, null));
+
+    const revoke_from_a = try Org.issueOrgRevoke(org_a, node, 2, 20);
+    swim.handleOrgRevoke(revoke_from_a);
+
+    try std.testing.expectEqual(@as(usize, 1), swim.revoked_count);
+    try std.testing.expect(swim.orgRevokesNode(org_a_pub, node));
+    try std.testing.expect(swim.isAuthorizedPeer(node, null));
+    try std.testing.expect(swim.isAuthorizedPeer(node, cert_b));
+    try std.testing.expect(membership.peers.get(node).?.state == .alive);
+
+    const revoke_from_b = try Org.issueOrgRevoke(org_b, node, 2, 21);
+    swim.handleOrgRevoke(revoke_from_b);
+
+    try std.testing.expectEqual(@as(usize, 2), swim.revoked_count);
+    try std.testing.expect(swim.orgRevokesNode(org_b_pub, node));
+    try std.testing.expect(!swim.isAuthorizedPeer(node, null));
+    try std.testing.expect(!swim.isAuthorizedPeer(node, cert_b));
+    try std.testing.expect(membership.peers.get(node).?.state == .dead);
+}
+
+test "org revokes are scoped to vouch issuer" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    swim.enableTrust();
+
+    const org_a = Org.generateOrgKeyPair();
+    const org_b = Org.generateOrgKeyPair();
+    const org_a_pub = org_a.public_key.toBytes();
+    const org_b_pub = org_b.public_key.toBytes();
+    swim.addTrustedOrg(org_a_pub);
+    swim.addTrustedOrg(org_b_pub);
+
+    const node = [_]u8{0x8a} ** 32;
+    swim.handleOrgVouch(issueVouch(org_b, node, 30));
+    try membership.upsert(aliveTestPeer(node));
+    try std.testing.expect(swim.isAuthorizedPeer(node, null));
+
+    const revoke_from_a = try Org.issueOrgRevoke(org_a, node, 2, 31);
+    swim.handleOrgRevoke(revoke_from_a);
+
+    try std.testing.expectEqual(@as(usize, 1), swim.revoked_count);
+    try std.testing.expect(swim.orgRevokesNode(org_a_pub, node));
+    try std.testing.expect(swim.isAuthorizedPeer(node, null));
+    try std.testing.expect(membership.peers.get(node).?.state == .alive);
+
+    const revoke_from_b = try Org.issueOrgRevoke(org_b, node, 2, 32);
+    swim.handleOrgRevoke(revoke_from_b);
+
+    try std.testing.expectEqual(@as(usize, 2), swim.revoked_count);
+    try std.testing.expect(swim.orgRevokesNode(org_b_pub, node));
+    try std.testing.expect(!swim.isAuthorizedPeer(node, null));
+    try std.testing.expect(membership.peers.get(node).?.state == .dead);
+}
+
 test "queued org revoke is applied locally and retained for broadcast" {
     const allocator = std.testing.allocator;
     var membership = Membership.MembershipTable.init(allocator, 5000);
     defer membership.deinit();
 
     var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    swim.enableTrust();
 
     const org_kp = Org.generateOrgKeyPair();
     const org_pubkey = org_kp.public_key.toBytes();
@@ -2348,6 +2458,8 @@ test "queued org revoke is applied locally and retained for broadcast" {
 
     const victim = [_]u8{0x79} ** 32;
     try membership.upsert(aliveTestPeer(victim));
+    const cert = try issueCertWire(org_kp, victim, "victim");
+    swim.recordPeerCertificate(victim, cert);
     const rev = try Org.issueOrgRevoke(org_kp, victim, 2, 10);
 
     swim.queueOrgCertRevoke(rev);

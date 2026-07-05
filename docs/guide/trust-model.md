@@ -129,8 +129,10 @@ verification signs the revoked node key, reason, and Lamport timestamp.
 Org admins revoke an org-signed node with `meshguard org-revoke`. The command
 loads the local org signing key, writes a signed `OrgCertRevoke` message under
 `revoked/`, and `meshguard up` queues the saved revocation for best-effort
-broadcast to known peers. Individual trust files can still be removed locally
-with `meshguard revoke` when a peer was admitted outside org trust.
+broadcast to known peers. Revocations are scoped to the issuing org, so they
+invalidate that org's certificate or vouch for the node without cancelling a
+different trusted org's authority. Individual trust files can still be removed
+locally with `meshguard revoke` when a peer was admitted outside org trust.
 
 ### Org Vouch (External Peers)
 
