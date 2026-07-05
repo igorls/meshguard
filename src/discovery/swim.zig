@@ -98,6 +98,7 @@ const OrgControlSlot = struct {
     data: [Org.ORG_REVOKE_WIRE_SIZE]u8,
     len: u16,
     remaining: u32,
+    next_peer_index: usize,
 };
 const MAX_ORG_CONTROL_QUEUE: usize = Org.MAX_ORG_REVOKES;
 
@@ -1129,7 +1130,7 @@ pub const SwimProtocol = struct {
     /// be amplified into a flood. Over-budget packets are dropped (counted),
     /// which is correct for an unreliable gossip protocol. Tunnel DATA does not
     /// use this path, so egress throughput is unaffected.
-    fn gossipSend(self: *SwimProtocol, data: []const u8, endpoint: messages.Endpoint) void {
+    fn tryGossipSend(self: *SwimProtocol, data: []const u8, endpoint: messages.Endpoint) bool {
         const now = nowNs();
         if (self.last_token_refill_ns == 0) self.last_token_refill_ns = now;
         const elapsed_s: f64 = @as(f64, @floatFromInt(now - self.last_token_refill_ns)) / 1_000_000_000.0;
@@ -1137,11 +1138,16 @@ pub const SwimProtocol = struct {
         self.send_tokens = @min(SEND_BURST, self.send_tokens + elapsed_s * SEND_RATE_PPS);
         if (self.send_tokens < 1.0) {
             self.sends_dropped_ratelimit +%= 1;
-            return; // over budget — drop to protect the network
+            return false; // over budget: drop to protect the network
         }
         self.send_tokens -= 1.0;
-        _ = self.socket.sendToEndpoint(data, endpoint) catch return;
+        _ = self.socket.sendToEndpoint(data, endpoint) catch return false;
         self.pkts_sent +%= 1;
+        return true;
+    }
+
+    fn gossipSend(self: *SwimProtocol, data: []const u8, endpoint: messages.Endpoint) void {
+        _ = self.tryGossipSend(data, endpoint);
     }
 
     fn sendPing(self: *SwimProtocol, endpoint: messages.Endpoint, target_pubkey: [32]u8) void {
@@ -1427,10 +1433,41 @@ pub const SwimProtocol = struct {
             .data = std.mem.zeroes([Org.ORG_REVOKE_WIRE_SIZE]u8),
             .len = @intCast(data.len),
             .remaining = self.config.max_gossip_broadcasts,
+            .next_peer_index = 0,
         };
         @memcpy(slot.data[0..data.len], data);
         self.org_control_queue[self.org_control_count] = slot;
         self.org_control_count += 1;
+    }
+
+    fn orgControlRecipientCount(self: *const SwimProtocol) usize {
+        var count: usize = 0;
+        var iter = self.membership.peers.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.state == .dead) continue;
+            if (entry.value_ptr.gossip_endpoint == null) continue;
+            count += 1;
+        }
+        return count;
+    }
+
+    fn sendOrgControlFromCursor(self: *SwimProtocol, slot: *OrgControlSlot, recipient_count: usize) bool {
+        var recipient_index: usize = 0;
+        var iter = self.membership.peers.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.state == .dead) continue;
+            const ep = entry.value_ptr.gossip_endpoint orelse continue;
+            const current_index = recipient_index;
+            recipient_index += 1;
+            if (current_index < slot.next_peer_index) continue;
+
+            if (!self.tryGossipSend(slot.data[0..slot.len], ep)) {
+                slot.next_peer_index = current_index;
+                return false;
+            }
+            slot.next_peer_index = current_index + 1;
+        }
+        return slot.next_peer_index >= recipient_count;
     }
 
     fn broadcastOrgControlQueue(self: *SwimProtocol) void {
@@ -1439,16 +1476,17 @@ pub const SwimProtocol = struct {
         var write: usize = 0;
         for (0..self.org_control_count) |read| {
             var slot = self.org_control_queue[read];
-            var sent_any = false;
-            var iter = self.membership.peers.iterator();
-            while (iter.next()) |entry| {
-                if (entry.value_ptr.state == .dead) continue;
-                const ep = entry.value_ptr.gossip_endpoint orelse continue;
-                self.gossipSend(slot.data[0..slot.len], ep);
-                sent_any = true;
+            const recipient_count = self.orgControlRecipientCount();
+            if (recipient_count == 0) {
+                slot.next_peer_index = 0;
+            } else {
+                if (slot.next_peer_index > recipient_count) slot.next_peer_index = recipient_count;
+                if (self.sendOrgControlFromCursor(&slot, recipient_count)) {
+                    slot.next_peer_index = 0;
+                    slot.remaining -|= 1;
+                }
             }
 
-            if (sent_any) slot.remaining -|= 1;
             if (slot.remaining > 0) {
                 self.org_control_queue[write] = slot;
                 write += 1;
@@ -2342,6 +2380,49 @@ test "retained org revoke can be re-advertised without duplicate queue entries" 
     swim.last_org_revoke_readvertise_ns = 0;
     swim.readvertiseOrgRevokes(2_000_000);
     try std.testing.expectEqual(@as(usize, 1), swim.org_control_count);
+}
+
+test "org revoke fan-out resumes after rate-limit drops" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+    var socket = Udp.UdpSocket.bind(0) catch return;
+    defer socket.close();
+
+    var swim = SwimProtocol.init(&membership, socket, .{ .max_gossip_broadcasts = 1 }, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+
+    var i: usize = 0;
+    while (i < 3) : (i += 1) {
+        var peer = aliveTestPeer([_]u8{@intCast(i + 3)} ** 32);
+        peer.gossip_endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, @intCast(43000 + i));
+        try membership.upsert(peer);
+    }
+
+    const data = [_]u8{0x42} ** Org.ORG_REVOKE_WIRE_SIZE;
+    swim.enqueueOrgControl(&data);
+    try std.testing.expectEqual(@as(usize, 1), swim.org_control_count);
+
+    swim.send_tokens = 1;
+    swim.last_token_refill_ns = nowNs();
+    swim.broadcastOrgControlQueue();
+    try std.testing.expectEqual(@as(usize, 1), swim.org_control_count);
+    try std.testing.expectEqual(@as(u32, 1), swim.org_control_queue[0].remaining);
+    try std.testing.expectEqual(@as(usize, 1), swim.org_control_queue[0].next_peer_index);
+    try std.testing.expectEqual(@as(u64, 1), swim.pkts_sent);
+
+    swim.send_tokens = 1;
+    swim.last_token_refill_ns = nowNs();
+    swim.broadcastOrgControlQueue();
+    try std.testing.expectEqual(@as(usize, 1), swim.org_control_count);
+    try std.testing.expectEqual(@as(u32, 1), swim.org_control_queue[0].remaining);
+    try std.testing.expectEqual(@as(usize, 2), swim.org_control_queue[0].next_peer_index);
+    try std.testing.expectEqual(@as(u64, 2), swim.pkts_sent);
+
+    swim.send_tokens = 1;
+    swim.last_token_refill_ns = nowNs();
+    swim.broadcastOrgControlQueue();
+    try std.testing.expectEqual(@as(usize, 0), swim.org_control_count);
+    try std.testing.expectEqual(@as(u64, 3), swim.pkts_sent);
 }
 
 test "gossiped dead does not instantly evict a third party (H2 regression)" {
