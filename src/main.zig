@@ -105,6 +105,11 @@ fn childExitedSuccessfully(term: std.process.Child.Term) bool {
     return childExitCode(term) == 0;
 }
 
+fn configuredStunServers(out: []lib.nat.Stun.StunServer) []const lib.nat.Stun.StunServer {
+    const cfg = Config{};
+    return lib.nat.Stun.configuredOrDefault(cfg.stun_servers, out);
+}
+
 pub fn main(init: std.process.Init) !void {
     runtime_io = init.io;
     const allocator = init.gpa;
@@ -998,8 +1003,10 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     } else {
         // Run STUN to discover our public endpoint and NAT type
         const Stun = lib.nat.Stun;
+        var stun_server_buf: [Stun.MAX_CONFIGURED_STUN_SERVERS]Stun.StunServer = undefined;
+        const stun_servers = configuredStunServers(&stun_server_buf);
         try stdout.writeStreamingAll(zio(), "  discovering public endpoint (STUN)...\n");
-        const stun_result = Stun.discover(&gossip_socket, gossip_port, &Stun.DEFAULT_STUN_SERVERS);
+        const stun_result = Stun.discover(&gossip_socket, gossip_port, stun_servers);
         swim.setPublicEndpoint(
             if (stun_result.nat_type != .unknown) messages.Endpoint{ .addr = stun_result.external.addr, .port = stun_result.external.port } else null,
             stun_result.nat_type,
@@ -1398,8 +1405,10 @@ fn cmdConnect(allocator: std.mem.Allocator, extra_args: []const []const u8) !voi
     defer socket.close();
 
     // STUN discovery
+    var stun_server_buf: [Stun.MAX_CONFIGURED_STUN_SERVERS]Stun.StunServer = undefined;
+    const stun_servers = configuredStunServers(&stun_server_buf);
     try stdout.writeStreamingAll(zio(), "  discovering public endpoint (STUN)...\n");
-    const stun_result = Stun.discover(&socket, gossip_port, &Stun.DEFAULT_STUN_SERVERS);
+    const stun_result = Stun.discover(&socket, gossip_port, stun_servers);
     if (stun_result.nat_type == .unknown) {
         try stderr.writeStreamingAll(zio(), "error: STUN failed — could not determine public endpoint\n");
         try stderr.writeStreamingAll(zio(), "  hint: check internet connectivity or firewall\n");
@@ -1425,7 +1434,7 @@ fn cmdConnect(allocator: std.mem.Allocator, extra_args: []const []const u8) !voi
     const ntp_time = CoordinatedPunch.currentTimeSecs();
 
     // Pick STUN server used (for token)
-    const stun_server = Stun.DEFAULT_STUN_SERVERS[0];
+    const stun_server = stun_result.server orelse stun_servers[0];
 
     switch (mode) {
         .generate => {

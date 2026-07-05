@@ -50,6 +50,14 @@ const CLASS_IN: u16 = 1;
 const HEADER_LEN: usize = 12;
 const MAX_RESPONSE: usize = 512; // Standard DNS UDP max
 
+fn ipv4SockaddrAddr(addr: [4]u8) u32 {
+    const host_order = (@as(u32, addr[0]) << 24) |
+        (@as(u32, addr[1]) << 16) |
+        (@as(u32, addr[2]) << 8) |
+        @as(u32, addr[3]);
+    return std.mem.nativeToBig(u32, host_order);
+}
+
 // ─── DNS Header ───
 
 const DnsHeader = struct {
@@ -63,18 +71,16 @@ const DnsHeader = struct {
 
 // ─── Public API ───
 
-/// Get nameserver IPv4 addresses. On Linux, parses /etc/resolv.conf.
+/// Get nameserver IPv4 addresses. On POSIX, parses /etc/resolv.conf.
 /// On Windows, uses well-known public DNS servers as fallback.
 pub fn getNameservers(buf: *[3][4]u8) usize {
-    if (comptime is_linux) {
-        return getNameserversLinux(buf);
-    } else if (comptime is_windows) {
+    if (comptime is_windows) {
         return getNameserversWindows(buf);
     }
-    return 0;
+    return getNameserversResolvConf(buf);
 }
 
-fn getNameserversLinux(buf: *[3][4]u8) usize {
+fn getNameserversResolvConf(buf: *[3][4]u8) usize {
     const z = zio();
     const file = std.Io.Dir.openFileAbsolute(z, "/etc/resolv.conf", .{}) catch return 0;
     defer file.close(z);
@@ -196,7 +202,7 @@ pub fn queryMDNS(allocator: std.mem.Allocator, service_name: []const u8) ![][]co
     const mdns_addr = posix.sockaddr.in{
         .family = posix.AF.INET,
         .port = std.mem.nativeToBig(u16, MDNS_PORT),
-        .addr = std.mem.nativeToBig(u32, @as(u32, @bitCast(MDNS_ADDR))),
+        .addr = ipv4SockaddrAddr(MDNS_ADDR),
         .zero = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
     };
     if (comptime is_linux) {
@@ -504,7 +510,7 @@ fn sendQuery(nameserver: [4]u8, port: u16, query: []const u8) ?QueryResponse {
     const addr = posix.sockaddr.in{
         .family = posix.AF.INET,
         .port = std.mem.nativeToBig(u16, port),
-        .addr = std.mem.nativeToBig(u32, @as(u32, @bitCast(nameserver))),
+        .addr = ipv4SockaddrAddr(nameserver),
         .zero = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
     };
 
@@ -643,6 +649,11 @@ test "responseMatchesQuery rejects spoofed/mismatched responses (H5 regression)"
 
     // Truncated response rejected (no OOB).
     try std.testing.expect(!responseMatchesQuery(buf[0..5], id, domain, TYPE_A));
+}
+
+test "IPv4 sockaddr address preserves octet order" {
+    const raw = ipv4SockaddrAddr(.{ 127, 0, 0, 53 });
+    try std.testing.expectEqual(@as(u32, 0x7f000035), std.mem.bigToNative(u32, raw));
 }
 
 test "parse meshguard TXT" {
