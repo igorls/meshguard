@@ -69,6 +69,16 @@ const MAX_PROBES: u8 = 25; // 5 seconds / 200ms
 /// The receiver recognizes this as a hole punch probe and ignores it
 /// (it's not a valid SWIM message and won't be processed by the gossip handler).
 const PROBE_MAGIC: [4]u8 = .{ 0x4D, 0x47, 0x48, 0x50 }; // "MGHP" = MeshGuard HolePunch
+const PROBE_SIZE: usize = PROBE_MAGIC.len + 16;
+
+pub const Probe = struct {
+    token: [16]u8,
+};
+
+pub const PunchSuccess = struct {
+    peer_pubkey: [32]u8,
+    endpoint: messages.Endpoint,
+};
 
 /// Hole punch coordinator — manages concurrent punch attempts.
 pub const Holepuncher = struct {
@@ -118,7 +128,9 @@ pub const Holepuncher = struct {
     ) ?messages.Endpoint {
         for (&self.active) |*slot| {
             if (slot.*) |*state| {
-                if (std.mem.eql(u8, &state.token, &response.token_echo)) {
+                if (std.mem.eql(u8, &state.token, &response.token_echo) and
+                    std.mem.eql(u8, &state.target_pubkey, &response.sender_pubkey))
+                {
                     state.target_public_endpoint = response.public_endpoint;
                     state.response_received = true;
                     return response.public_endpoint;
@@ -126,6 +138,48 @@ pub const Holepuncher = struct {
             }
         }
         return null; // no matching punch attempt
+    }
+
+    /// Accept an incoming request as the target peer and start a session keyed to
+    /// the initiator identity and token. This mirrors initiate(), but preserves
+    /// the initiator's token so later probes can be bound to the same session.
+    pub fn acceptRequest(
+        self: *Holepuncher,
+        our_pubkey: [32]u8,
+        request: messages.HolepunchRequest,
+        our_public_endpoint: messages.Endpoint,
+    ) bool {
+        for (&self.active) |*slot| {
+            if (slot.*) |*state| {
+                if (std.mem.eql(u8, &state.initiator_pubkey, &our_pubkey) and
+                    std.mem.eql(u8, &state.target_pubkey, &request.sender_pubkey))
+                {
+                    state.our_public_endpoint = our_public_endpoint;
+                    state.target_public_endpoint = request.public_endpoint;
+                    state.token = request.token;
+                    state.started_at_ns = nowNs();
+                    state.probes_sent = 0;
+                    state.response_received = true;
+                    return true;
+                }
+            }
+        }
+
+        const slot = for (&self.active, 0..) |*s, i| {
+            if (s.* == null) break i;
+        } else return false;
+
+        self.active[slot] = .{
+            .initiator_pubkey = our_pubkey,
+            .target_pubkey = request.sender_pubkey,
+            .our_public_endpoint = our_public_endpoint,
+            .target_public_endpoint = request.public_endpoint,
+            .token = request.token,
+            .started_at_ns = nowNs(),
+            .probes_sent = 0,
+            .response_received = true,
+        };
+        return true;
     }
 
     /// Build a HolepunchResponse for an incoming request.
@@ -162,7 +216,9 @@ pub const Holepuncher = struct {
                 if (state.target_public_endpoint) |target_ep| {
                     if (state.probes_sent < MAX_PROBES) {
                         // Send probe packet
-                        _ = socket.sendToEndpoint(&PROBE_MAGIC, target_ep) catch {};
+                        var probe_buf: [PROBE_SIZE]u8 = undefined;
+                        encodeProbe(state.token, &probe_buf);
+                        _ = socket.sendToEndpoint(&probe_buf, target_ep) catch {};
                         state.probes_sent += 1;
                     }
 
@@ -190,9 +246,39 @@ pub const Holepuncher = struct {
         return null;
     }
 
+    pub fn markProbeSuccess(self: *Holepuncher, probe: Probe, sender_endpoint: messages.Endpoint) ?PunchSuccess {
+        for (&self.active) |*slot| {
+            if (slot.*) |state| {
+                if (!std.mem.eql(u8, &state.token, &probe.token)) continue;
+                const target_ep = state.target_public_endpoint orelse continue;
+                if (!messages.Endpoint.eql(target_ep, sender_endpoint)) continue;
+                const success = PunchSuccess{
+                    .peer_pubkey = state.target_pubkey,
+                    .endpoint = target_ep,
+                };
+                slot.* = null;
+                return success;
+            }
+        }
+        return null;
+    }
+
+    pub fn encodeProbe(token: [16]u8, out: *[PROBE_SIZE]u8) void {
+        @memcpy(out[0..PROBE_MAGIC.len], &PROBE_MAGIC);
+        @memcpy(out[PROBE_MAGIC.len..][0..16], &token);
+    }
+
+    pub fn decodeProbe(data: []const u8) ?Probe {
+        if (data.len != PROBE_SIZE) return null;
+        if (!std.mem.eql(u8, data[0..PROBE_MAGIC.len], &PROBE_MAGIC)) return null;
+        var token: [16]u8 = undefined;
+        @memcpy(&token, data[PROBE_MAGIC.len..][0..16]);
+        return .{ .token = token };
+    }
+
     /// Check if a received packet is a hole punch probe.
     pub fn isProbe(data: []const u8) bool {
-        return data.len == PROBE_MAGIC.len and std.mem.eql(u8, data, &PROBE_MAGIC);
+        return decodeProbe(data) != null;
     }
 
     /// Count active punch attempts.
@@ -240,7 +326,12 @@ test "initiate and respond" {
 }
 
 test "probe magic detection" {
-    try std.testing.expect(Holepuncher.isProbe(&PROBE_MAGIC));
+    var probe_buf: [PROBE_SIZE]u8 = undefined;
+    Holepuncher.encodeProbe([_]u8{0x42} ** 16, &probe_buf);
+
+    try std.testing.expect(Holepuncher.isProbe(&probe_buf));
+    try std.testing.expectEqualSlices(u8, &([_]u8{0x42} ** 16), &Holepuncher.decodeProbe(&probe_buf).?.token);
+    try std.testing.expect(!Holepuncher.isProbe(&PROBE_MAGIC));
     try std.testing.expect(!Holepuncher.isProbe(&.{ 0x01, 0x02, 0x03, 0x04 }));
     try std.testing.expect(!Holepuncher.isProbe(&.{0x01}));
 }
@@ -259,4 +350,52 @@ test "max concurrent punches" {
     // Next one should fail
     try std.testing.expect(puncher.initiate([_]u8{0xAA} ** 32, [_]u8{0xFF} ** 32, our_ep) == null);
     try std.testing.expectEqual(puncher.activeCount(), MAX_CONCURRENT_PUNCHES);
+}
+
+test "holepunch response is bound to token and peer identity" {
+    var puncher = Holepuncher{};
+    const our_pubkey = [_]u8{0xAA} ** 32;
+    const target_pubkey = [_]u8{0xBB} ** 32;
+    const wrong_pubkey = [_]u8{0xCC} ** 32;
+    const our_ep = messages.Endpoint.initV4(.{ 1, 2, 3, 4 }, 51821);
+    const target_ep = messages.Endpoint.initV4(.{ 5, 6, 7, 8 }, 51821);
+
+    const req = puncher.initiate(our_pubkey, target_pubkey, our_ep).?;
+    try std.testing.expect(puncher.handleResponse(.{
+        .sender_pubkey = wrong_pubkey,
+        .public_endpoint = target_ep,
+        .token_echo = req.token,
+    }) == null);
+    try std.testing.expect(puncher.handleResponse(.{
+        .sender_pubkey = target_pubkey,
+        .public_endpoint = target_ep,
+        .token_echo = [_]u8{0x11} ** 16,
+    }) == null);
+    try std.testing.expect(puncher.handleResponse(.{
+        .sender_pubkey = target_pubkey,
+        .public_endpoint = target_ep,
+        .token_echo = req.token,
+    }) != null);
+}
+
+test "target accepts request with initiator session token" {
+    var puncher = Holepuncher{};
+    const our_pubkey = [_]u8{0xBB} ** 32;
+    const initiator_pubkey = [_]u8{0xAA} ** 32;
+    const our_ep = messages.Endpoint.initV4(.{ 5, 6, 7, 8 }, 51821);
+    const initiator_ep = messages.Endpoint.initV4(.{ 1, 2, 3, 4 }, 51821);
+    const token = [_]u8{0x99} ** 16;
+
+    try std.testing.expect(puncher.acceptRequest(our_pubkey, .{
+        .sender_pubkey = initiator_pubkey,
+        .target_pubkey = our_pubkey,
+        .public_endpoint = initiator_ep,
+        .token = token,
+    }, our_ep));
+    try std.testing.expectEqual(@as(usize, 1), puncher.activeCount());
+
+    const success = puncher.markProbeSuccess(.{ .token = token }, initiator_ep).?;
+    try std.testing.expectEqualSlices(u8, &initiator_pubkey, &success.peer_pubkey);
+    try std.testing.expect(messages.Endpoint.eql(initiator_ep, success.endpoint));
+    try std.testing.expectEqual(@as(usize, 0), puncher.activeCount());
 }

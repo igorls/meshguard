@@ -16,6 +16,7 @@ const keys = @import("../identity/keys.zig");
 const Org = @import("../identity/org.zig");
 const Udp = @import("../net/udp.zig");
 const Holepuncher = @import("../nat/holepunch.zig").Holepuncher;
+const Relay = @import("../nat/relay.zig");
 const log = std.log.scoped(.swim);
 
 // Max amount a single (possibly forged, unauthenticated) gossip entry may advance
@@ -75,6 +76,7 @@ pub const EventHandler = struct {
     onPeerPunched: ?*const fn (ctx: *anyopaque, peer: *const Membership.Peer, endpoint: messages.Endpoint) void = null,
     onAppMessage: ?*const fn (ctx: *anyopaque, data: []const u8) void = null,
     onWgPacket: ?*const fn (ctx: *anyopaque, data: []const u8, addr: [4]u8, port: u16) void = null,
+    onRelayWgPacket: ?*const fn (ctx: *anyopaque, data: []const u8, sender_pubkey: [32]u8, relay_endpoint: messages.Endpoint) void = null,
     /// Query whether a live WireGuard session currently exists for `wg_pubkey`.
     /// Used as an origin-authentication signal for restart detection (S2): SWIM
     /// ping/ack are not origin-authenticated, but holding a live tunnel proves the
@@ -200,6 +202,7 @@ pub const SwimProtocol = struct {
 
     // Hole punching coordinator
     holepuncher: Holepuncher = .{},
+    relay_limiter: Relay.IdentityRateLimiter = .{},
     last_punch_check_ns: i128 = 0,
     last_gossip_ns: i128 = 0,
 
@@ -674,8 +677,13 @@ pub const SwimProtocol = struct {
 
     fn handleMessage(self: *SwimProtocol, data: []const u8, sender_endpoint: messages.Endpoint) void {
         // Check for holepunch probes (raw UDP with MGHP magic, not SWIM-encoded)
-        if (data.len >= 4 and Holepuncher.isProbe(data[0..4])) {
-            self.handleHolepunchProbe(sender_endpoint);
+        if (Holepuncher.decodeProbe(data)) |probe| {
+            self.handleHolepunchProbe(probe, sender_endpoint);
+            return;
+        }
+
+        if (data.len > 0 and data[0] == @intFromEnum(messages.MessageType.relay_data)) {
+            self.handleRelayData(data, sender_endpoint);
             return;
         }
 
@@ -736,6 +744,26 @@ pub const SwimProtocol = struct {
             .org_cert_revoke => |rev| self.handleOrgRevoke(rev),
             .org_trust_vouch => |v| self.handleOrgVouch(v),
         }
+    }
+
+    fn handleRelayData(self: *SwimProtocol, data: []const u8, sender_endpoint: messages.Endpoint) void {
+        const frame = Relay.decodeRelayData(data) catch return;
+        if (!self.relay_limiter.allow(frame.sender_pubkey, nowNs())) return;
+
+        if (std.mem.eql(u8, &frame.target_pubkey, &self.our_pubkey)) {
+            if (self.handler) |h| {
+                if (h.onRelayWgPacket) |cb| {
+                    cb(h.ctx, frame.payload, frame.sender_pubkey, sender_endpoint);
+                } else if (h.onWgPacket) |cb| {
+                    cb(h.ctx, frame.payload, sender_endpoint.addr, sender_endpoint.port);
+                }
+            }
+            return;
+        }
+
+        const peer = self.membership.peers.get(frame.target_pubkey) orelse return;
+        const ep = peer.gossip_endpoint orelse peer.public_endpoint orelse return;
+        self.gossipSend(data, ep);
     }
 
     /// Handle an incoming 0x50 app message: deliver locally or relay.
@@ -1010,14 +1038,7 @@ pub const SwimProtocol = struct {
                 self.gossipSend(buf[0..written], sender_endpoint);
 
                 // Also start probing the initiator's endpoint
-                _ = self.holepuncher.initiate(self.our_pubkey, req.sender_pubkey, our_ep);
-                if (self.holepuncher.handleResponse(messages.HolepunchResponse{
-                    .sender_pubkey = req.sender_pubkey,
-                    .public_endpoint = req.public_endpoint,
-                    .token_echo = req.token,
-                })) |_| {
-                    // Probing will happen in tick()
-                }
+                _ = self.holepuncher.acceptRequest(self.our_pubkey, req, our_ep);
             }
         } else {
             // We're the rendezvous — forward to the target
@@ -1039,26 +1060,19 @@ pub const SwimProtocol = struct {
         }
     }
 
-    fn handleHolepunchProbe(self: *SwimProtocol, sender_endpoint: messages.Endpoint) void {
+    fn handleHolepunchProbe(self: *SwimProtocol, probe: @import("../nat/holepunch.zig").Probe, sender_endpoint: messages.Endpoint) void {
         // A probe arrived — the hole is punched!
-        // Find which peer this corresponds to by checking active punches
-        // For now, check all peers with matching public endpoints
-        var iter = self.membership.peers.iterator();
-        while (iter.next()) |entry| {
-            const peer = entry.value_ptr;
-            if (peer.public_endpoint) |pub_ep| {
-                if (pub_ep.eql(sender_endpoint)) {
-                    // Found the peer — notify handler to configure WG endpoint
-                    var ep_buf: [64]u8 = undefined;
-                    std.debug.print("  [punch] hole punched with {x:0>2}{x:0>2}... at {s}\n", .{
-                        peer.pubkey[0], peer.pubkey[1], sender_endpoint.format(&ep_buf),
-                    });
-                    if (self.handler) |h| {
-                        if (h.onPeerPunched) |callback| {
-                            callback(h.ctx, peer, sender_endpoint);
-                        }
+        // Bind success to the active session token and expected peer endpoint.
+        if (self.holepuncher.markProbeSuccess(probe, sender_endpoint)) |success| {
+            if (self.membership.peers.getPtr(success.peer_pubkey)) |peer| {
+                var ep_buf: [64]u8 = undefined;
+                std.debug.print("  [punch] hole punched with {x:0>2}{x:0>2}... at {s}\n", .{
+                    peer.pubkey[0], peer.pubkey[1], success.endpoint.format(&ep_buf),
+                });
+                if (self.handler) |h| {
+                    if (h.onPeerPunched) |callback| {
+                        callback(h.ctx, peer, success.endpoint);
                     }
-                    return;
                 }
             }
         }
@@ -1861,17 +1875,36 @@ const JoinCounter = struct {
     last_pubkey: ?[32]u8 = null,
 };
 
+const RelayDeliveryCounter = struct {
+    count: usize = 0,
+    payload: [64]u8 = .{0} ** 64,
+    payload_len: usize = 0,
+    addr: [4]u8 = .{0} ** 4,
+    port: u16 = 0,
+};
+
 fn countPeerJoin(ctx: *anyopaque, peer: *const Membership.Peer) void {
     const counter: *JoinCounter = @ptrCast(@alignCast(ctx));
     counter.count += 1;
     counter.last_pubkey = peer.pubkey;
 }
 
+fn ignorePeerJoin(_: *anyopaque, _: *const Membership.Peer) void {}
+
 fn ignorePeerDead(_: *anyopaque, _: [32]u8) void {}
 
 fn countPeerDead(ctx: *anyopaque, _: [32]u8) void {
     const counter: *JoinCounter = @ptrCast(@alignCast(ctx));
     counter.dead_count += 1;
+}
+
+fn countRelayWgPacket(ctx: *anyopaque, data: []const u8, addr: [4]u8, port: u16) void {
+    const counter: *RelayDeliveryCounter = @ptrCast(@alignCast(ctx));
+    counter.count += 1;
+    counter.payload_len = @min(data.len, counter.payload.len);
+    @memcpy(counter.payload[0..counter.payload_len], data[0..counter.payload_len]);
+    counter.addr = addr;
+    counter.port = port;
 }
 
 fn inertTestSocket() Udp.UdpSocket {
@@ -1901,6 +1934,35 @@ fn issueDelegatedCertV2Wire(org_kp: Org.OrgKeyPair, issuer_kp: Org.OrgKeyPair, n
     var cert_wire: [messages.ORG_CERT_WIRE_SIZE]u8 = undefined;
     cert.serialize(&cert_wire);
     return cert_wire;
+}
+
+test "relay data addressed to us is delivered as opaque WG packet" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+
+    var delivery = RelayDeliveryCounter{};
+    const our_pubkey = [_]u8{0x11} ** 32;
+    const sender_pubkey = [_]u8{0x22} ** 32;
+    const handler = EventHandler{
+        .ctx = &delivery,
+        .onPeerJoin = ignorePeerJoin,
+        .onPeerDead = ignorePeerDead,
+        .onWgPacket = countRelayWgPacket,
+    };
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, our_pubkey, [_]u8{0x33} ** 32, .{ 127, 0, 0, 1 }, 51821, handler);
+
+    var wg_payload = [_]u8{0} ** 32;
+    std.mem.writeInt(u32, wg_payload[0..4], 4, .little);
+    var frame: [Relay.RELAY_FRAME_HEADER_SIZE + wg_payload.len]u8 = undefined;
+    const frame_len = try Relay.encodeRelayData(&frame, sender_pubkey, our_pubkey, &wg_payload);
+
+    swim.feedPacketEndpoint(frame[0..frame_len], messages.Endpoint.initV4(.{ 198, 51, 100, 9 }, 40000));
+
+    try std.testing.expectEqual(@as(usize, 1), delivery.count);
+    try std.testing.expectEqualSlices(u8, &wg_payload, delivery.payload[0..delivery.payload_len]);
+    try std.testing.expectEqual([4]u8{ 198, 51, 100, 9 }, delivery.addr);
+    try std.testing.expectEqual(@as(u16, 40000), delivery.port);
 }
 
 fn issueVouch(org_kp: Org.OrgKeyPair, node_pubkey: [32]u8, lamport: u64) messages.OrgTrustVouch {

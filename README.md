@@ -215,16 +215,16 @@ Trust authorization order:
 
 ### NAT Traversal
 
-- **STUN**: RFC 5389 Binding Request to discover public endpoint + NAT type
-- **Hole punching**: Rendezvous-mediated UDP probing for cone NATs (4 concurrent, 5s timeout)
-- **Relay**: Public-IP mesh member forwards WG ciphertext for symmetric NATs
+- **STUN**: RFC 5389 Binding Requests across multiple servers to discover public endpoint + NAT mapping type
+- **Hole punching**: Rendezvous-mediated, identity/session-bound UDP probing for cone NATs (4 concurrent, 5s timeout)
+- **Relay**: Public-IP relay forwards only opaque WireGuard/Noise ciphertext for symmetric NATs
 
 ### Wire Protocol
 
 - Binary codec: type-tag-delimited, fixed-size fields, little-endian
 - SWIM: Ping (`0x01`), Ack (`0x03`), PingReq (`0x02`)
 - Handshake: Standard WireGuard Noise_IKpsk2 (Type 1, Type 2)
-- NAT: HolepunchRequest (`0x33`), HolepunchResponse (`0x34`)
+- NAT: RelayData (`0x31`), HolepunchRequest (`0x33`), HolepunchResponse (`0x34`)
 - Org: OrgAliasAnnounce (`0x41`), OrgCertRevoke (`0x42`), OrgTrustVouch (`0x43`)
 
 ## Benchmarks
