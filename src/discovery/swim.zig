@@ -228,7 +228,7 @@ pub const SwimProtocol = struct {
     vouched_count: usize = 0,
 
     // Node's own org certificate (if any, loaded at init)
-    our_org_cert: ?[186]u8 = null,
+    our_org_cert: ?[messages.ORG_CERT_WIRE_SIZE]u8 = null,
 
     // Control-plane send rate limiting (token bucket). A hard ceiling on
     // SWIM/gossip packets/sec so a pathological inbound rate (e.g. a NAT
@@ -317,6 +317,7 @@ pub const SwimProtocol = struct {
         if (!cert.isValid()) return false;
         if (!self.isOrgAuthorizedPeer(cert.org_pubkey)) return false;
         if (self.orgRevokesNode(cert.org_pubkey, pubkey)) return false;
+        if (cert.isDelegated() and self.orgRevokesNode(cert.org_pubkey, cert.issuer_pubkey)) return false;
         return true;
     }
 
@@ -327,16 +328,50 @@ pub const SwimProtocol = struct {
         if (!self.isOrgAuthorizedPeer(org_pubkey)) return false;
         if (!certExpiryValid(expires_at)) return false;
         if (self.orgRevokesNode(org_pubkey, pubkey)) return false;
+        if (peer.cert_issuer_pubkey) |issuer| {
+            if (self.orgRevokesNode(org_pubkey, issuer)) return false;
+        }
         return true;
+    }
+
+    fn revokedOrgGrantAffectsPeer(rev: messages.OrgCertRevoke, pubkey: [32]u8, peer: Membership.Peer) bool {
+        if (std.mem.eql(u8, &pubkey, &rev.node_pubkey)) return true;
+        const org_pubkey = peer.org_pubkey orelse return false;
+        if (!std.mem.eql(u8, &org_pubkey, &rev.org_pubkey)) return false;
+        if (peer.cert_issuer_pubkey) |issuer| {
+            return std.mem.eql(u8, &issuer, &rev.node_pubkey);
+        }
+        return false;
+    }
+
+    fn bindPeerWgKeyFromCert(self: *SwimProtocol, pubkey: [32]u8, signed_wg: [32]u8) void {
+        const current = self.membership.peers.get(pubkey) orelse return;
+        if (current.wg_pubkey) |existing| {
+            if (std.mem.eql(u8, &existing, &signed_wg)) return;
+            if (self.handler) |h| {
+                h.onPeerDead(h.ctx, pubkey);
+            }
+        }
+        if (self.membership.peers.getPtr(pubkey)) |peer| {
+            peer.wg_pubkey = signed_wg;
+            if (self.handler) |h| {
+                h.onPeerJoin(h.ctx, peer);
+            }
+        }
     }
 
     fn recordPeerCertificate(self: *SwimProtocol, pubkey: [32]u8, cert_wire: [messages.ORG_CERT_WIRE_SIZE]u8) void {
         if (!self.certAuthorizesPeer(pubkey, cert_wire)) return;
         const cert = Org.NodeCertificate.deserialize(&cert_wire);
+        const signed_wg = cert.boundWgPubkey();
         if (self.membership.peers.getPtr(pubkey)) |peer| {
             peer.org_pubkey = cert.org_pubkey;
+            peer.cert_issuer_pubkey = if (cert.isDelegated()) cert.issuer_pubkey else null;
             peer.org_node_name = cert.node_name;
             peer.cert_expires_at = cert.expires_at;
+        }
+        if (signed_wg) |wg| {
+            self.bindPeerWgKeyFromCert(pubkey, wg);
         }
     }
 
@@ -388,7 +423,7 @@ pub const SwimProtocol = struct {
     }
 
     /// Set this node's org certificate.
-    pub fn setOrgCert(self: *SwimProtocol, cert_wire: [186]u8) void {
+    pub fn setOrgCert(self: *SwimProtocol, cert_wire: [messages.ORG_CERT_WIRE_SIZE]u8) void {
         self.our_org_cert = cert_wire;
     }
 
@@ -825,17 +860,25 @@ pub const SwimProtocol = struct {
             self.revoked_count += 1;
             log.warn("node revoked by org (reason={d})", .{rev.reason});
 
-            // If the revoked node is currently authorized only by this org's
-            // cert/vouch, mark it dead. Other orgs or explicit key trust are
-            // independent authorization boundaries.
-            if (self.membership.peers.getPtr(rev.node_pubkey)) |peer| {
-                if ((peer.state == .alive or peer.state == .suspected) and
-                    !self.isAuthorizedPeer(rev.node_pubkey, null))
-                {
-                    self.membership.markDead(rev.node_pubkey);
-                    if (self.handler) |h| {
-                        h.onPeerDead(h.ctx, rev.node_pubkey);
-                    }
+            // If the revoked node, or any leaf cert issued by that node, is
+            // currently authorized only by this org's cert/vouch, mark it dead.
+            // Other orgs or explicit key trust are independent authorization
+            // boundaries.
+            while (true) {
+                var dead_key: ?[32]u8 = null;
+                var iter = self.membership.peers.iterator();
+                while (iter.next()) |entry| {
+                    const peer = entry.value_ptr.*;
+                    if (peer.state != .alive and peer.state != .suspected) continue;
+                    if (!revokedOrgGrantAffectsPeer(rev, entry.key_ptr.*, peer)) continue;
+                    if (self.isAuthorizedPeer(entry.key_ptr.*, null)) continue;
+                    dead_key = entry.key_ptr.*;
+                    break;
+                }
+                const key = dead_key orelse break;
+                self.membership.markDead(key);
+                if (self.handler) |h| {
+                    h.onPeerDead(h.ctx, key);
                 }
             }
         }
@@ -1814,6 +1857,7 @@ fn aliveTestPeer(pk: [32]u8) Membership.Peer {
 
 const JoinCounter = struct {
     count: usize = 0,
+    dead_count: usize = 0,
     last_pubkey: ?[32]u8 = null,
 };
 
@@ -1825,6 +1869,11 @@ fn countPeerJoin(ctx: *anyopaque, peer: *const Membership.Peer) void {
 
 fn ignorePeerDead(_: *anyopaque, _: [32]u8) void {}
 
+fn countPeerDead(ctx: *anyopaque, _: [32]u8) void {
+    const counter: *JoinCounter = @ptrCast(@alignCast(ctx));
+    counter.dead_count += 1;
+}
+
 fn inertTestSocket() Udp.UdpSocket {
     const fd: std.posix.socket_t = if (builtin.os.tag == .windows)
         @as(std.posix.socket_t, @ptrFromInt(std.math.maxInt(usize)))
@@ -1835,6 +1884,20 @@ fn inertTestSocket() Udp.UdpSocket {
 
 fn issueCertWire(org_kp: Org.OrgKeyPair, node_pubkey: [32]u8, name: []const u8) ![messages.ORG_CERT_WIRE_SIZE]u8 {
     var cert = try Org.issueCertificate(org_kp, node_pubkey, name, 0);
+    var cert_wire: [messages.ORG_CERT_WIRE_SIZE]u8 = undefined;
+    cert.serialize(&cert_wire);
+    return cert_wire;
+}
+
+fn issueCertV2Wire(org_kp: Org.OrgKeyPair, node_pubkey: [32]u8, wg_pubkey: [32]u8, name: []const u8) ![messages.ORG_CERT_WIRE_SIZE]u8 {
+    var cert = try Org.issueCertificateV2(org_kp, node_pubkey, wg_pubkey, name, 0);
+    var cert_wire: [messages.ORG_CERT_WIRE_SIZE]u8 = undefined;
+    cert.serialize(&cert_wire);
+    return cert_wire;
+}
+
+fn issueDelegatedCertV2Wire(org_kp: Org.OrgKeyPair, issuer_kp: Org.OrgKeyPair, node_pubkey: [32]u8, wg_pubkey: [32]u8, name: []const u8) ![messages.ORG_CERT_WIRE_SIZE]u8 {
+    var cert = try Org.issueDelegatedCertificateV2(org_kp, issuer_kp, node_pubkey, wg_pubkey, name, 0);
     var cert_wire: [messages.ORG_CERT_WIRE_SIZE]u8 = undefined;
     cert.serialize(&cert_wire);
     return cert_wire;
@@ -2226,6 +2289,153 @@ test "cert-only gossip candidate is probed then graduates on direct cert" {
     try std.testing.expectEqualSlices(u8, &wg_key, &membership.peers.get(node_pubkey).?.wg_pubkey.?);
     try std.testing.expectEqual(@as(usize, 1), joins.count);
     try std.testing.expectEqualSlices(u8, &node_pubkey, &joins.last_pubkey.?);
+}
+
+test "v2 org cert binds WireGuard key on direct cert admission" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+    const socket = inertTestSocket();
+
+    var joins = JoinCounter{};
+    const handler = EventHandler{
+        .ctx = &joins,
+        .onPeerJoin = countPeerJoin,
+        .onPeerDead = countPeerDead,
+    };
+    var swim = SwimProtocol.init(&membership, socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, handler);
+    swim.enableTrust();
+
+    const org_kp = Org.generateOrgKeyPair();
+    const org_pubkey = org_kp.public_key.toBytes();
+    swim.addTrustedOrg(org_pubkey);
+
+    const node_kp = keys.generate();
+    const node_pubkey = node_kp.public_key.toBytes();
+    const signed_wg = [_]u8{0x91} ** 32;
+    const cert_wire = try issueCertV2Wire(org_kp, node_pubkey, signed_wg, "node-v2");
+    const endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 43100);
+
+    var ack_buf: [1500]u8 = undefined;
+    const written = try codec.encodeAck(&ack_buf, .{
+        .sender_pubkey = node_pubkey,
+        .seq = 1,
+        .gossip = &.{},
+        .org_cert = cert_wire,
+        .has_org_cert = true,
+    });
+    swim.handleMessage(ack_buf[0..written], endpoint);
+
+    const recorded = membership.peers.get(node_pubkey).?;
+    try std.testing.expectEqualSlices(u8, &org_pubkey, &recorded.org_pubkey.?);
+    try std.testing.expectEqualSlices(u8, &signed_wg, &recorded.wg_pubkey.?);
+    try std.testing.expectEqual(@as(usize, 1), joins.count);
+    try std.testing.expectEqual(@as(usize, 0), joins.dead_count);
+}
+
+test "v2 org cert overrides preseeded gossip WireGuard key" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+    const socket = inertTestSocket();
+
+    var joins = JoinCounter{};
+    const handler = EventHandler{
+        .ctx = &joins,
+        .onPeerJoin = countPeerJoin,
+        .onPeerDead = countPeerDead,
+    };
+    var swim = SwimProtocol.init(&membership, socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, handler);
+    swim.enableTrust();
+
+    const org_kp = Org.generateOrgKeyPair();
+    swim.addTrustedOrg(org_kp.public_key.toBytes());
+
+    const node_kp = keys.generate();
+    const node_pubkey = node_kp.public_key.toBytes();
+    swim.addAuthorizedKey(node_pubkey);
+
+    const fake_wg = [_]u8{0xF0} ** 32;
+    const signed_wg = [_]u8{0x92} ** 32;
+    const endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 43101);
+
+    swim.applyGossip(.{
+        .subject_pubkey = node_pubkey,
+        .event = .join,
+        .lamport = 1,
+        .endpoint = endpoint,
+        .wg_pubkey = fake_wg,
+    });
+    try std.testing.expectEqualSlices(u8, &fake_wg, &membership.peers.get(node_pubkey).?.wg_pubkey.?);
+    try std.testing.expectEqual(@as(usize, 1), joins.count);
+
+    const cert_wire = try issueCertV2Wire(org_kp, node_pubkey, signed_wg, "node-v2");
+    var ack_buf: [1500]u8 = undefined;
+    const written = try codec.encodeAck(&ack_buf, .{
+        .sender_pubkey = node_pubkey,
+        .seq = 2,
+        .gossip = &.{},
+        .org_cert = cert_wire,
+        .has_org_cert = true,
+    });
+    swim.handleMessage(ack_buf[0..written], endpoint);
+
+    const recorded = membership.peers.get(node_pubkey).?;
+    try std.testing.expectEqualSlices(u8, &signed_wg, &recorded.wg_pubkey.?);
+    try std.testing.expectEqual(@as(usize, 1), joins.dead_count);
+    try std.testing.expectEqual(@as(usize, 2), joins.count);
+}
+
+test "delegated v2 org cert admits and intermediate revocation evicts leaf" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+    const socket = inertTestSocket();
+
+    var joins = JoinCounter{};
+    const handler = EventHandler{
+        .ctx = &joins,
+        .onPeerJoin = countPeerJoin,
+        .onPeerDead = countPeerDead,
+    };
+    var swim = SwimProtocol.init(&membership, socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, handler);
+    swim.enableTrust();
+
+    const org_kp = Org.generateOrgKeyPair();
+    const issuer_kp = Org.generateOrgKeyPair();
+    const org_pubkey = org_kp.public_key.toBytes();
+    const issuer_pubkey = issuer_kp.public_key.toBytes();
+    swim.addTrustedOrg(org_pubkey);
+
+    const node_kp = keys.generate();
+    const node_pubkey = node_kp.public_key.toBytes();
+    const signed_wg = [_]u8{0x93} ** 32;
+    const cert_wire = try issueDelegatedCertV2Wire(org_kp, issuer_kp, node_pubkey, signed_wg, "delegated");
+    const endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 43102);
+
+    var ack_buf: [1500]u8 = undefined;
+    const written = try codec.encodeAck(&ack_buf, .{
+        .sender_pubkey = node_pubkey,
+        .seq = 3,
+        .gossip = &.{},
+        .org_cert = cert_wire,
+        .has_org_cert = true,
+    });
+    swim.handleMessage(ack_buf[0..written], endpoint);
+
+    var recorded = membership.peers.get(node_pubkey).?;
+    try std.testing.expectEqualSlices(u8, &org_pubkey, &recorded.org_pubkey.?);
+    try std.testing.expectEqualSlices(u8, &issuer_pubkey, &recorded.cert_issuer_pubkey.?);
+    try std.testing.expectEqualSlices(u8, &signed_wg, &recorded.wg_pubkey.?);
+    try std.testing.expect(swim.isAuthorizedPeer(node_pubkey, null));
+
+    const revoke_issuer = try Org.issueOrgRevoke(org_kp, issuer_pubkey, 2, 50);
+    swim.handleOrgRevoke(revoke_issuer);
+
+    recorded = membership.peers.get(node_pubkey).?;
+    try std.testing.expect(!swim.isAuthorizedPeer(node_pubkey, cert_wire));
+    try std.testing.expect(recorded.state == .dead);
+    try std.testing.expectEqual(@as(usize, 1), joins.dead_count);
 }
 
 test "gossiped join still admits an individually authorized subject" {

@@ -64,8 +64,9 @@ Gossip entries are **piggybacked** on Ping and Ack messages — no dedicated gos
 
 **Total per entry: 115 bytes.** Ping and Ack also carry an 8-byte incarnation
 after the sequence number so peers can detect restarts. A fully-loaded Ping
-with 8 gossip entries is 970 bytes before the optional 187-byte org certificate
-extension, still under the default 1420-byte MTU.
+with 8 gossip entries is 970 bytes before the optional org certificate
+extension. New v2-sized extensions are 315 bytes including the presence byte,
+still under the default 1420-byte MTU.
 
 ## Handshake Flow
 

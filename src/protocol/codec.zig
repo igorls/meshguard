@@ -14,6 +14,7 @@ const messages = @import("messages.zig");
 const ENDPOINT_SIZE = 1 + 1 + 16 + 2;
 const GOSSIP_ENTRY_SIZE = 32 + 1 + 8 + ENDPOINT_SIZE + 1 + 32 + ENDPOINT_SIZE + 1; // 115 bytes
 const ORG_CERT_EXTENSION_SIZE = 1 + messages.ORG_CERT_WIRE_SIZE;
+const ORG_CERT_V1_EXTENSION_SIZE = 1 + 186;
 
 // ─── Encoding ───
 
@@ -468,11 +469,13 @@ fn decodeOrgCertExtension(
     if (pos >= data.len) return;
     if (data[pos] != 1) return;
     // A truncated/malformed trailing extension must not nullify an otherwise-valid
-    // SWIM packet (its liveness + gossip already parsed). Treat a short cert as "no
-    // cert present", mirroring the lenient gossip-entry loop, rather than failing the
-    // whole ping/ack decode.
-    if (pos + ORG_CERT_EXTENSION_SIZE > data.len) return;
-    @memcpy(cert, data[pos + 1 ..][0..messages.ORG_CERT_WIRE_SIZE]);
+    // SWIM packet (its liveness + gossip already parsed). Accept legacy v1
+    // 186-byte certs and zero-fill the v2 extension fields.
+    if (pos + ORG_CERT_V1_EXTENSION_SIZE > data.len) return;
+    @memset(cert, 0);
+    const available = data.len - pos - 1;
+    const copy_len = @min(available, messages.ORG_CERT_WIRE_SIZE);
+    @memcpy(cert[0..copy_len], data[pos + 1 ..][0..copy_len]);
     has_cert.* = true;
 }
 
@@ -691,6 +694,38 @@ test "ack optional org cert extension roundtrip" {
     }
 }
 
+test "ack accepts legacy v1 org cert extension" {
+    const pubkey = [_]u8{0xAA} ** 32;
+    const legacy_cert = [_]u8{0xA1} ** 186;
+    var buf: [1 + 32 + 8 + 8 + 1 + 1 + 186]u8 = undefined;
+    var pos: usize = 0;
+
+    buf[pos] = @intFromEnum(messages.MessageType.ack);
+    pos += 1;
+    @memcpy(buf[pos..][0..32], &pubkey);
+    pos += 32;
+    std.mem.writeInt(u64, buf[pos..][0..8], 99, .little);
+    pos += 8;
+    std.mem.writeInt(u64, buf[pos..][0..8], 0, .little);
+    pos += 8;
+    buf[pos] = 0;
+    pos += 1;
+    buf[pos] = 1;
+    pos += 1;
+    @memcpy(buf[pos..][0..legacy_cert.len], &legacy_cert);
+    pos += legacy_cert.len;
+
+    const decoded = try decode(buf[0..pos]);
+    switch (decoded) {
+        .ack => |a| {
+            try std.testing.expect(a.has_org_cert);
+            try std.testing.expectEqualSlices(u8, &legacy_cert, a.org_cert[0..legacy_cert.len]);
+            try std.testing.expect(std.mem.allEqual(u8, a.org_cert[legacy_cert.len..], 0));
+        },
+        else => return error.InvalidMessageType,
+    }
+}
+
 test "ping with gossip roundtrip" {
     const pubkey = [_]u8{0x01} ** 32;
     const subject = [_]u8{0x02} ** 32;
@@ -874,7 +909,7 @@ test "truncated trailing org-cert flag does not drop the whole packet (C4)" {
     var buf: [600]u8 = undefined;
     const written = try encodePing(&buf, ping);
 
-    // Append a stray cert-present flag (0x01) with no room for the 186-byte cert.
+    // Append a stray cert-present flag (0x01) with no room for a legacy 186-byte cert.
     // Pre-fix this returned error.BufferTooShort and failed the ENTIRE decode,
     // discarding otherwise-valid SWIM liveness + gossip.
     buf[written] = 1;

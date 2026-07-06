@@ -115,7 +115,11 @@ meshguard org-keygen
 
 # Sign a node's identity with the org key
 meshguard org-sign /path/to/node.pub --name node-1
-# → node-1.cert (186 bytes)
+# -> node-1.cert (v1, 186 bytes)
+
+# Or bind the node's WireGuard key in a v2 cert
+meshguard org-sign /path/to/node.pub --name node-1 --wg-pubkey /path/to/node.wg.pub
+# -> node-1.cert (v2, 314 bytes)
 
 # Remote peer: trust the org (one-time)
 meshguard trust <org-pubkey> --org --name eosrio
@@ -149,7 +153,7 @@ For fleets, trust one org public key instead of N individual keys:
 ```
 ~/.config/meshguard/
 ├── identity.key / identity.pub    # Node identity
-├── node.cert                      # Org-signed certificate (186 bytes)
+├── node.cert                      # Org-signed certificate (v1 186 B, v2 314 B)
 ├── authorized_keys/               # Individual peer trust
 │   └── validator-1.pub
 ├── trusted_orgs/                  # Org trust (auto-accept members)
@@ -190,7 +194,7 @@ Trust authorization order:
 - Mesh IPv6 deterministically derived: `Blake3(pubkey) → fd99:6d67::X:Y/64` (ULA, RFC 4193)
 - Dual-stack: both addresses assigned to the TUN interface automatically
 - Authorized keys directory gates mesh membership
-- **Org certificates**: 186-byte Ed25519-signed `NodeCertificate` for fleet trust
+- **Org certificates**: Ed25519-signed `NodeCertificate` for fleet trust; v2 certs also bind the WireGuard public key
 - **Mesh DNS**: deterministic `*.a1b2c3.mesh` domains per org, gossip-propagated aliases
 
 ### Discovery (SWIM)

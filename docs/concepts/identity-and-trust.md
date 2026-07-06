@@ -88,7 +88,7 @@ When two nodes discover each other:
 
 ## Org Trust & Certificates
 
-Organizations sign `NodeCertificate` structures (186 bytes) that bind a node's Ed25519 public key to an org identity. See the [Trust Model](/guide/trust-model) guide for full details.
+Organizations sign `NodeCertificate` structures that bind a node's Ed25519 public key to an org identity. v1 certificates are 186 bytes; v2 certificates are 314 bytes and can also bind the node's WireGuard public key. See the [Trust Model](/guide/trust-model) guide for full details.
 
 ## Deterministic Mesh DNS
 

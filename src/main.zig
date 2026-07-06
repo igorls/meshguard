@@ -32,7 +32,7 @@ const usage =
     \\  revoke      Revoke a peer's public key
     \\  export      Print this node's public key
     \\  org-keygen  Generate a new org keypair
-    \\  org-sign    Sign a node's key with org key (--name <label>)
+    \\  org-sign    Sign a node cert (--name <label>, --wg-pubkey <key>)
     \\  org-vouch   Vouch for an external node (auto-propagates to org members)
     \\  org-revoke  Sign an org certificate revocation
     \\  config show Show local node configuration (works offline)
@@ -506,10 +506,27 @@ fn cmdOrgKeygen(allocator: std.mem.Allocator) !void {
     try writeFormatted(stdout, "  public key: {s}\n", .{pk_b64});
     try writeFormatted(stdout, "  domain:     {s}.mesh\n", .{domain});
     try writeFormatted(stdout, "\nShare the public key with peers who should trust your org.\n", .{});
-    try writeFormatted(stdout, "Sign nodes with: meshguard org-sign <node.pub> --name <label>\n", .{});
+    try writeFormatted(stdout, "Sign nodes with: meshguard org-sign <node.pub> --name <label> [--wg-pubkey <key>]\n", .{});
 }
 
 /// Sign a node's public key with the org private key, producing a NodeCertificate.
+fn loadRaw32KeyArg(key_or_path: []const u8, out: *[32]u8) !void {
+    var raw_buf: [256]u8 = undefined;
+    const key_text = blk: {
+        const file = std.Io.Dir.cwd().openFile(zio(), key_or_path, .{}) catch break :blk key_or_path;
+        defer file.close(zio());
+        var reader = file.reader(zio(), &.{});
+        var total: usize = 0;
+        while (total < raw_buf.len) {
+            const n = reader.interface.readSliceShort(raw_buf[total..]) catch return error.InvalidKey;
+            if (n == 0) break;
+            total += n;
+        }
+        break :blk std.mem.trim(u8, raw_buf[0..total], "\n\r \t");
+    };
+    try std.base64.standard.Decoder.decode(out, key_text);
+}
+
 fn cmdOrgSign(allocator: std.mem.Allocator, node_key_path: []const u8, extra_args: []const []const u8) !void {
     const config_dir = try Config.ensureConfigDir(allocator);
     defer allocator.free(config_dir);
@@ -521,6 +538,7 @@ fn cmdOrgSign(allocator: std.mem.Allocator, node_key_path: []const u8, extra_arg
     // Parse --name and --expires from extra args
     var node_name: []const u8 = "node";
     var expires_at: i64 = 0; // default: never
+    var wg_pubkey: ?[32]u8 = null;
     var j: usize = 0;
     while (j < extra_args.len) : (j += 1) {
         if (std.mem.eql(u8, extra_args[j], "--name")) {
@@ -532,6 +550,23 @@ fn cmdOrgSign(allocator: std.mem.Allocator, node_key_path: []const u8, extra_arg
             if (j + 1 < extra_args.len) {
                 expires_at = std.fmt.parseInt(i64, extra_args[j + 1], 10) catch 0;
                 j += 1;
+            }
+        } else if (std.mem.eql(u8, extra_args[j], "--wg-pubkey")) {
+            if (j + 1 < extra_args.len) {
+                var parsed: [32]u8 = undefined;
+                loadRaw32KeyArg(extra_args[j + 1], &parsed) catch {
+                    try stderr.writeStreamingAll(zio(), "error: invalid WireGuard public key (expected base64 32-byte key or file)\n");
+                    std.process.exit(1);
+                };
+                if (std.mem.allEqual(u8, &parsed, 0)) {
+                    try stderr.writeStreamingAll(zio(), "error: invalid WireGuard public key (all-zero key)\n");
+                    std.process.exit(1);
+                }
+                wg_pubkey = parsed;
+                j += 1;
+            } else {
+                try stderr.writeStreamingAll(zio(), "error: --wg-pubkey requires a value\n");
+                std.process.exit(1);
             }
         }
     }
@@ -551,10 +586,16 @@ fn cmdOrgSign(allocator: std.mem.Allocator, node_key_path: []const u8, extra_arg
     }
 
     // Issue certificate
-    const cert = Org.issueCertificate(org_kp, node_pk_bytes, node_name, expires_at) catch {
-        try stderr.writeStreamingAll(zio(), "error: failed to sign certificate\n");
-        std.process.exit(1);
-    };
+    const cert = if (wg_pubkey) |wg|
+        Org.issueCertificateV2(org_kp, node_pk_bytes, wg, node_name, expires_at) catch {
+            try stderr.writeStreamingAll(zio(), "error: failed to sign certificate\n");
+            std.process.exit(1);
+        }
+    else
+        Org.issueCertificate(org_kp, node_pk_bytes, node_name, expires_at) catch {
+            try stderr.writeStreamingAll(zio(), "error: failed to sign certificate\n");
+            std.process.exit(1);
+        };
 
     // Save certificate
     const cert_filename = try std.fmt.allocPrint(allocator, "{s}.cert", .{node_name});
@@ -567,6 +608,7 @@ fn cmdOrgSign(allocator: std.mem.Allocator, node_key_path: []const u8, extra_arg
 
     const domain = Org.deriveOrgDomain(org_kp.public_key.toBytes());
     try writeFormatted(stdout, "Certificate signed for '{s}'.\n", .{node_name});
+    try writeFormatted(stdout, "  version:     v{d}\n", .{cert.version});
     try writeFormatted(stdout, "  mesh domain: {s}.{s}.mesh\n", .{ node_name, domain });
     try writeFormatted(stdout, "  saved to:    {s}\n", .{cert_path});
     if (expires_at == 0) {
@@ -1074,7 +1116,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     const cert_path = try std.fs.path.join(allocator, &.{ config_dir, "node.cert" });
     defer allocator.free(cert_path);
     if (lib.identity.Org.loadCertificate(allocator, cert_path)) |cert| {
-        var cert_wire: [186]u8 = undefined;
+        var cert_wire: [lib.protocol.Messages.ORG_CERT_WIRE_SIZE]u8 = undefined;
         cert.serialize(&cert_wire);
         swim.setOrgCert(cert_wire);
         try writeFormatted(stdout, "  org cert: {s} (org member)\n", .{cert.getName()});
@@ -4390,6 +4432,7 @@ fn cmdConfigShow(allocator: std.mem.Allocator) !void {
             var org_b64: [44]u8 = undefined;
             const org_pub_b64 = std.base64.standard.Encoder.encode(&org_b64, &cert.org_pubkey);
             try writeFormatted(stdout, "  org public key: {s}\n", .{org_pub_b64});
+            try writeFormatted(stdout, "  cert version:   v{d}\n", .{cert.version});
 
             const node_name = cert.getName();
             try writeFormatted(stdout, "  node name:      {s}\n", .{node_name});
@@ -4404,6 +4447,18 @@ fn cmdConfigShow(allocator: std.mem.Allocator) !void {
                 try stdout.writeStreamingAll(zio(), "  expires:        never\n");
             } else {
                 try writeFormatted(stdout, "  expires:        {d}\n", .{cert.expires_at});
+            }
+
+            if (cert.boundWgPubkey()) |wg_pubkey| {
+                var wg_b64: [44]u8 = undefined;
+                const wg_pub_b64 = std.base64.standard.Encoder.encode(&wg_b64, &wg_pubkey);
+                try writeFormatted(stdout, "  wg public key:  {s}\n", .{wg_pub_b64});
+            }
+
+            if (cert.isDelegated()) {
+                var issuer_b64: [44]u8 = undefined;
+                const issuer_pub_b64 = std.base64.standard.Encoder.encode(&issuer_b64, &cert.issuer_pubkey);
+                try writeFormatted(stdout, "  issuer key:     {s}\n", .{issuer_pub_b64});
             }
 
             if (!cert.isValid()) {

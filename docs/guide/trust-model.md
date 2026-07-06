@@ -63,7 +63,7 @@ For fleet deployments, managing N individual keys becomes impractical. **Org tru
 ```
 ~/.config/meshguard/
 ├── identity.key / identity.pub    # Node identity
-├── node.cert                      # Org-signed certificate (186 bytes)
+├── node.cert                      # Org-signed certificate (v1 186 B, v2 314 B)
 ├── authorized_keys/               # Individual peer trust
 │   └── validator-1.pub
 ├── trusted_orgs/                  # Org trust (auto-accept members)
@@ -75,19 +75,50 @@ For fleet deployments, managing N individual keys becomes impractical. **Org tru
 
 ### NodeCertificate Format
 
-Each certificate is a fixed-size 186-byte binary structure:
+meshguard supports two node-certificate versions during the v2 rollout:
 
-| Field         | Size     | Description                             |
-| ------------- | -------- | --------------------------------------- |
-| `version`     | 1 byte   | Certificate version (currently 1)       |
-| `org_pubkey`  | 32 bytes | Organization Ed25519 public key         |
-| `node_pubkey` | 32 bytes | Node Ed25519 public key                 |
-| `node_name`   | 32 bytes | DNS label, null-padded                  |
-| `issued_at`   | 8 bytes  | Unix timestamp                          |
-| `expires_at`  | 8 bytes  | Unix timestamp (0 = never)              |
-| `flags`       | 1 byte   | Reserved                                |
-| `signature`   | 64 bytes | Ed25519 signature over all prior fields |
-| _padding_     | 8 bytes  | Future expansion                        |
+| Version | Wire size | Description |
+| ------- | --------- | ----------- |
+| v1 | 186 bytes | Org signs node identity, name, issue time, expiry, and flags. WireGuard public keys are still learned from gossip. |
+| v2 | 314 bytes | v1 prefix plus signed WireGuard public key binding, issuer key, and optional delegated-issuer grant signature. |
+
+The shared v1 prefix is:
+
+| Field         | Size     | Description                              |
+| ------------- | -------- | ---------------------------------------- |
+| `version`     | 1 byte   | Certificate version (`1` or `2`)         |
+| `org_pubkey`  | 32 bytes | Organization Ed25519 public key          |
+| `node_pubkey` | 32 bytes | Node Ed25519 public key                  |
+| `node_name`   | 32 bytes | DNS label, null-padded                   |
+| `issued_at`   | 8 bytes  | Unix timestamp                           |
+| `expires_at`  | 8 bytes  | Unix timestamp (0 = never)               |
+| `flags`       | 1 byte   | Delegation flag in v2, reserved in v1    |
+| `signature`   | 64 bytes | Ed25519 signature over versioned payload |
+| _padding_     | 8 bytes  | v1 padding before v2 extension fields    |
+
+v2 appends:
+
+| Field | Size | Description |
+| ----- | ---- | ----------- |
+| `wg_pubkey` | 32 bytes | Signed X25519 WireGuard public key for this node |
+| `issuer_pubkey` | 32 bytes | Zero for normal direct certs, or the delegated issuer key when the delegation flag is set |
+| `delegation_signature` | 64 bytes | Org signature authorizing the delegated issuer; zero for direct org-signed v2 certs |
+
+For direct v2 certs, the org signs the full v2 payload. For delegated v2 certs,
+the issuer signs the node payload and the org signs a one-hop grant to that
+issuer. The issuer can be a human/role key or a partner org key. Revoking the
+issuer with `meshguard org-revoke` invalidates all leaves admitted through that
+issuer for the revoking org.
+
+### v1/v2 Migration Policy
+
+Upgraded meshguard nodes accept legacy v1 certificates and v2 certificates.
+Legacy meshguard nodes accept only v1 certificates. During a mixed-version
+rollout, upgrade binaries first and continue issuing v1 certs until every
+trust-enforcing peer has the v2 parser. Then issue v2 certs, usually with
+`meshguard org-sign --wg-pubkey`, to bind each node identity to its WireGuard
+public key. v1 peers remain supported, but their WireGuard key is still learned
+from gossip instead of the certificate.
 
 ### Mesh DNS
 
@@ -107,8 +138,11 @@ Organizations can also claim **human-readable aliases** (e.g. `*.eosrio.mesh`) v
 # Generate org keypair
 meshguard org-keygen
 
-# Sign a node's key
+# Sign a node's key with a v1 certificate
 meshguard org-sign /path/to/node.pub --name db-1
+
+# Sign a v2 certificate that binds the node's WireGuard public key
+meshguard org-sign /path/to/node.pub --name db-1 --wg-pubkey /path/to/node.wg.pub
 
 # Trust an org (auto-accept all signed nodes)
 meshguard trust <org-pubkey> --org --name eosrio
@@ -159,6 +193,8 @@ When a new peer connects, trust is evaluated in order:
    - Verify Ed25519 signature
    - Check certificate expiry
    - Confirm issuing org is in `trusted_orgs/`
+   - For v2, bind the peer's WireGuard public key from the signed cert
+   - For delegated v2, verify the org-signed issuer grant and issuer signature
 3. **Org vouch check** — has a trusted org vouched for this peer?
 4. **Revocation check** — has the cert/vouch been revoked via gossip?
 

@@ -281,7 +281,7 @@ meshguard org-keygen
 Sign a node's public key with the organization key.
 
 ```bash
-meshguard org-sign <node-key-or-path> [--name <label>] [--expires <unix-timestamp>]
+meshguard org-sign <node-key-or-path> [--name <label>] [--expires <unix-timestamp>] [--wg-pubkey <key-or-path>]
 ```
 
 | Argument | Description |
@@ -289,6 +289,11 @@ meshguard org-sign <node-key-or-path> [--name <label>] [--expires <unix-timestam
 | `<node-key-or-path>` | Base64 public key string _or_ path to a `.pub` file |
 | `--name` | Human-readable name for the node |
 | `--expires` | Unix timestamp when the signature expires (default: 0, never expires) |
+| `--wg-pubkey` | Base64 WireGuard public key string _or_ path to a file. When set, emits a v2 certificate that binds node identity to this WireGuard key. |
+
+Without `--wg-pubkey`, `org-sign` emits a legacy v1 certificate for mixed-version
+meshes. With `--wg-pubkey`, it emits a v2 certificate. Upgrade trust-enforcing
+peers before relying on v2-only certificates.
 
 ---
 
