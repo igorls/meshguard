@@ -66,6 +66,8 @@ pub const Peer = struct {
     // ── Org trust fields ──
     /// Org public key (if peer authenticated via org cert)
     org_pubkey: ?[32]u8 = null,
+    /// Cert issuer public key when admitted via delegated v2 cert.
+    cert_issuer_pubkey: ?[32]u8 = null,
     /// Node name from certificate (e.g. "node-1")
     org_node_name: [32]u8 = std.mem.zeroes([32]u8),
     /// Certificate expiry (0 = never, null = no cert)

@@ -5,7 +5,7 @@
 
 const std = @import("std");
 
-pub const ORG_CERT_WIRE_SIZE: usize = 186;
+pub const ORG_CERT_WIRE_SIZE: usize = 314;
 
 /// Message type tag — first byte of every wire message.
 pub const MessageType = enum(u8) {

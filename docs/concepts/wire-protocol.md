@@ -83,8 +83,12 @@ org certificate extension.
 The optional org certificate extension is appended to Ping/Ack after gossip as:
 
 ```
-[1B present=1][186B NodeCertificate]
+[1B present=1][314B NodeCertificate max]
 ```
+
+New encoders emit the full 314-byte v2-sized certificate slot. Decoders also
+accept the legacy `[1B present=1][186B NodeCertificate]` extension and zero-fill
+the v2-only fields so v1 certificates continue to work during rollout.
 
 ## HandshakeInitiation (Type 1)
 

@@ -44,10 +44,16 @@ pub const OrgKeyPair = struct {
 pub const ORG_REVOKE_WIRE_SIZE: usize = 1 + 32 + 32 + 1 + 8 + 64;
 pub const MAX_ORG_REVOKES: usize = 64;
 
+pub const CERT_VERSION_V1: u8 = 1;
+pub const CERT_VERSION_V2: u8 = 2;
+pub const CERT_FLAG_DELEGATED: u8 = 1 << 0;
+pub const V1_CERT_WIRE_SIZE: usize = 186;
+
 /// Fixed-size node certificate signed by an org key.
-/// Total: 186 bytes on the wire.
+/// v1 occupies the first 186 bytes; v2 appends WG key binding and an optional
+/// one-hop delegated issuer grant.
 pub const NodeCertificate = struct {
-    version: u8 = 1,
+    version: u8 = CERT_VERSION_V1,
     org_pubkey: [32]u8,
     node_pubkey: [32]u8,
     node_name: [32]u8, // DNS label, null-padded
@@ -55,15 +61,21 @@ pub const NodeCertificate = struct {
     expires_at: i64, // 0 = never
     flags: u8 = 0, // reserved
     signature: [64]u8 = std.mem.zeroes([64]u8),
+    wg_pubkey: [32]u8 = std.mem.zeroes([32]u8),
+    issuer_pubkey: [32]u8 = std.mem.zeroes([32]u8),
+    delegation_signature: [64]u8 = std.mem.zeroes([64]u8),
 
-    pub const WIRE_SIZE: usize = 186;
+    pub const WIRE_SIZE: usize = messages.ORG_CERT_WIRE_SIZE;
 
     /// The portion of the cert that is signed (everything except signature + padding).
     /// version(1) + org_pubkey(32) + node_pubkey(32) + node_name(32) + issued_at(8) + expires_at(8) + flags(1) = 114 bytes
-    const SIGNED_LEN: usize = 114;
+    const V1_SIGNED_LEN: usize = 114;
+    const V2_SIGNED_LEN: usize = V1_SIGNED_LEN + 32 + 32;
+    const DELEGATION_SIGNED_LEN: usize = 1 + 32 + 32 + 8 + 1;
 
     /// Serialize to a fixed-size wire buffer.
     pub fn serialize(self: *const NodeCertificate, out: *[WIRE_SIZE]u8) void {
+        @memset(out, 0);
         var pos: usize = 0;
         out[pos] = self.version;
         pos += 1;
@@ -81,8 +93,14 @@ pub const NodeCertificate = struct {
         pos += 1;
         @memcpy(out[pos..][0..64], &self.signature);
         pos += 64;
-        // Padding
-        @memset(out[pos..WIRE_SIZE], 0);
+        pos += V1_CERT_WIRE_SIZE - pos;
+        if (self.version >= CERT_VERSION_V2) {
+            @memcpy(out[pos..][0..32], &self.wg_pubkey);
+            pos += 32;
+            @memcpy(out[pos..][0..32], &self.issuer_pubkey);
+            pos += 32;
+            @memcpy(out[pos..][0..64], &self.delegation_signature);
+        }
     }
 
     /// Deserialize from a wire buffer.
@@ -103,6 +121,19 @@ pub const NodeCertificate = struct {
         const flags = data[pos];
         pos += 1;
         const signature = data[pos..][0..64].*;
+        pos += 64;
+        pos += V1_CERT_WIRE_SIZE - pos;
+
+        var wg_pubkey = std.mem.zeroes([32]u8);
+        var issuer_pubkey = std.mem.zeroes([32]u8);
+        var delegation_signature = std.mem.zeroes([64]u8);
+        if (version >= CERT_VERSION_V2) {
+            wg_pubkey = data[pos..][0..32].*;
+            pos += 32;
+            issuer_pubkey = data[pos..][0..32].*;
+            pos += 32;
+            delegation_signature = data[pos..][0..64].*;
+        }
 
         return .{
             .version = version,
@@ -113,12 +144,14 @@ pub const NodeCertificate = struct {
             .expires_at = expires_at,
             .flags = flags,
             .signature = signature,
+            .wg_pubkey = wg_pubkey,
+            .issuer_pubkey = issuer_pubkey,
+            .delegation_signature = delegation_signature,
         };
     }
 
-    /// Extract the signed payload (for signing/verification).
-    fn signedPayload(self: *const NodeCertificate) [SIGNED_LEN]u8 {
-        var buf: [SIGNED_LEN]u8 = undefined;
+    fn signedPayloadV1(self: *const NodeCertificate) [V1_SIGNED_LEN]u8 {
+        var buf: [V1_SIGNED_LEN]u8 = undefined;
         var pos: usize = 0;
         buf[pos] = self.version;
         pos += 1;
@@ -136,11 +169,49 @@ pub const NodeCertificate = struct {
         return buf;
     }
 
+    /// Extract the signed payload (for signing/verification).
+    fn signedPayload(self: *const NodeCertificate) [V2_SIGNED_LEN]u8 {
+        var buf: [V2_SIGNED_LEN]u8 = undefined;
+        const v1 = self.signedPayloadV1();
+        @memcpy(buf[0..V1_SIGNED_LEN], &v1);
+        var pos: usize = V1_SIGNED_LEN;
+        @memcpy(buf[pos..][0..32], &self.wg_pubkey);
+        pos += 32;
+        @memcpy(buf[pos..][0..32], &self.issuer_pubkey);
+        return buf;
+    }
+
+    fn delegationPayload(self: *const NodeCertificate) [DELEGATION_SIGNED_LEN]u8 {
+        var buf: [DELEGATION_SIGNED_LEN]u8 = undefined;
+        var pos: usize = 0;
+        buf[pos] = self.version;
+        pos += 1;
+        @memcpy(buf[pos..][0..32], &self.org_pubkey);
+        pos += 32;
+        @memcpy(buf[pos..][0..32], &self.issuer_pubkey);
+        pos += 32;
+        std.mem.writeInt(i64, buf[pos..][0..8], self.expires_at, .little);
+        pos += 8;
+        buf[pos] = self.flags;
+        return buf;
+    }
+
     /// Check if certificate is expired. Returns true if valid.
     pub fn isValid(self: *const NodeCertificate) bool {
-        if (self.version != 1) return false;
+        if (self.version != CERT_VERSION_V1 and self.version != CERT_VERSION_V2) return false;
+        if (self.version == CERT_VERSION_V2 and std.mem.allEqual(u8, &self.wg_pubkey, 0)) return false;
         if (self.expires_at == 0) return true; // never expires
         return nowUnixSecs() < self.expires_at;
+    }
+
+    pub fn isDelegated(self: *const NodeCertificate) bool {
+        return self.version == CERT_VERSION_V2 and (self.flags & CERT_FLAG_DELEGATED) != 0;
+    }
+
+    pub fn boundWgPubkey(self: *const NodeCertificate) ?[32]u8 {
+        if (self.version != CERT_VERSION_V2) return null;
+        if (std.mem.allEqual(u8, &self.wg_pubkey, 0)) return null;
+        return self.wg_pubkey;
     }
 
     /// Get the node name as a trimmed string (strips null padding).
@@ -234,17 +305,44 @@ pub fn loadOrgKeyPair(allocator: std.mem.Allocator, config_dir: []const u8) !Org
 
 /// Sign a node certificate with the org's private key.
 pub fn signCertificate(cert: *NodeCertificate, org_secret: Ed25519.SecretKey) !void {
-    const payload = cert.signedPayload();
     const kp = try Ed25519.KeyPair.fromSecretKey(org_secret);
+    if (cert.version == CERT_VERSION_V1) {
+        const payload = cert.signedPayloadV1();
+        const sig = try kp.sign(&payload, null);
+        cert.signature = sig.toBytes();
+        return;
+    }
+    const payload = cert.signedPayload();
     const sig = try kp.sign(&payload, null);
     cert.signature = sig.toBytes();
 }
 
 /// Verify a node certificate's signature against the embedded org public key.
 pub fn verifyCertificate(cert: *const NodeCertificate) bool {
+    if (cert.version == CERT_VERSION_V1) {
+        const payload = cert.signedPayloadV1();
+        const org_pk = Ed25519.PublicKey.fromBytes(cert.org_pubkey) catch return false;
+        const sig = Ed25519.Signature.fromBytes(cert.signature);
+        sig.verify(&payload, org_pk) catch return false;
+        return true;
+    }
+    if (cert.version != CERT_VERSION_V2) return false;
+
     const payload = cert.signedPayload();
-    const org_pk = Ed25519.PublicKey.fromBytes(cert.org_pubkey) catch return false;
     const sig = Ed25519.Signature.fromBytes(cert.signature);
+    if (cert.isDelegated()) {
+        if (std.mem.allEqual(u8, &cert.issuer_pubkey, 0)) return false;
+        const issuer_pk = Ed25519.PublicKey.fromBytes(cert.issuer_pubkey) catch return false;
+        sig.verify(&payload, issuer_pk) catch return false;
+
+        const grant_payload = cert.delegationPayload();
+        const org_pk = Ed25519.PublicKey.fromBytes(cert.org_pubkey) catch return false;
+        const grant_sig = Ed25519.Signature.fromBytes(cert.delegation_signature);
+        grant_sig.verify(&grant_payload, org_pk) catch return false;
+        return true;
+    }
+
+    const org_pk = Ed25519.PublicKey.fromBytes(cert.org_pubkey) catch return false;
     sig.verify(&payload, org_pk) catch return false;
     return true;
 }
@@ -269,6 +367,44 @@ pub fn issueCertificate(
     };
 
     try signCertificate(&cert, org_kp.secret_key);
+    return cert;
+}
+
+pub fn issueCertificateV2(
+    org_kp: OrgKeyPair,
+    node_pubkey: [32]u8,
+    wg_pubkey: [32]u8,
+    name: []const u8,
+    expires_at: i64,
+) !NodeCertificate {
+    if (std.mem.allEqual(u8, &wg_pubkey, 0)) return error.InvalidWireGuardKey;
+    var cert = try issueCertificate(org_kp, node_pubkey, name, expires_at);
+    cert.version = CERT_VERSION_V2;
+    cert.wg_pubkey = wg_pubkey;
+    cert.issuer_pubkey = std.mem.zeroes([32]u8);
+    cert.delegation_signature = std.mem.zeroes([64]u8);
+    try signCertificate(&cert, org_kp.secret_key);
+    return cert;
+}
+
+pub fn issueDelegatedCertificateV2(
+    org_kp: OrgKeyPair,
+    issuer_kp: OrgKeyPair,
+    node_pubkey: [32]u8,
+    wg_pubkey: [32]u8,
+    name: []const u8,
+    expires_at: i64,
+) !NodeCertificate {
+    var cert = try issueCertificateV2(org_kp, node_pubkey, wg_pubkey, name, expires_at);
+    cert.flags |= CERT_FLAG_DELEGATED;
+    cert.issuer_pubkey = issuer_kp.public_key.toBytes();
+
+    const grant_payload = cert.delegationPayload();
+    const org_signer = try Ed25519.KeyPair.fromSecretKey(org_kp.secret_key);
+    const grant_sig = try org_signer.sign(&grant_payload, null);
+    cert.delegation_signature = grant_sig.toBytes();
+
+    try signCertificate(&cert, issuer_kp.secret_key);
     return cert;
 }
 
@@ -361,7 +497,10 @@ pub fn loadCertificate(allocator: std.mem.Allocator, path: []const u8) !NodeCert
 
     var wire: [NodeCertificate.WIRE_SIZE]u8 = undefined;
     const n = try readFileBytes(file, &wire);
-    if (n < NodeCertificate.WIRE_SIZE) return error.InvalidCertificate;
+    if (n < V1_CERT_WIRE_SIZE) return error.InvalidCertificate;
+    if (n < NodeCertificate.WIRE_SIZE) {
+        @memset(wire[n..], 0);
+    }
     return NodeCertificate.deserialize(&wire);
 }
 
@@ -484,6 +623,113 @@ test "cert serialize/deserialize round-trip" {
     try std.testing.expectEqual(cert.issued_at, restored.issued_at);
     try std.testing.expectEqual(cert.expires_at, restored.expires_at);
     try std.testing.expectEqualStrings(cert.getName(), restored.getName());
+}
+
+test "v2 cert binds WireGuard key and detects tampering" {
+    const org_kp = generateOrgKeyPair();
+    const node_kp = Ed25519.KeyPair.generate(zio());
+    const wg_pubkey = [_]u8{0x44} ** 32;
+
+    const cert = try issueCertificateV2(
+        org_kp,
+        node_kp.public_key.toBytes(),
+        wg_pubkey,
+        "wg-bound",
+        0,
+    );
+
+    try std.testing.expectEqual(CERT_VERSION_V2, cert.version);
+    try std.testing.expect(verifyCertificate(&cert));
+    try std.testing.expect(cert.isValid());
+    try std.testing.expectEqualSlices(u8, &wg_pubkey, &cert.boundWgPubkey().?);
+    try std.testing.expectError(
+        error.InvalidWireGuardKey,
+        issueCertificateV2(org_kp, node_kp.public_key.toBytes(), std.mem.zeroes([32]u8), "zero-wg", 0),
+    );
+
+    var wire: [NodeCertificate.WIRE_SIZE]u8 = undefined;
+    cert.serialize(&wire);
+    const restored = NodeCertificate.deserialize(&wire);
+    try std.testing.expect(verifyCertificate(&restored));
+    try std.testing.expectEqualSlices(u8, &wg_pubkey, &restored.boundWgPubkey().?);
+
+    var tampered_wg = restored;
+    tampered_wg.wg_pubkey[0] ^= 0x01;
+    try std.testing.expect(!verifyCertificate(&tampered_wg));
+
+    var tampered_issuer = restored;
+    tampered_issuer.issuer_pubkey[0] ^= 0x01;
+    try std.testing.expect(!verifyCertificate(&tampered_issuer));
+}
+
+test "delegated v2 cert verifies issuer and org grant signatures" {
+    const org_kp = generateOrgKeyPair();
+    const issuer_kp = generateOrgKeyPair();
+    const node_kp = Ed25519.KeyPair.generate(zio());
+    const wg_pubkey = [_]u8{0x45} ** 32;
+
+    const cert = try issueDelegatedCertificateV2(
+        org_kp,
+        issuer_kp,
+        node_kp.public_key.toBytes(),
+        wg_pubkey,
+        "delegate",
+        0,
+    );
+
+    try std.testing.expectEqual(CERT_VERSION_V2, cert.version);
+    try std.testing.expect(cert.isDelegated());
+    try std.testing.expect(verifyCertificate(&cert));
+    try std.testing.expect(cert.isValid());
+    try std.testing.expectEqualSlices(u8, &issuer_kp.public_key.toBytes(), &cert.issuer_pubkey);
+    try std.testing.expectEqualSlices(u8, &wg_pubkey, &cert.boundWgPubkey().?);
+
+    var tampered_leaf = cert;
+    tampered_leaf.wg_pubkey[0] ^= 0x01;
+    try std.testing.expect(!verifyCertificate(&tampered_leaf));
+
+    var tampered_grant = cert;
+    tampered_grant.expires_at = 123;
+    try std.testing.expect(!verifyCertificate(&tampered_grant));
+
+    var tampered_issuer = cert;
+    tampered_issuer.issuer_pubkey[0] ^= 0x01;
+    try std.testing.expect(!verifyCertificate(&tampered_issuer));
+}
+
+test "load certificate accepts legacy v1 wire size" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(zio(), ".", allocator);
+    defer allocator.free(tmp_path);
+    const cert_path = try std.fs.path.join(allocator, &.{ tmp_path, "legacy.cert" });
+    defer allocator.free(cert_path);
+
+    const org_kp = generateOrgKeyPair();
+    const node_kp = Ed25519.KeyPair.generate(zio());
+    const cert = try issueCertificate(
+        org_kp,
+        node_kp.public_key.toBytes(),
+        "legacy",
+        0,
+    );
+
+    var wire: [NodeCertificate.WIRE_SIZE]u8 = undefined;
+    cert.serialize(&wire);
+
+    {
+        const file = try std.Io.Dir.createFileAbsolute(zio(), cert_path, .{});
+        defer file.close(zio());
+        try file.writeStreamingAll(zio(), wire[0..V1_CERT_WIRE_SIZE]);
+    }
+
+    const loaded = try loadCertificate(allocator, cert_path);
+    try std.testing.expectEqual(CERT_VERSION_V1, loaded.version);
+    try std.testing.expect(verifyCertificate(&loaded));
+    try std.testing.expect(loaded.isValid());
+    try std.testing.expectEqual(@as(?[32]u8, null), loaded.boundWgPubkey());
 }
 
 test "deterministic org domain" {
