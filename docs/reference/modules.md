@@ -90,7 +90,7 @@ Reference map of all source modules and their responsibilities.
 | `offload.zig`    | GSO/GRO offload: `IFF_VNET_HDR`, segmentation offload for high-throughput paths            |
 | `pipeline.zig`   | Packet processing pipeline: batched encrypt/decrypt with multi-queue TUN support           |
 | `io.zig`         | Event loop abstraction layer                                                               |
-| `io_uring.zig`   | Linux io_uring integration for async I/O                                                   |
+| `io_uring.zig`   | Linux io_uring UDP ring and TUN reader gates for async I/O                                 |
 
 ## `docker/`
 

@@ -3293,8 +3293,8 @@ fn userspaceEventLoop(
 
     // Set all TUN fds to non-blocking (only for legacy poll+read path).
     // io_uring manages its own waiting and needs blocking fds.
-    const use_io_uring = lib.net.IoUring.isAvailable();
-    if (!use_io_uring) {
+    const use_tun_io_uring = lib.net.IoUring.isTunReaderAvailable();
+    if (!use_tun_io_uring) {
         for (0..opened_workers) |w| {
             const flags = posix.system.fcntl(tun_fds[w], posix.F.GETFL, @as(usize, 0));
             switch (posix.errno(flags)) {
@@ -3353,10 +3353,10 @@ fn userspaceEventLoop(
         };
 
         // Log io_uring TUN reader choice (detection happened above)
-        if (use_io_uring) {
-            writeFormatted(stdout, "  io_uring: available, using ring-based TUN reader\n", .{}) catch {};
+        if (use_tun_io_uring) {
+            writeFormatted(stdout, "  io_uring TUN: using ring-based TUN reader\n", .{}) catch {};
         } else {
-            writeFormatted(stdout, "  io_uring: unavailable, using poll+read TUN reader\n", .{}) catch {};
+            writeFormatted(stdout, "  io_uring TUN: {s}, using poll+read TUN reader\n", .{lib.net.IoUring.tunReaderUnavailableReason()}) catch {};
         }
 
         // Parallel pipeline: TUN readers + encrypt workers
@@ -3369,7 +3369,7 @@ fn userspaceEventLoop(
                 data_pool,
                 crypto_queue,
             };
-            const thread = if (use_io_uring)
+            const thread = if (use_tun_io_uring)
                 std.Thread.spawn(.{}, tunReaderIoUring, args)
             else
                 std.Thread.spawn(.{}, tunReaderPipeline, args);
@@ -3425,17 +3425,34 @@ fn userspaceEventLoop(
 
     var gro_rx = BatchUdp.GROReceiver{};
     var udp_ring: lib.net.IoUring.UdpRing = undefined;
+    var udp_ring_init_error: ?anyerror = null;
+    const udp_ring_available = lib.net.IoUring.isUdpRingAvailable();
     const use_udp_ring = blk: {
-        udp_ring.init(udp_sock.fd) catch break :blk false;
+        if (!udp_ring_available) break :blk false;
+        udp_ring.init(udp_sock.fd) catch |err| {
+            udp_ring_init_error = err;
+            break :blk false;
+        };
         break :blk true;
     };
     defer if (use_udp_ring) udp_ring.deinit();
-    if (use_udp_ring) {
-        const sqpoll_msg = if (udp_ring.sqpoll) "SQPOLL" else "submit";
-        const buffer_msg = if (udp_ring.registered_buffers) "registered buffers" else "unregistered buffers";
-        writeFormatted(stdout, "  io_uring UDP: recvmsg/sendmsg ring active ({s}, {s})\n", .{ sqpoll_msg, buffer_msg }) catch {};
-    } else {
-        writeFormatted(stdout, "  io_uring UDP: unavailable, using poll+recvmsg path\n", .{}) catch {};
+    const udp_path = lib.net.IoUring.selectUdpPath(udp_ring_available, use_udp_ring);
+    switch (udp_path) {
+        .io_uring => {
+            const sqpoll_msg = if (udp_ring.sqpoll) "SQPOLL" else "submit";
+            const buffer_msg = if (udp_ring.registered_buffers) "registered buffers" else "unregistered buffers";
+            writeFormatted(stdout, "  UDP path: io_uring recvmsg/sendmsg ring active ({s}, {s})\n", .{ sqpoll_msg, buffer_msg }) catch {};
+        },
+        .poll_recvmsg => |reason| switch (reason) {
+            .runtime_unavailable => writeFormatted(stdout, "  UDP path: poll+recvmsg (io_uring runtime unavailable)\n", .{}) catch {},
+            .init_failed => {
+                if (udp_ring_init_error) |err| {
+                    writeFormatted(stdout, "  UDP path: poll+recvmsg (io_uring init failed: {s})\n", .{@errorName(err)}) catch {};
+                } else {
+                    writeFormatted(stdout, "  UDP path: poll+recvmsg (io_uring init failed)\n", .{}) catch {};
+                }
+            },
+        },
     }
 
     const MAX_DECRYPTED = 64;
