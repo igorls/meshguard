@@ -4,6 +4,7 @@ const posix = std.posix;
 const linux = std.os.linux;
 const IoUring = linux.IoUring;
 const Offload = @import("offload.zig");
+const Udp = @import("udp.zig");
 
 const UDP_RECV_USER_DATA: u64 = 0x1000_0000_0000_0000;
 const UDP_SEND_USER_DATA: u64 = 0x2000_0000_0000_0000;
@@ -28,6 +29,22 @@ fn initRing(entries: u16, use_sqpoll: bool) !IoUring {
         if (!use_sqpoll) return err;
         return try IoUring.init(entries, 0);
     };
+}
+
+pub const UdpFallbackReason = enum {
+    runtime_unavailable,
+    init_failed,
+};
+
+pub const UdpPath = union(enum) {
+    io_uring,
+    poll_recvmsg: UdpFallbackReason,
+};
+
+pub fn selectUdpPath(runtime_available: bool, init_succeeded: bool) UdpPath {
+    if (!runtime_available) return .{ .poll_recvmsg = .runtime_unavailable };
+    if (!init_succeeded) return .{ .poll_recvmsg = .init_failed };
+    return .io_uring;
 }
 
 /// TUN reader backed by io_uring.
@@ -365,15 +382,31 @@ pub const UdpRing = struct {
     }
 };
 
+/// Check whether the UDP io_uring path should be attempted. This is intentionally
+/// independent from the TUN-reader gate: UDP sockets can use recvmsg/sendmsg rings
+/// even while TUN character-device reads remain disabled pending validation.
+pub fn isUdpRingAvailable() bool {
+    if (builtin.os.tag != .linux) return false;
+    var ring = initRing(8, true) catch return false;
+    ring.deinit();
+    return true;
+}
+
 /// Check if io_uring is available AND compatible with TUN devices.
-/// Currently disabled: TUN character devices (tun_chr_read_iter) do not
-/// reliably support io_uring IORING_OP_READ — reads fail silently or
-/// return errors in LXC containers. The io_uring TUN reader code is
-/// preserved for future bare-metal testing.
-pub fn isAvailable() bool {
-    // TODO: Enable after validating io_uring reads on TUN devices work
-    // on bare metal (outside LXC containers).
+pub fn isTunReaderAvailable() bool {
+    // TUN character devices (tun_chr_read_iter) still need bare-metal validation:
+    // reads have failed silently or returned errors in LXC containers. Keep the
+    // reader code preserved, but do not let that disable the UDP ring path.
     return false;
+}
+
+pub fn tunReaderUnavailableReason() []const u8 {
+    return "disabled pending bare-metal TUN read validation";
+}
+
+/// Back-compat alias for older call sites; prefer the split gates above.
+pub fn isAvailable() bool {
+    return isTunReaderAvailable();
 }
 
 test "UdpRing parses UDP_GRO cmsg segment size" {
@@ -392,4 +425,60 @@ test "UdpRing parses UDP_GRO cmsg segment size" {
     slot.msg.controllen = cmsg_space;
 
     try std.testing.expectEqual(@as(u16, 1440), slot.segmentSize());
+}
+
+test "io_uring UDP and TUN availability gates are independent" {
+    switch (selectUdpPath(false, true)) {
+        .poll_recvmsg => |reason| try std.testing.expectEqual(UdpFallbackReason.runtime_unavailable, reason),
+        .io_uring => return error.TestUnexpectedResult,
+    }
+    switch (selectUdpPath(true, false)) {
+        .poll_recvmsg => |reason| try std.testing.expectEqual(UdpFallbackReason.init_failed, reason),
+        .io_uring => return error.TestUnexpectedResult,
+    }
+    switch (selectUdpPath(true, true)) {
+        .io_uring => {},
+        .poll_recvmsg => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(!isTunReaderAvailable());
+    _ = isUdpRingAvailable();
+}
+
+test "UdpRing receives loopback datagram when runtime available" {
+    if (!isUdpRingAvailable()) return;
+
+    var rx = try Udp.UdpSocket.bindAddr(.{ 127, 0, 0, 1 }, 0);
+    defer rx.close();
+    var tx = try Udp.UdpSocket.bindAddr(.{ 127, 0, 0, 1 }, 0);
+    defer tx.close();
+
+    var ring: UdpRing = undefined;
+    try ring.init(rx.fd);
+    defer ring.deinit();
+
+    const payload = "meshguard-udp-ring-probe";
+    try std.testing.expectEqual(payload.len, try tx.sendTo(payload, .{ 127, 0, 0, 1 }, rx.port));
+
+    var cqes: [UdpRing.RECV_DEPTH + UdpRing.SEND_DEPTH]linux.io_uring_cqe = undefined;
+    var attempts: usize = 0;
+    while (attempts < 100) : (attempts += 1) {
+        const n = ring.copyCompletions(&cqes, 0) catch 0;
+        for (cqes[0..n]) |cqe| {
+            ring.noteSendCompletion(cqe);
+            const recv = ring.recvCompletion(cqe) orelse {
+                if (UdpRing.recvSlotFromUserData(cqe.user_data)) |slot| {
+                    ring.resubmitRecv(slot, rx.fd) catch {};
+                }
+                continue;
+            };
+            try std.testing.expectEqualSlices(u8, payload, recv.data);
+            try std.testing.expectEqualSlices(u8, &[_]u8{ 127, 0, 0, 1 }, &recv.sender_addr);
+            try std.testing.expect(recv.sender_port != 0);
+            try ring.resubmitRecv(recv.slot, rx.fd);
+            return;
+        }
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+
+    return error.UdpRingProbeTimedOut;
 }

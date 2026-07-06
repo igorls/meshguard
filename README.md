@@ -241,6 +241,11 @@ Trust authorization order:
 | **meshguard** (Zig, userspace) | **3.93 Gbps** | **3.94 Gbps** | libsodium AVX2, UDP GRO, zero-copy GSO, NAPI busy-poll |
 | boringtun (Rust, userspace)    | 1.82 Gbps     | 1.81 Gbps     | Cloudflare userspace WG                                |
 
+Linux UDP sockets can use an `io_uring` recvmsg/sendmsg ring when runtime
+probing and initialization succeed; startup logs print the active UDP path.
+The poll+recvmsg path remains the fallback, and the separate TUN `io_uring`
+reader stays disabled pending bare-metal TUN read validation.
+
 ### Optimization History
 
 | Optimization                    | Download  | Δ    |
@@ -408,6 +413,7 @@ Core functionality is implemented and under active benchmarking:
 - [x] WireGuard tunnel FFI API (open/send/recv/close for encrypted audio/data channels)
 - [x] Compile-time AEAD backend selection (libsodium on Linux, std.crypto on Android/macOS/FreeBSD/Windows)
 - [x] Multi-queue TUN (`IFF_MULTI_QUEUE` — Linux, parallel I/O via flow-hash distribution)
+- [x] `io_uring` UDP ring (Linux runtime-gated, fallback to poll+recvmsg)
 - [x] `io_uring` TUN reader (implemented, runtime-disabled pending bare-metal TUN validation)
 - [x] IPv6 dual-stack (ULA `fd99:6d67::/64`, deterministic from pubkey via Blake3)
 - [x] DNS / mDNS seed discovery

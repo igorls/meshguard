@@ -78,7 +78,7 @@ meshguard is organized into six top-level modules, each with a focused responsib
 - **`utun.zig`** / **`fbsdtun.zig`** / **`wintun.zig`** — macOS, FreeBSD, and Windows userspace tunnel devices
 - **`darwincfg.zig`** / **`freebsdcfg.zig`** / **`wincfg.zig`** — platform interface configuration helpers
 - **`io.zig`** — Event loop abstraction layer
-- **`io_uring.zig`** — Linux io_uring integration for async I/O
+- **`io_uring.zig`** — Linux io_uring UDP ring and TUN reader gates for async I/O
 - **`pipeline.zig`** — Packet processing pipeline with batched encrypt/decrypt
 
 ## Packet Flow
