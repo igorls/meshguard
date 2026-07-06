@@ -42,7 +42,7 @@ meshguard's security model is built on three pillars: **cryptographic identity**
 
 - **Org admins hold signing keys** — treat like root CA keys
 - **Node certificates** — 186 bytes, stored at `~/.config/meshguard/node.cert`
-- **Revocation** — remove individual trust files immediately; signed org revocation messages are receive-side supported, but a public `org-revoke` CLI is not exposed yet
+- **Revocation** — remove individual trust files immediately with `meshguard revoke`, or sign issuer-scoped org revocations with `meshguard org-revoke`
 
 ## Attack Surface
 

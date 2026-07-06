@@ -115,6 +115,9 @@ meshguard trust <org-pubkey> --org --name eosrio
 
 # Vouch for an external standalone node
 meshguard org-vouch <solo-node-pubkey>
+
+# Revoke an org-signed node certificate
+meshguard org-revoke <node-pubkey> --reason admin-removed
 ```
 
 ### Revocation
@@ -123,9 +126,13 @@ The wire protocol supports signed `OrgCertRevoke` messages, which are
 propagated via gossip and enforced by peers that receive them. The receive-side
 verification signs the revoked node key, reason, and Lamport timestamp.
 
-The current CLI does not expose an `org-revoke` command yet. Until signer
-tooling is added, operational revocation is still done by removing individual
-trust files or rotating/reissuing org trust material.
+Org admins revoke an org-signed node with `meshguard org-revoke`. The command
+loads the local org signing key, writes a signed `OrgCertRevoke` message under
+`revoked/`, and `meshguard up` queues the saved revocation for best-effort
+broadcast to known peers. Revocations are scoped to the issuing org, so they
+invalidate that org's certificate or vouch for the node without cancelling a
+different trusted org's authority. Individual trust files can still be removed
+locally with `meshguard revoke` when a peer was admitted outside org trust.
 
 ### Org Vouch (External Peers)
 
@@ -141,7 +148,7 @@ All nodes trusting the vouching org will auto-accept the standalone node. This i
 
 - Cross-org peering without full membership
 - Onboarding partners to a fleet
-- Temporary trust grants (revocable once signed revocation tooling is exposed)
+- Temporary trust grants that can later be revoked with `meshguard org-revoke`
 
 ### Authorization Flow
 
