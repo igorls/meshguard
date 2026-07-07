@@ -270,26 +270,54 @@ pub fn discoverPublicEndpoint(socket: *Udp.UdpSocket, server: StunServer) !Exter
     };
 }
 
+pub fn externalAddressEql(a: ExternalAddress, b: ExternalAddress) bool {
+    return a.port == b.port and std.mem.eql(u8, &a.addr, &b.addr);
+}
+
+/// Classify NAT mapping behavior from one or more STUN observations.
+///
+/// A single server can only distinguish "same mapped port" from "mapped port";
+/// two different server observations are needed to identify endpoint-dependent
+/// mappings. If the external mapping changes across servers, peers should stop
+/// spending time on hole punching and move to relay fallback.
+pub fn classifyMapping(local_port: u16, observations: []const ExternalAddress) NatType {
+    if (observations.len == 0) return .unknown;
+    const first = observations[0];
+    for (observations[1..]) |obs| {
+        if (!externalAddressEql(first, obs)) return .symmetric;
+    }
+    return if (first.port == local_port) .public else .cone;
+}
+
 /// Try multiple STUN servers and determine our NAT type.
 /// `local_port` is the port we're bound to locally.
 pub fn discover(socket: *Udp.UdpSocket, local_port: u16, servers: []const StunServer) StunResult {
+    var observations: [MAX_CONFIGURED_STUN_SERVERS]ExternalAddress = undefined;
+    var observation_count: usize = 0;
+    var first_server: ?StunServer = null;
+
     for (servers) |server| {
         const ext = discoverPublicEndpoint(socket, server) catch continue;
-
-        // Determine NAT type by comparing ports
-        const nat_type: NatType = if (ext.port == local_port)
-            .public // same port → likely no NAT or full cone
-        else
-            .cone; // different port → some NAT present
-
-        return .{ .external = ext, .nat_type = nat_type, .server = server };
+        if (observation_count == 0) first_server = server;
+        if (observation_count < observations.len) {
+            observations[observation_count] = ext;
+            observation_count += 1;
+        }
+        if (observation_count >= 2) break;
     }
 
-    // All servers failed
+    if (observation_count == 0) {
+        return .{
+            .external = .{ .addr = .{ 0, 0, 0, 0 }, .port = 0 },
+            .nat_type = .unknown,
+            .server = null,
+        };
+    }
+
     return .{
-        .external = .{ .addr = .{ 0, 0, 0, 0 }, .port = 0 },
-        .nat_type = .unknown,
-        .server = null,
+        .external = observations[0],
+        .nat_type = classifyMapping(local_port, observations[0..observation_count]),
+        .server = first_server,
     };
 }
 
@@ -433,4 +461,20 @@ test "configured STUN servers fall back when none resolve" {
     try std.testing.expectEqual(@as(usize, DEFAULT_STUN_SERVERS.len), resolved.len);
     try std.testing.expectEqual(DEFAULT_STUN_SERVERS[0].host, resolved[0].host);
     try std.testing.expectEqual(DEFAULT_STUN_SERVERS[0].port, resolved[0].port);
+}
+
+test "classify mapping detects endpoint dependent symmetric NAT" {
+    const a = ExternalAddress{ .addr = .{ 203, 0, 113, 10 }, .port = 40000 };
+    const b = ExternalAddress{ .addr = .{ 203, 0, 113, 10 }, .port = 40001 };
+    try std.testing.expectEqual(NatType.symmetric, classifyMapping(51821, &.{ a, b }));
+}
+
+test "classify mapping keeps stable mappings direct or cone" {
+    const public = ExternalAddress{ .addr = .{ 203, 0, 113, 10 }, .port = 51821 };
+    try std.testing.expectEqual(NatType.public, classifyMapping(51821, &.{public}));
+    try std.testing.expectEqual(NatType.public, classifyMapping(51821, &.{ public, public }));
+
+    const cone = ExternalAddress{ .addr = .{ 203, 0, 113, 10 }, .port = 40000 };
+    try std.testing.expectEqual(NatType.cone, classifyMapping(51821, &.{cone}));
+    try std.testing.expectEqual(NatType.cone, classifyMapping(51821, &.{ cone, cone }));
 }

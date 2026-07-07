@@ -7,7 +7,8 @@ const linux = std.os.linux;
 const posix = std.posix;
 
 pub const BATCH_SIZE: usize = 64;
-pub const MAX_PACKET: usize = 2048;
+/// Fits the largest current relay datagram: 67-byte RelayData header + 2048-byte payload.
+pub const MAX_PACKET: usize = 2115;
 
 // Linux iovec — must match kernel ABI exactly
 const Iovec = extern struct {

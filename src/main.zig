@@ -2623,6 +2623,7 @@ fn flushPeerTxRing(
 /// Used only when encrypt_workers == 0 (legacy mode).
 fn dataPlaneWorker(
     running: *const std.atomic.Value(bool),
+    swim: *lib.discovery.Swim.SwimProtocol,
     wg_dev: *lib.wireguard.Device.WgDevice,
     tun_fd: posix.fd_t,
     udp_fd: posix.fd_t,
@@ -2634,6 +2635,7 @@ fn dataPlaneWorker(
     var tx = BatchUdp.BatchSender{};
     var tun_buf: [Offload.VNET_HDR_LEN + 65535]u8 align(@alignOf(Offload.VirtioNetHdr)) = undefined;
     var encrypt_bufs: [BatchUdp.BATCH_SIZE][1600]u8 = undefined;
+    var relay_bufs: [BatchUdp.BATCH_SIZE][lib.nat.Relay.RELAY_FRAME_HEADER_SIZE + lib.nat.Relay.MAX_RELAY_PAYLOAD]u8 = undefined;
     var seg_bufs: [BatchUdp.BATCH_SIZE][1500]u8 = undefined;
     var seg_slices: [BatchUdp.BATCH_SIZE][]u8 = undefined;
     for (0..BatchUdp.BATCH_SIZE) |i| {
@@ -2670,18 +2672,18 @@ fn dataPlaneWorker(
                         );
                         for (0..seg_count) |s| {
                             if (send_idx >= BatchUdp.BATCH_SIZE) break;
-                            encryptAndQueue(wg_dev, seg_bufs[s][0..seg_sizes[s]], &encrypt_bufs[send_idx], &tx, &send_idx);
+                            encryptAndQueue(swim, wg_dev, seg_bufs[s][0..seg_sizes[s]], &encrypt_bufs[send_idx], &relay_bufs[send_idx], &tx, &send_idx);
                         }
                     } else {
                         if (ip_data.len < 20) continue;
                         const mutable_data = tun_buf[Offload.VNET_HDR_LEN..n];
                         Offload.completeChecksum(vhdr.*, mutable_data);
-                        encryptAndQueue(wg_dev, mutable_data, &encrypt_bufs[send_idx], &tx, &send_idx);
+                        encryptAndQueue(swim, wg_dev, mutable_data, &encrypt_bufs[send_idx], &relay_bufs[send_idx], &tx, &send_idx);
                     }
                 } else {
                     if (n < 20) continue;
                     const ip_packet = tun_buf[0..n];
-                    encryptAndQueue(wg_dev, ip_packet, &encrypt_bufs[send_idx], &tx, &send_idx);
+                    encryptAndQueue(swim, wg_dev, ip_packet, &encrypt_bufs[send_idx], &relay_bufs[send_idx], &tx, &send_idx);
                 }
             }
 
@@ -2692,9 +2694,11 @@ fn dataPlaneWorker(
 
 /// Encrypt an IP packet and queue it for batch sending.
 fn encryptAndQueue(
+    swim: *lib.discovery.Swim.SwimProtocol,
     wg_dev: *lib.wireguard.Device.WgDevice,
     ip_packet: []const u8,
     encrypt_buf: *[1600]u8,
+    relay_buf: *[lib.nat.Relay.RELAY_FRAME_HEADER_SIZE + lib.nat.Relay.MAX_RELAY_PAYLOAD]u8,
     tx: *lib.net.BatchUdp.BatchSender,
     send_idx: *usize,
 ) void {
@@ -2702,13 +2706,47 @@ fn encryptAndQueue(
     const target_slot = wg_dev.lookupByMeshIp(dst_ip);
     if (target_slot) |slot| {
         if (wg_dev.encryptForPeer(slot, ip_packet, encrypt_buf)) |enc_len| {
-            if (wg_dev.peers[slot]) |peer| {
-                if (peer.endpoint_addr[0] != 0) {
-                    tx.queue(encrypt_buf[0..enc_len], peer.endpoint_addr, peer.endpoint_port);
-                    send_idx.* += 1;
-                }
-            }
+            queueWgCiphertextForSlot(swim, wg_dev, slot, encrypt_buf[0..enc_len], relay_buf, tx, send_idx);
         } else |_| {}
+    }
+}
+
+fn queueWgCiphertextForSlot(
+    swim: *lib.discovery.Swim.SwimProtocol,
+    wg_dev: *lib.wireguard.Device.WgDevice,
+    slot: usize,
+    payload: []const u8,
+    relay_buf: *[lib.nat.Relay.RELAY_FRAME_HEADER_SIZE + lib.nat.Relay.MAX_RELAY_PAYLOAD]u8,
+    tx: *lib.net.BatchUdp.BatchSender,
+    send_idx: *usize,
+) void {
+    const peer = wg_dev.peers[slot] orelse return;
+
+    var target_nat: lib.protocol.Messages.NatType = .unknown;
+    var relay_ep: ?@import("protocol/messages.zig").Endpoint = null;
+    swim.membership.lock.lockSharedUncancelable(zio());
+    if (swim.membership.peers.get(peer.identity_key)) |member| target_nat = member.nat_type;
+    relay_ep = relayEndpointForPeer(swim, peer.identity_key);
+    swim.membership.lock.unlockShared(zio());
+
+    const relay_available = relay_ep != null;
+    if (peer.endpoint()) |direct_ep| {
+        const path = lib.nat.Relay.choosePath(swim.our_nat_type, target_nat, true, relay_available);
+        if (path == .direct or path == .holepunch or !relay_available) {
+            if (direct_ep.addr6 == null) {
+                tx.queue(payload, direct_ep.addr, direct_ep.port);
+                send_idx.* += 1;
+                return;
+            }
+            if (!relay_available) return;
+        }
+    }
+
+    if (relay_ep) |ep| {
+        if (ep.addr6 != null) return;
+        const relay_len = lib.nat.Relay.encodeRelayData(relay_buf, swim.our_pubkey, peer.identity_key, payload) catch return;
+        tx.queue(relay_buf[0..relay_len], ep.addr, ep.port);
+        send_idx.* += 1;
     }
 }
 
@@ -2845,6 +2883,126 @@ fn orgPubkeyLocked(membership: *lib.discovery.Membership.MembershipTable, identi
     return if (membership.peers.getPtr(identity_key)) |mp| mp.org_pubkey else null;
 }
 
+fn relayEndpointForPeer(
+    swim: *lib.discovery.Swim.SwimProtocol,
+    target_pubkey: [32]u8,
+) ?@import("protocol/messages.zig").Endpoint {
+    const relay = lib.nat.Relay.selectRelayForPair(&swim.membership.peers, swim.our_pubkey, target_pubkey) orelse return null;
+    return relay.gossip_endpoint orelse relay.public_endpoint;
+}
+
+fn sendRelayFrameToEndpoint(
+    swim: *lib.discovery.Swim.SwimProtocol,
+    udp_sock: *lib.net.Udp.UdpSocket,
+    target_pubkey: [32]u8,
+    payload: []const u8,
+    relay_endpoint: @import("protocol/messages.zig").Endpoint,
+) bool {
+    var relay_buf: [lib.nat.Relay.RELAY_FRAME_HEADER_SIZE + lib.nat.Relay.MAX_RELAY_PAYLOAD]u8 = undefined;
+    const relay_len = lib.nat.Relay.encodeRelayData(&relay_buf, swim.our_pubkey, target_pubkey, payload) catch return false;
+    _ = udp_sock.sendToEndpoint(relay_buf[0..relay_len], relay_endpoint) catch return false;
+    return true;
+}
+
+fn sendWgCiphertextToPeer(
+    swim: *lib.discovery.Swim.SwimProtocol,
+    wg_dev: *lib.wireguard.Device.WgDevice,
+    udp_sock: *lib.net.Udp.UdpSocket,
+    target_pubkey: [32]u8,
+    payload: []const u8,
+    preferred_relay: ?@import("protocol/messages.zig").Endpoint,
+) bool {
+    if (preferred_relay) |ep| {
+        return sendRelayFrameToEndpoint(swim, udp_sock, target_pubkey, payload, ep);
+    }
+
+    const relay_ep = preferred_relay orelse relayEndpointForPeer(swim, target_pubkey);
+    const relay_available = relay_ep != null;
+
+    if (wg_dev.findByIdentity(target_pubkey)) |slot| {
+        if (wg_dev.peers[slot]) |peer| {
+            if (peer.endpoint()) |direct_ep| {
+                const path: lib.nat.Relay.RelayPath = if (swim.membership.peers.get(target_pubkey)) |member|
+                    lib.nat.Relay.choosePath(swim.our_nat_type, member.nat_type, true, relay_available)
+                else
+                    .direct;
+                if (path == .direct or path == .holepunch or !relay_available) {
+                    _ = udp_sock.sendToEndpoint(payload, direct_ep) catch return false;
+                    return true;
+                }
+            }
+        }
+    }
+
+    if (relay_ep) |ep| {
+        return sendRelayFrameToEndpoint(swim, udp_sock, target_pubkey, payload, ep);
+    }
+    return false;
+}
+
+fn sendWgCiphertextForSlot(
+    swim: *lib.discovery.Swim.SwimProtocol,
+    wg_dev: *lib.wireguard.Device.WgDevice,
+    udp_sock: *lib.net.Udp.UdpSocket,
+    slot: usize,
+    payload: []const u8,
+) bool {
+    const peer = wg_dev.peers[slot] orelse return false;
+    return sendWgCiphertextToPeer(swim, wg_dev, udp_sock, peer.identity_key, payload, null);
+}
+
+fn processRelayedWgPacket(
+    frame: lib.nat.Relay.DecodedRelayData,
+    relay_endpoint: @import("protocol/messages.zig").Endpoint,
+    wg_dev: *lib.wireguard.Device.WgDevice,
+    swim: *lib.discovery.Swim.SwimProtocol,
+    udp_sock: *lib.net.Udp.UdpSocket,
+    stdout: std.Io.File,
+    decrypt_storage: *[64][1500]u8,
+    decrypt_lens: *[64]usize,
+    decrypt_slots: *[64]usize,
+    n_decrypted: *usize,
+    service_filter: *const lib.services.Policy.ServiceFilter,
+) void {
+    if (!swim.isAllowedRelayParticipant(frame.sender_pubkey)) return;
+    if (!swim.isAllowedRelayParticipant(frame.target_pubkey)) return;
+    if (!swim.relay_limiter.allow(frame.sender_pubkey, nowAwakeNs())) return;
+
+    const Device = lib.wireguard.Device;
+    switch (Device.PacketType.classify(frame.payload)) {
+        .wg_transport => {
+            if (n_decrypted.* < 64) {
+                if (wg_dev.decryptTransport(frame.payload, &decrypt_storage[n_decrypted.*])) |result| {
+                    const org_pk = orgPubkeyLocked(swim.membership, result.identity_key);
+                    if (!service_filter.allowPacket(result.identity_key, org_pk, decrypt_storage[n_decrypted.*][0..result.len])) return;
+                    decrypt_lens[n_decrypted.*] = result.len;
+                    decrypt_slots[n_decrypted.*] = result.slot;
+                    n_decrypted.* += 1;
+                } else |_| {}
+            }
+        },
+        .wg_handshake_init => {
+            if (frame.payload.len >= @sizeOf(lib.wireguard.Noise.HandshakeInitiation)) {
+                const msg: *const lib.wireguard.Noise.HandshakeInitiation = @ptrCast(@alignCast(frame.payload.ptr));
+                if (wg_dev.handleInitiation(msg, relay_endpoint.addr)) |hs_result| {
+                    const resp_bytes = std.mem.asBytes(&hs_result.response);
+                    _ = sendWgCiphertextToPeer(swim, wg_dev, udp_sock, frame.sender_pubkey, resp_bytes, relay_endpoint);
+                    writeFormatted(stdout, "  WG handshake: responded via relay\n", .{}) catch {};
+                } else |_| {}
+            }
+        },
+        .wg_handshake_resp => {
+            if (frame.payload.len >= @sizeOf(lib.wireguard.Noise.HandshakeResponse)) {
+                const msg: *const lib.wireguard.Noise.HandshakeResponse = @ptrCast(@alignCast(frame.payload.ptr));
+                if (wg_dev.handleResponse(msg)) |_| {
+                    writeFormatted(stdout, "  WG handshake: completed via relay\n", .{}) catch {};
+                } else |_| {}
+            }
+        },
+        .wg_cookie, .stun, .swim, .unknown => {},
+    }
+}
+
 /// Parallel decrypt worker: pulls encrypted transport packets from the DecryptQueue,
 /// decrypts them using wg_dev.decryptTransport (thread-safe via replay_lock), and writes
 /// plaintext to TUN. This parallelizes the download path across N cores.
@@ -2910,6 +3068,32 @@ fn processIncomingPacket(
 ) void {
     const Device = lib.wireguard.Device;
 
+    if (pkt.len > 0 and pkt[0] == @intFromEnum(lib.protocol.Messages.MessageType.relay_data)) {
+        const relay_endpoint = @import("protocol/messages.zig").Endpoint.initV4(sender_addr, sender_port);
+        if (lib.nat.Relay.decodeRelayData(pkt)) |frame| {
+            if (std.mem.eql(u8, &frame.target_pubkey, &swim.our_pubkey)) {
+                processRelayedWgPacket(
+                    frame,
+                    relay_endpoint,
+                    wg_dev,
+                    swim,
+                    udp_sock,
+                    stdout,
+                    decrypt_storage,
+                    decrypt_lens,
+                    decrypt_slots,
+                    n_decrypted,
+                    service_filter,
+                );
+            } else {
+                swim.feedPacket(pkt, sender_addr, sender_port);
+            }
+        } else |_| {
+            swim.feedPacket(pkt, sender_addr, sender_port);
+        }
+        return;
+    }
+
     const pkt_type = Device.PacketType.classify(pkt);
     // Optimization: Extract dominant data-plane case to explicit if branch
     if (pkt_type == .wg_transport) {
@@ -2974,12 +3158,11 @@ fn windowsEventLoop(
     service_filter: *const lib.services.Policy.ServiceFilter,
     control_socket: *lib.services.Control.ControlSocket,
 ) !void {
-    const Device = lib.wireguard.Device;
-    const Noise = lib.wireguard.Noise;
-
     var tun_buf: [65536]u8 = undefined;
-    var udp_recv_buf: [2048]u8 = undefined;
-    var decrypt_buf: [1500]u8 = undefined;
+    var udp_recv_buf: [lib.nat.Relay.MAX_RELAY_DATAGRAM]u8 = undefined;
+    var decrypt_storage: [64][1500]u8 = undefined;
+    var decrypt_lens: [64]usize = undefined;
+    var decrypt_slots: [64]usize = undefined;
     var encrypt_buf: [2048]u8 = undefined; // 16B header + 1500B payload + 16B poly1305 tag
     var last_handshake_check_ns: i128 = 0;
 
@@ -2987,52 +3170,28 @@ fn windowsEventLoop(
         // ─── 1. Process incoming UDP packets (WG + SWIM multiplexed) ───
         // Drain up to 64 packets per iteration — fully non-blocking
         var udp_count: u32 = 0;
+        var n_decrypted: usize = 0;
         while (udp_count < 64) : (udp_count += 1) {
             const recv = (udp_sock.recvFrom(&udp_recv_buf) catch break) orelse break;
             const pkt = recv.data;
 
-            const pkt_type = Device.PacketType.classify(pkt);
-            // Optimization: Extract dominant data-plane case to explicit if branch
-            if (pkt_type == .wg_transport) {
-                // Decrypt WG transport → write plaintext to Wintun
-                if (wg_dev.decryptTransport(pkt, &decrypt_buf)) |result| {
-                    // Apply service filter before writing to TUN (IPv4 + IPv6, M5).
-                    {
-                        const org_pk = orgPubkeyLocked(swim.membership, result.identity_key);
-                        if (!service_filter.allowPacket(result.identity_key, org_pk, decrypt_buf[0..result.len])) continue;
-                    }
-                    tun_dev.write(decrypt_buf[0..result.len]) catch {};
-                } else |_| {}
-            } else switch (pkt_type) {
-                .wg_handshake_init => {
-                    if (pkt.len >= @sizeOf(Noise.HandshakeInitiation)) {
-                        const msg: *const Noise.HandshakeInitiation = @ptrCast(@alignCast(pkt.ptr));
-                        if (wg_dev.handleInitiation(msg, recv.sender_addr)) |hs_result| {
-                            const resp_bytes = std.mem.asBytes(&hs_result.response);
-                            _ = udp_sock.sendTo(resp_bytes, recv.sender_addr, recv.sender_port) catch 0;
-                            writeFormatted(stdout, "  WG handshake: responded to initiation\n", .{}) catch {};
-                        } else |_| {}
-                    }
-                },
-                .wg_handshake_resp => {
-                    if (pkt.len >= @sizeOf(Noise.HandshakeResponse)) {
-                        const msg: *const Noise.HandshakeResponse = @ptrCast(@alignCast(pkt.ptr));
-                        if (wg_dev.handleResponse(msg)) |slot| {
-                            if (wg_dev.peers[slot]) |*p| {
-                                p.endpoint_addr = recv.sender_addr;
-                                p.endpoint_port = recv.sender_port;
-                            }
-                            writeFormatted(stdout, "  WG handshake: completed with peer\n", .{}) catch {};
-                        } else |_| {}
-                    }
-                },
-                .wg_transport => unreachable,
-                .wg_cookie => {},
-                // SWIM and STUN packets: feed to SWIM via feedPacket (non-blocking)
-                .stun => swim.feedPacket(pkt, recv.sender_addr, recv.sender_port),
-                .swim => swim.feedPacket(pkt, recv.sender_addr, recv.sender_port),
-                .unknown => {},
-            }
+            processIncomingPacket(
+                pkt,
+                recv.sender_addr,
+                recv.sender_port,
+                wg_dev,
+                swim,
+                udp_sock,
+                stdout,
+                &decrypt_storage,
+                &decrypt_lens,
+                &decrypt_slots,
+                &n_decrypted,
+                service_filter,
+            );
+        }
+        for (0..n_decrypted) |i| {
+            tun_dev.write(decrypt_storage[i][0..decrypt_lens[i]]) catch {};
         }
 
         // ─── 2. SWIM timers-only tick (gossip, failure detection, NAT) ───
@@ -3053,17 +3212,14 @@ fn windowsEventLoop(
             const dst_ip: [4]u8 = .{ ip_pkt[16], ip_pkt[17], ip_pkt[18], ip_pkt[19] };
 
             if (wg_dev.lookupByMeshIp(dst_ip)) |slot| {
-                const peer = wg_dev.peers[slot] orelse continue;
-                if (peer.endpoint_port == 0) continue; // No endpoint yet
-
                 // Encrypt and send
                 if (wg_dev.encryptForPeer(slot, ip_pkt, &encrypt_buf)) |enc_len| {
-                    _ = udp_sock.sendTo(encrypt_buf[0..enc_len], peer.endpoint_addr, peer.endpoint_port) catch {};
+                    _ = sendWgCiphertextForSlot(swim, wg_dev, udp_sock, slot, encrypt_buf[0..enc_len]);
                 } else |_| {
                     // No tunnel — attempt handshake if due
                     if (wg_dev.initiateHandshake(slot)) |init_msg| {
                         const init_bytes = std.mem.asBytes(&init_msg);
-                        _ = udp_sock.sendTo(init_bytes, peer.endpoint_addr, peer.endpoint_port) catch {};
+                        _ = sendWgCiphertextForSlot(swim, wg_dev, udp_sock, slot, init_bytes);
                     } else |_| {} // rate-limited or other error
                 }
             }
@@ -3075,10 +3231,10 @@ fn windowsEventLoop(
             last_handshake_check_ns = now_ns;
             for (&wg_dev.peers, 0..) |*slot, i| {
                 if (slot.*) |peer| {
-                    if (peer.active_tunnel == null and peer.endpoint_port != 0) {
+                    if (peer.active_tunnel == null) {
                         if (wg_dev.initiateHandshake(i)) |init_msg| {
                             const init_bytes = std.mem.asBytes(&init_msg);
-                            _ = udp_sock.sendTo(init_bytes, peer.endpoint_addr, peer.endpoint_port) catch {};
+                            _ = sendWgCiphertextForSlot(swim, wg_dev, udp_sock, i, init_bytes);
                         } else |_| {}
                     }
                 }
@@ -3121,12 +3277,11 @@ fn macosEventLoop(
     service_filter: *const lib.services.Policy.ServiceFilter,
     control_socket: *lib.services.Control.ControlSocket,
 ) !void {
-    const Device = lib.wireguard.Device;
-    const Noise = lib.wireguard.Noise;
-
     var tun_buf: [65536]u8 = undefined;
-    var udp_recv_buf: [2048]u8 = undefined;
-    var decrypt_buf: [1500]u8 = undefined;
+    var udp_recv_buf: [lib.nat.Relay.MAX_RELAY_DATAGRAM]u8 = undefined;
+    var decrypt_storage: [64][1500]u8 = undefined;
+    var decrypt_lens: [64]usize = undefined;
+    var decrypt_slots: [64]usize = undefined;
     var encrypt_buf: [2048]u8 = undefined; // 16B header + 1500B payload + 16B poly1305 tag
     var last_handshake_check_ns: i128 = 0;
 
@@ -3136,51 +3291,28 @@ fn macosEventLoop(
 
         // ─── 2. Process incoming UDP packets (WG + SWIM multiplexed) ───
         var udp_count: u32 = 0;
+        var n_decrypted: usize = 0;
         while (udp_count < 64) : (udp_count += 1) {
             const recv = (udp_sock.recvFrom(&udp_recv_buf) catch break) orelse break;
             const pkt = recv.data;
 
-            const pkt_type = Device.PacketType.classify(pkt);
-            // Optimization: Extract dominant data-plane case to explicit if branch
-            if (pkt_type == .wg_transport) {
-                // Decrypt WG transport → write plaintext to utun
-                if (wg_dev.decryptTransport(pkt, &decrypt_buf)) |result| {
-                    // Apply service filter before writing to TUN (IPv4 + IPv6, M5).
-                    {
-                        const org_pk = orgPubkeyLocked(swim.membership, result.identity_key);
-                        if (!service_filter.allowPacket(result.identity_key, org_pk, decrypt_buf[0..result.len])) continue;
-                    }
-                    tun_dev.write(decrypt_buf[0..result.len]) catch {};
-                } else |_| {}
-            } else switch (pkt_type) {
-                .wg_handshake_init => {
-                    if (pkt.len >= @sizeOf(Noise.HandshakeInitiation)) {
-                        const msg: *const Noise.HandshakeInitiation = @ptrCast(@alignCast(pkt.ptr));
-                        if (wg_dev.handleInitiation(msg, recv.sender_addr)) |hs_result| {
-                            const resp_bytes = std.mem.asBytes(&hs_result.response);
-                            _ = udp_sock.sendTo(resp_bytes, recv.sender_addr, recv.sender_port) catch 0;
-                            writeFormatted(stdout, "  WG handshake: responded to initiation\n", .{}) catch {};
-                        } else |_| {}
-                    }
-                },
-                .wg_handshake_resp => {
-                    if (pkt.len >= @sizeOf(Noise.HandshakeResponse)) {
-                        const msg: *const Noise.HandshakeResponse = @ptrCast(@alignCast(pkt.ptr));
-                        if (wg_dev.handleResponse(msg)) |slot| {
-                            if (wg_dev.peers[slot]) |*p| {
-                                p.endpoint_addr = recv.sender_addr;
-                                p.endpoint_port = recv.sender_port;
-                            }
-                            writeFormatted(stdout, "  WG handshake: completed with peer\n", .{}) catch {};
-                        } else |_| {}
-                    }
-                },
-                .wg_transport => unreachable,
-                .wg_cookie => {},
-                .stun => swim.feedPacket(pkt, recv.sender_addr, recv.sender_port),
-                .swim => swim.feedPacket(pkt, recv.sender_addr, recv.sender_port),
-                .unknown => {},
-            }
+            processIncomingPacket(
+                pkt,
+                recv.sender_addr,
+                recv.sender_port,
+                wg_dev,
+                swim,
+                udp_sock,
+                stdout,
+                &decrypt_storage,
+                &decrypt_lens,
+                &decrypt_slots,
+                &n_decrypted,
+                service_filter,
+            );
+        }
+        for (0..n_decrypted) |i| {
+            tun_dev.write(decrypt_storage[i][0..decrypt_lens[i]]) catch {};
         }
 
         // ─── 3. Read utun → encrypt → send via UDP ───
@@ -3196,17 +3328,14 @@ fn macosEventLoop(
             const dst_ip: [4]u8 = .{ ip_pkt[16], ip_pkt[17], ip_pkt[18], ip_pkt[19] };
 
             if (wg_dev.lookupByMeshIp(dst_ip)) |slot| {
-                const peer = wg_dev.peers[slot] orelse continue;
-                if (peer.endpoint_port == 0) continue; // No endpoint yet
-
                 // Encrypt and send
                 if (wg_dev.encryptForPeer(slot, ip_pkt, &encrypt_buf)) |enc_len| {
-                    _ = udp_sock.sendTo(encrypt_buf[0..enc_len], peer.endpoint_addr, peer.endpoint_port) catch {};
+                    _ = sendWgCiphertextForSlot(swim, wg_dev, udp_sock, slot, encrypt_buf[0..enc_len]);
                 } else |_| {
                     // No tunnel — attempt handshake if due
                     if (wg_dev.initiateHandshake(slot)) |init_msg| {
                         const init_bytes = std.mem.asBytes(&init_msg);
-                        _ = udp_sock.sendTo(init_bytes, peer.endpoint_addr, peer.endpoint_port) catch {};
+                        _ = sendWgCiphertextForSlot(swim, wg_dev, udp_sock, slot, init_bytes);
                     } else |_| {}
                 }
             }
@@ -3218,10 +3347,10 @@ fn macosEventLoop(
             last_handshake_check_ns = now_ns;
             for (&wg_dev.peers, 0..) |*slot, i| {
                 if (slot.*) |peer| {
-                    if (peer.active_tunnel == null and peer.endpoint_port != 0) {
+                    if (peer.active_tunnel == null) {
                         if (wg_dev.initiateHandshake(i)) |init_msg| {
                             const init_bytes = std.mem.asBytes(&init_msg);
-                            _ = udp_sock.sendTo(init_bytes, peer.endpoint_addr, peer.endpoint_port) catch {};
+                            _ = sendWgCiphertextForSlot(swim, wg_dev, udp_sock, i, init_bytes);
                         } else |_| {}
                     }
                 }
@@ -3399,6 +3528,7 @@ fn userspaceEventLoop(
         for (0..opened_workers) |w| {
             threads[spawned] = std.Thread.spawn(.{}, dataPlaneWorker, .{
                 &swim.running,
+                swim,
                 wg_dev,
                 tun_fds[w],
                 udp_sock.fd,

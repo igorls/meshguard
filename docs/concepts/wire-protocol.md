@@ -18,25 +18,26 @@ SWIM messages use a **1-byte type tag**:
 
 ## SWIM / Protocol Codec Tags
 
-The 1-byte tags below are handled by `protocol/codec.zig` after packet
-classification has ruled out WireGuard and STUN:
+The 1-byte tags below are handled after packet classification has ruled out
+WireGuard and STUN. SWIM and hole-punch messages use `protocol/codec.zig`;
+`RelayData` uses the ciphertext-only helpers in `nat/relay.zig`.
 
 | Tag    | Name              | Category  | Direction       |
 | ------ | ----------------- | --------- | --------------- |
 | `0x01` | Ping              | SWIM      | A → B           |
 | `0x02` | PingReq           | SWIM      | A → C (probe B) |
 | `0x03` | Ack               | SWIM      | B → A           |
+| `0x31` | RelayData         | NAT       | A → Relay → B   |
 | `0x33` | HolepunchRequest  | NAT       | A → Rendezvous  |
 | `0x34` | HolepunchResponse | NAT       | B → Rendezvous  |
 | `0x41` | OrgAliasAnnounce  | Org Trust | Gossip          |
 | `0x42` | OrgCertRevoke     | Org Trust | Gossip          |
 | `0x43` | OrgTrustVouch     | Org Trust | Gossip          |
 
-`messages.zig` reserves additional enum values for future protocol messages,
-but the codec currently decodes the tags listed above. WireGuard handshake,
-cookie, and transport packets are classified by their 4-byte WireGuard type
-(`1`-`4`), not by this 1-byte table. The FFI app-message path uses `0x50`
-outside this codec.
+`messages.zig` reserves additional enum values for future protocol messages.
+WireGuard handshake, cookie, and transport packets are classified by their
+4-byte WireGuard type (`1`-`4`), not by this 1-byte table. The FFI app-message
+path uses `0x50` outside this codec.
 
 ## Ping
 
@@ -119,6 +120,20 @@ Standard Noise_IKpsk2 response message.
 
 Total: **92 bytes**.
 
+## RelayData
+
+Opaque relay frame for WireGuard/Noise packets when direct and punched paths are
+unavailable. The relay routes by identity metadata and forwards the payload
+unchanged; it is not a WireGuard peer for the relayed tunnel.
+
+```
+[0x31][32B sender_pubkey][32B target_pubkey][2B payload_len (BE)][N WireGuard packet bytes]
+```
+
+The payload must be shaped like WireGuard message type `1`, `2`, `3`, or `4`
+using the standard little-endian WireGuard type field. Non-WireGuard payloads
+are rejected by the relay frame decoder.
+
 ## HolepunchRequest
 
 ```
@@ -134,6 +149,17 @@ Total: **101 bytes**.
 ```
 
 Total: **69 bytes**.
+
+## HolepunchProbe
+
+Raw probe packet, not decoded by `protocol/codec.zig`:
+
+```
+["MGHP"][16B punch token]
+```
+
+The token is the same identity/session-bound nonce from the corresponding
+HolepunchRequest/HolepunchResponse exchange.
 
 ## OrgAliasAnnounce
 

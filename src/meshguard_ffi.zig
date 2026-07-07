@@ -358,6 +358,7 @@ export fn meshguard_join(
         .onPeerPunched = null,
         .onAppMessage = &onAppMessageCallback,
         .onWgPacket = &onWgPacketCallback,
+        .onRelayWgPacket = &onRelayWgPacketCallback,
         .hasActiveTunnel = &hasActiveTunnelCallback,
         .reinitiateHandshake = &reinitiateHandshakeCallback,
     };
@@ -417,6 +418,7 @@ export fn meshguard_join_ipv6(
         .onPeerPunched = null,
         .onAppMessage = &onAppMessageCallback,
         .onWgPacket = &onWgPacketCallback,
+        .onRelayWgPacket = &onRelayWgPacketCallback,
         .hasActiveTunnel = &hasActiveTunnelCallback,
         .reinitiateHandshake = &reinitiateHandshakeCallback,
     };
@@ -478,6 +480,7 @@ export fn meshguard_join_lan(
         .onPeerPunched = null,
         .onAppMessage = &onAppMessageCallback,
         .onWgPacket = &onWgPacketCallback,
+        .onRelayWgPacket = &onRelayWgPacketCallback,
         .hasActiveTunnel = &hasActiveTunnelCallback,
         .reinitiateHandshake = &reinitiateHandshakeCallback,
     };
@@ -1213,16 +1216,77 @@ fn reinitiateHandshakeCallback(raw_ctx: *anyopaque, peer: *const Membership.Peer
         if (std.mem.order(u8, &dev.static_public, &wg_key) != .lt) return; // only the initiator
         const ep: messages.Endpoint = if (peer.gossip_endpoint) |e| e else if (peer.public_endpoint) |pe| pe else return;
         if (dev.reinitiate(wg_key)) |init_msg| {
-            if (ctx.socket) |*sock| {
-                _ = sock.sendToEndpoint(std.mem.asBytes(&init_msg), ep) catch 0;
-            }
+            _ = sendWgCiphertextToPeer(ctx, peer.pubkey, std.mem.asBytes(&init_msg), ep, null);
         } else |_| {}
     }
+}
+
+fn relayEndpointForPeer(ctx: *MeshguardContext, target_pubkey: [32]u8) ?messages.Endpoint {
+    if (ctx.swim != null) {
+        const relay = lib.nat.Relay.selectRelayForPair(&ctx.membership.peers, ctx.ed25519_public, target_pubkey) orelse return null;
+        return relay.gossip_endpoint orelse relay.public_endpoint;
+    }
+    return null;
+}
+
+fn sendRelayFrame(ctx: *MeshguardContext, target_pubkey: [32]u8, data: []const u8, relay_endpoint: messages.Endpoint) bool {
+    var relay_buf: [lib.nat.Relay.MAX_RELAY_DATAGRAM]u8 = undefined;
+    const relay_len = lib.nat.Relay.encodeRelayData(&relay_buf, ctx.ed25519_public, target_pubkey, data) catch return false;
+    if (ctx.socket) |*sock| {
+        _ = sock.sendToEndpoint(relay_buf[0..relay_len], relay_endpoint) catch return false;
+        return true;
+    }
+    return false;
+}
+
+fn sendWgCiphertextToPeer(
+    ctx: *MeshguardContext,
+    target_pubkey: [32]u8,
+    data: []const u8,
+    direct_endpoint: ?messages.Endpoint,
+    preferred_relay: ?messages.Endpoint,
+) bool {
+    if (preferred_relay) |relay_ep| return sendRelayFrame(ctx, target_pubkey, data, relay_ep);
+
+    var target_nat: messages.NatType = .unknown;
+    var relay_ep: ?messages.Endpoint = null;
+    if (ctx.swim) |*swim| {
+        ctx.membership.lock.lockSharedUncancelable(zio());
+        if (ctx.membership.peers.get(target_pubkey)) |peer| target_nat = peer.nat_type;
+        relay_ep = relayEndpointForPeer(ctx, target_pubkey);
+        ctx.membership.lock.unlockShared(zio());
+
+        const relay_available = relay_ep != null;
+        if (direct_endpoint) |ep| {
+            const path = lib.nat.Relay.choosePath(swim.our_nat_type, target_nat, true, relay_available);
+            if (path == .direct or path == .holepunch or !relay_available) {
+                if (ctx.socket) |*sock| {
+                    _ = sock.sendToEndpoint(data, ep) catch return false;
+                    return true;
+                }
+                return false;
+            }
+        }
+    } else if (direct_endpoint) |ep| {
+        if (ctx.socket) |*sock| {
+            _ = sock.sendToEndpoint(data, ep) catch return false;
+            return true;
+        }
+        return false;
+    }
+
+    if (relay_ep) |ep| return sendRelayFrame(ctx, target_pubkey, data, ep);
+    return false;
 }
 
 fn onWgPacketCallback(raw_ctx: *anyopaque, data: []const u8, sender_addr: [4]u8, sender_port: u16) void {
     const ctx: *MeshguardContext = @ptrCast(@alignCast(raw_ctx));
     handleWgPacket(ctx, data, sender_addr, sender_port);
+}
+
+fn onRelayWgPacketCallback(raw_ctx: *anyopaque, data: []const u8, sender_pubkey: [32]u8, relay_endpoint: messages.Endpoint) void {
+    const ctx: *MeshguardContext = @ptrCast(@alignCast(raw_ctx));
+    handleRelayWgPacket(ctx, data, sender_pubkey, relay_endpoint);
 }
 
 /// Process incoming WireGuard packets (Type 1/2/4) for tunnel support.
@@ -1343,6 +1407,74 @@ fn handleWgPacket(ctx: *MeshguardContext, data: []const u8, sender_addr: [4]u8, 
     }
 }
 
+fn handleRelayWgPacket(ctx: *MeshguardContext, data: []const u8, sender_pubkey: [32]u8, relay_endpoint: messages.Endpoint) void {
+    if (data.len < 4) return;
+    if (ctx.wg_device == null) return;
+
+    const pkt_type = Device.PacketType.classify(data);
+    switch (pkt_type) {
+        .wg_handshake_init => {
+            ctx.wg_lock.lockUncancelable(zio());
+            defer ctx.wg_lock.unlock(zio());
+
+            var dev = &ctx.wg_device.?;
+            if (data.len < @sizeOf(noise.HandshakeInitiation)) return;
+            const msg: *const noise.HandshakeInitiation = @ptrCast(@alignCast(data.ptr));
+
+            const result = dev.handleInitiation(msg, relay_endpoint.addr) catch |err| blk: {
+                if (err != error.UnknownPeer) return;
+
+                if (ctx.membership.peers.get(sender_pubkey)) |m_peer| {
+                    if (m_peer.wg_pubkey) |wg_pk| {
+                        const ep = m_peer.gossip_endpoint orelse m_peer.public_endpoint orelse relay_endpoint;
+                        _ = dev.addPeerWithEndpoint(
+                            m_peer.pubkey,
+                            wg_pk,
+                            ep,
+                            m_peer.mesh_ip,
+                            m_peer.mesh_ip6,
+                        ) catch {};
+                    }
+                }
+
+                break :blk dev.handleInitiationAdmitted(msg) catch return;
+            };
+
+            const resp_bytes: [*]const u8 = @ptrCast(&result.response);
+            _ = sendRelayFrame(ctx, sender_pubkey, resp_bytes[0..@sizeOf(noise.HandshakeResponse)], relay_endpoint);
+
+            std.debug.print("  🔑 WG handshake init handled via relay (slot {d})\n", .{result.slot});
+        },
+        .wg_handshake_resp => {
+            ctx.wg_lock.lockUncancelable(zio());
+            defer ctx.wg_lock.unlock(zio());
+
+            var dev = &ctx.wg_device.?;
+            if (data.len < @sizeOf(noise.HandshakeResponse)) return;
+            const msg: *const noise.HandshakeResponse = @ptrCast(@alignCast(data.ptr));
+            const slot = dev.handleResponse(msg) catch return;
+
+            std.debug.print("  🔑 WG handshake complete via relay (slot {d}), tunnel ready\n", .{slot});
+        },
+        .wg_transport => {
+            ctx.wg_lock.lockSharedUncancelable(zio());
+            defer ctx.wg_lock.unlockShared(zio());
+
+            var dev = &ctx.wg_device.?;
+            var plaintext: [1500]u8 = undefined;
+            const result = dev.decryptTransport(data, &plaintext) catch return;
+            const sender_identity: [32]u8 = result.identity_key;
+
+            if (result.len < 4) return;
+            if (plaintext[0] != 0 or plaintext[1] != 0) return;
+            const payload_len = std.mem.readInt(u16, plaintext[2..4], .little);
+            const payload_end = tunnelFramePayloadLen(result.len, payload_len) orelse return;
+            enqueueTunnelMessage(ctx, sender_identity, plaintext[4..][0..payload_end]);
+        },
+        else => {},
+    }
+}
+
 /// Enqueue a decrypted tunnel message to the tunnel inbox.
 /// Finding #3: Capacity check + atomic valid flag to prevent torn reads.
 fn enqueueTunnelMessage(ctx: *MeshguardContext, sender_identity: [32]u8, data: []const u8) void {
@@ -1419,8 +1551,7 @@ export fn meshguard_tunnel_open(
 
     // Send handshake initiation packet to peer
     const init_bytes: [*]const u8 = @ptrCast(&init_msg);
-    const socket = c.socket orelse return -8;
-    _ = socket.sendTo(init_bytes[0..@sizeOf(noise.HandshakeInitiation)], ep.addr, ep.port) catch return -8;
+    if (!sendWgCiphertextToPeer(c, target_key, init_bytes[0..@sizeOf(noise.HandshakeInitiation)], ep, null)) return -8;
 
     std.debug.print("  \xf0\x9f\x94\x91 Tunnel handshake sent to {x:0>2}{x:0>2}...\n", .{ target_key[0], target_key[1] });
     return 0;
@@ -1495,15 +1626,14 @@ export fn meshguard_tunnel_send(
     }
 
     // Read endpoint while we have the lock
-    const ep_addr = peer.endpoint_addr;
-    const ep_port = peer.endpoint_port;
+    const direct_ep = peer.endpoint();
 
     // Release shared lock before I/O
     c.wg_lock.unlockShared(zio());
 
     // Send via UDP to peer's endpoint
-    const socket = c.socket orelse return -6;
-    _ = socket.sendTo(out_buf[0..encrypted_len], ep_addr, ep_port) catch return -7;
+    if (c.socket == null) return -6;
+    if (!sendWgCiphertextToPeer(c, target_key, out_buf[0..encrypted_len], direct_ep, null)) return -7;
 
     // Rekeying requires exclusive lock (modifies index_map)
     if (requires_rekey) {
@@ -1513,7 +1643,7 @@ export fn meshguard_tunnel_send(
             var rekey_dev = wd;
             if (rekey_dev.initiateHandshake(slot)) |rekey_msg| {
                 const rekey_bytes: [*]const u8 = @ptrCast(&rekey_msg);
-                _ = socket.sendTo(rekey_bytes[0..@sizeOf(noise.HandshakeInitiation)], ep_addr, ep_port) catch {};
+                _ = sendWgCiphertextToPeer(c, target_key, rekey_bytes[0..@sizeOf(noise.HandshakeInitiation)], direct_ep, null);
             } else |_| {}
         }
     }

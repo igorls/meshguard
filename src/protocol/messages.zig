@@ -195,6 +195,13 @@ pub const RelayRequest = struct {
     target_pubkey: [32]u8,
 };
 
+/// Relay data: opaque WireGuard/Noise packet forwarded by identity metadata.
+pub const RelayData = struct {
+    sender_pubkey: [32]u8,
+    target_pubkey: [32]u8,
+    payload: []const u8,
+};
+
 /// Endpoint update: broadcast when a node's external IP changes.
 pub const EndpointUpdate = struct {
     sender_pubkey: [32]u8,
@@ -251,6 +258,7 @@ test "message type values" {
     try std.testing.expectEqual(@as(u8, 0x01), @intFromEnum(MessageType.ping));
     try std.testing.expectEqual(@as(u8, 0x10), @intFromEnum(MessageType.handshake_init));
     try std.testing.expectEqual(@as(u8, 0x30), @intFromEnum(MessageType.relay_request));
+    try std.testing.expectEqual(@as(u8, 0x31), @intFromEnum(MessageType.relay_data));
     try std.testing.expectEqual(@as(u8, 0x33), @intFromEnum(MessageType.holepunch_request));
     try std.testing.expectEqual(@as(u8, 0x34), @intFromEnum(MessageType.holepunch_response));
     try std.testing.expectEqual(@as(u8, 0x43), @intFromEnum(MessageType.org_trust_vouch));

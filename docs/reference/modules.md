@@ -47,9 +47,9 @@ Reference map of all source modules and their responsibilities.
 
 | File                    | Purpose                                                                                                                |
 | ----------------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `stun.zig`              | STUN client (RFC 5389): Binding Request/Response encoding, XOR-MAPPED-ADDRESS parsing, NAT type detection              |
-| `holepunch.zig`         | UDP hole punching: `Holepuncher` state machine, probe magic (`MGHP`), rendezvous-mediated exchange, 4 concurrent slots |
-| `relay.zig`             | Relay selection: best public-IP peer by RTT, capacity checking, `RelayInfo` struct                                     |
+| `stun.zig`              | STUN client (RFC 5389): Binding Request/Response encoding, XOR-MAPPED-ADDRESS parsing, multi-server NAT classification |
+| `holepunch.zig`         | UDP hole punching: `Holepuncher` state machine, token-bound `MGHP` probes, rendezvous-mediated exchange                |
+| `relay.zig`             | Ciphertext-only relay/rendezvous core: signed endpoint registration, relay frame codec, per-identity rate limiting     |
 | `upnp.zig`              | UPnP-IGD port forwarding: SSDP discovery, SOAP AddPortMapping, lease renewal                                           |
 | `coordinated_punch.zig` | Token-based coordinated punch: `meshguard connect` token exchange for direct peer setup                                |
 
