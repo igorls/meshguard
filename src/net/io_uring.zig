@@ -134,7 +134,8 @@ pub const UdpRing = struct {
     // Keep spare SQEs beyond recv+send slots for completions/resubmits during bursts.
     pub const RING_DEPTH: u16 = 128;
     pub const RECV_BUF_SIZE: usize = 65536;
-    pub const SEND_BUF_SIZE: usize = 2048;
+    /// Fits the largest current relay datagram: 67-byte RelayData header + 2048-byte payload.
+    pub const SEND_BUF_SIZE: usize = 2115;
 
     pub const RecvCompletion = struct {
         data: []const u8,

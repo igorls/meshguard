@@ -409,6 +409,15 @@ pub const SwimProtocol = struct {
         return false;
     }
 
+    pub fn isKnownRelayParticipant(self: *const SwimProtocol, pubkey: [32]u8) bool {
+        if (std.mem.eql(u8, &pubkey, &self.our_pubkey)) return true;
+        return self.membership.peers.contains(pubkey);
+    }
+
+    pub fn isAllowedRelayParticipant(self: *const SwimProtocol, pubkey: [32]u8) bool {
+        return self.isKnownRelayParticipant(pubkey) and self.isAuthorizedPeer(pubkey, null);
+    }
+
     /// Check if a peer is authorized via org cert (checking peer's org cert against trusted orgs).
     pub fn isOrgAuthorizedPeer(self: *const SwimProtocol, org_pubkey: [32]u8) bool {
         for (self.trusted_orgs[0..self.trusted_org_count]) |trusted| {
@@ -488,7 +497,7 @@ pub const SwimProtocol = struct {
         if (try self.socket.pollRead(poll_ms)) {
             // Drain all available messages
             while (true) {
-                var recv_buf: [1500]u8 = undefined;
+                var recv_buf: [Relay.MAX_RELAY_DATAGRAM]u8 = undefined;
                 const result = try self.socket.recvFrom(&recv_buf);
                 if (result == null) break;
                 const recv = result.?;
@@ -635,7 +644,7 @@ pub const SwimProtocol = struct {
         const poll_ms: i32 = 200;
         if (try self.socket.pollRead(poll_ms)) {
             while (true) {
-                var recv_buf: [1500]u8 = undefined;
+                var recv_buf: [Relay.MAX_RELAY_DATAGRAM]u8 = undefined;
                 const result = try self.socket.recvFrom(&recv_buf);
                 if (result == null) break;
                 const recv = result.?;
@@ -748,6 +757,8 @@ pub const SwimProtocol = struct {
 
     fn handleRelayData(self: *SwimProtocol, data: []const u8, sender_endpoint: messages.Endpoint) void {
         const frame = Relay.decodeRelayData(data) catch return;
+        if (!self.isAllowedRelayParticipant(frame.sender_pubkey)) return;
+        if (!self.isAllowedRelayParticipant(frame.target_pubkey)) return;
         if (!self.relay_limiter.allow(frame.sender_pubkey, nowNs())) return;
 
         if (std.mem.eql(u8, &frame.target_pubkey, &self.our_pubkey)) {
@@ -755,7 +766,8 @@ pub const SwimProtocol = struct {
                 if (h.onRelayWgPacket) |cb| {
                     cb(h.ctx, frame.payload, frame.sender_pubkey, sender_endpoint);
                 } else if (h.onWgPacket) |cb| {
-                    cb(h.ctx, frame.payload, sender_endpoint.addr, sender_endpoint.port);
+                    const msg_type = if (frame.payload.len >= 4) std.mem.readInt(u32, frame.payload[0..4], .little) else 0;
+                    if (msg_type == 4) cb(h.ctx, frame.payload, sender_endpoint.addr, sender_endpoint.port);
                 }
             }
             return;
@@ -1944,6 +1956,21 @@ test "relay data addressed to us is delivered as opaque WG packet" {
     var delivery = RelayDeliveryCounter{};
     const our_pubkey = [_]u8{0x11} ** 32;
     const sender_pubkey = [_]u8{0x22} ** 32;
+    try membership.upsert(.{
+        .pubkey = sender_pubkey,
+        .name = "",
+        .state = .alive,
+        .gossip_endpoint = messages.Endpoint.initV4(.{ 198, 51, 100, 9 }, 40000),
+        .wg_pubkey = null,
+        .mesh_ip = .{ 10, 99, 0x22, 0x22 },
+        .mesh_ip6 = .{0} ** 16,
+        .wg_port = 51830,
+        .lamport = 1,
+        .last_seen_ns = nowNs(),
+        .suspected_at_ns = null,
+        .last_rtt_ns = null,
+        .handshake_complete = false,
+    });
     const handler = EventHandler{
         .ctx = &delivery,
         .onPeerJoin = ignorePeerJoin,
@@ -1963,6 +1990,31 @@ test "relay data addressed to us is delivered as opaque WG packet" {
     try std.testing.expectEqualSlices(u8, &wg_payload, delivery.payload[0..delivery.payload_len]);
     try std.testing.expectEqual([4]u8{ 198, 51, 100, 9 }, delivery.addr);
     try std.testing.expectEqual(@as(u16, 40000), delivery.port);
+}
+
+test "relay data from unknown sender is ignored" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+
+    var delivery = RelayDeliveryCounter{};
+    const our_pubkey = [_]u8{0x11} ** 32;
+    const unknown_sender = [_]u8{0x44} ** 32;
+    const handler = EventHandler{
+        .ctx = &delivery,
+        .onPeerJoin = ignorePeerJoin,
+        .onPeerDead = ignorePeerDead,
+        .onWgPacket = countRelayWgPacket,
+    };
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, our_pubkey, [_]u8{0x33} ** 32, .{ 127, 0, 0, 1 }, 51821, handler);
+
+    var wg_payload = [_]u8{0} ** 32;
+    std.mem.writeInt(u32, wg_payload[0..4], 4, .little);
+    var frame: [Relay.RELAY_FRAME_HEADER_SIZE + wg_payload.len]u8 = undefined;
+    const frame_len = try Relay.encodeRelayData(&frame, unknown_sender, our_pubkey, &wg_payload);
+
+    swim.feedPacketEndpoint(frame[0..frame_len], messages.Endpoint.initV4(.{ 198, 51, 100, 9 }, 40000));
+    try std.testing.expectEqual(@as(usize, 0), delivery.count);
 }
 
 fn issueVouch(org_kp: Org.OrgKeyPair, node_pubkey: [32]u8, lamport: u64) messages.OrgTrustVouch {

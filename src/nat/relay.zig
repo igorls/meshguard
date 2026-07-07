@@ -31,6 +31,7 @@ pub const DEFAULT_MAX_RELAY_PEERS: u16 = 10;
 pub const MAX_RENDEZVOUS_RECORDS: usize = 64;
 pub const MAX_RELAY_PAYLOAD: usize = 2048;
 pub const RELAY_FRAME_HEADER_SIZE: usize = 1 + 32 + 32 + 2;
+pub const MAX_RELAY_DATAGRAM: usize = RELAY_FRAME_HEADER_SIZE + MAX_RELAY_PAYLOAD;
 pub const REGISTRATION_NONCE_SIZE: usize = 32;
 pub const REGISTRATION_SIGNED_SIZE: usize = 32 + 1 + 16 + 2 + REGISTRATION_NONCE_SIZE;
 const CHALLENGE_TTL_NS: i128 = 60 * std.time.ns_per_s;
@@ -100,14 +101,20 @@ pub const IdentityRateLimiter = struct {
 
     fn findOrInsert(self: *IdentityRateLimiter, pubkey: [32]u8, now_ns: i128) ?usize {
         var empty: ?usize = null;
+        var oldest: ?usize = null;
+        var oldest_seen_ns: i128 = std.math.maxInt(i128);
         for (&self.entries, 0..) |*entry, i| {
             if (entry.*) |e| {
                 if (std.mem.eql(u8, &e.pubkey, &pubkey)) return i;
+                if (e.last_refill_ns < oldest_seen_ns) {
+                    oldest_seen_ns = e.last_refill_ns;
+                    oldest = i;
+                }
             } else if (empty == null) {
                 empty = i;
             }
         }
-        const slot = empty orelse return null;
+        const slot = empty orelse oldest orelse return null;
         self.entries[slot] = .{
             .pubkey = pubkey,
             .tokens = BURST,
@@ -416,4 +423,16 @@ test "identity rate limiter is per identity" {
     try std.testing.expect(!limiter.allow(a, 0));
     try std.testing.expect(limiter.allow(b, 0));
     try std.testing.expect(limiter.allow(a, std.time.ns_per_s));
+}
+
+test "identity rate limiter evicts oldest identity when full" {
+    var limiter = IdentityRateLimiter{};
+    for (0..MAX_RENDEZVOUS_RECORDS) |i| {
+        var pubkey = [_]u8{0} ** 32;
+        pubkey[31] = @intCast(i);
+        try std.testing.expect(limiter.allow(pubkey, @intCast(i)));
+    }
+
+    const newcomer = [_]u8{0xFF} ** 32;
+    try std.testing.expect(limiter.allow(newcomer, 10_000));
 }

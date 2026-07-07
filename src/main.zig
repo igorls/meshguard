@@ -2736,8 +2736,9 @@ fn queueWgCiphertextForSlot(
             if (direct_ep.addr6 == null) {
                 tx.queue(payload, direct_ep.addr, direct_ep.port);
                 send_idx.* += 1;
+                return;
             }
-            return;
+            if (!relay_available) return;
         }
     }
 
@@ -2963,6 +2964,8 @@ fn processRelayedWgPacket(
     n_decrypted: *usize,
     service_filter: *const lib.services.Policy.ServiceFilter,
 ) void {
+    if (!swim.isAllowedRelayParticipant(frame.sender_pubkey)) return;
+    if (!swim.isAllowedRelayParticipant(frame.target_pubkey)) return;
     if (!swim.relay_limiter.allow(frame.sender_pubkey, nowAwakeNs())) return;
 
     const Device = lib.wireguard.Device;
@@ -3156,7 +3159,7 @@ fn windowsEventLoop(
     control_socket: *lib.services.Control.ControlSocket,
 ) !void {
     var tun_buf: [65536]u8 = undefined;
-    var udp_recv_buf: [2048]u8 = undefined;
+    var udp_recv_buf: [lib.nat.Relay.MAX_RELAY_DATAGRAM]u8 = undefined;
     var decrypt_storage: [64][1500]u8 = undefined;
     var decrypt_lens: [64]usize = undefined;
     var decrypt_slots: [64]usize = undefined;
@@ -3275,7 +3278,7 @@ fn macosEventLoop(
     control_socket: *lib.services.Control.ControlSocket,
 ) !void {
     var tun_buf: [65536]u8 = undefined;
-    var udp_recv_buf: [2048]u8 = undefined;
+    var udp_recv_buf: [lib.nat.Relay.MAX_RELAY_DATAGRAM]u8 = undefined;
     var decrypt_storage: [64][1500]u8 = undefined;
     var decrypt_lens: [64]usize = undefined;
     var decrypt_slots: [64]usize = undefined;
