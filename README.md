@@ -3,454 +3,239 @@
 [![CI](https://github.com/igorls/meshguard/actions/workflows/ci.yml/badge.svg)](https://github.com/igorls/meshguard/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**Decentralized, serverless, WireGuard®-compatible mesh VPN daemon.**
+**Decentralized, serverless, WireGuard-compatible mesh VPN daemon written in Zig.**
 
-Zero central authority. Trust-agnostic. Dual-stack IPv4/IPv6. Portable Zig release artifacts.
+meshguard builds encrypted tunnels between trusted peers without a hosted
+coordination service, control plane, or central address allocator. It is designed
+for validators, edge fleets, lab networks, and embedded/mobile apps that need
+automatic peer discovery while keeping trust local to each node or organization.
 
-## The Problem
+## Contents
 
-Building a secure mesh network between N nodes (blockchain validators, edge servers, IoT clusters) means choosing between:
+- [Why meshguard](#why-meshguard)
+- [Features](#features)
+- [Install](#install)
+- [Quick start](#quick-start)
+- [Trust model](#trust-model)
+- [Build from source](#build-from-source)
+- [Platform support](#platform-support)
+- [Performance](#performance)
+- [Documentation](#documentation)
+- [Security](#security)
+- [License](#license)
 
-- **Central control plane** — convenient, but requires trusting a third-party coordinator. Unacceptable in trustless environments.
-- **Manual WireGuard** — fully decentralized, but managing N×(N-1)/2 peer entries by hand breaks down at ~20 nodes.
-- **Open mesh overlays** — auto-discovery works, but no permissioned membership. Anyone can join.
+## Why meshguard
 
-**meshguard** fills the gap: auto-discovers peers, negotiates WireGuard tunnels, traverses NATs, and enforces membership — all serverless.
+Traditional mesh VPN setups usually force one of three tradeoffs:
 
-## How It Works
+| Approach | Tradeoff |
+| --- | --- |
+| Hosted control plane | Convenient, but every node depends on a coordinator. |
+| Manual WireGuard config | Decentralized, but peer management grows poorly as the mesh expands. |
+| Open discovery overlay | Easy to join, but membership is not permissioned by default. |
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                          meshguard                              │
-│                                                                 │
-│  ┌──────────┐  ┌───────────────┐  ┌──────────────────────────┐  │
-│  │ Identity │  │   Discovery   │  │    WireGuard Engine      │  │
-│  │          │  │               │  │                          │  │
-│  │ Ed25519  │  │ SWIM Protocol │  │  Noise IK Handshake      │  │
-│  │ Keys     │  │ Membership    │  │  ChaCha20-Poly1305       │  │
-│  │ Trust    │  │ Seed peers    │  │  Transport tunnels       │  │
-│  └──────────┘  │ LAN multicast │  │  Anti-replay window      │  │
-│                └───────────────┘  └──────────────────────────┘  │
-│  ┌──────────┐  ┌───────────────┐  ┌──────────────────────────┐  │
-│  │   NAT    │  │   Protocol    │  │       Network I/O        │  │
-│  │          │  │               │  │                          │  │
-│  │ STUN     │  │ Wire codec    │  │  UDP socket (gossip)     │  │
-│  │ Holepunch│  │ Message types │  │  TUN device (packets)    │  │
-│  │ UPnP-IGD │  │ Binary format │  │  Netlink (kernel WG)     │  │
-│  └──────────┘  └───────────────┘  └──────────────────────────┘  │
-│  ┌───────────────────────────────────────────────────────────┐  │
-│  │                    Service Access Control                 │  │
-│  │  Per-peer/org/global rules · Port-level allow/deny       │  │
-│  │  File-based policies · In-process at decrypt→TUN         │  │
-│  └───────────────────────────────────────────────────────────┘  │
-│  ┌───────────────────────────────────────────────────────────┐  │
-│  │                    FFI / Mobile Embedding                 │  │
-│  │  C-ABI shared library · SWIM gossip · Encrypted messages │  │
-│  │  WireGuard tunnels · LAN discovery                       │  │
-│  └───────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
-```
+meshguard fills the middle ground: peers discover each other automatically,
+negotiate WireGuard tunnels, traverse NATs, and enforce explicit membership
+without a required server.
 
-### Key Design Decisions
+## Features
 
-| Decision                     | Rationale                                                                                                                             |
-| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| **Ed25519 identity keys**    | Separate from WireGuard X25519 — rotate transport keys without changing identity                                                      |
-| **Single-port multiplexing** | WireGuard, SWIM gossip, STUN, and hole punching share one UDP port (51821). Packet type classified by first 4 bytes                   |
-| **SWIM gossip protocol**     | O(log N) convergence, built-in failure detection, no coordinator                                                                      |
-| **Dual WireGuard modes**     | Kernel module (fastest) or full userspace (portable `std.crypto`, optional libsodium acceleration on Linux amd64)                    |
-| **Trust-agnostic**           | `authorized_keys/` directory — you decide how keys get there                                                                          |
-| **Org trust (hierarchical)** | Trust one org key → auto-accept all nodes signed by that org                                                                          |
-| **Deterministic mesh IPs**   | Blake3(pubkey) → `10.99.X.Y` (IPv4) + `fd99:6d67::X:Y` (IPv6 ULA). No DHCP or central allocator; large meshes should still monitor for hash collisions |
-| **Deterministic mesh DNS**   | Blake3(org_pubkey) → `*.a1b2c3.mesh`. Per-org deterministic subdomains                                                                |
-| **Cross-platform**           | Linux, macOS, FreeBSD, Windows, Android, iOS — same Zig codebase, platform-specific TUN + ifconfig/netlink                            |
-| **Android/iOS FFI**          | C-ABI shared/static library — SWIM gossip + encrypted messaging without TUN. Build with `zig build -Dtarget=aarch64-linux-android`    |
-| **libc `poll()` compat**     | Uses POSIX `poll()` via libc instead of raw Linux syscall — required for Android seccomp                                              |
+- **Serverless discovery** using SWIM gossip, static seed peers, DNS TXT seeds,
+  and LAN mDNS discovery.
+- **Local trust enforcement** with per-node authorized keys, optional org-signed
+  node certificates, org revocation, and org vouching for external peers.
+- **WireGuard-compatible data plane** with Linux kernel mode or a portable
+  userspace implementation.
+- **Deterministic addressing** from node public keys: IPv4 under `10.99.0.0/16`
+  and IPv6 ULA under `fd99:6d67::/64`.
+- **NAT traversal** with STUN, coordinated UDP hole punching, UPnP-IGD, and
+  ciphertext-only relay fallback for difficult networks.
+- **Service access control** for global, per-peer, and per-org port policies.
+- **Mobile and embedded FFI** for Android and iOS app-level encrypted messaging
+  and tunnel data channels.
+- **Portable Zig build** with optional libsodium acceleration on Linux.
 
-## Quick Start
+## Install
 
-### Install
+Linux:
 
-**Linux:**
 ```bash
 curl -fsSL https://raw.githubusercontent.com/igorls/meshguard/main/install.sh | bash
 ```
 
-**Windows (PowerShell as Admin):**
+Windows PowerShell:
+
 ```powershell
 irm https://raw.githubusercontent.com/igorls/meshguard/main/install.ps1 | iex
 ```
 
-### Usage
+Manual release downloads are available on the
+[GitHub Releases](https://github.com/igorls/meshguard/releases/latest) page.
+
+## Quick start
+
+On each node, generate an identity:
 
 ```bash
-# Generate identity
 meshguard keygen
+```
 
-# Share your public key with peers
+Export and exchange public keys with the peers you want to trust:
+
+```bash
 meshguard export > my-node.pub
-
-# Trust a peer
 meshguard trust /path/to/peer.pub --name validator-3
+```
 
-# Join the mesh (userspace WireGuard — default)
+Start the mesh with at least one reachable seed peer:
+
+```bash
 meshguard up --seed 1.2.3.4:51821
+```
 
-# Join the mesh (kernel WireGuard — Linux only)
-meshguard up --seed 1.2.3.4:51821 --kernel
+Useful follow-up commands:
 
-# Check status
+```bash
 meshguard status
-
-# Stop
 meshguard down
+meshguard config show
 ```
 
-### Org Trust (Fleet Mode)
+Linux can use the kernel WireGuard module instead of the userspace data plane:
 
 ```bash
-# Org admin: generate org keypair
-meshguard org-keygen
-# → prints public key + deterministic domain (a1b2c3.mesh)
-
-# Sign a node's identity with the org key
-meshguard org-sign /path/to/node.pub --name node-1
-# -> node-1.cert (v1, 186 bytes)
-
-# Or bind the node's WireGuard key in a v2 cert
-meshguard org-sign /path/to/node.pub --name node-1 --wg-pubkey /path/to/node.wg.pub
-# -> node-1.cert (v2, 314 bytes)
-
-# Remote peer: trust the org (one-time)
-meshguard trust <org-pubkey> --org --name eosrio
-
-# Node: install cert and start
-cp node-1.cert ~/.config/meshguard/node.cert
-meshguard up --seed 1.2.3.4:51821
-# → auto-accepted by any peer trusting the org
-
-# Vouch for an external standalone node (propagates to all org members)
-meshguard org-vouch <solo-node-pubkey>
+meshguard up --seed 1.2.3.4:51821 --kernel
 ```
 
-## Trust Model
+For direct peer setup without a long-lived seed, use coordinated tokens:
 
-meshguard supports **two trust models** that can be used independently or together:
-
-### Individual Trust
-
-meshguard reads public keys from `~/.config/meshguard/authorized_keys/`. How they get there is your choice:
-
-- **Manual**: `scp` keys between nodes
-- **Config management**: Ansible/Salt push keys to all nodes
-- **Blockchain**: Query on-chain validator registry, write `.pub` files
-- **Git**: Keep keys in a repo, `git pull` on a cron job
-
-### Org Trust (Hierarchical)
-
-For fleets, trust one org public key instead of N individual keys:
-
+```bash
+meshguard connect --generate
+meshguard connect --join mg://...
 ```
+
+See the [getting started guide](docs/guide/getting-started.md) and
+[CLI reference](docs/reference/cli.md) for the complete command surface.
+
+## Trust model
+
+meshguard supports individual peer trust and organization trust. They can be used
+separately or together.
+
+### Individual trust
+
+Each node keeps trusted peer keys in its config directory:
+
+```text
 ~/.config/meshguard/
-├── identity.key / identity.pub    # Node identity
-├── node.cert                      # Org-signed certificate (v1 186 B, v2 314 B)
-├── authorized_keys/               # Individual peer trust
-│   └── validator-1.pub
-├── trusted_orgs/                  # Org trust (auto-accept members)
-│   └── eosrio.org
-└── services/                      # Service access control (optional)
-    ├── default                    # Default action: "allow" or "deny"
-    ├── global.policy              # Global rules (all peers)
-    ├── peer/                      # Per-peer policies
-    │   └── node-1.policy
-    └── org/                       # Per-org policies
-        └── eosrio.policy
+├── identity.key
+├── identity.pub
+└── authorized_keys/
+    └── validator-3.pub
 ```
 
-Each org gets a **deterministic mesh domain**: `Blake3(org_pubkey)[0..3].hex()` → `*.a1b2c3.mesh`. Orgs can also claim human-readable aliases via gossip (e.g. `*.eosrio.mesh`).
+How keys arrive there is intentionally out of scope. You can exchange them
+manually, distribute them with config management, sync them from Git, or derive
+them from an external registry.
 
-Trust is **bidirectional** — both peers must have each other's key (or mutual org trust / vouch) for a tunnel to form.
+### Organization trust
 
-### Org Vouch (External Peers)
-
-Org admins can **vouch for standalone nodes** without making them full org members. The vouch is gossip-propagated — all nodes trusting the org auto-accept the vouched node:
+For fleets, an org key can sign node identities so peers only need to trust the
+org once:
 
 ```bash
-meshguard org-vouch <solo-node-pubkey>
+meshguard org-keygen
+meshguard org-sign /path/to/node.pub --name node-1 --wg-pubkey /path/to/node.wg.pub
+meshguard trust <org-pubkey> --org --name example-org
 ```
 
-Trust authorization order:
+Org admins can also revoke signed nodes or vouch for standalone external nodes.
+Details live in the [trust model guide](docs/guide/trust-model.md).
 
-1. Individual key in `authorized_keys/`?
-2. Valid org cert from a trusted org?
-3. Vouched by a trusted org?
+## Build from source
 
-## Architecture
-
-### Identity & Addressing
-
-- Ed25519 keypair per node (`identity.key` / `identity.pub`)
-- Mesh IPv4 deterministically derived: `Blake3(pubkey) → 10.99.X.Y/16`
-- Mesh IPv6 deterministically derived: `Blake3(pubkey) → fd99:6d67::X:Y/64` (ULA, RFC 4193)
-- Dual-stack: both addresses assigned to the TUN interface automatically
-- Authorized keys directory gates mesh membership
-- **Org certificates**: Ed25519-signed `NodeCertificate` for fleet trust; v2 certs also bind the WireGuard public key
-- **Mesh DNS**: deterministic `*.a1b2c3.mesh` domains per org, gossip-propagated aliases
-
-### Discovery (SWIM)
-
-- Gossip-based failure detection with ping / ack / ping-req
-- Lamport timestamps for crdt-like conflict resolution
-- Membership events piggybacked on SWIM messages (up to 8 per packet, 115 bytes each)
-- Peer states: alive → suspected → dead, with configurable timeout
-
-### WireGuard Engine
-
-- **Kernel mode**: `RTM_NEWLINK` + Genetlink peer configuration via netlink
-- **Userspace mode**: Full Noise_IKpsk2 handshake, ChaCha20-Poly1305 transport, TUN device
-- O(1) handshake routing via `decryptInitiatorStatic` + static key lookup table
-- `IndexTable`: fixed-size open-addressed hash table with Fibonacci hashing (no allocator)
-- Anti-replay: 2048-bit sliding window bitmap
-- Key lifecycle: rekey at 120s / 2^60 messages, reject at 180s, keepalive at 10s
-
-### NAT Traversal
-
-- **STUN**: RFC 5389 Binding Requests across multiple servers to discover public endpoint + NAT mapping type
-- **Hole punching**: Rendezvous-mediated, identity/session-bound UDP probing for cone NATs (4 concurrent, 5s timeout)
-- **Relay**: Public-IP relay forwards only opaque WireGuard/Noise ciphertext for symmetric NATs
-
-### Wire Protocol
-
-- Binary codec: type-tag-delimited, fixed-size fields, little-endian
-- SWIM: Ping (`0x01`), Ack (`0x03`), PingReq (`0x02`)
-- Handshake: Standard WireGuard Noise_IKpsk2 (Type 1, Type 2)
-- NAT: RelayData (`0x31`), HolepunchRequest (`0x33`), HolepunchResponse (`0x34`)
-- Org: OrgAliasAnnounce (`0x41`), OrgCertRevoke (`0x42`), OrgTrustVouch (`0x43`)
-
-## Benchmarks
-
-### Throughput (iperf3, 10s, single peer)
-
-> **Hardware**: Intel i9-12900KF (16C/24T, 5.2 GHz), 128 GB DDR5, Ubuntu 24.04  
-> **Setup**: Two LXC containers on localhost, 8 encrypt workers, MTU 1420
-
-| Implementation                 | Download      | Upload        | Notes                                                  |
-| ------------------------------ | ------------- | ------------- | ------------------------------------------------------ |
-| wireguard-go (Go, userspace)   | 10.6 Gbps     | 11.1 Gbps     | Go asm ChaCha20, goroutine parallelism                 |
-| WireGuard (kernel module)      | 4.98 Gbps     | 4.99 Gbps     | In-kernel datapath                                     |
-| **meshguard** (Zig, userspace) | **3.93 Gbps** | **3.94 Gbps** | libsodium AVX2, UDP GRO, zero-copy GSO, NAPI busy-poll |
-| boringtun (Rust, userspace)    | 1.82 Gbps     | 1.81 Gbps     | Cloudflare userspace WG                                |
-
-Linux UDP sockets can use an `io_uring` recvmsg/sendmsg ring when runtime
-probing and initialization succeed; startup logs print the active UDP path.
-The poll+recvmsg path remains the fallback, and the separate TUN `io_uring`
-reader stays disabled pending bare-metal TUN read validation.
-
-### Optimization History
-
-| Optimization                    | Download  | Δ    |
-| ------------------------------- | --------- | ---- |
-| Baseline                        | 2.26 Gbps | —    |
-| + Zero-copy GSO split           | 2.65 Gbps | +17% |
-| + `sendmmsg` batch sends        | 2.72 Gbps | +20% |
-| + libsodium AVX2 ChaCha20       | 3.07 Gbps | +36% |
-| + UDP GRO (64KB coalesced recv) | 3.89 Gbps | +72% |
-| + SO_BUSY_POLL + drain loop     | 3.93 Gbps | +74% |
-
-### Run benchmarks
+meshguard requires Zig `0.16.0` or newer.
 
 ```bash
-bash docker/lxc-mg-bench.sh 10 8    # 10s, 8 encrypt workers
-bash docker/lxc-4way-bench.sh 10     # Compare all implementations
-bash docker/perf-capture.sh 10 8     # Flamegraph + perf report
-```
-
-## Docker
-
-```bash
-# Multi-node mesh with Docker Compose
-docker compose up
-
-# Benchmark configuration
-docker compose -f docker-compose.bench.yml up
-```
-
-## Requirements
-
-### Linux Server / Desktop
-
-- **Zig 0.16+**
-- **Linux** (kernel WireGuard module _or_ TUN device support)
-- **libsodium** — _optional_ AVX2 accelerator, on by default on Linux
-  (`libsodium-dev` to build, `libsodium23` at runtime). Build with
-  `-Dno-sodium=true` / `-Dcrypto-backend=std` to use `std.crypto` instead and drop
-  the dependency entirely (see [Crypto backend](#crypto-backend)).
-- `sudo` or `CAP_NET_ADMIN` for interface creation
-
-### macOS
-
-- **Zig 0.16+**
-- `sudo` for utun interface creation
-- No libsodium needed — uses `std.crypto` on macOS
-
-### FreeBSD
-
-- **Zig 0.16+**
-- `sudo` or root for `/dev/tun` access
-- No libsodium needed — uses `std.crypto` on FreeBSD
-
-### Windows
-
-- **Zig 0.16+** (for building from source)
-- **Administrator privileges** for TUN interface creation
-- **wintun.dll** — bundled automatically by the build system and install script
-- No libsodium needed — uses `std.crypto` on Windows
-
-### Android / iOS (FFI)
-
-- **Zig 0.16+** (cross-compiles to Android/iOS targets)
-- **No libsodium** — the FFI library uses `std.crypto` only
-- Android NDK / iOS SDK **not required** — Zig's bundled libc includes platform headers
-- iOS builds produce a static library (`libmeshguard-ffi.a`)
-
-## Building
-
-```bash
-# Debug build (Linux — exe + static lib + FFI shared lib)
+# Debug build
 zig build
 
-# Release (optimized)
+# Optimized release build
 zig build -Doptimize=ReleaseFast
 
 # Run tests
 zig build test
+```
 
-# Cross-compile for aarch64 Linux without libsodium
+Cross-compile examples:
+
+```bash
 zig build -Dtarget=aarch64-linux-gnu -Doptimize=ReleaseFast -Dno-sodium=true
-
-# macOS (native or cross-compile)
 zig build -Dtarget=aarch64-macos -Doptimize=ReleaseFast
-
-# FreeBSD (cross-compile)
 zig build -Dtarget=x86_64-freebsd -Doptimize=ReleaseFast
-
-# Windows (native or cross-compile)
 zig build -Dtarget=x86_64-windows -Doptimize=ReleaseFast
-# → zig-out/bin/meshguard.exe + wintun.dll
-
-# Android aarch64 (produces libmeshguard-ffi.so only)
 zig build -Dtarget=aarch64-linux-android -Doptimize=ReleaseFast
-
-# iOS aarch64 (produces libmeshguard-ffi.a — static)
 zig build -Dtarget=aarch64-ios -Doptimize=ReleaseFast
 ```
 
-Windows builds automatically bundle `wintun.dll` alongside `meshguard.exe`.
-Android builds produce only `libmeshguard-ffi.so` — the CLI binary, static library, and unit tests are excluded.
+Crypto primitives are available through Zig `std.crypto`. libsodium is an
+optional Linux acceleration backend and can be disabled with `-Dno-sodium=true`
+or `-Dcrypto-backend=std`.
 
-### Crypto backend
+## Platform support
 
-MeshGuard's **required** crypto primitives — ChaCha20-Poly1305 (AEAD), Ed25519
-(signatures), X25519 (key exchange) — are always available via Zig's `std.crypto`.
-**libsodium is an optional implementation accelerator**, not a dependency: its
-hand-written AVX2 ChaCha20-Poly1305 is ~2× faster than `std.crypto` at MTU/bulk
-sizes on Linux x86_64, so it is auto-selected there. Everywhere else
-(macOS/FreeBSD/Windows/Android/iOS) `std.crypto` is used.
+| Platform | Support |
+| --- | --- |
+| Linux | Userspace mode by default; kernel WireGuard mode with `--kernel`; optional libsodium acceleration. |
+| macOS | Userspace mode through `utun`; no kernel WireGuard mode. |
+| FreeBSD | Userspace mode through `tun(4)`; no kernel WireGuard mode. |
+| Windows | Userspace mode through Wintun; `meshguard up` requires Administrator privileges. |
+| Android | C-ABI shared library for app embedding; no CLI TUN interface. |
+| iOS | C-ABI static library for app embedding; no CLI TUN interface. |
 
-Select the backend with `-Dcrypto-backend` (or the `-Dno-sodium=true` alias):
+## Performance
 
-| Build flag | Backend |
-|---|---|
-| _(default)_ / `-Dcrypto-backend=auto` | libsodium on Linux desktop, `std.crypto` elsewhere |
-| `-Dno-sodium=true` / `-Dcrypto-backend=std` | `std.crypto` everywhere — **no libsodium**, no `libsodium-dev` |
-| `-Dcrypto-backend=sodium` | force libsodium (link must be available for the target) |
-
-```bash
-# Build + test on Linux with zero libsodium dependency:
-zig build -Dno-sodium=true
-zig build test -Dno-sodium=true
-```
-
-The choice is resolved in `build.zig` and passed to the source via `build_options`,
-so the compiled code and the linker always agree. Downstream packages that embed
-MeshGuard from source can pass the same `use_libsodium` option through and never
-touch system libsodium.
-
-## Status
-
-Core functionality is implemented and under active benchmarking:
-
-- [x] Ed25519 keygen, save/load, sign/verify
-- [x] Authorized keys directory management
-- [x] Deterministic mesh IP derivation (Blake3)
-- [x] CLI: `keygen`, `trust`, `revoke`, `export`, `up`, `down`, `status`, `version`
-- [x] SWIM gossip protocol with Lamport clocks
-- [x] Binary wire protocol codec
-- [x] Kernel WireGuard via netlink (RTM_NEWLINK + Genetlink)
-- [x] Full userspace WireGuard (Noise IK, ChaCha20-Poly1305, TUN)
-- [x] STUN public endpoint discovery
-- [x] UDP hole punching (rendezvous-mediated)
-- [x] Relay selection for symmetric NAT
-- [x] Daemon event loop (kernel + userspace modes)
-- [x] Docker + LXC benchmarking infrastructure
-- [x] Org trust — hierarchical PKI with org certificates
-- [x] Deterministic mesh DNS domains (Blake3 → `*.a1b2c3.mesh`)
-- [x] Org alias system via SWIM gossip
-- [x] Org certificate revocation via gossip
-- [x] Org vouch for external nodes via gossip
-- [x] `recvmmsg`/`sendmmsg` batched I/O
-- [x] GRO/GSO via `IFF_VNET_HDR` for TUN
-- [x] libsodium AVX2 ChaCha20-Poly1305
-- [x] UDP GRO on control-plane socket
-- [x] NAPI busy-poll + GRO drain loop
-- [x] Android FFI shared library (`libmeshguard-ffi.so`)
-- [x] FFI app-level encrypted messaging (wire type `0x50`)
-- [x] LAN multicast discovery
-- [x] UPnP-IGD port forwarding
-- [x] Coordinated punch (token-based direct connect)
-- [x] Open mode (`--open` flag for trust-free operation)
-- [x] Service access control (`meshguard service` — per-peer/org/global port policies)
-- [x] WireGuard tunnel FFI API (open/send/recv/close for encrypted audio/data channels)
-- [x] Compile-time AEAD backend selection (libsodium on Linux, std.crypto on Android/macOS/FreeBSD/Windows)
-- [x] Multi-queue TUN (`IFF_MULTI_QUEUE` — Linux, parallel I/O via flow-hash distribution)
-- [x] `io_uring` UDP ring (Linux runtime-gated, fallback to poll+recvmsg)
-- [x] `io_uring` TUN reader (implemented, runtime-disabled pending bare-metal TUN validation)
-- [x] IPv6 dual-stack (ULA `fd99:6d67::/64`, deterministic from pubkey via Blake3)
-- [x] DNS / mDNS seed discovery
-- [x] macOS support (utun + ifconfig/route)
-- [x] FreeBSD support (tun(4) + ifconfig/route)
-- [x] Windows support (Wintun + named pipe IPC)
-- [x] iOS FFI static library (`libmeshguard-ffi.a`)
-
-## Mobile / Embedded
-
-meshguard provides a **C-ABI shared library** (`libmeshguard-ffi.so`) for embedding in mobile apps. The FFI surface exposes:
-
-- **Lifecycle**: `meshguard_init`, `meshguard_join`, `meshguard_join_lan`, `meshguard_leave`, `meshguard_destroy`
-- **Messaging**: `meshguard_send`, `meshguard_recv` — end-to-end encrypted app-level messages
-- **Tunnels**: `meshguard_tunnel_open`, `meshguard_tunnel_send`, `meshguard_tunnel_recv`, `meshguard_tunnel_close` — WireGuard-encrypted data channels (e.g., VoIP audio)
-- **Discovery**: SWIM gossip + LAN multicast — no seed server required on local networks
-- **Callbacks**: `meshguard_set_on_message`, `meshguard_set_on_peer_event` — push notifications for peer events
-- **Query**: `meshguard_peer_count`, `meshguard_get_peers`, `meshguard_get_peer_info`, `meshguard_debug_info`
-
-The FFI library uses WireGuard Noise IK for encrypted tunnels but does **not** create TUN interfaces — tunnel data is delivered via an in-process ring buffer, suitable for VoIP audio or app-level data streams. Uses `std.crypto` only (no libsodium dependency).
-
-See [Android embedding guide](https://igorls.github.io/meshguard/guide/android-embedding) for JNI integration details.
+Current userspace Linux benchmarks report roughly **3.93 Gbps download** and
+**3.94 Gbps upload** in the documented LXC localhost test setup with 8 encrypt
+workers. See [PERFORMANCE.md](PERFORMANCE.md) for methodology, optimization
+history, and remaining performance work.
 
 ## Documentation
 
-Full documentation: **[igorls.github.io/meshguard](https://igorls.github.io/meshguard/)**
+- [Full documentation site](https://igorls.github.io/meshguard/)
+- [Getting started](docs/guide/getting-started.md)
+- [Configuration](docs/guide/configuration.md)
+- [Trust model](docs/guide/trust-model.md)
+- [Service access control](docs/guide/services.md)
+- [Android embedding](docs/guide/android-embedding.md)
+- [Architecture](docs/concepts/architecture.md)
+- [Wire protocol](docs/concepts/wire-protocol.md)
+- [CLI reference](docs/reference/cli.md)
+- [Module map](docs/reference/modules.md)
 
-To run locally:
+Run the docs site locally:
 
 ```bash
-cd docs && bun install && bun run docs:dev
+cd docs
+bun install
+bun run docs:dev
 ```
+
+## Security
+
+Please do not open public issues for security vulnerabilities. Use the process in
+[SECURITY.md](SECURITY.md), which includes GitHub Security Advisories and direct
+maintainer contact guidance.
+
+For the security model and hardening notes, see
+[docs/concepts/security.md](docs/concepts/security.md).
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
 
----
-
-"WireGuard" and the "WireGuard" logo are [registered trademarks](https://www.wireguard.com/trademark-policy/) of Jason A. Donenfeld. meshguard is an independent, clean-room implementation of the [WireGuard protocol](https://www.wireguard.com/protocol/) and is not affiliated with or endorsed by the WireGuard project.
+"WireGuard" and the "WireGuard" logo are
+[registered trademarks](https://www.wireguard.com/trademark-policy/) of Jason A.
+Donenfeld. meshguard is an independent, clean-room implementation of the
+[WireGuard protocol](https://www.wireguard.com/protocol/) and is not affiliated
+with or endorsed by the WireGuard project.
