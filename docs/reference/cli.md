@@ -257,7 +257,7 @@ meshguard connect --join mg://...
 | -------------------------- | ---------------------------------------------------------- |
 | `MESHGUARD_CONFIG_DIR`     | Override config directory (default: `~/.config/meshguard`) |
 | `MESHGUARD_CONTROL_PATH`   | Control socket bind and CLI connect path (no default fallback when set) |
-| `MESHGUARD_GOSSIP_PORT`    | Gossip/listen UDP port when `--gossip-port` is omitted     |
+| `MESHGUARD_GOSSIP_PORT`    | Gossip/listen UDP port when `--gossip-port` is omitted. Explicit invalid values fail closed (no fallback to 51821). |
 
 Default config directories are `%APPDATA%\meshguard\` on Windows,
 `/etc/meshguard` when running as root on POSIX systems, otherwise

@@ -342,27 +342,16 @@ pub fn main(init: std.process.Init) !void {
 
 // ─── Command implementations ───
 
-const DEFAULT_GOSSIP_PORT: u16 = 51821;
-const GOSSIP_PORT_ENV = "MESHGUARD_GOSSIP_PORT";
-
-fn resolveGossipPort(allocator: std.mem.Allocator, extra_args: []const []const u8) u16 {
-    var i: usize = 0;
-    while (i < extra_args.len) : (i += 1) {
-        if (std.mem.eql(u8, extra_args[i], "--gossip-port") and i + 1 < extra_args.len) {
-            if (std.fmt.parseInt(u16, extra_args[i + 1], 10)) |port| {
-                if (port != 0) return port;
-            } else |_| {}
-        }
-    }
-
-    if (Config.getEnvVarOwned(allocator, GOSSIP_PORT_ENV) catch null) |val| {
+fn resolveGossipPort(allocator: std.mem.Allocator, extra_args: []const []const u8) Config.GossipPortError!u16 {
+    if (Config.getEnvVarOwned(allocator, Config.GOSSIP_PORT_ENV) catch null) |val| {
         defer allocator.free(val);
-        if (std.fmt.parseInt(u16, std.mem.trim(u8, val, " \t\r\n"), 10)) |port| {
-            if (port != 0) return port;
-        } else |_| {}
+        return Config.resolveGossipPort(extra_args, val);
     }
+    return Config.resolveGossipPort(extra_args, null);
+}
 
-    return DEFAULT_GOSSIP_PORT;
+fn writeInvalidGossipPort(stderr: std.Io.File) !void {
+    try stderr.writeStreamingAll(zio(), "error: invalid --gossip-port or MESHGUARD_GOSSIP_PORT (expected UDP port 1-65535)\n");
 }
 
 fn writeFormatted(file: std.Io.File, comptime fmt: []const u8, args: anytype) !void {
@@ -1106,7 +1095,10 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     }
 
     // Bind gossip UDP socket
-    const gossip_port: u16 = resolveGossipPort(allocator, extra_args);
+    const gossip_port = resolveGossipPort(allocator, extra_args) catch {
+        try writeInvalidGossipPort(stderr);
+        std.process.exit(1);
+    };
     var gossip_socket = blk: {
         if (announce_addr) |ep| {
             // Bind to announced IP for correct source-based routing on multi-homed servers
@@ -1633,7 +1625,10 @@ fn cmdConnect(allocator: std.mem.Allocator, extra_args: []const []const u8) !voi
 
     // Must use the same gossip port the daemon will bind to,
     // so the NAT hole punched here stays valid after restart.
-    const gossip_port: u16 = resolveGossipPort(allocator, extra_args);
+    const gossip_port = resolveGossipPort(allocator, extra_args) catch {
+        try writeInvalidGossipPort(stderr);
+        std.process.exit(1);
+    };
 
     // Stop running service first (otherwise we can't bind the port)
     // Only relevant on Linux where systemd may be managing the service.

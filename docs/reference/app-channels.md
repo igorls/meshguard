@@ -83,6 +83,11 @@ default gossip port.
 | `--gossip-port <port>` | `meshguard up` and `meshguard connect` | `51821` |
 | `MESHGUARD_GOSSIP_PORT` | Same commands when the flag is omitted | `51821` |
 
+An explicit `--gossip-port` or `MESHGUARD_GOSSIP_PORT` must be a UDP port in
+`1–65535`. Missing, empty, zero, non-numeric, or out-of-range values are a
+hard error — they do **not** fall back to `51821`. Unset flag and unset env
+keep the default.
+
 When `MESHGUARD_CONTROL_PATH` is set, the client connects **only** to that path
 and does not fall back to the production socket. CLI `SEND`/`RECV`/`APP*` and
 `status`/`down` all honor it.
