@@ -1149,7 +1149,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
         kp.public_key.toBytes(),
         mesh_ip,
         wg_private_key,
-        control_path, // validated override or platform default
+        control_path_flag, // preserve env-path parent creation after early validation
     );
     defer control.deinit(allocator);
 
