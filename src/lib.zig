@@ -91,4 +91,5 @@ test {
         _ = wireguard.NlSocket;
     }
     _ = services.Policy;
+    _ = services.Control;
 }

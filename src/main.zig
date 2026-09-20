@@ -37,6 +37,11 @@ const usage =
     \\  org-revoke  Sign an org certificate revocation
     \\  config show Show local node configuration (works offline)
     \\  service     Manage service access policies
+    \\  send        Send encrypted message to peer (meshguard send <peer> <msg>)
+    \\  recv        Receive next encrypted message (meshguard recv [--wait <ms>])
+    \\  invite      Create agent room meet link (meshguard invite [--name <label>])
+    \\  join        Join an agent room via meet link (meshguard join <token>)
+    \\  agent       Run autonomous agent worker loop (meshguard agent)
     \\  upgrade     Upgrade to the latest release from GitHub
     \\  version     Print version
     \\
@@ -243,6 +248,39 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, command, "service")) {
         try cmdService(allocator, args[2..]);
+        return;
+    }
+
+    if (std.mem.eql(u8, command, "send")) {
+        if (args.len < 3) {
+            try getStdErr().writeStreamingAll(zio(), "usage: meshguard send <peer-pubkey-hex-or-b64> <message>\n");
+            std.process.exit(1);
+        }
+        try cmdSend(allocator, args[2..]);
+        return;
+    }
+
+    if (std.mem.eql(u8, command, "recv")) {
+        try cmdRecv(allocator, args[2..]);
+        return;
+    }
+
+    if (std.mem.eql(u8, command, "invite")) {
+        try cmdInvite(allocator, args[2..]);
+        return;
+    }
+
+    if (std.mem.eql(u8, command, "join")) {
+        if (args.len < 3) {
+            try getStdErr().writeStreamingAll(zio(), "usage: meshguard join <invite-token>\n");
+            std.process.exit(1);
+        }
+        try cmdJoin(allocator, args[0], args[2]);
+        return;
+    }
+
+    if (std.mem.eql(u8, command, "agent")) {
+        try cmdAgent(allocator, args[2..]);
         return;
     }
 
@@ -1025,18 +1063,26 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     var membership = lib.discovery.Membership.MembershipTable.init(allocator, 5000);
     defer membership.deinit();
 
-    // Initialize control socket (Unix domain socket API)
+    // Initialize control socket (IPC API)
     var control = lib.services.Control.ControlSocket.init(
         allocator,
         &membership,
         kp.public_key.toBytes(),
         mesh_ip,
+        wg_private_key,
         null, // use default path
     );
     defer control.deinit(allocator);
 
     // Create WG event handler context
-    var wg_handler_ctx = WgHandlerCtx{ .stdout = stdout, .membership = &membership, .socket = &gossip_socket, .use_kernel = !gossip_only };
+    var wg_handler_ctx = WgHandlerCtx{
+        .stdout = stdout,
+        .membership = &membership,
+        .socket = &gossip_socket,
+        .use_kernel = !gossip_only,
+        .control_socket = &control,
+        .our_wg_private = wg_private_key,
+    };
 
     // Initialize SWIM protocol
     var swim = lib.discovery.Swim.SwimProtocol.init(
@@ -1054,8 +1100,14 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
             .onPeerPunched = &wgOnPeerPunched,
             .hasActiveTunnel = &wgHasActiveTunnel,
             .reinitiateHandshake = &wgReinitiate,
+            .onAppMessage = &wgOnAppMessage,
         },
     );
+
+    // Wire control socket to SWIM datagram sender and tick handler
+    control.setSendHandler(&swim, &sendControlDatagram);
+    control.setTickHandler(&swim, &tickControlSwim);
+
     // SWIM-driven handshake retransmit is only needed for the userspace WG data
     // plane; kernel WireGuard retransmits its own, and gossip-only has none.
     swim.retransmit_handshakes = !use_kernel_wg and !gossip_only;
@@ -1863,6 +1915,8 @@ const WgHandlerCtx = struct {
     wg_device: ?*lib.wireguard.Device.WgDevice = null,
     socket: ?*lib.net.Udp.UdpSocket = null,
     use_kernel: bool = true,
+    control_socket: ?*lib.services.Control.ControlSocket = null,
+    our_wg_private: [32]u8 = [_]u8{0} ** 32,
 };
 
 /// S2: report whether we hold a live userspace WG tunnel to `wg_pubkey`. Kernel WG
@@ -2027,6 +2081,56 @@ fn wgOnPeerPunched(ctx: *anyopaque, peer: *const lib.discovery.Membership.Peer, 
 
         writeFormatted(handler.stdout, "  peer punched: {s} (direct connection established)\n", .{ip_str}) catch {};
     }
+}
+
+fn wgOnAppMessage(ctx: *anyopaque, data: []const u8) void {
+    const handler: *WgHandlerCtx = @ptrCast(@alignCast(ctx));
+    const control = handler.control_socket orelse return;
+
+    // Minimum 0x50 packet: 1 + 32 + 32 + 12 + 16 = 93 bytes
+    if (data.len < 93 or data[0] != 0x50) return;
+
+    // Wire format: [0x50] [32B dest] [32B sender] [12B nonce] [N ciphertext] [16B tag]
+    const sender_pubkey = data[33..65];
+    const nonce: [12]u8 = data[65..77].*;
+    const payload_len = data.len - 77 - 16;
+    if (payload_len > 1024) return;
+
+    const ciphertext = data[77..][0..payload_len];
+    const tag: [16]u8 = data[77 + payload_len ..][0..16].*;
+
+    var peer_key: [32]u8 = undefined;
+    @memcpy(&peer_key, sender_pubkey);
+
+    const peer = handler.membership.peers.get(peer_key) orelse return;
+    const peer_wg_pubkey = peer.wg_pubkey orelse return;
+
+    const shared = std.crypto.dh.X25519.scalarmult(handler.our_wg_private, peer_wg_pubkey) catch return;
+    const key_result = lib.wireguard.Crypto.kdf2(shared, "meshguard-app-v1");
+    const enc_key = key_result.key;
+
+    var plaintext: [1024]u8 = undefined;
+    std.crypto.aead.chacha_poly.ChaCha20Poly1305.decrypt(
+        plaintext[0..payload_len],
+        ciphertext,
+        tag,
+        sender_pubkey,
+        nonce,
+        enc_key,
+    ) catch return;
+
+    _ = control.pushMessage(peer_key, plaintext[0..payload_len]);
+}
+
+fn sendControlDatagram(ctx: *anyopaque, data: []const u8, ep: lib.protocol.Messages.Endpoint) bool {
+    const swim_ptr: *lib.discovery.Swim.SwimProtocol = @ptrCast(@alignCast(ctx));
+    _ = swim_ptr.socket.sendToEndpoint(data, ep) catch return false;
+    return true;
+}
+
+fn tickControlSwim(ctx: *anyopaque) void {
+    const swim_ptr: *lib.discovery.Swim.SwimProtocol = @ptrCast(@alignCast(ctx));
+    swim_ptr.tick() catch {};
 }
 
 /// Maximum data-plane worker threads (TUN readers + encrypt workers combined).
@@ -4109,6 +4213,12 @@ fn printControlStatus(allocator: std.mem.Allocator, stdout: std.Io.File, respons
         },
         else => {},
     };
+
+    if (jsonIntField(root, "queued_msgs")) |qm| {
+        if (qm > 0) {
+            try writeFormatted(stdout, "  messages: {d} queued\n", .{qm});
+        }
+    }
 }
 
 const FormattedBytes = struct {
@@ -4918,3 +5028,500 @@ fn cmdUpgrade(_: std.mem.Allocator) !void {
     try stdout.writeStreamingAll(zio(), "\n  ✓ upgrade complete\n");
     try writeFormatted(stdout, "  {s} → {s}\n", .{ current, latest });
 }
+
+// ─── Agent & E2EE Messaging Commands ───
+
+const parsePubkey = lib.services.Control.parsePubkey;
+const appendJsonEscaped = lib.services.Control.appendJsonEscaped;
+
+fn findJsonStringField(json: []const u8, field: []const u8) ?[]const u8 {
+    var field_buf: [128]u8 = undefined;
+    const target = std.fmt.bufPrint(&field_buf, "\"{s}\"", .{field}) catch return null;
+    const key_pos = std.mem.indexOf(u8, json, target) orelse return null;
+    const after_key = json[key_pos + target.len ..];
+    const colon_pos = std.mem.indexOfScalar(u8, after_key, ':') orelse return null;
+    const after_colon = std.mem.trimStart(u8, after_key[colon_pos + 1 ..], " \t\r\n");
+    if (after_colon.len == 0) return null;
+
+    if (after_colon[0] == '"') {
+        var i: usize = 1;
+        while (i < after_colon.len) : (i += 1) {
+            if (after_colon[i] == '\\' and i + 1 < after_colon.len) {
+                i += 1;
+            } else if (after_colon[i] == '"') {
+                return after_colon[1..i];
+            }
+        }
+        return null;
+    } else {
+        var i: usize = 0;
+        while (i < after_colon.len) : (i += 1) {
+            const c = after_colon[i];
+            if (c == ',' or c == '}' or c == ']' or c == ' ' or c == '\t' or c == '\r' or c == '\n') {
+                break;
+            }
+        }
+        if (i > 0) return after_colon[0..i];
+        return null;
+    }
+}
+
+fn unescapeJsonString(input: []const u8, out: []u8) usize {
+    var in_idx: usize = 0;
+    var out_idx: usize = 0;
+    while (in_idx < input.len and out_idx < out.len) {
+        if (input[in_idx] == '\\' and in_idx + 1 < input.len) {
+            in_idx += 1;
+            switch (input[in_idx]) {
+                'n' => out[out_idx] = '\n',
+                'r' => out[out_idx] = '\r',
+                't' => out[out_idx] = '\t',
+                '"' => out[out_idx] = '"',
+                '\\' => out[out_idx] = '\\',
+                else => out[out_idx] = input[in_idx],
+            }
+            in_idx += 1;
+            out_idx += 1;
+        } else {
+            out[out_idx] = input[in_idx];
+            in_idx += 1;
+            out_idx += 1;
+        }
+    }
+    return out_idx;
+}
+
+const ShellResult = struct {
+    exit_code: u8,
+    stdout: []const u8,
+    stderr: []const u8,
+};
+
+fn executeShellCommand(
+    command: []const u8,
+    out_buf: []u8,
+    err_buf: []u8,
+) ShellResult {
+    const is_win = comptime @import("builtin").os.tag == .windows;
+    const argv: []const []const u8 = if (is_win)
+        &.{ "cmd.exe", "/c", command }
+    else
+        &.{ "/bin/sh", "-c", command };
+
+    var child = spawnChild(.{
+        .argv = argv,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    }) catch {
+        const err_msg = "failed to spawn shell process";
+        const copy_len = @min(err_msg.len, err_buf.len);
+        @memcpy(err_buf[0..copy_len], err_msg[0..copy_len]);
+        return .{
+            .exit_code = 127,
+            .stdout = "",
+            .stderr = err_buf[0..copy_len],
+        };
+    };
+    defer child.kill(zio());
+
+    const out_read = if (child.stdout) |f| readAll(f, out_buf) catch 0 else 0;
+    const err_read = if (child.stderr) |f| readAll(f, err_buf) catch 0 else 0;
+
+    const term = child.wait(zio()) catch {
+        return .{
+            .exit_code = 1,
+            .stdout = out_buf[0..out_read],
+            .stderr = err_buf[0..err_read],
+        };
+    };
+
+    const code = childExitCode(term) orelse 1;
+    return .{
+        .exit_code = code,
+        .stdout = out_buf[0..out_read],
+        .stderr = err_buf[0..err_read],
+    };
+}
+
+fn cmdSend(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
+    const stdout = getStdOut();
+    const stderr = getStdErr();
+
+    if (args.len < 2) {
+        try stderr.writeStreamingAll(zio(), "usage: meshguard send <peer-pubkey-hex-or-b64> <message...>\n");
+        std.process.exit(1);
+    }
+
+    const peer_key = args[0];
+    const message = try std.mem.join(allocator, " ", args[1..]);
+    defer allocator.free(message);
+
+    var cmd_buf: [2048]u8 = undefined;
+    const cmd = std.fmt.bufPrint(&cmd_buf, "SEND {s} {s}\n", .{ peer_key, message }) catch {
+        try stderr.writeStreamingAll(zio(), "error: message payload too large (max 1024 bytes)\n");
+        std.process.exit(1);
+    };
+
+    var resp_buf: [1024]u8 = undefined;
+    const resp_len = lib.services.Control.sendControlCommand(allocator, cmd, &resp_buf) catch |err| {
+        try writeFormatted(stderr, "error: failed to communicate with meshguard daemon: {s}\n", .{@errorName(err)});
+        try stderr.writeStreamingAll(zio(), "  hint: ensure meshguard daemon is running ('meshguard up')\n");
+        std.process.exit(1);
+    };
+
+    const resp = resp_buf[0..resp_len];
+    if (std.mem.indexOf(u8, resp, "\"ok\":true") != null) {
+        try stdout.writeStreamingAll(zio(), "✓ Message sent.\n");
+    } else {
+        if (findJsonStringField(resp, "error")) |err_desc| {
+            try writeFormatted(stderr, "error: {s}\n", .{err_desc});
+        } else {
+            try writeFormatted(stderr, "error: {s}\n", .{resp});
+        }
+        std.process.exit(1);
+    }
+}
+
+fn cmdRecv(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
+    const stdout = getStdOut();
+    const stderr = getStdErr();
+
+    var wait_ms: u32 = 0;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--wait") and i + 1 < args.len) {
+            i += 1;
+            wait_ms = std.fmt.parseInt(u32, args[i], 10) catch 0;
+        }
+    }
+
+    var cmd_buf: [64]u8 = undefined;
+    const cmd = std.fmt.bufPrint(&cmd_buf, "RECV {d}\n", .{wait_ms}) catch "RECV\n";
+
+    var resp_buf: [4096]u8 = undefined;
+    const resp_len = lib.services.Control.sendControlCommand(allocator, cmd, &resp_buf) catch |err| {
+        try writeFormatted(stderr, "error: failed to communicate with meshguard daemon: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+
+    const resp = resp_buf[0..resp_len];
+    if (std.mem.indexOf(u8, resp, "\"empty\":true") != null) {
+        try stdout.writeStreamingAll(zio(), "(no messages)\n");
+        return;
+    }
+
+    if (findJsonStringField(resp, "error")) |err_desc| {
+        try writeFormatted(stderr, "error: {s}\n", .{err_desc});
+        std.process.exit(1);
+    }
+
+    const sender = findJsonStringField(resp, "sender") orelse "unknown";
+    const data_raw = findJsonStringField(resp, "data") orelse "";
+
+    var unescaped: [2048]u8 = undefined;
+    const len = unescapeJsonString(data_raw, &unescaped);
+
+    try writeFormatted(stdout, "From: {s}\nPayload:\n{s}\n", .{ sender, unescaped[0..len] });
+}
+
+fn cmdInvite(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
+    const stdout = getStdOut();
+    const stderr = getStdErr();
+
+    var label: []const u8 = "grok-worker";
+    var seed: []const u8 = "187.16.79.234:51821";
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--name") and i + 1 < args.len) {
+            i += 1;
+            label = args[i];
+        } else if (std.mem.eql(u8, args[i], "--seed") and i + 1 < args.len) {
+            i += 1;
+            seed = args[i];
+        }
+    }
+
+    const config_dir = try lib.config.Config.ensureConfigDir(allocator);
+    defer allocator.free(config_dir);
+
+    const kp = Identity.load(allocator, config_dir) catch |err| {
+        try writeFormatted(stderr, "error: failed to load identity: {s}\n", .{@errorName(err)});
+        try stderr.writeStreamingAll(zio(), "  hint: run 'meshguard keygen' first\n");
+        std.process.exit(1);
+    };
+
+    const host_ed_pub = kp.public_key.toBytes();
+    const host_ed_hex = std.fmt.bytesToHex(host_ed_pub, .lower);
+
+    // Derive X25519 WG public key
+    const sk_bytes = kp.secret_key.seed();
+    var hash: [64]u8 = undefined;
+    std.crypto.hash.sha2.Sha512.hash(&sk_bytes, &hash, .{});
+    var wg_private_key: [32]u8 = hash[0..32].*;
+    wg_private_key[0] &= 248;
+    wg_private_key[31] &= 127;
+    wg_private_key[31] |= 64;
+    const wg_public_key = std.crypto.dh.X25519.recoverPublicKey(wg_private_key) catch {
+        try stderr.writeStreamingAll(zio(), "error: failed to derive WG key\n");
+        std.process.exit(1);
+    };
+    const host_wg_hex = std.fmt.bytesToHex(wg_public_key, .lower);
+
+    var json_buf: [512]u8 = undefined;
+    const json_str = try std.fmt.bufPrint(
+        &json_buf,
+        "{{\"host\":\"{s}\",\"wg\":\"{s}\",\"seed\":\"{s}\",\"name\":\"{s}\"}}",
+        .{ &host_ed_hex, &host_wg_hex, seed, label },
+    );
+
+    var token_buf: [1024]u8 = undefined;
+    const token_b64 = std.base64.url_safe_no_pad.Encoder.encode(&token_buf, json_str);
+
+    try stdout.writeStreamingAll(zio(), "\n================================================================\n");
+    try stdout.writeStreamingAll(zio(), "  MeshGuard Agent Invite Link (\"Google Meet for Agents\")\n");
+    try stdout.writeStreamingAll(zio(), "================================================================\n\n");
+    try writeFormatted(stdout, "Target Agent Label: {s}\n", .{label});
+    try writeFormatted(stdout, "Public Seed:        {s}\n", .{seed});
+    try writeFormatted(stdout, "Host Identity:      {s}\n\n", .{&host_ed_hex});
+    try writeFormatted(stdout, "Invite Token:\n  mgjoin://{s}\n\n", .{token_b64});
+    try stdout.writeStreamingAll(zio(), "Share this one-liner with Grok Bot or any remote cloud agent:\n\n");
+    try writeFormatted(stdout, "  curl -fsSL https://raw.githubusercontent.com/igorls/meshguard/main/dist/agent-join.sh | bash -s -- {s}\n\n", .{token_b64});
+    try stdout.writeStreamingAll(zio(), "Or if meshguard is already installed locally/remotely:\n");
+    try writeFormatted(stdout, "  meshguard join {s}\n", .{token_b64});
+    try stdout.writeStreamingAll(zio(), "================================================================\n\n");
+}
+
+fn cmdJoin(allocator: std.mem.Allocator, exe_path: []const u8, token_arg: []const u8) !void {
+    const stdout = getStdOut();
+    const stderr = getStdErr();
+
+    var raw_token = token_arg;
+    if (std.mem.startsWith(u8, raw_token, "mgjoin://")) {
+        raw_token = raw_token["mgjoin://".len..];
+    }
+
+    var json_buf: [1024]u8 = undefined;
+    const json_len = std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(raw_token) catch {
+        try stderr.writeStreamingAll(zio(), "error: invalid base64 invite token\n");
+        std.process.exit(1);
+    };
+    if (json_len > json_buf.len) {
+        try stderr.writeStreamingAll(zio(), "error: invite token too large\n");
+        std.process.exit(1);
+    }
+    std.base64.url_safe_no_pad.Decoder.decode(json_buf[0..json_len], raw_token) catch {
+        try stderr.writeStreamingAll(zio(), "error: failed to decode invite token\n");
+        std.process.exit(1);
+    };
+    const json = json_buf[0..json_len];
+
+    const host_hex = findJsonStringField(json, "host") orelse {
+        try stderr.writeStreamingAll(zio(), "error: invite token missing 'host'\n");
+        std.process.exit(1);
+    };
+    const seed = findJsonStringField(json, "seed") orelse "187.16.79.234:51821";
+    const name = findJsonStringField(json, "name") orelse "agent";
+
+    try stdout.writeStreamingAll(zio(), "\n[join] Decoded invite token:\n");
+    try writeFormatted(stdout, "  Session name:  {s}\n", .{name});
+    try writeFormatted(stdout, "  Host pubkey:   {s}\n", .{host_hex});
+    try writeFormatted(stdout, "  Seed address:  {s}\n", .{seed});
+
+    // Ensure local identity exists
+    const config_dir = try lib.config.Config.ensureConfigDir(allocator);
+    defer allocator.free(config_dir);
+
+    if (Identity.load(allocator, config_dir)) |_| {} else |_| {
+        try stdout.writeStreamingAll(zio(), "[join] Generating local identity keypair for this agent...\n");
+        const new_kp = Identity.generate();
+        Identity.save(allocator, config_dir, new_kp) catch |err| {
+            try writeFormatted(stderr, "warning: could not save identity: {s}\n", .{@errorName(err)});
+        };
+    }
+
+    // Check if daemon is running
+    var resp_buf: [2048]u8 = undefined;
+    var daemon_ready = false;
+    if (lib.services.Control.sendControlCommand(allocator, "STATUS", &resp_buf)) |len| {
+        if (std.mem.indexOf(u8, resp_buf[0..len], "\"running\":true") != null) {
+            daemon_ready = true;
+        }
+    } else |_| {}
+
+    if (!daemon_ready) {
+        try stdout.writeStreamingAll(zio(), "[join] Daemon not running, starting userspace daemon in background...\n");
+
+        _ = spawnChild(.{
+            .argv = &.{
+                exe_path,
+                "up",
+                "--no-tun",
+                "--seed",
+                seed,
+                "--open",
+            },
+            .stdout = .ignore,
+            .stderr = .ignore,
+        }) catch |err| {
+            try writeFormatted(stderr, "error: failed to start daemon: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+
+        // Wait for daemon to respond on control socket (up to 5 seconds)
+        var attempts: usize = 0;
+        while (attempts < 25) : (attempts += 1) {
+            std.Io.sleep(zio(), std.Io.Duration.fromNanoseconds(200 * std.time.ns_per_ms), .awake) catch {};
+            if (lib.services.Control.sendControlCommand(allocator, "STATUS", &resp_buf)) |len| {
+                if (std.mem.indexOf(u8, resp_buf[0..len], "\"running\":true") != null) {
+                    daemon_ready = true;
+                    break;
+                }
+            } else |_| {}
+        }
+
+        if (!daemon_ready) {
+            try stderr.writeStreamingAll(zio(), "error: timed out waiting for meshguard daemon to start\n");
+            std.process.exit(1);
+        }
+        try stdout.writeStreamingAll(zio(), "[join] ✓ Daemon started successfully.\n");
+    } else {
+        try stdout.writeStreamingAll(zio(), "[join] ✓ Using existing running meshguard daemon.\n");
+    }
+
+    // Wait for host to appear in PEERS (up to 10 seconds)
+    try stdout.writeStreamingAll(zio(), "[join] Discovering host via seed...\n");
+    var host_connected = false;
+    var peer_attempts: usize = 0;
+    while (peer_attempts < 50) : (peer_attempts += 1) {
+        if (lib.services.Control.sendControlCommand(allocator, "PEERS", &resp_buf)) |len| {
+            if (std.mem.indexOf(u8, resp_buf[0..len], host_hex) != null) {
+                host_connected = true;
+                break;
+            }
+        } else |_| {}
+        std.Io.sleep(zio(), std.Io.Duration.fromNanoseconds(200 * std.time.ns_per_ms), .awake) catch {};
+    }
+
+    if (host_connected) {
+        try stdout.writeStreamingAll(zio(), "[join] ✓ Host discovered in mesh!\n");
+    } else {
+        try stdout.writeStreamingAll(zio(), "[join] (waiting for host handshake to complete...)\n");
+    }
+
+    // Send greeting to host
+    var send_cmd_buf: [512]u8 = undefined;
+    const send_cmd = std.fmt.bufPrint(&send_cmd_buf, "SEND {s} {{\"type\":\"agent.joined\",\"name\":\"{s}\"}}\n", .{ host_hex, name }) catch unreachable;
+
+    _ = lib.services.Control.sendControlCommand(allocator, send_cmd, &resp_buf) catch |err| {
+        try writeFormatted(stderr, "warning: greeting send returned: {s}\n", .{@errorName(err)});
+    };
+    try stdout.writeStreamingAll(zio(), "[join] ✓ Sent 'agent.joined' greeting to host.\n");
+
+    const host_pub = parsePubkey(host_hex);
+    try runAgentLoop(allocator, host_pub);
+}
+
+fn cmdAgent(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
+    const stderr = getStdErr();
+    var host_filter: ?[32]u8 = null;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--host") and i + 1 < args.len) {
+            i += 1;
+            host_filter = parsePubkey(args[i]) orelse {
+                try stderr.writeStreamingAll(zio(), "error: invalid host public key\n");
+                std.process.exit(1);
+            };
+        }
+    }
+
+    try runAgentLoop(allocator, host_filter);
+}
+
+fn runAgentLoop(allocator: std.mem.Allocator, host_filter: ?[32]u8) !void {
+    const stdout = getStdOut();
+    try stdout.writeStreamingAll(zio(), "\n[agent] Worker loop active, listening for encrypted tasks...\n");
+    try stdout.writeStreamingAll(zio(), "[agent] Press Ctrl+C to stop.\n\n");
+
+    var resp_buf: [4096]u8 = undefined;
+
+    while (true) {
+        // Poll for message with 2s timeout
+        const resp_len = lib.services.Control.sendControlCommand(allocator, "RECV 2000", &resp_buf) catch |err| {
+            try writeFormatted(stdout, "[agent] Control socket error: {s}. Retrying in 1s...\n", .{@errorName(err)});
+            std.Io.sleep(zio(), std.Io.Duration.fromNanoseconds(1000 * std.time.ns_per_ms), .awake) catch {};
+            continue;
+        };
+
+        const resp = resp_buf[0..resp_len];
+        if (std.mem.indexOf(u8, resp, "\"empty\":true") != null) {
+            continue;
+        }
+
+        const sender_hex = findJsonStringField(resp, "sender") orelse continue;
+        const data_raw = findJsonStringField(resp, "data") orelse continue;
+
+        const sender_pub = parsePubkey(sender_hex) orelse continue;
+        if (host_filter) |filter| {
+            if (!std.mem.eql(u8, &sender_pub, &filter)) {
+                continue; // Ignore messages not from our session host
+            }
+        }
+
+        var unescaped_buf: [2048]u8 = undefined;
+        const unescaped_len = unescapeJsonString(data_raw, &unescaped_buf);
+        const payload = unescaped_buf[0..unescaped_len];
+
+        const task_id = findJsonStringField(payload, "id") orelse "task";
+        const command = findJsonStringField(payload, "command") orelse {
+            if (std.mem.indexOf(u8, payload, "agent.joined") != null) {
+                try writeFormatted(stdout, "[agent] Peer {s} joined.\n", .{sender_hex});
+            } else {
+                try writeFormatted(stdout, "[agent] Received non-command message from {s}: {s}\n", .{ sender_hex, payload });
+            }
+            continue;
+        };
+
+        try writeFormatted(stdout, "[agent] Task received (id={s}): {s}\n", .{ task_id, command });
+
+        var exec_out_buf: [2048]u8 = undefined;
+        var exec_err_buf: [1024]u8 = undefined;
+        const exec_result = executeShellCommand(command, &exec_out_buf, &exec_err_buf);
+
+        try writeFormatted(stdout, "[agent] Completed with exit code {d}. Sending reply...\n", .{exec_result.exit_code});
+
+        var reply_buf: [4096]u8 = undefined;
+        var pos: usize = 0;
+        const rep_pre = std.fmt.bufPrint(&reply_buf, "{{\"type\":\"agent.reply\",\"id\":\"{s}\",\"exit_code\":{d},\"stdout\":\"", .{
+            task_id,
+            exec_result.exit_code,
+        }) catch continue;
+        pos += rep_pre.len;
+
+        _ = appendJsonEscaped(&reply_buf, &pos, exec_result.stdout);
+
+        const rep_mid = "\",\"stderr\":\"";
+        @memcpy(reply_buf[pos..][0..rep_mid.len], rep_mid);
+        pos += rep_mid.len;
+
+        _ = appendJsonEscaped(&reply_buf, &pos, exec_result.stderr);
+
+        const rep_post = "\"}\n";
+        @memcpy(reply_buf[pos..][0..rep_post.len], rep_post);
+        pos += rep_post.len;
+
+        var send_cmd_buf: [4096]u8 = undefined;
+        const send_cmd = std.fmt.bufPrint(&send_cmd_buf, "SEND {s} {s}", .{ sender_hex, reply_buf[0..pos] }) catch continue;
+
+        var send_resp: [512]u8 = undefined;
+        _ = lib.services.Control.sendControlCommand(allocator, send_cmd, &send_resp) catch |err| {
+            try writeFormatted(stdout, "[agent] Failed to send reply: {s}\n", .{@errorName(err)});
+            continue;
+        };
+
+        try writeFormatted(stdout, "[agent] ✓ Reply sent to {s}.\n", .{sender_hex});
+    }
+}
+
