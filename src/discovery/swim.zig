@@ -803,7 +803,7 @@ pub const SwimProtocol = struct {
         var dest_key: [32]u8 = undefined;
         @memcpy(&dest_key, dest_pubkey);
         const peer = self.membership.peers.get(dest_key) orelse return;
-        const ep = peer.gossip_endpoint orelse return;
+        const ep = peer.gossip_endpoint orelse peer.public_endpoint orelse return;
 
         // Forward the entire message as-is (encrypted, we can't read it)
         self.gossipSend(data, ep);

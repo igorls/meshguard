@@ -26,6 +26,7 @@ const messages = @import("../protocol/messages.zig");
 const X25519 = std.crypto.dh.X25519;
 const ChaCha20Poly1305 = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
 const crypto = @import("../wireguard/crypto.zig");
+const Relay = @import("../nat/relay.zig");
 
 const unix_peer = if (has_getpeereid) struct {
     extern "c" fn getpeereid(socket: c_int, euid: *std.c.uid_t, egid: *std.c.gid_t) c_int;
@@ -213,6 +214,118 @@ pub fn parsePubkey(input: []const u8) ?[32]u8 {
         } else |_| {}
     }
     return null;
+}
+
+pub fn findJsonStringField(json: []const u8, field: []const u8) ?[]const u8 {
+    var in_string = false;
+    var escape = false;
+    var depth: usize = 0;
+    var i: usize = 0;
+
+    while (i < json.len) : (i += 1) {
+        const c = json[i];
+        if (escape) {
+            escape = false;
+            continue;
+        }
+        if (c == '\\' and in_string) {
+            escape = true;
+            continue;
+        }
+        if (c == '"') {
+            in_string = !in_string;
+            if (in_string and depth == 1) {
+                const key_start = i + 1;
+                var j = key_start;
+                var key_escape = false;
+                while (j < json.len) : (j += 1) {
+                    if (key_escape) {
+                        key_escape = false;
+                        continue;
+                    }
+                    if (json[j] == '\\') {
+                        key_escape = true;
+                        continue;
+                    }
+                    if (json[j] == '"') break;
+                }
+                if (j < json.len) {
+                    const key = json[key_start..j];
+                    i = j;
+                    in_string = false;
+
+                    var k = j + 1;
+                    while (k < json.len and (json[k] == ' ' or json[k] == '\t' or json[k] == '\r' or json[k] == '\n')) : (k += 1) {}
+                    if (k < json.len and json[k] == ':') {
+                        k += 1;
+                        while (k < json.len and (json[k] == ' ' or json[k] == '\t' or json[k] == '\r' or json[k] == '\n')) : (k += 1) {}
+                        if (std.mem.eql(u8, key, field)) {
+                            if (k < json.len and json[k] == '"') {
+                                const val_start = k + 1;
+                                var v = val_start;
+                                var val_esc = false;
+                                while (v < json.len) : (v += 1) {
+                                    if (val_esc) {
+                                        val_esc = false;
+                                        continue;
+                                    }
+                                    if (json[v] == '\\') {
+                                        val_esc = true;
+                                        continue;
+                                    }
+                                    if (json[v] == '"') return json[val_start..v];
+                                }
+                                return null;
+                            } else {
+                                const val_start = k;
+                                var v = val_start;
+                                while (v < json.len) : (v += 1) {
+                                    const vc = json[v];
+                                    if (vc == ',' or vc == '}' or vc == ']' or vc == ' ' or vc == '\t' or vc == '\r' or vc == '\n') break;
+                                }
+                                if (v > val_start) return json[val_start..v];
+                                return null;
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        if (!in_string) {
+            if (c == '{' or c == '[') {
+                depth += 1;
+            } else if (c == '}' or c == ']') {
+                if (depth > 0) depth -= 1;
+            }
+        }
+    }
+    return null;
+}
+
+pub fn unescapeJsonString(input: []const u8, out: []u8) usize {
+    var in_idx: usize = 0;
+    var out_idx: usize = 0;
+    while (in_idx < input.len and out_idx < out.len) {
+        if (input[in_idx] == '\\' and in_idx + 1 < input.len) {
+            in_idx += 1;
+            switch (input[in_idx]) {
+                'n' => out[out_idx] = '\n',
+                'r' => out[out_idx] = '\r',
+                't' => out[out_idx] = '\t',
+                '"' => out[out_idx] = '"',
+                '\\' => out[out_idx] = '\\',
+                else => out[out_idx] = input[in_idx],
+            }
+            in_idx += 1;
+            out_idx += 1;
+        } else {
+            out[out_idx] = input[in_idx];
+            in_idx += 1;
+            out_idx += 1;
+        }
+    }
+    return out_idx;
 }
 
 pub const ControlSocket = struct {
@@ -558,44 +671,30 @@ pub const ControlSocket = struct {
     }
 
     fn handleRecv(self: *ControlSocket, timeout_ms: u32, resp_buf: []u8) usize {
-        var now_ms = nowMilliSecs();
-        const deadline_ms = now_ms + @as(i64, timeout_ms);
+        _ = timeout_ms;
+        if (self.popMessage()) |msg| {
+            var pos: usize = 0;
+            const prefix = "{\"ok\":true,\"sender\":\"";
+            @memcpy(resp_buf[pos..][0..prefix.len], prefix);
+            pos += prefix.len;
 
-        while (true) {
-            if (self.popMessage()) |msg| {
-                var pos: usize = 0;
-                const prefix = "{\"ok\":true,\"sender\":\"";
-                @memcpy(resp_buf[pos..][0..prefix.len], prefix);
-                pos += prefix.len;
+            const hex = std.fmt.bytesToHex(msg.sender_pubkey, .lower);
+            @memcpy(resp_buf[pos..][0..hex.len], &hex);
+            pos += hex.len;
 
-                const hex = std.fmt.bytesToHex(msg.sender_pubkey, .lower);
-                @memcpy(resp_buf[pos..][0..hex.len], &hex);
-                pos += hex.len;
+            const data_pre = "\",\"data\":\"";
+            @memcpy(resp_buf[pos..][0..data_pre.len], data_pre);
+            pos += data_pre.len;
 
-                const data_pre = "\",\"data\":\"";
-                @memcpy(resp_buf[pos..][0..data_pre.len], data_pre);
-                pos += data_pre.len;
-
-                if (!appendJsonEscaped(resp_buf, &pos, msg.data[0..msg.len])) {
-                    return formatError(resp_buf, "response buffer overflow");
-                }
-
-                const suffix = std.fmt.bufPrint(resp_buf[pos..], "\",\"timestamp\":{d}}}\n", .{msg.timestamp}) catch {
-                    return formatError(resp_buf, "response formatting error");
-                };
-                pos += suffix.len;
-                return pos;
+            if (!appendJsonEscaped(resp_buf, &pos, msg.data[0..msg.len])) {
+                return formatError(resp_buf, "response buffer overflow");
             }
 
-            now_ms = nowMilliSecs();
-            if (now_ms >= deadline_ms) break;
-
-            if (self.tick_fn) |tick| {
-                if (self.tick_ctx) |ctx| {
-                    tick(ctx);
-                }
-            }
-            std.Io.sleep(zio(), std.Io.Duration.fromNanoseconds(10 * std.time.ns_per_ms), .awake) catch {};
+            const suffix = std.fmt.bufPrint(resp_buf[pos..], "\",\"timestamp\":{d}}}\n", .{msg.timestamp}) catch {
+                return formatError(resp_buf, "response formatting error");
+            };
+            pos += suffix.len;
+            return pos;
         }
 
         const empty_msg = "{\"empty\":true}\n";
@@ -671,8 +770,8 @@ pub const ControlSocket = struct {
             return formatError(resp_buf, "peer wireguard key not known yet");
         };
 
-        const peer_ep = peer.gossip_endpoint orelse {
-            return formatError(resp_buf, "peer gossip endpoint not known");
+        const peer_ep = peer.gossip_endpoint orelse peer.public_endpoint orelse {
+            return formatError(resp_buf, "peer endpoint not known");
         };
 
         var msg_buf: [1 + 32 + 32 + 12 + MAX_MESSAGE_PAYLOAD + 16]u8 = undefined;
@@ -706,7 +805,20 @@ pub const ControlSocket = struct {
             return formatError(resp_buf, "daemon sender not configured");
         };
 
-        if (!send_fn(self.send_ctx.?, msg_buf[0..total_len], peer_ep)) {
+        const sent_direct = send_fn(self.send_ctx.?, msg_buf[0..total_len], peer_ep);
+        var sent_relay = false;
+
+        if (peer.nat_type != .public) {
+            if (Relay.selectRelayForPair(&self.membership.peers, self.our_pubkey, dest_key)) |relay| {
+                if (relay.gossip_endpoint orelse relay.public_endpoint) |relay_ep| {
+                    if (!std.mem.eql(u8, &relay.pubkey, &dest_key)) {
+                        sent_relay = send_fn(self.send_ctx.?, msg_buf[0..total_len], relay_ep);
+                    }
+                }
+            }
+        }
+
+        if (!sent_direct and !sent_relay) {
             return formatError(resp_buf, "udp transmission failed");
         }
 
@@ -1146,3 +1258,97 @@ test "ControlSocket handleCommand RECV with queued message" {
     try std.testing.expect(std.mem.indexOf(u8, resp, "42424242") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "hello \\\"agent\\\"\\nnew line") != null);
 }
+
+test "findJsonStringField ignores nested fields inside string values" {
+    const json = "{\"command\":\"curl http://host -d '{\\\"id\\\": 999}'\", \"id\":\"real_task_42\", \"num\":123}";
+
+    const cmd = findJsonStringField(json, "command");
+    try std.testing.expect(cmd != null);
+    try std.testing.expectEqualStrings("curl http://host -d '{\\\"id\\\": 999}'", cmd.?);
+
+    // Crucial check: top-level id is found, NOT the nested id inside command!
+    const id = findJsonStringField(json, "id");
+    try std.testing.expect(id != null);
+    try std.testing.expectEqualStrings("real_task_42", id.?);
+
+    const num = findJsonStringField(json, "num");
+    try std.testing.expect(num != null);
+    try std.testing.expectEqualStrings("123", num.?);
+
+    const nonexistent = findJsonStringField(json, "nonexistent");
+    try std.testing.expect(nonexistent == null);
+}
+
+test "unescapeJsonString decodes escapes correctly" {
+    const raw = "hello\\nworld\\r\\t\\\"test\\\\";
+    var buf: [64]u8 = undefined;
+    const len = unescapeJsonString(raw, &buf);
+    try std.testing.expectEqualStrings("hello\nworld\r\t\"test\\", buf[0..len]);
+}
+
+test "ControlSocket handleSend falls back to public_endpoint" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 10);
+    defer membership.deinit();
+
+    const peer_pk = [_]u8{0x77} ** 32;
+    const peer_wg = [_]u8{0x88} ** 32;
+    const pub_ep = messages.Endpoint.initV4(.{ 192, 168, 1, 50 }, 51820);
+
+    try membership.upsert(.{
+        .pubkey = peer_pk,
+        .name = "",
+        .state = .alive,
+        .gossip_endpoint = null, // gossip endpoint is null!
+        .public_endpoint = pub_ep, // but public endpoint is known!
+        .wg_pubkey = peer_wg,
+        .mesh_ip = .{ 10, 99, 0, 77 },
+        .mesh_ip6 = .{0} ** 16,
+        .wg_port = 51830,
+        .lamport = 1,
+        .last_seen_ns = 1,
+        .suspected_at_ns = null,
+        .last_rtt_ns = null,
+        .handshake_complete = false,
+    });
+
+    var control = ControlSocket.init(
+        allocator,
+        &membership,
+        [_]u8{1} ** 32,
+        .{ 10, 99, 0, 1 },
+        [_]u8{2} ** 32,
+        "dummy.sock",
+    );
+    defer control.deinit(allocator);
+
+    const DummySender = struct {
+        sent: bool = false,
+        sent_to: ?messages.Endpoint = null,
+
+        fn send(ctx_ptr: *anyopaque, data: []const u8, ep: messages.Endpoint) bool {
+            _ = data;
+            const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            self.sent = true;
+            self.sent_to = ep;
+            return true;
+        }
+    };
+
+    var dummy = DummySender{};
+    control.setSendHandler(&dummy, DummySender.send);
+
+    var resp_buf: [512]u8 = undefined;
+    const pk_hex = std.fmt.bytesToHex(peer_pk, .lower);
+    var cmd_buf: [128]u8 = undefined;
+    const cmd = std.fmt.bufPrint(&cmd_buf, "SEND {s} test-payload", .{&pk_hex}) catch unreachable;
+
+    const len = control.handleCommand(cmd, &resp_buf);
+    const resp = resp_buf[0..len];
+
+    // Must succeed (fallback to public_endpoint), not fail with "peer gossip endpoint not known"
+    try std.testing.expectEqualStrings("{\"ok\":true}\n", resp);
+    try std.testing.expect(dummy.sent);
+    try std.testing.expectEqual(pub_ep.port, dummy.sent_to.?.port);
+}
+

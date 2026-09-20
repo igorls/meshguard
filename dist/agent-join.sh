@@ -29,45 +29,59 @@ if [ -z "$MESHGUARD" ]; then
   OS="$(uname -s)"
   ARCH="$(uname -m)"
 
-  ASSET="meshguard-linux-amd64-static"
-  if [ "$OS" = "Linux" ]; then
-    case "$ARCH" in
-      x86_64|amd64)
-        ASSET="meshguard-linux-amd64-static"
-        ;;
-      aarch64|arm64)
-        ASSET="meshguard-linux-arm64-static"
-        ;;
-      *)
-        ASSET="meshguard-linux-amd64-static"
-        ;;
-    esac
-  elif [ "$OS" = "Darwin" ]; then
-    case "$ARCH" in
-      arm64)
-        ASSET="meshguard-macos-arm64"
-        ;;
-      *)
-        ASSET="meshguard-macos-amd64"
-        ;;
-    esac
+  TARGET_DIR="."
+  if [ ! -w "$TARGET_DIR" ]; then
+    TARGET_DIR="/tmp"
   fi
 
+  BIN_NAME="meshguard"
+  ASSET="meshguard-linux-amd64-static"
+  case "$OS" in
+    Linux)
+      case "$ARCH" in
+        x86_64|amd64)
+          ASSET="meshguard-linux-amd64-static"
+          ;;
+        aarch64|arm64)
+          ASSET="meshguard-linux-arm64-static"
+          ;;
+        *)
+          ASSET="meshguard-linux-amd64-static"
+          ;;
+      esac
+      ;;
+    Darwin)
+      case "$ARCH" in
+        arm64)
+          ASSET="meshguard-macos-arm64"
+          ;;
+        *)
+          ASSET="meshguard-macos-amd64"
+          ;;
+      esac
+      ;;
+    MINGW*|MSYS*|CYGWIN*|Windows_NT)
+      ASSET="meshguard-windows-amd64.exe"
+      BIN_NAME="meshguard.exe"
+      ;;
+  esac
+
+  TARGET_BIN="$TARGET_DIR/$BIN_NAME"
   URL="https://github.com/igorls/meshguard/releases/download/v0.9.0/${ASSET}"
-  echo "[agent-join] Fetching $URL -> ./meshguard..."
+  echo "[agent-join] Fetching $URL -> $TARGET_BIN..."
 
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$URL" -o ./meshguard
+    curl -fsSL "$URL" -o "$TARGET_BIN"
   elif command -v wget >/dev/null 2>&1; then
-    wget -qO ./meshguard "$URL"
+    wget -qO "$TARGET_BIN" "$URL"
   else
     echo "Error: curl or wget is required to download meshguard."
     exit 1
   fi
 
-  chmod +x ./meshguard
-  MESHGUARD="./meshguard"
-  echo "[agent-join] ✓ Binary ready: ./meshguard"
+  chmod +x "$TARGET_BIN"
+  MESHGUARD="$TARGET_BIN"
+  echo "[agent-join] ✓ Binary ready: $TARGET_BIN"
 fi
 
 echo "[agent-join] Joining MeshGuard room..."

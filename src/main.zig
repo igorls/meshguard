@@ -2083,6 +2083,30 @@ fn wgOnPeerPunched(ctx: *anyopaque, peer: *const lib.discovery.Membership.Peer, 
     }
 }
 
+var recent_app_nonces: [128][12]u8 = undefined;
+var recent_app_nonces_head: usize = 0;
+var recent_app_nonces_count: usize = 0;
+var recent_app_nonces_lock: std.Io.Mutex = .init;
+
+fn isDuplicateAppNonce(nonce: [12]u8) bool {
+    recent_app_nonces_lock.lockUncancelable(zio());
+    defer recent_app_nonces_lock.unlock(zio());
+
+    var i: usize = 0;
+    while (i < recent_app_nonces_count) : (i += 1) {
+        if (std.mem.eql(u8, &recent_app_nonces[i], &nonce)) {
+            return true;
+        }
+    }
+
+    recent_app_nonces[recent_app_nonces_head] = nonce;
+    recent_app_nonces_head = (recent_app_nonces_head + 1) % recent_app_nonces.len;
+    if (recent_app_nonces_count < recent_app_nonces.len) {
+        recent_app_nonces_count += 1;
+    }
+    return false;
+}
+
 fn wgOnAppMessage(ctx: *anyopaque, data: []const u8) void {
     const handler: *WgHandlerCtx = @ptrCast(@alignCast(ctx));
     const control = handler.control_socket orelse return;
@@ -2093,6 +2117,7 @@ fn wgOnAppMessage(ctx: *anyopaque, data: []const u8) void {
     // Wire format: [0x50] [32B dest] [32B sender] [12B nonce] [N ciphertext] [16B tag]
     const sender_pubkey = data[33..65];
     const nonce: [12]u8 = data[65..77].*;
+    if (isDuplicateAppNonce(nonce)) return;
     const payload_len = data.len - 77 - 16;
     if (payload_len > 1024) return;
 
@@ -3103,7 +3128,12 @@ fn processRelayedWgPacket(
                 } else |_| {}
             }
         },
-        .wg_cookie, .stun, .swim, .unknown => {},
+        .swim => {
+            if (frame.payload.len > 0 and frame.payload[0] == 0x50) {
+                swim.feedPacketEndpoint(frame.payload, relay_endpoint);
+            }
+        },
+        .wg_cookie, .stun, .unknown => {},
     }
 }
 
@@ -5035,35 +5065,90 @@ const parsePubkey = lib.services.Control.parsePubkey;
 const appendJsonEscaped = lib.services.Control.appendJsonEscaped;
 
 fn findJsonStringField(json: []const u8, field: []const u8) ?[]const u8 {
-    var field_buf: [128]u8 = undefined;
-    const target = std.fmt.bufPrint(&field_buf, "\"{s}\"", .{field}) catch return null;
-    const key_pos = std.mem.indexOf(u8, json, target) orelse return null;
-    const after_key = json[key_pos + target.len ..];
-    const colon_pos = std.mem.indexOfScalar(u8, after_key, ':') orelse return null;
-    const after_colon = std.mem.trimStart(u8, after_key[colon_pos + 1 ..], " \t\r\n");
-    if (after_colon.len == 0) return null;
+    var in_string = false;
+    var escape = false;
+    var depth: usize = 0;
+    var i: usize = 0;
 
-    if (after_colon[0] == '"') {
-        var i: usize = 1;
-        while (i < after_colon.len) : (i += 1) {
-            if (after_colon[i] == '\\' and i + 1 < after_colon.len) {
-                i += 1;
-            } else if (after_colon[i] == '"') {
-                return after_colon[1..i];
+    while (i < json.len) : (i += 1) {
+        const c = json[i];
+        if (escape) {
+            escape = false;
+            continue;
+        }
+        if (c == '\\' and in_string) {
+            escape = true;
+            continue;
+        }
+        if (c == '"') {
+            in_string = !in_string;
+            if (in_string and depth == 1) {
+                const key_start = i + 1;
+                var j = key_start;
+                var key_escape = false;
+                while (j < json.len) : (j += 1) {
+                    if (key_escape) {
+                        key_escape = false;
+                        continue;
+                    }
+                    if (json[j] == '\\') {
+                        key_escape = true;
+                        continue;
+                    }
+                    if (json[j] == '"') break;
+                }
+                if (j < json.len) {
+                    const key = json[key_start..j];
+                    i = j;
+                    in_string = false;
+
+                    var k = j + 1;
+                    while (k < json.len and (json[k] == ' ' or json[k] == '\t' or json[k] == '\r' or json[k] == '\n')) : (k += 1) {}
+                    if (k < json.len and json[k] == ':') {
+                        k += 1;
+                        while (k < json.len and (json[k] == ' ' or json[k] == '\t' or json[k] == '\r' or json[k] == '\n')) : (k += 1) {}
+                        if (std.mem.eql(u8, key, field)) {
+                            if (k < json.len and json[k] == '"') {
+                                const val_start = k + 1;
+                                var v = val_start;
+                                var val_esc = false;
+                                while (v < json.len) : (v += 1) {
+                                    if (val_esc) {
+                                        val_esc = false;
+                                        continue;
+                                    }
+                                    if (json[v] == '\\') {
+                                        val_esc = true;
+                                        continue;
+                                    }
+                                    if (json[v] == '"') return json[val_start..v];
+                                }
+                                return null;
+                            } else {
+                                const val_start = k;
+                                var v = val_start;
+                                while (v < json.len) : (v += 1) {
+                                    const vc = json[v];
+                                    if (vc == ',' or vc == '}' or vc == ']' or vc == ' ' or vc == '\t' or vc == '\r' or vc == '\n') break;
+                                }
+                                if (v > val_start) return json[val_start..v];
+                                return null;
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        if (!in_string) {
+            if (c == '{' or c == '[') {
+                depth += 1;
+            } else if (c == '}' or c == ']') {
+                if (depth > 0) depth -= 1;
             }
         }
-        return null;
-    } else {
-        var i: usize = 0;
-        while (i < after_colon.len) : (i += 1) {
-            const c = after_colon[i];
-            if (c == ',' or c == '}' or c == ']' or c == ' ' or c == '\t' or c == '\r' or c == '\n') {
-                break;
-            }
-        }
-        if (i > 0) return after_colon[0..i];
-        return null;
     }
+    return null;
 }
 
 fn unescapeJsonString(input: []const u8, out: []u8) usize {
@@ -5097,6 +5182,33 @@ const ShellResult = struct {
     stderr: []const u8,
 };
 
+fn readCapped(file: std.Io.File, buf: []u8) usize {
+    var reader = file.reader(zio(), &.{});
+    var stored: usize = 0;
+    var scrap: [512]u8 = undefined;
+    while (true) {
+        if (stored < buf.len) {
+            const n = reader.interface.readSliceShort(buf[stored..]) catch break;
+            if (n == 0) break;
+            stored += n;
+        } else {
+            const n = reader.interface.readSliceShort(&scrap) catch break;
+            if (n == 0) break;
+        }
+    }
+    return stored;
+}
+
+const StderrReader = struct {
+    file: std.Io.File,
+    buf: []u8,
+    read: usize = 0,
+
+    fn run(self: *@This()) void {
+        self.read = readCapped(self.file, self.buf);
+    }
+};
+
 fn executeShellCommand(
     command: []const u8,
     out_buf: []u8,
@@ -5124,8 +5236,17 @@ fn executeShellCommand(
     };
     defer child.kill(zio());
 
-    const out_read = if (child.stdout) |f| readAll(f, out_buf) catch 0 else 0;
-    const err_read = if (child.stderr) |f| readAll(f, err_buf) catch 0 else 0;
+    var stderr_ctx = StderrReader{
+        .file = child.stderr.?,
+        .buf = err_buf,
+    };
+    const stderr_thread = std.Thread.spawn(.{}, StderrReader.run, .{&stderr_ctx}) catch null;
+
+    const out_read = if (child.stdout) |f| readCapped(f, out_buf) else 0;
+    if (stderr_thread) |t| {
+        t.join();
+    }
+    const err_read = if (stderr_thread != null) stderr_ctx.read else (if (child.stderr) |f| readCapped(f, err_buf) else 0);
 
     const term = child.wait(zio()) catch {
         return .{
@@ -5155,6 +5276,11 @@ fn cmdSend(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     const peer_key = args[0];
     const message = try std.mem.join(allocator, " ", args[1..]);
     defer allocator.free(message);
+
+    if (std.mem.indexOfAny(u8, message, "\r\n") != null) {
+        try stderr.writeStreamingAll(zio(), "error: message payload cannot contain unescaped newline characters. Please escape newlines as \\n.\n");
+        std.process.exit(1);
+    }
 
     var cmd_buf: [2048]u8 = undefined;
     const cmd = std.fmt.bufPrint(&cmd_buf, "SEND {s} {s}\n", .{ peer_key, message }) catch {
@@ -5197,33 +5323,39 @@ fn cmdRecv(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         }
     }
 
-    var cmd_buf: [64]u8 = undefined;
-    const cmd = std.fmt.bufPrint(&cmd_buf, "RECV {d}", .{wait_ms}) catch "RECV";
-
     var resp_buf: [4096]u8 = undefined;
-    const resp_len = lib.services.Control.sendControlCommand(allocator, cmd, &resp_buf) catch |err| {
-        try writeFormatted(stderr, "error: failed to communicate with meshguard daemon: {s}\n", .{@errorName(err)});
-        std.process.exit(1);
-    };
+    const start_ms = @as(i64, @intCast(std.Io.Timestamp.now(zio(), .real).toMilliseconds()));
+    const deadline_ms = start_ms + @as(i64, wait_ms);
 
-    const resp = resp_buf[0..resp_len];
-    if (std.mem.indexOf(u8, resp, "\"empty\":true") != null) {
-        try stdout.writeStreamingAll(zio(), "(no messages)\n");
-        return;
+    while (true) {
+        const resp_len = lib.services.Control.sendControlCommand(allocator, "RECV", &resp_buf) catch |err| {
+            try writeFormatted(stderr, "error: failed to communicate with meshguard daemon: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+
+        const resp = resp_buf[0..resp_len];
+        if (std.mem.indexOf(u8, resp, "\"empty\":true") == null) {
+            if (findJsonStringField(resp, "error")) |err_desc| {
+                try writeFormatted(stderr, "error: {s}\n", .{err_desc});
+                std.process.exit(1);
+            }
+
+            const sender = findJsonStringField(resp, "sender") orelse "unknown";
+            const data_raw = findJsonStringField(resp, "data") orelse "";
+
+            var unescaped: [2048]u8 = undefined;
+            const len = unescapeJsonString(data_raw, &unescaped);
+
+            try writeFormatted(stdout, "From: {s}\nPayload:\n{s}\n", .{ sender, unescaped[0..len] });
+            return;
+        }
+
+        const now_ms = @as(i64, @intCast(std.Io.Timestamp.now(zio(), .real).toMilliseconds()));
+        if (now_ms >= deadline_ms) break;
+        std.Io.sleep(zio(), std.Io.Duration.fromNanoseconds(100 * std.time.ns_per_ms), .awake) catch {};
     }
 
-    if (findJsonStringField(resp, "error")) |err_desc| {
-        try writeFormatted(stderr, "error: {s}\n", .{err_desc});
-        std.process.exit(1);
-    }
-
-    const sender = findJsonStringField(resp, "sender") orelse "unknown";
-    const data_raw = findJsonStringField(resp, "data") orelse "";
-
-    var unescaped: [2048]u8 = undefined;
-    const len = unescapeJsonString(data_raw, &unescaped);
-
-    try writeFormatted(stdout, "From: {s}\nPayload:\n{s}\n", .{ sender, unescaped[0..len] });
+    try stdout.writeStreamingAll(zio(), "(no messages)\n");
 }
 
 fn cmdInvite(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
@@ -5270,14 +5402,22 @@ fn cmdInvite(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     };
     const host_wg_hex = std.fmt.bytesToHex(wg_public_key, .lower);
 
-    var json_buf: [512]u8 = undefined;
-    const json_str = try std.fmt.bufPrint(
-        &json_buf,
-        "{{\"host\":\"{s}\",\"wg\":\"{s}\",\"seed\":\"{s}\",\"name\":\"{s}\"}}",
-        .{ &host_ed_hex, &host_wg_hex, seed, label },
-    );
+    var json_buf: [1024]u8 = undefined;
+    var json_pos: usize = 0;
+    const pre = std.fmt.bufPrint(&json_buf, "{{\"host\":\"{s}\",\"wg\":\"{s}\",\"seed\":\"", .{ &host_ed_hex, &host_wg_hex }) catch unreachable;
+    json_pos += pre.len;
+    _ = appendJsonEscaped(&json_buf, &json_pos, seed);
+    const mid = "\",\"name\":\"";
+    @memcpy(json_buf[json_pos..][0..mid.len], mid);
+    json_pos += mid.len;
+    _ = appendJsonEscaped(&json_buf, &json_pos, label);
+    const post = "\"}\n";
+    @memcpy(json_buf[json_pos..][0..post.len], post);
+    json_pos += post.len;
 
-    var token_buf: [1024]u8 = undefined;
+    const json_str = json_buf[0..json_pos];
+
+    var token_buf: [2048]u8 = undefined;
     const token_b64 = std.base64.url_safe_no_pad.Encoder.encode(&token_buf, json_str);
 
     try stdout.writeStreamingAll(zio(), "\n================================================================\n");
@@ -5303,19 +5443,46 @@ fn cmdJoin(allocator: std.mem.Allocator, exe_path: []const u8, token_arg: []cons
         raw_token = raw_token["mgjoin://".len..];
     }
 
-    var json_buf: [1024]u8 = undefined;
-    const json_len = std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(raw_token) catch {
+    var json_buf: [2048]u8 = undefined;
+    var json_len: usize = 0;
+    var decoded = false;
+
+    if (std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(raw_token)) |sz| {
+        if (sz <= json_buf.len) {
+            if (std.base64.url_safe_no_pad.Decoder.decode(json_buf[0..sz], raw_token)) |_| {
+                json_len = sz;
+                decoded = true;
+            } else |_| {}
+        }
+    } else |_| {}
+
+    if (!decoded) {
+        if (std.base64.standard.Decoder.calcSizeForSlice(raw_token)) |sz| {
+            if (sz <= json_buf.len) {
+                if (std.base64.standard.Decoder.decode(json_buf[0..sz], raw_token)) |_| {
+                    json_len = sz;
+                    decoded = true;
+                } else |_| {}
+            }
+        } else |_| {}
+    }
+
+    if (!decoded) {
+        if (std.base64.url_safe.Decoder.calcSizeForSlice(raw_token)) |sz| {
+            if (sz <= json_buf.len) {
+                if (std.base64.url_safe.Decoder.decode(json_buf[0..sz], raw_token)) |_| {
+                    json_len = sz;
+                    decoded = true;
+                } else |_| {}
+            }
+        } else |_| {}
+    }
+
+    if (!decoded) {
         try stderr.writeStreamingAll(zio(), "error: invalid base64 invite token\n");
         std.process.exit(1);
-    };
-    if (json_len > json_buf.len) {
-        try stderr.writeStreamingAll(zio(), "error: invite token too large\n");
-        std.process.exit(1);
     }
-    std.base64.url_safe_no_pad.Decoder.decode(json_buf[0..json_len], raw_token) catch {
-        try stderr.writeStreamingAll(zio(), "error: failed to decode invite token\n");
-        std.process.exit(1);
-    };
+
     const json = json_buf[0..json_len];
 
     const host_hex = findJsonStringField(json, "host") orelse {
@@ -5342,6 +5509,10 @@ fn cmdJoin(allocator: std.mem.Allocator, exe_path: []const u8, token_arg: []cons
         };
     }
 
+    // Resolve exact executable path
+    const self_exe = std.process.executablePathAlloc(zio(), allocator) catch exe_path;
+    defer if (!std.mem.eql(u8, self_exe, exe_path)) allocator.free(self_exe);
+
     // Check if daemon is running
     var resp_buf: [2048]u8 = undefined;
     var daemon_ready = false;
@@ -5356,7 +5527,7 @@ fn cmdJoin(allocator: std.mem.Allocator, exe_path: []const u8, token_arg: []cons
 
         _ = spawnChild(.{
             .argv = &.{
-                exe_path,
+                self_exe,
                 "up",
                 "--no-tun",
                 "--seed",
@@ -5391,34 +5562,29 @@ fn cmdJoin(allocator: std.mem.Allocator, exe_path: []const u8, token_arg: []cons
         try stdout.writeStreamingAll(zio(), "[join] ✓ Using existing running meshguard daemon.\n");
     }
 
-    // Wait for host to appear in PEERS (up to 10 seconds)
+    // Discover host via seed and send greeting
     try stdout.writeStreamingAll(zio(), "[join] Discovering host via seed...\n");
-    var host_connected = false;
-    var peer_attempts: usize = 0;
-    while (peer_attempts < 50) : (peer_attempts += 1) {
-        if (lib.services.Control.sendControlCommand(allocator, "PEERS", &resp_buf)) |len| {
-            if (std.mem.indexOf(u8, resp_buf[0..len], host_hex) != null) {
-                host_connected = true;
-                break;
-            }
-        } else |_| {}
-        std.Io.sleep(zio(), std.Io.Duration.fromNanoseconds(200 * std.time.ns_per_ms), .awake) catch {};
-    }
 
-    if (host_connected) {
-        try stdout.writeStreamingAll(zio(), "[join] ✓ Host discovered in mesh!\n");
-    } else {
-        try stdout.writeStreamingAll(zio(), "[join] (waiting for host handshake to complete...)\n");
-    }
-
-    // Send greeting to host
     var send_cmd_buf: [512]u8 = undefined;
     const send_cmd = std.fmt.bufPrint(&send_cmd_buf, "SEND {s} {{\"type\":\"agent.joined\",\"name\":\"{s}\"}}\n", .{ host_hex, name }) catch unreachable;
 
-    _ = lib.services.Control.sendControlCommand(allocator, send_cmd, &resp_buf) catch |err| {
-        try writeFormatted(stderr, "warning: greeting send returned: {s}\n", .{@errorName(err)});
-    };
-    try stdout.writeStreamingAll(zio(), "[join] ✓ Sent 'agent.joined' greeting to host.\n");
+    var greeting_sent = false;
+    var greet_attempts: usize = 0;
+    while (greet_attempts < 30) : (greet_attempts += 1) {
+        if (lib.services.Control.sendControlCommand(allocator, send_cmd, &resp_buf)) |len| {
+            if (std.mem.indexOf(u8, resp_buf[0..len], "\"ok\":true") != null) {
+                greeting_sent = true;
+                break;
+            }
+        } else |_| {}
+        std.Io.sleep(zio(), std.Io.Duration.fromNanoseconds(500 * std.time.ns_per_ms), .awake) catch {};
+    }
+
+    if (greeting_sent) {
+        try stdout.writeStreamingAll(zio(), "[join] ✓ Host discovered and 'agent.joined' greeting confirmed!\n");
+    } else {
+        try stdout.writeStreamingAll(zio(), "[join] (warning: greeting not acknowledged yet; proceeding to agent loop)\n");
+    }
 
     const host_pub = parsePubkey(host_hex);
     try runAgentLoop(allocator, host_pub);
@@ -5450,8 +5616,8 @@ fn runAgentLoop(allocator: std.mem.Allocator, host_filter: ?[32]u8) !void {
     var resp_buf: [4096]u8 = undefined;
 
     while (true) {
-        // Poll for message with 2s timeout
-        const resp_len = lib.services.Control.sendControlCommand(allocator, "RECV 2000", &resp_buf) catch |err| {
+        // Poll daemon for message (non-blocking RECV, 200ms sleep)
+        const resp_len = lib.services.Control.sendControlCommand(allocator, "RECV", &resp_buf) catch |err| {
             try writeFormatted(stdout, "[agent] Control socket error: {s}. Retrying in 1s...\n", .{@errorName(err)});
             std.Io.sleep(zio(), std.Io.Duration.fromNanoseconds(1000 * std.time.ns_per_ms), .awake) catch {};
             continue;
@@ -5459,6 +5625,7 @@ fn runAgentLoop(allocator: std.mem.Allocator, host_filter: ?[32]u8) !void {
 
         const resp = resp_buf[0..resp_len];
         if (std.mem.indexOf(u8, resp, "\"empty\":true") != null) {
+            std.Io.sleep(zio(), std.Io.Duration.fromNanoseconds(200 * std.time.ns_per_ms), .awake) catch {};
             continue;
         }
 
@@ -5488,13 +5655,28 @@ fn runAgentLoop(allocator: std.mem.Allocator, host_filter: ?[32]u8) !void {
 
         try writeFormatted(stdout, "[agent] Task received (id={s}): {s}\n", .{ task_id, command });
 
-        var exec_out_buf: [2048]u8 = undefined;
-        var exec_err_buf: [1024]u8 = undefined;
+        var exec_out_buf: [1024]u8 = undefined;
+        var exec_err_buf: [512]u8 = undefined;
         const exec_result = executeShellCommand(command, &exec_out_buf, &exec_err_buf);
 
         try writeFormatted(stdout, "[agent] Completed with exit code {d}. Sending reply...\n", .{exec_result.exit_code});
 
-        var reply_buf: [4096]u8 = undefined;
+        // Cap outputs so reply comfortably fits inside MAX_MESSAGE_PAYLOAD (1024 bytes)
+        var out_slice = exec_result.stdout;
+        var out_truncated = false;
+        if (out_slice.len > 550) {
+            out_slice = out_slice[0..550];
+            out_truncated = true;
+        }
+
+        var err_slice = exec_result.stderr;
+        var err_truncated = false;
+        if (err_slice.len > 180) {
+            err_slice = err_slice[0..180];
+            err_truncated = true;
+        }
+
+        var reply_buf: [lib.services.Control.MAX_MESSAGE_PAYLOAD]u8 = undefined;
         var pos: usize = 0;
         const rep_pre = std.fmt.bufPrint(&reply_buf, "{{\"type\":\"agent.reply\",\"id\":\"{s}\",\"exit_code\":{d},\"stdout\":\"", .{
             task_id,
@@ -5502,28 +5684,51 @@ fn runAgentLoop(allocator: std.mem.Allocator, host_filter: ?[32]u8) !void {
         }) catch continue;
         pos += rep_pre.len;
 
-        _ = appendJsonEscaped(&reply_buf, &pos, exec_result.stdout);
+        _ = appendJsonEscaped(&reply_buf, &pos, out_slice);
+        if (out_truncated) {
+            const trunc = "...[truncated]";
+            if (pos + trunc.len < reply_buf.len - 100) {
+                @memcpy(reply_buf[pos..][0..trunc.len], trunc);
+                pos += trunc.len;
+            }
+        }
 
         const rep_mid = "\",\"stderr\":\"";
         @memcpy(reply_buf[pos..][0..rep_mid.len], rep_mid);
         pos += rep_mid.len;
 
-        _ = appendJsonEscaped(&reply_buf, &pos, exec_result.stderr);
+        _ = appendJsonEscaped(&reply_buf, &pos, err_slice);
+        if (err_truncated) {
+            const trunc = "...[truncated]";
+            if (pos + trunc.len < reply_buf.len - 50) {
+                @memcpy(reply_buf[pos..][0..trunc.len], trunc);
+                pos += trunc.len;
+            }
+        }
 
         const rep_post = "\"}\n";
         @memcpy(reply_buf[pos..][0..rep_post.len], rep_post);
         pos += rep_post.len;
 
-        var send_cmd_buf: [4096]u8 = undefined;
+        var send_cmd_buf: [lib.services.Control.MAX_MESSAGE_PAYLOAD + 128]u8 = undefined;
         const send_cmd = std.fmt.bufPrint(&send_cmd_buf, "SEND {s} {s}", .{ sender_hex, reply_buf[0..pos] }) catch continue;
 
         var send_resp: [512]u8 = undefined;
-        _ = lib.services.Control.sendControlCommand(allocator, send_cmd, &send_resp) catch |err| {
-            try writeFormatted(stdout, "[agent] Failed to send reply: {s}\n", .{@errorName(err)});
+        const resp_n = lib.services.Control.sendControlCommand(allocator, send_cmd, &send_resp) catch |err| {
+            try writeFormatted(stdout, "[agent] Failed to send reply to {s}: {s}\n", .{ sender_hex, @errorName(err) });
             continue;
         };
 
-        try writeFormatted(stdout, "[agent] ✓ Reply sent to {s}.\n", .{sender_hex});
+        const resp_slice = send_resp[0..resp_n];
+        if (std.mem.indexOf(u8, resp_slice, "\"ok\":true") != null) {
+            try writeFormatted(stdout, "[agent] ✓ Reply sent to {s}.\n", .{sender_hex});
+        } else {
+            if (findJsonStringField(resp_slice, "error")) |err_desc| {
+                try writeFormatted(stdout, "[agent] Failed to send reply to {s}: {s}\n", .{ sender_hex, err_desc });
+            } else {
+                try writeFormatted(stdout, "[agent] Failed to send reply to {s}: {s}\n", .{ sender_hex, resp_slice });
+            }
+        }
     }
 }
 
