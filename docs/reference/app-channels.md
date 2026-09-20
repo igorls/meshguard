@@ -13,7 +13,7 @@ Newline-delimited text commands, JSON responses (same style as `SEND`/`RECV`).
 
 | Command | Effect |
 | ------- | ------ |
-| `APPSEND <peer-pubkey-hex> <channel> <payload>` | Frame as `MGAPP1`, encrypt, send on the existing `0x50`/Noise path |
+| `APPSEND <peer-pubkey-hex-or-b64> <channel> <payload>` | Frame as `MGAPP1`, encrypt, send on the existing `0x50`/Noise path |
 | `APPRECV <channel>` | Pop the oldest message from **that channel only** |
 | `APPINFO` | `{"protocol":1,"maxPayload":952}` |
 
@@ -37,7 +37,7 @@ MGAPP1 <channel> <payload>
 
 - Reserved prefix: `MGAPP1` followed by a space (7 bytes).
 - Channel: charset `[a-z0-9._-]`, length 1–64. Anything else is rejected.
-- Payload may contain spaces; the first space after the prefix separates the
+- Payload must be nonempty and may contain spaces; the first space after the prefix separates the
   channel name, the rest is the payload.
 - Malformed or oversize frames are **rejected**, never truncated, and never
   placed on the legacy queue.
@@ -66,7 +66,9 @@ that: advertise and enforce 952.
 
 - Legacy queue: 64 messages, drop-oldest, used only by `SEND`/`RECV`/`MSGS`.
 - Application queues: one bounded ring per channel (also 64, drop-oldest **on
-  that channel only**). Up to 8 concurrent channels.
+  that channel only**). Up to 8 concurrent channels with queued messages;
+  draining a channel releases its slot for reuse. Nonempty queues are not evicted
+  to admit a new channel.
 - `RECV`/`MSGS` never see `MGAPP1` frames.
 - `APPRECV A` never pops channel `B`.
 - Demux happens when decrypted plaintext is pushed, not at pop time.
@@ -86,11 +88,15 @@ default gossip port.
 An explicit `--gossip-port` or `MESHGUARD_GOSSIP_PORT` must be a UDP port in
 `1–65535`. Missing, empty, zero, non-numeric, or out-of-range values are a
 hard error — they do **not** fall back to `51821`. Unset flag and unset env
-keep the default.
+keep the default. `up` validates these settings before creating a configuration
+directory or setting up a network interface.
 
 When `MESHGUARD_CONTROL_PATH` is set, the client connects **only** to that path
 and does not fall back to the production socket. CLI `SEND`/`RECV`/`APP*` and
 `status`/`down` all honor it.
+Empty, whitespace-only, or NUL-containing paths are errors, including explicit
+`--control-path` values. An unavailable explicit endpoint also fails closed:
+`status`/`down` do not query or remove the default kernel interface.
 
 Example (does not stop a production worker):
 

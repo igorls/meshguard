@@ -17,6 +17,12 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Gossip/listen UDP port override via `--gossip-port` and `MESHGUARD_GOSSIP_PORT`.
   Explicit invalid values fail closed (no silent fallback to 51821).
 
+### Fixed
+- Reject empty control-path overrides before startup side effects, and prevent
+  explicit endpoint failures from falling back to the default kernel interface.
+- Validate gossip-port overrides before creating an interface; reclaim drained
+  application-channel slots and reject empty application payloads consistently.
+
 ## [0.10.0] — 2026-07-05
 
 ### Added

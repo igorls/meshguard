@@ -888,9 +888,6 @@ fn cmdRevoke(allocator: std.mem.Allocator, key_or_name: []const u8) !void {
 }
 
 fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
-    const config_dir = try Config.ensureConfigDir(allocator);
-    defer allocator.free(config_dir);
-
     const stdout = getStdOut();
     const stderr = getStdErr();
 
@@ -915,7 +912,8 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
             if (std.mem.eql(u8, extra_args[i], "--help") or std.mem.eql(u8, extra_args[i], "-h")) {
                 try getStdOut().writeStreamingAll(zio(), usage);
                 return;
-            } else if (std.mem.eql(u8, extra_args[i], "--control-path") and i + 1 < extra_args.len) {
+            } else if (std.mem.eql(u8, extra_args[i], "--control-path")) {
+                if (i + 1 >= extra_args.len) return error.InvalidControlPath;
                 i += 1;
                 control_path_flag = extra_args[i];
             } else if (std.mem.eql(u8, extra_args[i], "--gossip-port") and i + 1 < extra_args.len) {
@@ -955,6 +953,18 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
             }
         }
     }
+
+    // Reject invalid overrides before filesystem, discovery, or interface setup.
+    const gossip_port = resolveGossipPort(allocator, extra_args) catch {
+        try writeInvalidGossipPort(stderr);
+        std.process.exit(1);
+    };
+    const control_path_env = if (control_path_flag == null) try lib.services.Control.controlPathFromEnv(allocator) else null;
+    defer if (control_path_env) |path| allocator.free(path);
+    const control_path = control_path_flag orelse control_path_env;
+    if (control_path) |path| try lib.services.Control.validateControlPath(path);
+    const config_dir = try Config.ensureConfigDir(allocator);
+    defer allocator.free(config_dir);
 
     // Resolve seeds (static + DNS TXT + mDNS)
     const has_discovery = dns_domain.len > 0 or use_mdns;
@@ -1095,10 +1105,6 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     }
 
     // Bind gossip UDP socket
-    const gossip_port = resolveGossipPort(allocator, extra_args) catch {
-        try writeInvalidGossipPort(stderr);
-        std.process.exit(1);
-    };
     var gossip_socket = blk: {
         if (announce_addr) |ep| {
             // Bind to announced IP for correct source-based routing on multi-homed servers
@@ -1137,13 +1143,13 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     defer membership.deinit();
 
     // Initialize control socket (IPC API)
-    var control = lib.services.Control.ControlSocket.init(
+    var control = try lib.services.Control.ControlSocket.init(
         allocator,
         &membership,
         kp.public_key.toBytes(),
         mesh_ip,
         wg_private_key,
-        control_path_flag, // null → MESHGUARD_CONTROL_PATH or platform default
+        control_path, // validated override or platform default
     );
     defer control.deinit(allocator);
 
@@ -5975,4 +5981,3 @@ fn runAgentLoop(allocator: std.mem.Allocator, host_filter: ?[32]u8) !void {
         }
     }
 }
-

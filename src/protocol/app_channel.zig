@@ -45,6 +45,7 @@ pub const ParseError = error{
 
 pub const EncodeError = error{
     InvalidChannel,
+    EmptyPayload,
     Oversize,
 };
 
@@ -82,11 +83,13 @@ pub fn parse(data: []const u8) ParseError!Frame {
     const channel = rest[0..space];
     const payload = rest[space + 1 ..];
     if (!isValidChannel(channel)) return error.InvalidChannel;
+    if (payload.len == 0) return error.Malformed;
     return .{ .channel = channel, .payload = payload };
 }
 
 pub fn encode(channel: []const u8, payload: []const u8, out: []u8) EncodeError![]u8 {
     if (!isValidChannel(channel)) return error.InvalidChannel;
+    if (payload.len == 0) return error.EmptyPayload;
     const need = encodedLen(channel, payload);
     if (need > MAX_PLAINTEXT or out.len < need) return error.Oversize;
 
@@ -165,4 +168,10 @@ test "unframed plaintext is not an app frame" {
     try std.testing.expect(!looksLikeAppFrame("MGAPP1"));
     try std.testing.expect(!looksLikeAppFrame("MGAPP2 meshrooms-v1 x"));
     try std.testing.expect(looksLikeAppFrame("MGAPP1 meshrooms-v1 x"));
+}
+
+test "empty application payloads are rejected on receive" {
+    try std.testing.expectError(error.Malformed, parse("MGAPP1 meshrooms-v1 "));
+    var buf: [MAX_PLAINTEXT]u8 = undefined;
+    try std.testing.expectError(error.EmptyPayload, encode(MESHROOMS_CHANNEL, "", &buf));
 }
