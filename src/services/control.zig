@@ -582,10 +582,7 @@ pub const ControlSocket = struct {
         const sock = self.server orelse return false;
         var handled = false;
         while (true) {
-            const client = if (comptime is_linux)
-                std.c.accept4(sock, null, null, @intCast(posix.SOCK.NONBLOCK))
-            else
-                std.c.accept(sock, null, null);
+            const client = std.c.accept(sock, null, null);
             if (client < 0) break;
             defer closeSocket(client);
             self.handleClientUnix(client);
@@ -601,6 +598,14 @@ pub const ControlSocket = struct {
     }
 
     fn handleClientUnix(self: *ControlSocket, client: posix.socket_t) void {
+        var fds = [_]posix.pollfd{.{
+            .fd = client,
+            .events = posix.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = posix.poll(&fds, 1000) catch return;
+        if (ready == 0 or (fds[0].revents & posix.POLL.IN) == 0) return;
+
         var buf: [2048]u8 = undefined;
         const n = posix.read(client, &buf) catch return;
         if (n == 0) return;
