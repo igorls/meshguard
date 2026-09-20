@@ -1742,7 +1742,7 @@ test "invalid channel names are rejected by IPC and demux" {
 
     const sender = [_]u8{0x55} ** 32;
     try std.testing.expect(!control.pushMessage(sender, "MGAPP1 BAD payload"));
-    try std.testing.expect(!control.pushMessage(sender, "MGAPP1 has space payload"));
+    try std.testing.expect(!control.pushMessage(sender, "MGAPP1 has/slash payload"));
     try std.testing.expectEqual(@as(usize, 0), control.getMessageCount());
 
     var resp_buf: [512]u8 = undefined;
