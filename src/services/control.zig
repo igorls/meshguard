@@ -130,6 +130,7 @@ const win = if (is_windows) struct {
     extern "kernel32" fn CloseHandle(hObject: HANDLE) callconv(.winapi) BOOL;
     extern "kernel32" fn GetLastError() callconv(.winapi) windows.Win32Error;
     extern "kernel32" fn ReadFile(hFile: HANDLE, lpBuffer: ?*anyopaque, nNumberOfBytesToRead: DWORD, lpNumberOfBytesRead: ?*DWORD, lpOverlapped: ?*anyopaque) callconv(.winapi) BOOL;
+    extern "kernel32" fn PeekNamedPipe(hNamedPipe: HANDLE, lpBuffer: ?*anyopaque, nBufferSize: DWORD, lpBytesRead: ?*DWORD, lpTotalBytesAvail: ?*DWORD, lpBytesLeftThisMessage: ?*DWORD) callconv(.winapi) BOOL;
     extern "kernel32" fn WriteFile(hFile: HANDLE, lpBuffer: ?*const anyopaque, nNumberOfBytesToWrite: DWORD, lpNumberOfBytesWritten: ?*DWORD, lpOverlapped: ?*anyopaque) callconv(.winapi) BOOL;
     extern "kernel32" fn FlushFileBuffers(hFile: HANDLE) callconv(.winapi) BOOL;
     extern "kernel32" fn CreateFileW(lpFileName: LPCWSTR, dwDesiredAccess: DWORD, dwShareMode: DWORD, lpSecurityAttributes: ?*anyopaque, dwCreationDisposition: DWORD, dwFlagsAndAttributes: DWORD, hTemplateFile: ?HANDLE) callconv(.winapi) HANDLE;
@@ -360,6 +361,35 @@ const ResolvedPath = struct {
 
 pub fn validateControlPath(path: []const u8) !void {
     if (std.mem.trim(u8, path, " \t\r\n").len == 0 or std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidControlPath;
+    if (comptime !is_windows) _ = try existingUnixSocket(path);
+}
+
+fn existingUnixSocket(path: []const u8) !?std.Io.File.Stat {
+    const stat = std.Io.Dir.cwd().statFile(zio(), path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    if (stat.kind != .unix_domain_socket) return error.InvalidControlPath;
+    return stat;
+}
+
+fn unlinkOwnedUnixSocket(path: []const u8, expected: std.Io.File.Stat) void {
+    const current = (existingUnixSocket(path) catch return) orelse return;
+    if (current.inode == expected.inode) deleteFileAbsolute(path);
+}
+
+fn removeStaleUnixSocket(path: []const u8) !void {
+    const existing = (try existingUnixSocket(path)) orelse return;
+    const addr = try initUnixSocketAddress(path);
+    const probe = try linuxSocket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer closeSocket(probe);
+    try setNonBlocking(probe);
+    const rc = std.c.connect(probe, @ptrCast(&addr.addr), addr.len);
+    switch (posix.errno(rc)) {
+        .CONNREFUSED => unlinkOwnedUnixSocket(path, existing),
+        .NOENT => {},
+        else => return error.ControlSocketInUse,
+    }
 }
 
 pub fn controlPathFromEnv(allocator: std.mem.Allocator) !?[]u8 {
@@ -410,6 +440,7 @@ pub const ControlSocket = struct {
     server: if (is_windows) ?std.os.windows.HANDLE else ?posix.socket_t,
     socket_path: []const u8,
     socket_path_owned: bool,
+    bound_socket_stat: ?std.Io.File.Stat = null,
     membership: *Membership.MembershipTable,
     our_pubkey: [32]u8,
     our_mesh_ip: [4]u8,
@@ -616,7 +647,7 @@ pub const ControlSocket = struct {
     }
 
     fn listenUnix(self: *ControlSocket) !void {
-        deleteFileAbsolute(self.socket_path);
+        try removeStaleUnixSocket(self.socket_path);
 
         const addr = try initUnixSocketAddress(self.socket_path);
         const sock_type = if (comptime is_linux)
@@ -632,6 +663,8 @@ pub const ControlSocket = struct {
         if (std.c.bind(sock, @ptrCast(&addr.addr), addr.len) != 0) {
             return error.BindFailed;
         }
+        const bound_stat = (try existingUnixSocket(self.socket_path)) orelse return error.BindFailed;
+        errdefer unlinkOwnedUnixSocket(self.socket_path, bound_stat);
         if (std.c.listen(sock, 64) != 0) {
             return error.ListenFailed;
         }
@@ -643,6 +676,7 @@ pub const ControlSocket = struct {
         }
 
         self.server = sock;
+        self.bound_socket_stat = bound_stat;
     }
 
     fn listenWindows(self: *ControlSocket) !void {
@@ -690,7 +724,7 @@ pub const ControlSocket = struct {
             var bytes_read: win.DWORD = 0;
             const read_ok = win.ReadFile(pipe_handle, @ptrCast(&buf), buf.len, &bytes_read, null);
             if (read_ok != @as(win.BOOL, @enumFromInt(0)) and bytes_read > 0) {
-                const cmd = std.mem.trimEnd(u8, buf[0..bytes_read], "\r\n \t");
+                const cmd = std.mem.trimEnd(u8, buf[0..bytes_read], "\r\n");
                 var resp_buf: [8192]u8 = undefined;
                 const resp_len = self.formatCommandResponse(cmd, &resp_buf, true);
                 if (resp_len > 0) {
@@ -745,9 +779,9 @@ pub const ControlSocket = struct {
         const n = posix.read(client, &buf) catch return;
         if (n == 0) return;
 
-        const cmd = std.mem.trimEnd(u8, buf[0..n], "\r\n \t");
+        const cmd = std.mem.trimEnd(u8, buf[0..n], "\r\n");
         var resp_buf: [8192]u8 = undefined;
-        const stop_authorized = std.mem.eql(u8, cmd, "STOP") and stopAuthorizedUnix(client);
+        const stop_authorized = std.mem.eql(u8, std.mem.trim(u8, cmd, " \t"), "STOP") and stopAuthorizedUnix(client);
         const resp_len = self.formatCommandResponse(cmd, &resp_buf, stop_authorized);
         if (resp_len > 0) {
             writeSocket(client, resp_buf[0..resp_len]);
@@ -755,7 +789,9 @@ pub const ControlSocket = struct {
     }
 
     pub fn formatCommandResponse(self: *ControlSocket, cmd_raw: []const u8, buf: []u8, stop_authorized: bool) usize {
-        const cmd = std.mem.trim(u8, cmd_raw, " \t\r\n");
+        const line = std.mem.trimStart(u8, std.mem.trimEnd(u8, cmd_raw, "\r\n"), " \t");
+        // Everything after the APPSEND channel separator is application data.
+        const cmd = if (std.mem.startsWith(u8, line, "APPSEND ")) line else std.mem.trimEnd(u8, line, " \t");
 
         if (std.mem.eql(u8, cmd, "PEERS")) {
             return self.formatPeers(buf);
@@ -881,19 +917,19 @@ pub const ControlSocket = struct {
     }
 
     fn handleAppSend(self: *ControlSocket, rest: []const u8, resp_buf: []u8) usize {
-        const trimmed = std.mem.trim(u8, rest, " \t\r\n");
+        const trimmed = std.mem.trimStart(u8, rest, " \t");
         const key_space = std.mem.indexOf(u8, trimmed, " ") orelse {
             return formatError(resp_buf, "missing channel in APPSEND command");
         };
 
         const dest_key_str = trimmed[0..key_space];
-        const after_key = std.mem.trim(u8, trimmed[key_space + 1 ..], " \t");
+        const after_key = std.mem.trimStart(u8, trimmed[key_space + 1 ..], " \t");
         const chan_space = std.mem.indexOf(u8, after_key, " ") orelse {
             return formatError(resp_buf, "missing payload in APPSEND command");
         };
 
         const channel = after_key[0..chan_space];
-        const payload = std.mem.trim(u8, after_key[chan_space + 1 ..], " \t\r\n");
+        const payload = after_key[chan_space + 1 ..];
 
         if (!app_channel.isValidChannel(channel)) {
             return formatError(resp_buf, "invalid channel name");
@@ -1136,7 +1172,10 @@ pub const ControlSocket = struct {
                 closeSocket(sock);
                 self.server = null;
             }
-            deleteFileAbsolute(self.socket_path);
+            if (self.bound_socket_stat) |stat| {
+                unlinkOwnedUnixSocket(self.socket_path, stat);
+                self.bound_socket_stat = null;
+            }
         }
         if (self.socket_path_owned) {
             allocator.free(self.socket_path);
@@ -1316,16 +1355,65 @@ fn requestWindows(path: []const u8, command: []const u8, out: []u8) !usize {
         return error.WriteFailed;
     }
 
-    var bytes_read: win.DWORD = 0;
-    if (win.ReadFile(handle, @ptrCast(out.ptr), @intCast(out.len), &bytes_read, null) == @as(win.BOOL, @enumFromInt(0))) {
-        return error.ReadFailed;
+    const deadline = nowMilliSecs() + 1000;
+    var used: usize = 0;
+    while (used < out.len) {
+        var available: win.DWORD = 0;
+        if (win.PeekNamedPipe(handle, null, 0, null, &available, null) == @as(win.BOOL, @enumFromInt(0))) return error.ReadFailed;
+        if (available == 0) {
+            if (nowMilliSecs() >= deadline) return error.ControlSocketUnavailable;
+            std.Io.sleep(zio(), std.Io.Duration.fromNanoseconds(5 * std.time.ns_per_ms), .awake) catch {};
+            continue;
+        }
+        var bytes_read: win.DWORD = 0;
+        const capacity: win.DWORD = @intCast(@min(out.len - used, available));
+        if (win.ReadFile(handle, @ptrCast(out[used..].ptr), capacity, &bytes_read, null) == @as(win.BOOL, @enumFromInt(0))) return error.ReadFailed;
+        if (bytes_read == 0) return error.ReadFailed;
+        used += bytes_read;
+        if (std.mem.indexOfScalar(u8, out[0..used], '\n')) |end| return end + 1;
+        if (nowMilliSecs() >= deadline) return error.ControlSocketUnavailable;
     }
-    if (bytes_read == 0) return error.ReadFailed;
-    if (bytes_read == out.len) return error.ResponseTooLarge;
-    return @intCast(bytes_read);
+    return error.ResponseTooLarge;
 }
 
 pub const sendControlCommand = request;
+
+test "Unix listener reclaims only stale sockets and cleans up only its own path" {
+    if (comptime is_windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/control.sock", .{temp.sub_path});
+    defer allocator.free(path);
+    var membership = Membership.MembershipTable.init(allocator, 10);
+    defer membership.deinit();
+    var control = try ControlSocket.init(allocator, &membership, [_]u8{1} ** 32, .{ 10, 99, 0, 1 }, [_]u8{2} ** 32, path);
+    defer control.deinit(allocator);
+    try control.listen();
+    var duplicate = try ControlSocket.init(allocator, &membership, [_]u8{1} ** 32, .{ 10, 99, 0, 1 }, [_]u8{2} ** 32, path);
+    try std.testing.expectError(error.ControlSocketInUse, duplicate.listen());
+    duplicate.deinit(allocator);
+    try std.testing.expect((try existingUnixSocket(path)) != null);
+    control.deinit(allocator);
+    try std.testing.expect((try existingUnixSocket(path)) == null);
+
+    // A closed listener leaves a stale socket, which may safely be reclaimed.
+    const stale = try linuxSocket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    const addr = try initUnixSocketAddress(path);
+    const rc = std.c.bind(stale, @ptrCast(&addr.addr), addr.len);
+    closeSocket(stale);
+    try std.testing.expectEqual(@as(c_int, 0), rc);
+    try control.listen();
+
+    // Replacing a bound socket with a regular file must survive deinit and relisten.
+    try temp.dir.deleteFile(zio(), "control.sock");
+    const file = try temp.dir.createFile(zio(), "control.sock", .{});
+    file.close(zio());
+    control.deinit(allocator);
+    try std.testing.expectError(error.InvalidControlPath, control.listen());
+    const stat = try temp.dir.statFile(zio(), "control.sock", .{ .follow_symlinks = false });
+    try std.testing.expectEqual(std.Io.File.Kind.file, stat.kind);
+}
 
 test "control STOP response toggles stop flag" {
     const allocator = std.testing.allocator;
@@ -1917,7 +2005,7 @@ test "APPSEND frames plaintext before the 0x50 encrypt path" {
     var resp_buf: [512]u8 = undefined;
     const pk_hex = std.fmt.bytesToHex(peer_pk, .lower);
     var cmd_buf: [256]u8 = undefined;
-    const cmd = std.fmt.bufPrint(&cmd_buf, "APPSEND {s} meshrooms-v1 hello rooms", .{&pk_hex}) catch unreachable;
+    const cmd = std.fmt.bufPrint(&cmd_buf, "APPSEND {s} meshrooms-v1   hello rooms \t \n", .{&pk_hex}) catch unreachable;
     const len = control.handleCommand(cmd, &resp_buf);
     try std.testing.expectEqualStrings("{\"ok\":true}\n", resp_buf[0..len]);
     try std.testing.expect(dummy.sent);
@@ -1942,7 +2030,7 @@ test "APPSEND frames plaintext before the 0x50 encrypt path" {
         nonce,
         key_result.key,
     ) catch unreachable;
-    try std.testing.expectEqualStrings("MGAPP1 meshrooms-v1 hello rooms", plaintext[0..payload_len]);
+    try std.testing.expectEqualStrings("MGAPP1 meshrooms-v1   hello rooms \t ", plaintext[0..payload_len]);
 
     try std.testing.expect(control.pushMessage(peer_pk, plaintext[0..payload_len]));
     try std.testing.expectEqual(@as(usize, 0), control.getMessageCount());
