@@ -201,12 +201,16 @@ port, but it is not decoded by `protocol/codec.zig`.
 [0x50][32B dest_pubkey][32B sender_pubkey][12B nonce][N ciphertext][16B tag]
 ```
 
-Minimum size: **93 bytes** (empty payload). Maximum payload: 1024 bytes.
+Minimum size: **93 bytes** (empty payload). Maximum **plaintext** : 1024 bytes.
 
 - **Key derivation**: X25519(sender_private, dest_wg_pubkey) → HKDF("meshguard-app-v1") → symmetric key
 - **AD**: sender's Ed25519 public key
 - **Routing**: intermediate peers forward the entire packet as-is (encrypted, opaque) to the destination by pubkey lookup
 - **Delivery**: when `dest_pubkey` matches our own, the message is decrypted and delivered via callback
+- **Optional application framing**: decrypted plaintext that starts with `MGAPP1 `
+  is demuxed onto an isolated per-channel queue (`APPSEND`/`APPRECV`). Unframed
+  plaintext stays on the legacy `SEND`/`RECV` queue. See
+  [Application messaging channels](../reference/app-channels.md).
 
 ## Endpoint Encoding
 

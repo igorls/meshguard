@@ -48,6 +48,7 @@ pub const wireguard = struct {
 pub const protocol = struct {
     pub const Messages = @import("protocol/messages.zig");
     pub const Codec = @import("protocol/codec.zig");
+    pub const AppChannel = @import("protocol/app_channel.zig");
 };
 
 pub const net = struct {
@@ -92,4 +93,5 @@ test {
     }
     _ = services.Policy;
     _ = services.Control;
+    _ = protocol.AppChannel;
 }

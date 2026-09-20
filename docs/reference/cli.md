@@ -84,6 +84,8 @@ meshguard up [options]
 | `--gossip-only`     | `false`  | Run discovery/rendezvous only, no TUN/WG    |
 | `--no-tun`          | `false`  | Alias for `--gossip-only`                   |
 | `--open`            | `false`  | Accept all peers (skip trust enforcement)   |
+| `--gossip-port`     | `51821`  | Gossip/listen UDP port                      |
+| `--control-path`    | _(auto)_ | Control socket / named-pipe path            |
 
 **Startup sequence**:
 
@@ -251,9 +253,11 @@ meshguard connect --join mg://...
 
 ## Environment Variables
 
-| Variable               | Description                                                |
-| ---------------------- | ---------------------------------------------------------- |
-| `MESHGUARD_CONFIG_DIR` | Override config directory (default: `~/.config/meshguard`) |
+| Variable                   | Description                                                |
+| -------------------------- | ---------------------------------------------------------- |
+| `MESHGUARD_CONFIG_DIR`     | Override config directory (default: `~/.config/meshguard`) |
+| `MESHGUARD_CONTROL_PATH`   | Control socket bind and CLI connect path (no default fallback when set) |
+| `MESHGUARD_GOSSIP_PORT`    | Gossip/listen UDP port when `--gossip-port` is omitted     |
 
 Default config directories are `%APPDATA%\meshguard\` on Windows,
 `/etc/meshguard` when running as root on POSIX systems, otherwise
@@ -330,6 +334,40 @@ queues that revocation for broadcast the next time `meshguard up` runs.
 Revocations are scoped to the issuing org: they invalidate that org's
 certificate or vouch for the node, not certificates or vouches from other
 trusted orgs.
+
+---
+
+## `meshguard appsend`
+
+Send an isolated application-channel message. The daemon frames the plaintext
+as `MGAPP1 <channel> <payload>` and encrypts it on the existing `0x50` path.
+
+```bash
+meshguard appsend <peer-pubkey-hex-or-b64> <channel> <message>
+```
+
+Channel names must match `[a-z0-9._-]{1,64}`. Meshrooms uses `meshrooms-v1`.
+
+---
+
+## `meshguard apprecv`
+
+Pop the next message from one application channel. Never reads the legacy
+`RECV` queue or another channel.
+
+```bash
+meshguard apprecv <channel> [--wait <ms>]
+```
+
+---
+
+## `meshguard appinfo`
+
+Print `{"protocol":1,"maxPayload":952}` from the daemon. `maxPayload` is the
+conservative framed maximum (1024-byte `0x50` plaintext minus `MGAPP1 `, a
+64-byte channel, and the payload separator).
+
+See [Application messaging channels](app-channels.md).
 
 ---
 

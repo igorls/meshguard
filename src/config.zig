@@ -9,7 +9,7 @@ fn zio() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
 }
 
-fn getEnvVarOwned(allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
+pub fn getEnvVarOwned(allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
     const builtin = @import("builtin");
     if (comptime builtin.os.tag == .windows) {
         return std.process.Environ.getAlloc(.{ .block = .global }, allocator, key) catch |err| switch (err) {

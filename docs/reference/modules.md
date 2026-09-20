@@ -57,14 +57,15 @@ Reference map of all source modules and their responsibilities.
 
 | File           | Purpose                                                                                                                                          |
 | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `messages.zig` | Wire message type definitions: `Ping`, `Ack`, `PingReq`, `HandshakeInit/Resp`, `GossipEntry`, `HolepunchRequest/Response`, `NatType`, `Endpoint` |
-| `codec.zig`    | Binary codec: encode/decode for active protocol messages, 115-byte gossip entries, IPv4/IPv6 endpoints, org cert extensions |
+| `messages.zig`    | Wire message type definitions: `Ping`, `Ack`, `PingReq`, `HandshakeInit/Resp`, `GossipEntry`, `HolepunchRequest/Response`, `NatType`, `Endpoint` |
+| `codec.zig`       | Binary codec: encode/decode for active protocol messages, 115-byte gossip entries, IPv4/IPv6 endpoints, org cert extensions |
+| `app_channel.zig` | `MGAPP1` application-channel framing, channel validation, and honest `maxPayload` |
 
 ## `services/`
 
 | File          | Purpose                                                                              |
 | ------------- | ------------------------------------------------------------------------------------ |
-| `control.zig` | Control socket server (Unix domain socket / Windows named pipe) for `meshguard status`, `down` |
+| `control.zig` | Control socket server (Unix domain socket / Windows named pipe) for `meshguard status`, `down`, `SEND`/`RECV`, and isolated `APP*` channels |
 | `policy.zig`  | Service access control engine: policy file parsing, rule evaluation, packet filtering |
 
 ## `crypto/`

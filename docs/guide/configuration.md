@@ -63,6 +63,8 @@ $MESHGUARD_CONFIG_DIR/
 | `--no-tun`          | `false`  | Alias for `--gossip-only`                        |
 | `--encrypt-workers` | `0`      | Number of encryption threads (0 = serial)        |
 | `--open`            | `false`  | Accept all peers (skip trust enforcement)        |
+| `--gossip-port`     | `51821`  | Gossip/listen UDP port (`MESHGUARD_GOSSIP_PORT`) |
+| `--control-path`    | _(auto)_ | Control socket path (`MESHGUARD_CONTROL_PATH`)   |
 
 ### `meshguard keygen`
 
@@ -80,7 +82,7 @@ $MESHGUARD_CONFIG_DIR/
 
 | Parameter         | Value          | Source             |
 | ----------------- | -------------- | ------------------ |
-| Gossip port       | `51821`        | `config.zig`       |
+| Gossip port       | `51821`        | `--gossip-port` / `MESHGUARD_GOSSIP_PORT` / `config.zig` |
 | WireGuard port    | `51830`        | `config.zig`       |
 | Mesh prefix       | `10.99.0.0/16` | `wireguard/ip.zig` |
 | Interface name    | `mg0`          | `wg_config.zig`    |

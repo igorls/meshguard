@@ -39,6 +39,9 @@ const usage =
     \\  service     Manage service access policies
     \\  send        Send encrypted message to peer (meshguard send <peer> <msg>)
     \\  recv        Receive next encrypted message (meshguard recv [--wait <ms>])
+    \\  appsend     Send MGAPP1 channel message (meshguard appsend <peer> <channel> <msg>)
+    \\  apprecv     Receive next message on a channel (meshguard apprecv <channel>)
+    \\  appinfo     Print application-channel protocol and maxPayload
     \\  invite      Create agent room meet link (meshguard invite [--name <label>])
     \\  join        Join an agent room via meet link (meshguard join <token>)
     \\  agent       Run autonomous agent worker loop (meshguard agent)
@@ -46,15 +49,17 @@ const usage =
     \\  version     Print version
     \\
     \\OPTIONS:
-    \\  --seed <host:port>   Seed peer (IP or hostname, can be repeated)
-    \\  --dns <domain>       Discover seeds via DNS TXT records
-    \\  --mdns               Discover seeds via mDNS on LAN
-    \\  --announce <ip>      Override public IP (skip STUN)
-    \\  --kernel             Use kernel WireGuard (requires root)
-    \\  --gossip-only        Run discovery/rendezvous only, without TUN/WireGuard
-    \\  --no-tun             Alias for --gossip-only
-    \\  --open               Accept all peers (skip trust enforcement)
-    \\  -h, --help          Show this help
+    \\  --seed <host:port>        Seed peer (IP or hostname, can be repeated)
+    \\  --dns <domain>            Discover seeds via DNS TXT records
+    \\  --mdns                    Discover seeds via mDNS on LAN
+    \\  --announce <ip>           Override public IP (skip STUN)
+    \\  --kernel                  Use kernel WireGuard (requires root)
+    \\  --gossip-only             Run discovery/rendezvous only, without TUN/WireGuard
+    \\  --no-tun                  Alias for --gossip-only
+    \\  --open                    Accept all peers (skip trust enforcement)
+    \\  --gossip-port <port>      Override gossip/listen UDP port (default 51821)
+    \\  --control-path <path>     Override control socket path for this daemon
+    \\  -h, --help               Show this help
     \\
 ;
 
@@ -288,6 +293,29 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, command, "appsend")) {
+        if (args.len < 4) {
+            try getStdErr().writeStreamingAll(zio(), "usage: meshguard appsend <peer-pubkey-hex-or-b64> <channel> <message>\n");
+            std.process.exit(1);
+        }
+        try cmdAppSend(allocator, args[2..]);
+        return;
+    }
+
+    if (std.mem.eql(u8, command, "apprecv")) {
+        if (args.len < 3) {
+            try getStdErr().writeStreamingAll(zio(), "usage: meshguard apprecv <channel> [--wait <ms>]\n");
+            std.process.exit(1);
+        }
+        try cmdAppRecv(allocator, args[2..]);
+        return;
+    }
+
+    if (std.mem.eql(u8, command, "appinfo")) {
+        try cmdAppInfo(allocator);
+        return;
+    }
+
     if (std.mem.eql(u8, command, "invite")) {
         try cmdInvite(allocator, args[2..]);
         return;
@@ -313,6 +341,29 @@ pub fn main(init: std.process.Init) !void {
 }
 
 // ─── Command implementations ───
+
+const DEFAULT_GOSSIP_PORT: u16 = 51821;
+const GOSSIP_PORT_ENV = "MESHGUARD_GOSSIP_PORT";
+
+fn resolveGossipPort(allocator: std.mem.Allocator, extra_args: []const []const u8) u16 {
+    var i: usize = 0;
+    while (i < extra_args.len) : (i += 1) {
+        if (std.mem.eql(u8, extra_args[i], "--gossip-port") and i + 1 < extra_args.len) {
+            if (std.fmt.parseInt(u16, extra_args[i + 1], 10)) |port| {
+                if (port != 0) return port;
+            } else |_| {}
+        }
+    }
+
+    if (Config.getEnvVarOwned(allocator, GOSSIP_PORT_ENV) catch null) |val| {
+        defer allocator.free(val);
+        if (std.fmt.parseInt(u16, std.mem.trim(u8, val, " \t\r\n"), 10)) |port| {
+            if (port != 0) return port;
+        } else |_| {}
+    }
+
+    return DEFAULT_GOSSIP_PORT;
+}
 
 fn writeFormatted(file: std.Io.File, comptime fmt: []const u8, args: anytype) !void {
     var buf: [4096]u8 = undefined;
@@ -865,6 +916,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     var encrypt_workers: usize = 0; // 0 = auto (CPU count)
     var open_mode: bool = false; // --open: skip trust, accept any peer
     var gossip_only: bool = false; // --gossip-only/--no-tun: seed/rendezvous mode
+    var control_path_flag: ?[]const u8 = null;
     // Collect raw seed strings for hostname resolution
     var seed_strs: [16][]const u8 = undefined;
     var seed_str_count: usize = 0;
@@ -874,6 +926,12 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
             if (std.mem.eql(u8, extra_args[i], "--help") or std.mem.eql(u8, extra_args[i], "-h")) {
                 try getStdOut().writeStreamingAll(zio(), usage);
                 return;
+            } else if (std.mem.eql(u8, extra_args[i], "--control-path") and i + 1 < extra_args.len) {
+                i += 1;
+                control_path_flag = extra_args[i];
+            } else if (std.mem.eql(u8, extra_args[i], "--gossip-port") and i + 1 < extra_args.len) {
+                i += 1;
+                // Parsed by resolveGossipPort; consume the value so it is not treated as unknown.
             } else if (std.mem.eql(u8, extra_args[i], "--seed") and i + 1 < extra_args.len) {
                 i += 1;
                 if (seed_str_count < seed_strs.len) {
@@ -1048,7 +1106,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     }
 
     // Bind gossip UDP socket
-    const gossip_port: u16 = 51821;
+    const gossip_port: u16 = resolveGossipPort(allocator, extra_args);
     var gossip_socket = blk: {
         if (announce_addr) |ep| {
             // Bind to announced IP for correct source-based routing on multi-homed servers
@@ -1070,7 +1128,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
                 };
         } else {
             break :blk lib.net.Udp.UdpSocket.bind(gossip_port) catch {
-                try stderr.writeStreamingAll(zio(), "error: failed to bind gossip port 51821\n");
+                try writeFormatted(stderr, "error: failed to bind gossip port {d}\n", .{gossip_port});
                 if (comptime @import("builtin").os.tag == .linux) {
                     lib.wireguard.Config.teardown(lib.wireguard.Config.DEFAULT_IFNAME) catch {};
                 }
@@ -1093,7 +1151,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
         kp.public_key.toBytes(),
         mesh_ip,
         wg_private_key,
-        null, // use default path
+        control_path_flag, // null → MESHGUARD_CONTROL_PATH or platform default
     );
     defer control.deinit(allocator);
 
@@ -1575,7 +1633,7 @@ fn cmdConnect(allocator: std.mem.Allocator, extra_args: []const []const u8) !voi
 
     // Must use the same gossip port the daemon will bind to,
     // so the NAT hole punched here stays valid after restart.
-    const gossip_port: u16 = 51821;
+    const gossip_port: u16 = resolveGossipPort(allocator, extra_args);
 
     // Stop running service first (otherwise we can't bind the port)
     // Only relevant on Linux where systemd may be managing the service.
@@ -1606,7 +1664,7 @@ fn cmdConnect(allocator: std.mem.Allocator, extra_args: []const []const u8) !voi
 
     // Bind to the gossip port (same port meshguard up will use)
     var socket = lib.net.Udp.UdpSocket.bind(gossip_port) catch {
-        try stderr.writeStreamingAll(zio(), "error: failed to bind gossip port 51821\n");
+        try writeFormatted(stderr, "error: failed to bind gossip port {d}\n", .{gossip_port});
         try stderr.writeStreamingAll(zio(), "  hint: is meshguard already running? Stop it first.\n");
         std.process.exit(1);
     };
@@ -5287,6 +5345,135 @@ fn executeShellCommand(
         .stdout = out_buf[0..out_read],
         .stderr = err_buf[0..err_read],
     };
+}
+
+fn cmdAppSend(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
+    const stdout = getStdOut();
+    const stderr = getStdErr();
+
+    if (args.len < 3) {
+        try stderr.writeStreamingAll(zio(), "usage: meshguard appsend <peer-pubkey-hex-or-b64> <channel> <message...>\n");
+        std.process.exit(1);
+    }
+
+    const peer_key = args[0];
+    const channel = args[1];
+    const message = try std.mem.join(allocator, " ", args[2..]);
+    defer allocator.free(message);
+
+    if (!lib.protocol.AppChannel.isValidChannel(channel)) {
+        try stderr.writeStreamingAll(zio(), "error: invalid channel name (use [a-z0-9._-], length 1-64)\n");
+        std.process.exit(1);
+    }
+
+    if (std.mem.indexOfAny(u8, message, "\r\n") != null) {
+        try stderr.writeStreamingAll(zio(), "error: message payload cannot contain unescaped newline characters. Please escape newlines as \\n.\n");
+        std.process.exit(1);
+    }
+
+    var cmd_buf: [2048]u8 = undefined;
+    const cmd = std.fmt.bufPrint(&cmd_buf, "APPSEND {s} {s} {s}\n", .{ peer_key, channel, message }) catch {
+        try stderr.writeStreamingAll(zio(), "error: application payload too large for control command\n");
+        std.process.exit(1);
+    };
+
+    var resp_buf: [1024]u8 = undefined;
+    const resp_len = lib.services.Control.sendControlCommand(allocator, cmd, &resp_buf) catch |err| {
+        try writeFormatted(stderr, "error: failed to communicate with meshguard daemon: {s}\n", .{@errorName(err)});
+        try stderr.writeStreamingAll(zio(), "  hint: ensure meshguard daemon is running ('meshguard up')\n");
+        std.process.exit(1);
+    };
+
+    const resp = resp_buf[0..resp_len];
+    if (std.mem.indexOf(u8, resp, "\"ok\":true") != null) {
+        try stdout.writeStreamingAll(zio(), "✓ Application message sent.\n");
+    } else {
+        if (findJsonStringField(resp, "error")) |err_desc| {
+            try writeFormatted(stderr, "error: {s}\n", .{err_desc});
+        } else {
+            try writeFormatted(stderr, "error: {s}\n", .{resp});
+        }
+        std.process.exit(1);
+    }
+}
+
+fn cmdAppRecv(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
+    const stdout = getStdOut();
+    const stderr = getStdErr();
+
+    var channel: ?[]const u8 = null;
+    var wait_ms: u32 = 0;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--wait") and i + 1 < args.len) {
+            i += 1;
+            wait_ms = std.fmt.parseInt(u32, args[i], 10) catch 0;
+        } else if (!std.mem.startsWith(u8, args[i], "-")) {
+            if (channel == null) {
+                channel = args[i];
+            } else {
+                wait_ms = std.fmt.parseInt(u32, args[i], 10) catch wait_ms;
+            }
+        }
+    }
+
+    const ch = channel orelse {
+        try stderr.writeStreamingAll(zio(), "usage: meshguard apprecv <channel> [--wait <ms>]\n");
+        std.process.exit(1);
+    };
+    if (!lib.protocol.AppChannel.isValidChannel(ch)) {
+        try stderr.writeStreamingAll(zio(), "error: invalid channel name (use [a-z0-9._-], length 1-64)\n");
+        std.process.exit(1);
+    }
+
+    var cmd_buf: [96]u8 = undefined;
+    const cmd = std.fmt.bufPrint(&cmd_buf, "APPRECV {s}", .{ch}) catch unreachable;
+
+    var resp_buf: [4096]u8 = undefined;
+    const start_ms = @as(i64, @intCast(std.Io.Timestamp.now(zio(), .real).toMilliseconds()));
+    const deadline_ms = start_ms + @as(i64, wait_ms);
+
+    while (true) {
+        const resp_len = lib.services.Control.sendControlCommand(allocator, cmd, &resp_buf) catch |err| {
+            try writeFormatted(stderr, "error: failed to communicate with meshguard daemon: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+
+        const resp = resp_buf[0..resp_len];
+        if (std.mem.indexOf(u8, resp, "\"empty\":true") == null) {
+            if (findJsonStringField(resp, "error")) |err_desc| {
+                try writeFormatted(stderr, "error: {s}\n", .{err_desc});
+                std.process.exit(1);
+            }
+
+            const sender = findJsonStringField(resp, "sender") orelse "unknown";
+            const data_raw = findJsonStringField(resp, "data") orelse "";
+
+            var unescaped: [2048]u8 = undefined;
+            const len = unescapeJsonString(data_raw, &unescaped);
+
+            try writeFormatted(stdout, "From: {s}\nChannel: {s}\nPayload:\n{s}\n", .{ sender, ch, unescaped[0..len] });
+            return;
+        }
+
+        const now_ms = @as(i64, @intCast(std.Io.Timestamp.now(zio(), .real).toMilliseconds()));
+        if (now_ms >= deadline_ms) break;
+        std.Io.sleep(zio(), std.Io.Duration.fromNanoseconds(100 * std.time.ns_per_ms), .awake) catch {};
+    }
+
+    try stdout.writeStreamingAll(zio(), "(no messages)\n");
+}
+
+fn cmdAppInfo(allocator: std.mem.Allocator) !void {
+    const stdout = getStdOut();
+    const stderr = getStdErr();
+
+    var resp_buf: [256]u8 = undefined;
+    const resp_len = lib.services.Control.sendControlCommand(allocator, "APPINFO", &resp_buf) catch |err| {
+        try writeFormatted(stderr, "error: failed to communicate with meshguard daemon: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    try stdout.writeStreamingAll(zio(), resp_buf[0..resp_len]);
 }
 
 fn cmdSend(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {

@@ -7,6 +7,15 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## Unreleased
 
+### Added
+- Isolated application messaging channels over the existing encrypted `0x50`
+  payload: `APPSEND` / `APPRECV` / `APPINFO`, `MGAPP1` framing, and per-channel
+  queues so Meshrooms (`meshrooms-v1`) cannot be starved by legacy `RECV`.
+- `MESHGUARD_CONTROL_PATH` honored on both daemon bind and CLI connect, plus
+  `meshguard up --control-path`. Isolated candidate daemons no longer steal
+  `/run/meshguard/meshguard.sock` or `\\.\pipe\meshguard`.
+- Gossip/listen UDP port override via `--gossip-port` and `MESHGUARD_GOSSIP_PORT`.
+
 ## [0.10.0] — 2026-07-05
 
 ### Added
