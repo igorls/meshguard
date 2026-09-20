@@ -498,7 +498,7 @@ pub const ControlSocket = struct {
         if (std.c.bind(sock, @ptrCast(&addr.addr), addr.len) != 0) {
             return error.BindFailed;
         }
-        if (std.c.listen(sock, 4) != 0) {
+        if (std.c.listen(sock, 64) != 0) {
             return error.ListenFailed;
         }
 
@@ -544,14 +544,19 @@ pub const ControlSocket = struct {
 
     fn pollUnix(self: *ControlSocket) bool {
         const sock = self.server orelse return false;
-        const client = if (comptime is_linux)
-            std.c.accept4(sock, null, null, @intCast(posix.SOCK.NONBLOCK))
-        else
-            std.c.accept(sock, null, null);
-        if (client < 0) return false;
-        defer closeSocket(client);
-        self.handleClientUnix(client);
-        return true;
+        var handled = false;
+        while (true) {
+            const client = if (comptime is_linux)
+                std.c.accept4(sock, null, null, @intCast(posix.SOCK.NONBLOCK))
+            else
+                std.c.accept(sock, null, null);
+            if (client < 0) break;
+            defer closeSocket(client);
+            self.handleClientUnix(client);
+            handled = true;
+            if (comptime !is_linux) break;
+        }
+        return handled;
     }
 
     fn pollWindows(self: *ControlSocket) bool {

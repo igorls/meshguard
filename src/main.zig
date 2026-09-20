@@ -118,12 +118,19 @@ fn isChildStillRunning(child: *std.process.Child) bool {
         const WaitForSingleObject = struct {
             extern "kernel32" fn WaitForSingleObject(hHandle: std.os.windows.HANDLE, dwMilliseconds: std.os.windows.DWORD) callconv(.winapi) std.os.windows.DWORD;
         }.WaitForSingleObject;
+        const WAIT_TIMEOUT: std.os.windows.DWORD = 258;
         const res = WaitForSingleObject(id, 0);
-        return res != 0; // 0 is WAIT_OBJECT_0 (signaled = terminated)
+        return res == WAIT_TIMEOUT;
     } else {
         var status: c_int = 0;
-        const res = std.c.waitpid(id, &status, 1); // 1 = WNOHANG
-        return res == 0;
+        while (true) {
+            const res = std.c.waitpid(id, &status, 1); // 1 = WNOHANG
+            if (res == 0) return true; // process is still running
+            if (res > 0) return false; // child exited
+            const err = std.posix.errno(res);
+            if (err == .INTR) continue; // signal interrupted, retry
+            return false; // ECHILD or error (child already reaped/no longer exists)
+        }
     }
 }
 
@@ -1230,25 +1237,27 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
                 const nat_type_str = if (stun_result.nat_type == .cone) "cone" else "symmetric";
                 try writeFormatted(stdout, "  public endpoint: {s}:{d} (behind NAT, {s})\n", .{ pub_ip, stun_result.external.port, nat_type_str });
 
-                // Try UPnP port forwarding
-                try stdout.writeStreamingAll(zio(), "  trying UPnP port forwarding...\n");
-                const UPnP = lib.nat.UPnP;
-                if (UPnP.addPortMapping(gossip_port, gossip_port, "meshguard", 3600)) |upnp_result| {
-                    // Use UPnP external IP if available, otherwise fall back to STUN IP
-                    const effective_ip = if (upnp_result.external_ip[0] == 0 and upnp_result.external_ip[1] == 0)
-                        stun_result.external.addr
-                    else
-                        upnp_result.external_ip;
-                    var upnp_ip_buf: [15]u8 = undefined;
-                    const upnp_ip = lib.wireguard.Ip.formatIp(effective_ip, &upnp_ip_buf);
-                    try writeFormatted(stdout, "  ✓ UPnP: port {d} forwarded (external IP: {s})\n", .{ gossip_port, upnp_ip });
-                    // Update public endpoint — UPnP makes us directly reachable
-                    swim.setPublicEndpoint(
-                        messages.Endpoint{ .addr = effective_ip, .port = gossip_port },
-                        .public,
-                    );
-                } else |upnp_err| {
-                    try writeFormatted(stdout, "  UPnP: {s} (will use hole punching)\n", .{@errorName(upnp_err)});
+                // Try UPnP port forwarding (skip in gossip-only mode to avoid 5s SSDP timeout on cloud VMs)
+                if (!gossip_only) {
+                    try stdout.writeStreamingAll(zio(), "  trying UPnP port forwarding...\n");
+                    const UPnP = lib.nat.UPnP;
+                    if (UPnP.addPortMapping(gossip_port, gossip_port, "meshguard", 3600)) |upnp_result| {
+                        // Use UPnP external IP if available, otherwise fall back to STUN IP
+                        const effective_ip = if (upnp_result.external_ip[0] == 0 and upnp_result.external_ip[1] == 0)
+                            stun_result.external.addr
+                        else
+                            upnp_result.external_ip;
+                        var upnp_ip_buf: [15]u8 = undefined;
+                        const upnp_ip = lib.wireguard.Ip.formatIp(effective_ip, &upnp_ip_buf);
+                        try writeFormatted(stdout, "  ✓ UPnP: port {d} forwarded (external IP: {s})\n", .{ gossip_port, upnp_ip });
+                        // Update public endpoint — UPnP makes us directly reachable
+                        swim.setPublicEndpoint(
+                            messages.Endpoint{ .addr = effective_ip, .port = gossip_port },
+                            .public,
+                        );
+                    } else |upnp_err| {
+                        try writeFormatted(stdout, "  UPnP: {s} (will use hole punching)\n", .{@errorName(upnp_err)});
+                    }
                 }
             },
             .unknown => try stdout.writeStreamingAll(zio(), "  STUN: could not determine public endpoint\n"),
@@ -5545,12 +5554,8 @@ fn cmdJoin(allocator: std.mem.Allocator, exe_path: []const u8, token_arg: []cons
         defer if (log_path) |p| allocator.free(p);
 
         var log_file: ?std.Io.File = null;
-        var log_file_err: ?std.Io.File = null;
         if (log_path) |p| {
             log_file = std.Io.Dir.createFileAbsolute(zio(), p, .{ .truncate = true }) catch null;
-            if (log_file != null) {
-                log_file_err = std.Io.Dir.openFileAbsolute(zio(), p, .{ .mode = .write_only }) catch null;
-            }
         }
 
         var child_proc = spawnChild(.{
@@ -5563,17 +5568,15 @@ fn cmdJoin(allocator: std.mem.Allocator, exe_path: []const u8, token_arg: []cons
                 "--open",
             },
             .stdout = if (log_file) |f| .{ .file = f } else .ignore,
-            .stderr = if (log_file_err) |f| .{ .file = f } else if (log_file) |f| .{ .file = f } else .ignore,
+            .stderr = if (log_file) |f| .{ .file = f } else .ignore,
         }) catch |err| {
             if (log_file) |f| f.close(zio());
-            if (log_file_err) |f| f.close(zio());
             try writeFormatted(stderr, "error: failed to start daemon: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
 
-        // Close parent write handles to log file so child flushes cleanly
+        // Close parent write handle to log file so child flushes cleanly
         if (log_file) |f| f.close(zio());
-        if (log_file_err) |f| f.close(zio());
 
         // Wait for daemon to respond on control socket (up to 20 seconds: 100 attempts * 200ms)
         var attempts: usize = 0;
@@ -5607,7 +5610,7 @@ fn cmdJoin(allocator: std.mem.Allocator, exe_path: []const u8, token_arg: []cons
                     var log_read_buf: [4096]u8 = undefined;
                     const bytes_read = readAll(lf, &log_read_buf) catch 0;
                     if (bytes_read > 0) {
-                        try stderr.writeStreamingAll(zio(), "\n--- Daemon log (~/.config/meshguard/daemon.log) ---\n");
+                        try writeFormatted(stderr, "\n--- Daemon log ({s}) ---\n", .{p});
                         try stderr.writeStreamingAll(zio(), log_read_buf[0..bytes_read]);
                         try stderr.writeStreamingAll(zio(), "----------------------------------------------------\n");
                     }

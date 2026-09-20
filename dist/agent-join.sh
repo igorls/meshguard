@@ -18,7 +18,7 @@ echo "================================================================"
 
 # Check if meshguard is installed in PATH (or local override requested)
 MESHGUARD=""
-if command -v meshguard >/dev/null 2>&1; then
+if command -v meshguard >/dev/null 2>&1 && meshguard version 2>/dev/null | grep -q "0.9.0"; then
   MESHGUARD="meshguard"
 elif [ -n "$MESHGUARD_LOCAL" ] && [ -x "./meshguard" ]; then
   MESHGUARD="./meshguard"
@@ -70,16 +70,18 @@ if [ -z "$MESHGUARD" ]; then
   URL="https://github.com/igorls/meshguard/releases/download/v0.9.0/${ASSET}"
   echo "[agent-join] Fetching $URL -> $TARGET_BIN..."
 
+  TMP_BIN="${TARGET_BIN}.tmp.$$"
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$URL" -o "$TARGET_BIN"
+    curl -fsSL "$URL" -o "$TMP_BIN"
   elif command -v wget >/dev/null 2>&1; then
-    wget -qO "$TARGET_BIN" "$URL"
+    wget -qO "$TMP_BIN" "$URL"
   else
     echo "Error: curl or wget is required to download meshguard."
     exit 1
   fi
 
-  chmod +x "$TARGET_BIN"
+  chmod +x "$TMP_BIN"
+  mv -f "$TMP_BIN" "$TARGET_BIN"
   MESHGUARD="$TARGET_BIN"
   echo "[agent-join] ✓ Binary ready: $TARGET_BIN"
 fi
