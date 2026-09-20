@@ -769,7 +769,9 @@ pub const ControlSocket = struct {
             return formatError(resp_buf, "peer not found in membership table");
         };
 
-        if (peer.state != .alive and peer.state != .suspected) {
+        const relay_opt = Relay.selectRelayForPair(&self.membership.peers, self.our_pubkey, dest_key);
+
+        if (peer.state != .alive and peer.state != .suspected and relay_opt == null) {
             return formatError(resp_buf, "peer is not active");
         }
 
@@ -777,9 +779,10 @@ pub const ControlSocket = struct {
             return formatError(resp_buf, "peer wireguard key not known yet");
         };
 
-        const peer_ep = peer.gossip_endpoint orelse peer.public_endpoint orelse {
+        const peer_ep = peer.gossip_endpoint orelse peer.public_endpoint;
+        if (peer_ep == null and relay_opt == null) {
             return formatError(resp_buf, "peer endpoint not known");
-        };
+        }
 
         var msg_buf: [1 + 32 + 32 + 12 + MAX_MESSAGE_PAYLOAD + 16]u8 = undefined;
         msg_buf[0] = 0x50;
@@ -812,11 +815,14 @@ pub const ControlSocket = struct {
             return formatError(resp_buf, "daemon sender not configured");
         };
 
-        const sent_direct = send_fn(self.send_ctx.?, msg_buf[0..total_len], peer_ep);
+        var sent_direct = false;
+        if (peer_ep) |ep| {
+            sent_direct = send_fn(self.send_ctx.?, msg_buf[0..total_len], ep);
+        }
         var sent_relay = false;
 
-        if (peer.nat_type != .public) {
-            if (Relay.selectRelayForPair(&self.membership.peers, self.our_pubkey, dest_key)) |relay| {
+        if (peer.nat_type != .public or !sent_direct) {
+            if (relay_opt) |relay| {
                 if (relay.gossip_endpoint orelse relay.public_endpoint) |relay_ep| {
                     if (!std.mem.eql(u8, &relay.pubkey, &dest_key)) {
                         sent_relay = send_fn(self.send_ctx.?, msg_buf[0..total_len], relay_ep);

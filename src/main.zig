@@ -1082,8 +1082,8 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
 
     try writeFormatted(stdout, "  gossip port: {d}\n", .{gossip_port});
 
-    // Initialize membership table
-    var membership = lib.discovery.Membership.MembershipTable.init(allocator, 5000);
+    // Initialize membership table (15s suspicion timeout for WAN tolerance)
+    var membership = lib.discovery.Membership.MembershipTable.init(allocator, 15000);
     defer membership.deinit();
 
     // Initialize control socket (IPC API)

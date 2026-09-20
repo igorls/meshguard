@@ -64,8 +64,8 @@ pub const SwimConfig = struct {
     max_gossip_broadcasts: u32 = 6, // how many times to broadcast each gossip entry
     // How often to re-advertise our own identity + wg_pubkey into gossip so a peer
     // that missed the one-shot registration-time advertisement still learns our WG
-    // key (issue #114). 0 disables. Default 30s.
-    self_readvertise_interval_ms: u32 = 30000,
+    // key (issue #114). 0 disables. Default 5s.
+    self_readvertise_interval_ms: u32 = 5000,
 };
 
 /// Callback interface for SWIM events (e.g. WireGuard peer management).
@@ -117,6 +117,16 @@ const PendingPing = struct {
     sent_at_ns: i128,
     escalated: bool, // whether we've already sent ping-req
     candidate_probe: bool, // unauthenticated candidate probes never PING-REQ
+};
+
+/// Pending indirect ping request tracking (when acting as a SWIM relay for another peer)
+const PendingPingReq = struct {
+    requester_pubkey: [32]u8,
+    requester_endpoint: messages.Endpoint,
+    target_pubkey: [32]u8,
+    req_seq: u64,
+    forwarded_seq: u64,
+    sent_at_ns: i128,
 };
 
 /// Hard ceiling on SWIM control-plane send rate (packets/sec). Legitimate
@@ -183,6 +193,10 @@ pub const SwimProtocol = struct {
     // Pending pings awaiting ACK
     pending: [16]PendingPing = std.mem.zeroes([16]PendingPing),
     pending_count: usize = 0,
+
+    // Pending indirect ping requests forwarded for other peers
+    pending_reqs: [16]PendingPingReq = std.mem.zeroes([16]PendingPingReq),
+    pending_req_count: usize = 0,
 
     // Gossip queue with broadcast counters
     gossip_queue: [32]GossipSlot = std.mem.zeroes([32]GossipSlot),
@@ -287,6 +301,7 @@ pub const SwimProtocol = struct {
     pub fn setPublicEndpoint(self: *SwimProtocol, endpoint: ?messages.Endpoint, nat_type: messages.NatType) void {
         self.our_public_endpoint = endpoint;
         self.our_nat_type = nat_type;
+        self.enqueueSelfGossip();
     }
 
     /// Add an authorized peer pubkey. Call before run().
@@ -1049,19 +1064,72 @@ pub const SwimProtocol = struct {
             self.applyGossip(entry);
         }
 
+        // If this ACK satisfies an indirect ping request forwarded on behalf of another peer,
+        // relay the ACK back to the original requester!
+        var req_i: usize = 0;
+        while (req_i < self.pending_req_count) {
+            const pr = &self.pending_reqs[req_i];
+            if (pr.forwarded_seq == ack.seq and std.mem.eql(u8, &pr.target_pubkey, &ack.sender_pubkey)) {
+                // Target genuinely replied with a fresh live ACK!
+                // Relay confirmation back to requester. Sender is OUR pubkey (relay),
+                // so requester updates our endpoint, preserving target's endpoint unchanged.
+                const relay_ack = messages.Ack{
+                    .sender_pubkey = self.our_pubkey,
+                    .seq = pr.req_seq,
+                    .incarnation = self.our_incarnation,
+                    .gossip = &.{},
+                    .org_cert = std.mem.zeroes([messages.ORG_CERT_WIRE_SIZE]u8),
+                    .has_org_cert = false,
+                };
+                var ack_buf: [1500]u8 = undefined;
+                if (codec.encodeAck(&ack_buf, relay_ack)) |written| {
+                    self.gossipSend(ack_buf[0..written], pr.requester_endpoint);
+                    self.acks_sent +%= 1;
+                } else |_| {}
+
+                self.pending_reqs[req_i] = self.pending_reqs[self.pending_req_count - 1];
+                self.pending_req_count -= 1;
+            } else {
+                req_i += 1;
+            }
+        }
+
         // Clear pending ping
         self.clearPending(ack.seq);
     }
 
     fn handlePingReq(self: *SwimProtocol, req: messages.PingReq, sender_endpoint: messages.Endpoint) void {
-        _ = sender_endpoint;
+        const target = self.membership.peers.get(req.target_pubkey) orelse return;
+        const target_ep = target.gossip_endpoint orelse target.public_endpoint orelse return;
 
-        // Forward ping to the target
-        if (self.membership.peers.get(req.target_pubkey)) |target| {
-            if (target.gossip_endpoint) |ep| {
-                self.sendPing(ep, req.target_pubkey);
+        // Bounded capacity: evict oldest if full
+        const now = nowNs();
+        if (self.pending_req_count >= self.pending_reqs.len) {
+            var oldest_idx: usize = 0;
+            var oldest_time = self.pending_reqs[0].sent_at_ns;
+            for (self.pending_reqs[1..self.pending_req_count], 1..) |pr, idx| {
+                if (pr.sent_at_ns < oldest_time) {
+                    oldest_time = pr.sent_at_ns;
+                    oldest_idx = idx;
+                }
             }
+            self.pending_reqs[oldest_idx] = self.pending_reqs[self.pending_req_count - 1];
+            self.pending_req_count -= 1;
         }
+
+        const fwd_seq = self.seq + 1;
+        self.pending_reqs[self.pending_req_count] = .{
+            .requester_pubkey = req.sender_pubkey,
+            .requester_endpoint = sender_endpoint,
+            .target_pubkey = req.target_pubkey,
+            .req_seq = req.seq,
+            .forwarded_seq = fwd_seq,
+            .sent_at_ns = now,
+        };
+        self.pending_req_count += 1;
+
+        // Forward fresh PING to target
+        self.sendPing(target_ep, req.target_pubkey);
     }
 
     // ─── Hole Punching ───
@@ -1233,6 +1301,35 @@ pub const SwimProtocol = struct {
                 .public_endpoint = if (peer_info) |p| p.public_endpoint else null,
                 .nat_type = if (peer_info) |p| p.nat_type else .unknown,
             });
+
+            // Also enqueue gossip for other alive peers so the joining node learns existing peers immediately in ACK
+            var peer_it = self.membership.peers.iterator();
+            while (peer_it.next()) |p_entry| {
+                if (self.gossip_count >= self.gossip_queue.len) break;
+                const p = p_entry.value_ptr;
+                if (p.state != .alive) continue;
+                if (std.mem.eql(u8, &p.pubkey, &self.our_pubkey)) continue;
+                if (std.mem.eql(u8, &p.pubkey, &pubkey)) continue;
+
+                var already_queued = false;
+                for (0..self.gossip_count) |q_i| {
+                    if (std.mem.eql(u8, &self.gossip_queue[q_i].entry.subject_pubkey, &p.pubkey)) {
+                        already_queued = true;
+                        break;
+                    }
+                }
+                if (already_queued) continue;
+
+                self.enqueueGossip(.{
+                    .subject_pubkey = p.pubkey,
+                    .event = .alive,
+                    .lamport = p.lamport,
+                    .endpoint = p.gossip_endpoint orelse p.public_endpoint,
+                    .wg_pubkey = p.wg_pubkey,
+                    .public_endpoint = p.public_endpoint,
+                    .nat_type = p.nat_type,
+                });
+            }
         }
     }
 
@@ -1306,6 +1403,10 @@ pub const SwimProtocol = struct {
         var i: usize = 0;
         while (i < self.pending_count) {
             if (self.pending[i].seq == seq) {
+                // If this was an authenticated probe (or indirect escalated probe), mark target alive
+                if (!self.pending[i].candidate_probe) {
+                    self.membership.markAlive(self.pending[i].target_pubkey, null);
+                }
                 // Remove by swapping with last
                 self.pending[i] = self.pending[self.pending_count - 1];
                 self.pending_count -= 1;
@@ -1346,6 +1447,17 @@ pub const SwimProtocol = struct {
                 }
             } else {
                 i += 1;
+            }
+        }
+
+        // Also clean up timed-out relayed ping requests (older than 5s)
+        var pr_i: usize = 0;
+        while (pr_i < self.pending_req_count) {
+            if (now - self.pending_reqs[pr_i].sent_at_ns > 5 * std.time.ns_per_s) {
+                self.pending_reqs[pr_i] = self.pending_reqs[self.pending_req_count - 1];
+                self.pending_req_count -= 1;
+            } else {
+                pr_i += 1;
             }
         }
     }
@@ -1655,6 +1767,36 @@ pub const SwimProtocol = struct {
         if (self.gossip_count >= self.gossip_queue.len) return;
         self.last_self_readvertise_ns = now_ns;
         self.enqueueSelfGossip();
+
+        // Also re-advertise our alive peers so other peers (especially newly connected
+        // peers who joined after the initial join burst) learn about the rest of the mesh!
+        var it = self.membership.peers.iterator();
+        while (it.next()) |entry| {
+            if (self.gossip_count >= self.gossip_queue.len) break;
+            const peer = entry.value_ptr;
+            if (peer.state != .alive) continue;
+            if (std.mem.eql(u8, &peer.pubkey, &self.our_pubkey)) continue;
+
+            // Check if this peer is already in the gossip queue to avoid duplicates
+            var already_queued = false;
+            for (0..self.gossip_count) |q_i| {
+                if (std.mem.eql(u8, &self.gossip_queue[q_i].entry.subject_pubkey, &peer.pubkey)) {
+                    already_queued = true;
+                    break;
+                }
+            }
+            if (already_queued) continue;
+
+            self.enqueueGossip(.{
+                .subject_pubkey = peer.pubkey,
+                .event = .alive,
+                .lamport = peer.lamport,
+                .endpoint = peer.gossip_endpoint orelse peer.public_endpoint,
+                .wg_pubkey = peer.wg_pubkey,
+                .public_endpoint = peer.public_endpoint,
+                .nat_type = peer.nat_type,
+            });
+        }
     }
 
     /// Detect and heal a peer restart signalled by a ping/ack. A higher incarnation
@@ -1805,7 +1947,8 @@ pub const SwimProtocol = struct {
                 // For peers we already track, liveness is decided by our own
                 // failure detector (direct ping/ack → markAlive), never by
                 // unauthenticated gossip.
-                if (entry.endpoint) |ep| {
+                const learn_ep = entry.endpoint orelse entry.public_endpoint;
+                if (learn_ep) |ep| {
                     if (self.membership.peers.getPtr(entry.subject_pubkey) == null) {
                         self.registerOrUpdatePeerEndpoint(entry.subject_pubkey, ep);
                     }
@@ -1832,6 +1975,16 @@ pub const SwimProtocol = struct {
                     if (entry.wg_pubkey) |wg_key| {
                         if (peer.wg_pubkey == null) {
                             peer.wg_pubkey = wg_key;
+                            // Re-gossip this peer's alive event so all peers learn its WG pubkey
+                            self.enqueueGossip(.{
+                                .subject_pubkey = entry.subject_pubkey,
+                                .event = .alive,
+                                .lamport = peer.lamport,
+                                .endpoint = peer.gossip_endpoint,
+                                .wg_pubkey = wg_key,
+                                .public_endpoint = peer.public_endpoint,
+                                .nat_type = peer.nat_type,
+                            });
                             // Fire onPeerJoin now that we have the WG key
                             if (self.handler) |h| {
                                 h.onPeerJoin(h.ctx, peer);
