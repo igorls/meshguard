@@ -28,8 +28,9 @@ CLI wrappers (`meshguard appsend`, `meshguard apprecv`, `meshguard appinfo`)
 talk to the daemon through the same control socket as `send`/`recv`.
 For `apprecv`, the first argument is always the channel, including names such
 as `-alerts` or `--wait`; place an optional `--wait <ms>` after it. Receive
-buffers allow for JSON escaping of the full payload, and Unix clients assemble
-the complete newline-delimited response before decoding it.
+buffers allow for JSON escaping of the full payload. Unix sockets and Windows
+byte-mode pipes assemble complete newline-delimited commands and responses
+before processing them.
 
 ## Wire format
 
@@ -41,8 +42,9 @@ MGAPP1 <channel> <payload>
 
 - Reserved prefix: `MGAPP1` followed by a space (7 bytes).
 - Channel: charset `[a-z0-9._-]`, length 1–64. Anything else is rejected.
-- Payload must be nonempty and may contain spaces; the first space after the prefix separates the
-  channel name, the rest is the payload.
+- Payload must be nonempty, valid UTF-8 and at most 952 bytes. The first space
+  after the prefix separates the channel name; everything after the channel
+  separator is payload, including leading and trailing spaces or tabs.
 - Malformed or oversize frames are **rejected**, never truncated, and never
   placed on the legacy queue.
 - Unframed / non-`MGAPP1` plaintext continues to the legacy `SEND`/`RECV`/`MSGS`
@@ -63,8 +65,8 @@ len("MGAPP1 ") + len(channel) + 1
 1024 - 7 - 64 - 1 = 952
 ```
 
-`meshrooms-v1` (12 bytes) could carry 1004 bytes, but clients must not assume
-that: advertise and enforce 952.
+All channels enforce the advertised 952-byte payload limit on send and receive,
+including short channel names with additional frame space available.
 
 ## Queue isolation
 
@@ -101,6 +103,11 @@ and does not fall back to the production socket. CLI `SEND`/`RECV`/`APP*` and
 Empty, whitespace-only, or NUL-containing paths are errors, including explicit
 `--control-path` values. An unavailable explicit endpoint also fails closed:
 `status`/`down` do not query or remove the default kernel interface.
+Startup fails if an explicit control endpoint cannot be bound. Unix paths
+reject existing regular files, directories and symlinks, preserve active
+listeners, and reclaim only stale sockets. Cleanup removes only the socket
+created by that listener. Windows reserves an exclusive pipe instance before
+reporting successful startup.
 
 Example (does not stop a production worker):
 

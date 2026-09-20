@@ -574,7 +574,7 @@ pub const ControlSocket = struct {
 
     pub fn pushAppMessage(self: *ControlSocket, sender: [32]u8, channel: []const u8, data: []const u8) bool {
         if (!app_channel.isValidChannel(channel)) return false;
-        if (data.len == 0 or data.len > MAX_MESSAGE_PAYLOAD) return false;
+        if (data.len == 0 or data.len > app_channel.MAX_APP_PAYLOAD or !std.unicode.utf8ValidateSlice(data)) return false;
 
         self.queue_lock.lockUncancelable(zio());
         defer self.queue_lock.unlock(zio());
@@ -933,6 +933,7 @@ pub const ControlSocket = struct {
         const frame = app_channel.encode(channel, payload, &frame_buf) catch |err| switch (err) {
             error.InvalidChannel => return formatError(resp_buf, "invalid channel name"),
             error.EmptyPayload => return formatError(resp_buf, "empty payload"),
+            error.InvalidUtf8 => return formatError(resp_buf, "payload must be valid UTF-8"),
             error.Oversize => return formatError(resp_buf, "payload exceeds maximum application frame length"),
         };
 
@@ -1957,6 +1958,10 @@ test "oversize and malformed MGAPP1 frames are rejected without truncate" {
     try std.testing.expect(!control.pushMessage(sender, "MGAPP1 "));
     try std.testing.expect(!control.pushMessage(sender, "MGAPP1 meshrooms-v1"));
     try std.testing.expect(!control.pushMessage(sender, "MGAPP1  payload"));
+    try std.testing.expect(!control.pushMessage(sender, "MGAPP1 meshrooms-v1 \xff"));
+    try std.testing.expect(!control.pushMessage(sender, "MGAPP1 meshrooms-v1 " ++ "x" ** (app_channel.MAX_APP_PAYLOAD + 1)));
+    try std.testing.expect(!control.pushAppMessage(sender, "meshrooms-v1", "\xff"));
+    try std.testing.expect(!control.pushAppMessage(sender, "meshrooms-v1", "x" ** (app_channel.MAX_APP_PAYLOAD + 1)));
 
     var oversize: [MAX_MESSAGE_PAYLOAD + 32]u8 = undefined;
     const prefix = "MGAPP1 meshrooms-v1 ";
