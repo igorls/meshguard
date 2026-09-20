@@ -1,4 +1,4 @@
-"""Exercise startup validation using only isolated paths and no daemon starts."""
+"""Exercise isolated IPC and startup; test daemons use loopback gossip without TUN."""
 import os
 import json
 from pathlib import Path
@@ -124,6 +124,79 @@ class ControlStartup(unittest.TestCase):
         for channel in ("-alerts", "--wait"):
             with self.subTest(channel=channel):
                 self.rejected(["apprecv", channel], "ExplicitControlSocketUnavailable")
+
+    def start_args(self):
+        subprocess.run([str(BINARY), "keygen"], env=self.env, capture_output=True, check=True, timeout=10)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
+            udp.bind(("127.0.0.1", 0))
+            port = udp.getsockname()[1]
+        return [str(BINARY), "up", "--no-tun", "--announce", "127.0.0.1",
+                "--gossip-port", str(port)]
+
+    def stop_child(self, child):
+        if child.poll() is None:
+            child.terminate()
+            try:
+                child.wait(3)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait(3)
+
+    def test_explicit_listener_failure_is_fatal(self):
+        if os.name == "nt":
+            server = WindowsPipe(self.env["MESHGUARD_CONTROL_PATH"])
+        else:
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(self.env["MESHGUARD_CONTROL_PATH"])
+            server.listen(4)
+        self.addCleanup(server.close)
+        args = self.start_args()
+        for flags in ([], ["--control-path", self.env["MESHGUARD_CONTROL_PATH"]]):
+            with self.subTest(flags=flags):
+                child = subprocess.Popen(args + flags, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                try:
+                    stdout, stderr = child.communicate(timeout=3)
+                except subprocess.TimeoutExpired:
+                    self.fail("daemon continued after explicit endpoint collision")
+                finally:
+                    self.stop_child(child)
+                self.assertNotEqual(child.returncode, 0)
+                self.assertIn(b"control socket: failed", stdout + stderr)
+
+    def test_server_waits_for_complete_command(self):
+        child = subprocess.Popen(self.start_args(), env=self.env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(self.stop_child, child)
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                if os.name == "nt":
+                    conn = open(self.env["MESHGUARD_CONTROL_PATH"], "r+b", buffering=0)
+                else:
+                    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    conn.settimeout(3)
+                    conn.connect(self.env["MESHGUARD_CONTROL_PATH"])
+                break
+            except OSError:
+                if os.name != "nt":
+                    conn.close()
+                if time.monotonic() >= deadline or child.poll() is not None:
+                    raise
+                time.sleep(0.02)
+        with conn:
+            send = conn.write if os.name == "nt" else conn.sendall
+            send(b"APPSEND " + b"a" * 64 + b" ")
+            time.sleep(0.03)
+            send(b"meshrooms-v1 complete payload\n")
+            if os.name == "nt":
+                response = conn.readline()
+            else:
+                response = conn.recv(8192)
+        self.assertEqual(json.loads(response)["error"], "peer not found in membership table")
+        # The same listener must handle subsequent clients and stop cleanly.
+        for command in ("appinfo", "down"):
+            result = subprocess.run([str(BINARY), command], env=self.env, capture_output=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(child.wait(3), 0)
 
     @unittest.skipIf(os.name == "nt", "Unix filesystem socket paths only")
     def test_control_path_preserves_existing_files(self):

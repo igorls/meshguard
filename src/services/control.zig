@@ -135,6 +135,7 @@ const win = if (is_windows) struct {
     extern "kernel32" fn FlushFileBuffers(hFile: HANDLE) callconv(.winapi) BOOL;
     extern "kernel32" fn CreateFileW(lpFileName: LPCWSTR, dwDesiredAccess: DWORD, dwShareMode: DWORD, lpSecurityAttributes: ?*anyopaque, dwCreationDisposition: DWORD, dwFlagsAndAttributes: DWORD, hTemplateFile: ?HANDLE) callconv(.winapi) HANDLE;
     extern "kernel32" fn WaitNamedPipeW(lpNamedPipeName: LPCWSTR, nTimeOut: DWORD) callconv(.winapi) BOOL;
+    extern "kernel32" fn CancelSynchronousIo(hThread: HANDLE) callconv(.winapi) BOOL;
 } else struct {};
 
 pub const DEFAULT_SOCKET_PATH = if (is_windows) "\\\\.\\pipe\\meshguard" else "/run/meshguard/meshguard.sock";
@@ -441,6 +442,9 @@ pub const ControlSocket = struct {
     socket_path: []const u8,
     socket_path_owned: bool,
     bound_socket_stat: ?std.Io.File.Stat = null,
+    control_thread: ?std.Thread = null,
+    windows_stopping: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    windows_exited: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     membership: *Membership.MembershipTable,
     our_pubkey: [32]u8,
     our_mesh_ip: [4]u8,
@@ -681,49 +685,46 @@ pub const ControlSocket = struct {
 
     fn listenWindows(self: *ControlSocket) !void {
         if (comptime !is_windows) return;
-
-        const thread = try std.Thread.spawn(.{}, controlThreadWindows, .{self});
-        thread.detach();
+        var name_buf: [512]u16 = undefined;
+        const pipe_name = try windowsPipeNameZ(self.socket_path, &name_buf);
+        // Reserve the name synchronously: duplicate daemons must not share it.
+        const pipe_handle = win.CreateNamedPipeW(
+            pipe_name,
+            0x00000003 | 0x00080000, // PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE
+            0, // PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT
+            1,
+            4096,
+            4096,
+            5000,
+            null,
+        );
+        if (pipe_handle == win.windows.INVALID_HANDLE_VALUE) return error.BindFailed;
+        errdefer _ = win.CloseHandle(pipe_handle);
+        self.windows_stopping.store(false, .release);
+        self.windows_exited.store(false, .release);
+        self.control_thread = try std.Thread.spawn(.{}, controlThreadWindows, .{ self, pipe_handle });
+        self.server = pipe_handle;
     }
 
-    fn controlThreadWindows(self: *ControlSocket) void {
-        var name_buf: [512]u16 = undefined;
-        const pipe_name = windowsPipeNameZ(self.socket_path, &name_buf) catch return;
-
-        while (true) {
+    fn controlThreadWindows(self: *ControlSocket, pipe_handle: win.HANDLE) void {
+        defer self.windows_exited.store(true, .release);
+        defer _ = win.DisconnectNamedPipe(pipe_handle);
+        while (!self.windows_stopping.load(.acquire)) {
             if (self.stop_flag) |flag| {
                 if (!flag.load(.acquire)) break;
-            }
-
-            const pipe_handle = win.CreateNamedPipeW(
-                pipe_name,
-                0x00000003, // PIPE_ACCESS_DUPLEX
-                0x00000000, // PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT
-                255, // PIPE_UNLIMITED_INSTANCES
-                4096, // out buffer
-                4096, // in buffer
-                5000, // default timeout
-                null, // default security
-            );
-
-            if (pipe_handle == win.windows.INVALID_HANDLE_VALUE) {
-                std.Io.sleep(zio(), std.Io.Duration.fromNanoseconds(100 * std.time.ns_per_ms), .awake) catch {};
-                continue;
             }
 
             const connected = win.ConnectNamedPipe(pipe_handle, null);
             if (connected == @as(win.BOOL, @enumFromInt(0))) {
                 const err = win.GetLastError();
                 if (err != @as(win.windows.Win32Error, @enumFromInt(535))) { // ERROR_PIPE_CONNECTED
-                    _ = win.CloseHandle(pipe_handle);
+                    _ = win.DisconnectNamedPipe(pipe_handle);
                     continue;
                 }
             }
 
             var buf: [2048]u8 = undefined;
-            var bytes_read: win.DWORD = 0;
-            const read_ok = win.ReadFile(pipe_handle, @ptrCast(&buf), buf.len, &bytes_read, null);
-            if (read_ok != @as(win.BOOL, @enumFromInt(0)) and bytes_read > 0) {
+            if (readWindowsLine(pipe_handle, &buf)) |bytes_read| {
                 const cmd = std.mem.trimEnd(u8, buf[0..bytes_read], "\r\n");
                 var resp_buf: [8192]u8 = undefined;
                 const resp_len = self.formatCommandResponse(cmd, &resp_buf, true);
@@ -732,10 +733,9 @@ pub const ControlSocket = struct {
                     _ = win.WriteFile(pipe_handle, @ptrCast(resp_buf[0..resp_len].ptr), @intCast(resp_len), &bytes_written, null);
                     _ = win.FlushFileBuffers(pipe_handle);
                 }
-            }
+            } else |_| {}
 
             _ = win.DisconnectNamedPipe(pipe_handle);
-            _ = win.CloseHandle(pipe_handle);
         }
     }
 
@@ -767,17 +767,8 @@ pub const ControlSocket = struct {
     }
 
     fn handleClientUnix(self: *ControlSocket, client: posix.socket_t) void {
-        var fds = [_]posix.pollfd{.{
-            .fd = client,
-            .events = posix.POLL.IN,
-            .revents = 0,
-        }};
-        const ready = posix.poll(&fds, 1000) catch return;
-        if (ready == 0 or (fds[0].revents & posix.POLL.IN) == 0) return;
-
         var buf: [2048]u8 = undefined;
-        const n = posix.read(client, &buf) catch return;
-        if (n == 0) return;
+        const n = readUnixLine(client, &buf, 1000) catch return;
 
         const cmd = std.mem.trimEnd(u8, buf[0..n], "\r\n");
         var resp_buf: [8192]u8 = undefined;
@@ -1163,6 +1154,17 @@ pub const ControlSocket = struct {
 
     pub fn deinit(self: *ControlSocket, allocator: std.mem.Allocator) void {
         if (comptime is_windows) {
+            if (self.control_thread) |thread| {
+                self.windows_stopping.store(true, .release);
+                // Cancel any synchronous connect/read/write, including a call
+                // which begins just after the stop flag was set.
+                while (!self.windows_exited.load(.acquire)) {
+                    _ = win.CancelSynchronousIo(thread.getHandle());
+                    std.Io.sleep(zio(), std.Io.Duration.fromNanoseconds(5 * std.time.ns_per_ms), .awake) catch {};
+                }
+                thread.join();
+                self.control_thread = null;
+            }
             if (self.server) |pipe| {
                 _ = win.CloseHandle(pipe);
                 self.server = null;
@@ -1285,6 +1287,10 @@ fn requestUnixPath(path: []const u8, command: []const u8, out: []u8) !usize {
         }
     }
 
+    return readUnixLine(sock, out, poll_timeout);
+}
+
+fn readUnixLine(sock: posix.socket_t, out: []u8, poll_timeout: i32) !usize {
     var fds = [_]posix.pollfd{.{
         .fd = sock,
         .events = posix.POLL.IN,
@@ -1300,7 +1306,7 @@ fn requestUnixPath(path: []const u8, command: []const u8, out: []u8) !usize {
         const n = readSocket(sock, out[used..]) catch return error.ReadFailed;
         if (n == 0) return error.ReadFailed;
         used += n;
-        // Unix sockets are streams: a complete response may require several reads.
+        // Commands and responses are newline-delimited streams.
         if (std.mem.indexOfScalar(u8, out[0..used], '\n')) |end| return end + 1;
     }
     return error.ResponseTooLarge;
@@ -1355,6 +1361,10 @@ fn requestWindows(path: []const u8, command: []const u8, out: []u8) !usize {
         return error.WriteFailed;
     }
 
+    return readWindowsLine(handle, out);
+}
+
+fn readWindowsLine(handle: win.HANDLE, out: []u8) !usize {
     const deadline = nowMilliSecs() + 1000;
     var used: usize = 0;
     while (used < out.len) {
@@ -1377,6 +1387,25 @@ fn requestWindows(path: []const u8, command: []const u8, out: []u8) !usize {
 }
 
 pub const sendControlCommand = request;
+
+test "Windows listener reserves its name and joins the worker during cleanup" {
+    if (comptime !is_windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const path = try std.fmt.allocPrint(allocator, "\\\\.\\pipe\\meshguard-test-{s}", .{temp.sub_path});
+    defer allocator.free(path);
+    var membership = Membership.MembershipTable.init(allocator, 10);
+    defer membership.deinit();
+    var control = try ControlSocket.init(allocator, &membership, [_]u8{1} ** 32, .{ 10, 99, 0, 1 }, [_]u8{2} ** 32, path);
+    defer control.deinit(allocator);
+    try control.listen();
+    var duplicate = try ControlSocket.init(allocator, &membership, [_]u8{1} ** 32, .{ 10, 99, 0, 1 }, [_]u8{2} ** 32, path);
+    defer duplicate.deinit(allocator);
+    try std.testing.expectError(error.BindFailed, duplicate.listen());
+    control.deinit(allocator);
+    try duplicate.listen();
+}
 
 test "Unix listener reclaims only stale sockets and cleans up only its own path" {
     if (comptime is_windows) return error.SkipZigTest;

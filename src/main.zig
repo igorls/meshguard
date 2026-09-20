@@ -1195,6 +1195,12 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     // Start control socket immediately so IPC is available during startup
     control.listen() catch |err| {
         try writeFormatted(stdout, "  control socket: failed ({s})\n", .{@errorName(err)});
+        if (control_path != null) {
+            if (comptime @import("builtin").os.tag == .linux) {
+                if (use_kernel_wg and !gossip_only) lib.wireguard.Config.teardown(lib.wireguard.Config.DEFAULT_IFNAME) catch {};
+            }
+            return err;
+        }
     };
     if (control.server != null) {
         try writeFormatted(stdout, "  control socket: {s}\n", .{control.socket_path});
