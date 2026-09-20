@@ -5192,11 +5192,13 @@ fn cmdRecv(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         if (std.mem.eql(u8, args[i], "--wait") and i + 1 < args.len) {
             i += 1;
             wait_ms = std.fmt.parseInt(u32, args[i], 10) catch 0;
+        } else if (!std.mem.startsWith(u8, args[i], "-")) {
+            wait_ms = std.fmt.parseInt(u32, args[i], 10) catch 0;
         }
     }
 
     var cmd_buf: [64]u8 = undefined;
-    const cmd = std.fmt.bufPrint(&cmd_buf, "RECV {d}\n", .{wait_ms}) catch "RECV\n";
+    const cmd = std.fmt.bufPrint(&cmd_buf, "RECV {d}", .{wait_ms}) catch "RECV";
 
     var resp_buf: [4096]u8 = undefined;
     const resp_len = lib.services.Control.sendControlCommand(allocator, cmd, &resp_buf) catch |err| {

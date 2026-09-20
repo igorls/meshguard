@@ -841,7 +841,8 @@ fn stopAuthorizedUnix(client: posix.socket_t) bool {
     return false;
 }
 
-pub fn request(allocator: std.mem.Allocator, command: []const u8, out: []u8) !usize {
+pub fn request(allocator: std.mem.Allocator, command_raw: []const u8, out: []u8) !usize {
+    const command = std.mem.trimEnd(u8, command_raw, "\r\n");
     if (command.len == 0 or std.mem.indexOfAny(u8, command, "\r\n") != null) {
         return error.InvalidCommand;
     }
