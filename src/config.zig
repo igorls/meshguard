@@ -25,9 +25,6 @@ pub fn getEnvVarOwned(allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
     return try allocator.dupe(u8, std.mem.span(value));
 }
 
-    // Identity
-    name: []const u8 = "meshguard-node",
-
     pub const DEFAULT_GOSSIP_PORT: u16 = 51821;
     pub const GOSSIP_PORT_ENV = "MESHGUARD_GOSSIP_PORT";
     pub const GossipPortError = error{InvalidGossipPort};
@@ -56,6 +53,9 @@ pub fn getEnvVarOwned(allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
         if (env) |value| return parseGossipPort(value);
         return DEFAULT_GOSSIP_PORT;
     }
+
+    // Identity
+    name: []const u8 = "meshguard-node",
 
     // Mesh
     interface: []const u8 = "mg0",
