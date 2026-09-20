@@ -33,6 +33,9 @@ jobs:
       - name: Build (ReleaseFast)
         run: zig build -Doptimize=ReleaseFast
 
+      - name: Control endpoint and startup regression checks
+        run: python scripts/test-control-startup.py zig-out/bin/meshguard${{ runner.os == 'Windows' && '.exe' || '' }}
+
   test-linux:
     name: Test (ubuntu)
     runs-on: ubuntu-latest
