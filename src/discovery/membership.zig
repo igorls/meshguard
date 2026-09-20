@@ -243,6 +243,16 @@ pub const MembershipTable = struct {
         return result.toOwnedSlice();
     }
 
+    /// Count alive peers in table.
+    pub fn countAlive(self: *const MembershipTable) usize {
+        var n: usize = 0;
+        var iter = self.peers.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.state == .alive) n += 1;
+        }
+        return n;
+    }
+
     /// Pick a random alive peer for SWIM probing.
     pub fn randomAlivePeer(self: *MembershipTable) ?*Peer {
         var alive_count: usize = 0;

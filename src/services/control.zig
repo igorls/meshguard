@@ -514,24 +514,60 @@ pub const ControlSocket = struct {
     fn listenWindows(self: *ControlSocket) !void {
         if (comptime !is_windows) return;
 
+        const thread = try std.Thread.spawn(.{}, controlThreadWindows, .{self});
+        thread.detach();
+    }
+
+    fn controlThreadWindows(self: *ControlSocket) void {
         const pipe_name = std.unicode.utf8ToUtf16LeStringLiteral("\\\\.\\pipe\\meshguard");
 
-        const pipe_handle = win.CreateNamedPipeW(
-            pipe_name,
-            0x00000003 | 0x00080000, // PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE
-            0x00000000 | 0x00000000 | 0x00000001, // PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT
-            1, // max instances
-            4096, // out buffer
-            4096, // in buffer
-            0, // default timeout
-            null, // default security
-        );
+        while (true) {
+            if (self.stop_flag) |flag| {
+                if (!flag.load(.acquire)) break;
+            }
 
-        if (pipe_handle == win.windows.INVALID_HANDLE_VALUE) {
-            return error.NamedPipeCreateFailed;
+            const pipe_handle = win.CreateNamedPipeW(
+                pipe_name,
+                0x00000003, // PIPE_ACCESS_DUPLEX
+                0x00000000, // PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT
+                255, // PIPE_UNLIMITED_INSTANCES
+                4096, // out buffer
+                4096, // in buffer
+                5000, // default timeout
+                null, // default security
+            );
+
+            if (pipe_handle == win.windows.INVALID_HANDLE_VALUE) {
+                std.Io.sleep(zio(), std.Io.Duration.fromNanoseconds(100 * std.time.ns_per_ms), .awake) catch {};
+                continue;
+            }
+
+            const connected = win.ConnectNamedPipe(pipe_handle, null);
+            if (connected == @as(win.BOOL, @enumFromInt(0))) {
+                const err = win.GetLastError();
+                if (err != @as(win.windows.Win32Error, @enumFromInt(535))) { // ERROR_PIPE_CONNECTED
+                    _ = win.CloseHandle(pipe_handle);
+                    continue;
+                }
+            }
+
+            var buf: [2048]u8 = undefined;
+            var bytes_read: win.DWORD = 0;
+            const read_ok = win.ReadFile(pipe_handle, @ptrCast(&buf), buf.len, &bytes_read, null);
+            if (read_ok != @as(win.BOOL, @enumFromInt(0)) and bytes_read > 0) {
+                const cmd = std.mem.trimEnd(u8, buf[0..bytes_read], "\r\n \t");
+                var resp_buf: [8192]u8 = undefined;
+                const resp_len = self.formatCommandResponse(cmd, &resp_buf, true);
+                if (resp_len > 0) {
+                    var bytes_written: win.DWORD = 0;
+                    _ = win.WriteFile(pipe_handle, @ptrCast(resp_buf[0..resp_len].ptr), @intCast(resp_len), &bytes_written, null);
+                    _ = win.FlushFileBuffers(pipe_handle);
+                }
+            }
+
+            _ = win.DisconnectNamedPipe(pipe_handle);
+            _ = win.CloseHandle(pipe_handle);
         }
-
-        self.server = pipe_handle;
     }
 
     pub fn poll(self: *ControlSocket) bool {
@@ -560,47 +596,8 @@ pub const ControlSocket = struct {
     }
 
     fn pollWindows(self: *ControlSocket) bool {
-        if (comptime !is_windows) return false;
-
-        const pipe = self.server orelse return false;
-        const error_pipe_connected = @as(win.windows.Win32Error, @enumFromInt(535));
-        const error_no_data = @as(win.windows.Win32Error, @enumFromInt(232));
-        const error_pipe_listening = @as(win.windows.Win32Error, @enumFromInt(536));
-
-        const connected = win.ConnectNamedPipe(pipe, null);
-        if (connected == @as(win.BOOL, @enumFromInt(0))) {
-            const err = win.GetLastError();
-            if (err == error_no_data) {
-                _ = win.DisconnectNamedPipe(pipe);
-                return false;
-            }
-            if (err != error_pipe_connected and err != error_pipe_listening) return false;
-            if (err == error_pipe_listening) return false;
-        }
-
-        var buf: [2048]u8 = undefined;
-        var bytes_read: win.DWORD = 0;
-        const read_ok = win.ReadFile(pipe, @ptrCast(&buf), buf.len, &bytes_read, null);
-        if (read_ok == @as(win.BOOL, @enumFromInt(0)) or bytes_read == 0) {
-            if (win.GetLastError() == @as(win.windows.Win32Error, @enumFromInt(232))) {
-                return false;
-            }
-            _ = win.DisconnectNamedPipe(pipe);
-            return false;
-        }
-
-        const cmd = std.mem.trimEnd(u8, buf[0..bytes_read], "\r\n \t");
-
-        var resp_buf: [8192]u8 = undefined;
-        const resp_len = self.formatCommandResponse(cmd, &resp_buf, true);
-        if (resp_len > 0) {
-            var bytes_written: win.DWORD = 0;
-            _ = win.WriteFile(pipe, @ptrCast(resp_buf[0..resp_len].ptr), @intCast(resp_len), &bytes_written, null);
-            _ = win.FlushFileBuffers(pipe);
-        }
-
-        _ = win.DisconnectNamedPipe(pipe);
-        return true;
+        _ = self;
+        return false;
     }
 
     fn handleClientUnix(self: *ControlSocket, client: posix.socket_t) void {
@@ -1031,10 +1028,10 @@ fn requestUnixPath(path: []const u8, command: []const u8, out: []u8) !usize {
 fn requestWindows(command: []const u8, out: []u8) !usize {
     if (comptime !is_windows) unreachable;
 
-    const pipe_name = std.unicode.utf8ToUtf16LeStringLiteral(DEFAULT_SOCKET_PATH);
+    const pipe_name = std.unicode.utf8ToUtf16LeStringLiteral("\\\\.\\pipe\\meshguard");
     var attempts: usize = 0;
     var handle: win.HANDLE = win.windows.INVALID_HANDLE_VALUE;
-    while (attempts < 10) : (attempts += 1) {
+    while (attempts < 50) : (attempts += 1) {
         handle = win.CreateFileW(
             pipe_name,
             0x80000000 | 0x40000000, // GENERIC_READ | GENERIC_WRITE
@@ -1048,9 +1045,9 @@ fn requestWindows(command: []const u8, out: []u8) !usize {
 
         const err = win.GetLastError();
         if (err == @as(win.windows.Win32Error, @enumFromInt(231))) { // ERROR_PIPE_BUSY
-            _ = win.WaitNamedPipeW(pipe_name, 200);
+            _ = win.WaitNamedPipeW(pipe_name, 500);
         } else {
-            const waited = win.WaitNamedPipeW(pipe_name, 200);
+            const waited = win.WaitNamedPipeW(pipe_name, 500);
             if (waited == @as(win.BOOL, @enumFromInt(0))) {
                 std.Io.sleep(zio(), std.Io.Duration.fromNanoseconds(50 * std.time.ns_per_ms), .awake) catch {};
             }

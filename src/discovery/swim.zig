@@ -175,6 +175,11 @@ pub const SwimProtocol = struct {
     // Set true by the daemon only in userspace-TUN mode.
     retransmit_handshakes: bool = false,
 
+    // Configured seed endpoints for initial discovery and periodic reconnection
+    seeds: [16]messages.Endpoint = std.mem.zeroes([16]messages.Endpoint),
+    seed_count: usize = 0,
+    last_seed_ping_ns: i128 = 0,
+
     // Pending pings awaiting ACK
     pending: [16]PendingPing = std.mem.zeroes([16]PendingPing),
     pending_count: usize = 0,
@@ -558,11 +563,35 @@ pub const SwimProtocol = struct {
             self.last_punch_check_ns = now_ns;
             self.checkUnreachablePeers();
         }
+
+        // 8. Periodically re-ping seeds if isolated or to refresh rendezvous
+        self.reconnectSeeds(now_ns);
     }
 
-    /// Send initial PINGs to seed peers.
+    fn reconnectSeeds(self: *SwimProtocol, now_ns: i128) void {
+        if (self.seed_count == 0) return;
+        const seed_interval_ns: i128 = if (self.membership.countAlive() == 0)
+            2_000_000_000 // 2 seconds when isolated
+        else
+            15_000_000_000; // 15 seconds to keep seed rendezvous active
+        if (now_ns - self.last_seed_ping_ns >= seed_interval_ns) {
+            self.last_seed_ping_ns = now_ns;
+            for (self.seeds[0..self.seed_count]) |seed| {
+                self.sendPing(seed, [_]u8{0} ** 32);
+            }
+        }
+    }
+
+    /// Send initial PINGs to seed peers and record them for periodic reconnection.
     pub fn seedPeers(self: *SwimProtocol, seeds: []const messages.Endpoint) void {
-        for (seeds) |seed| {
+        const to_copy = @min(seeds.len, self.seeds.len);
+        for (0..to_copy) |i| {
+            self.seeds[i] = seeds[i];
+        }
+        self.seed_count = to_copy;
+        self.last_seed_ping_ns = nowNs();
+
+        for (self.seeds[0..self.seed_count]) |seed| {
             // Send a ping to each seed — we don't know their pubkey yet,
             // so we use a zero pubkey as "hello" ping
             self.sendPing(seed, [_]u8{0} ** 32);
@@ -631,6 +660,9 @@ pub const SwimProtocol = struct {
             self.last_punch_check_ns = now_ns;
             self.checkUnreachablePeers();
         }
+
+        // 7. Periodically re-ping seeds if isolated or to refresh rendezvous
+        self.reconnectSeeds(now_ns);
     }
 
     /// Receive-only tick for suspended/background mode.
