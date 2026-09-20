@@ -111,6 +111,22 @@ fn childExitedSuccessfully(term: std.process.Child.Term) bool {
     return childExitCode(term) == 0;
 }
 
+fn isChildStillRunning(child: *std.process.Child) bool {
+    const id = child.id orelse return false;
+    const is_win = comptime @import("builtin").os.tag == .windows;
+    if (is_win) {
+        const WaitForSingleObject = struct {
+            extern "kernel32" fn WaitForSingleObject(hHandle: std.os.windows.HANDLE, dwMilliseconds: std.os.windows.DWORD) callconv(.winapi) std.os.windows.DWORD;
+        }.WaitForSingleObject;
+        const res = WaitForSingleObject(id, 0);
+        return res != 0; // 0 is WAIT_OBJECT_0 (signaled = terminated)
+    } else {
+        var status: c_int = 0;
+        const res = std.c.waitpid(id, &status, 1); // 1 = WNOHANG
+        return res == 0;
+    }
+}
+
 fn configuredStunServers(out: []lib.nat.Stun.StunServer) []const lib.nat.Stun.StunServer {
     const cfg = Config{};
     return lib.nat.Stun.configuredOrDefault(cfg.stun_servers, out);
@@ -1113,6 +1129,14 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     swim.retransmit_handshakes = !use_kernel_wg and !gossip_only;
     control.setStopFlag(&swim.running);
 
+    // Start control socket immediately so IPC is available during startup
+    control.listen() catch |err| {
+        try writeFormatted(stdout, "  control socket: failed ({s})\n", .{@errorName(err)});
+    };
+    if (control.server != null) {
+        try writeFormatted(stdout, "  control socket: {s}\n", .{control.socket_path});
+    }
+
     // Load authorized keys and enable trust enforcement (unless --open)
     if (!open_mode) {
         const authorized_peers = lib.identity.Trust.loadAuthorizedKeys(allocator, config_dir) catch &.{};
@@ -1229,14 +1253,6 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
             },
             .unknown => try stdout.writeStreamingAll(zio(), "  STUN: could not determine public endpoint\n"),
         }
-    }
-
-    // Start control socket
-    control.listen() catch |err| {
-        try writeFormatted(stdout, "  control socket: failed ({s})\n", .{@errorName(err)});
-    };
-    if (control.server != null) {
-        try writeFormatted(stdout, "  control socket: {s}\n", .{control.socket_path});
     }
 
     // Seed initial peers
@@ -5525,7 +5541,19 @@ fn cmdJoin(allocator: std.mem.Allocator, exe_path: []const u8, token_arg: []cons
     if (!daemon_ready) {
         try stdout.writeStreamingAll(zio(), "[join] Daemon not running, starting userspace daemon in background...\n");
 
-        _ = spawnChild(.{
+        const log_path = std.fs.path.join(allocator, &.{ config_dir, "daemon.log" }) catch null;
+        defer if (log_path) |p| allocator.free(p);
+
+        var log_file: ?std.Io.File = null;
+        var log_file_err: ?std.Io.File = null;
+        if (log_path) |p| {
+            log_file = std.Io.Dir.createFileAbsolute(zio(), p, .{ .truncate = true }) catch null;
+            if (log_file != null) {
+                log_file_err = std.Io.Dir.openFileAbsolute(zio(), p, .{ .mode = .write_only }) catch null;
+            }
+        }
+
+        var child_proc = spawnChild(.{
             .argv = &.{
                 self_exe,
                 "up",
@@ -5534,16 +5562,23 @@ fn cmdJoin(allocator: std.mem.Allocator, exe_path: []const u8, token_arg: []cons
                 seed,
                 "--open",
             },
-            .stdout = .ignore,
-            .stderr = .ignore,
+            .stdout = if (log_file) |f| .{ .file = f } else .ignore,
+            .stderr = if (log_file_err) |f| .{ .file = f } else if (log_file) |f| .{ .file = f } else .ignore,
         }) catch |err| {
+            if (log_file) |f| f.close(zio());
+            if (log_file_err) |f| f.close(zio());
             try writeFormatted(stderr, "error: failed to start daemon: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
 
-        // Wait for daemon to respond on control socket (up to 5 seconds)
+        // Close parent write handles to log file so child flushes cleanly
+        if (log_file) |f| f.close(zio());
+        if (log_file_err) |f| f.close(zio());
+
+        // Wait for daemon to respond on control socket (up to 20 seconds: 100 attempts * 200ms)
         var attempts: usize = 0;
-        while (attempts < 25) : (attempts += 1) {
+        var child_exited = false;
+        while (attempts < 100) : (attempts += 1) {
             std.Io.sleep(zio(), std.Io.Duration.fromNanoseconds(200 * std.time.ns_per_ms), .awake) catch {};
             if (lib.services.Control.sendControlCommand(allocator, "STATUS", &resp_buf)) |len| {
                 if (std.mem.indexOf(u8, resp_buf[0..len], "\"running\":true") != null) {
@@ -5551,10 +5586,34 @@ fn cmdJoin(allocator: std.mem.Allocator, exe_path: []const u8, token_arg: []cons
                     break;
                 }
             } else |_| {}
+
+            if (!isChildStillRunning(&child_proc)) {
+                child_exited = true;
+                break;
+            }
         }
 
         if (!daemon_ready) {
-            try stderr.writeStreamingAll(zio(), "error: timed out waiting for meshguard daemon to start\n");
+            if (child_exited) {
+                try stderr.writeStreamingAll(zio(), "error: meshguard daemon exited prematurely\n");
+            } else {
+                try stderr.writeStreamingAll(zio(), "error: timed out waiting for meshguard daemon to start\n");
+            }
+
+            // Print daemon.log if available
+            if (log_path) |p| {
+                if (std.Io.Dir.openFileAbsolute(zio(), p, .{})) |lf| {
+                    defer lf.close(zio());
+                    var log_read_buf: [4096]u8 = undefined;
+                    const bytes_read = readAll(lf, &log_read_buf) catch 0;
+                    if (bytes_read > 0) {
+                        try stderr.writeStreamingAll(zio(), "\n--- Daemon log (~/.config/meshguard/daemon.log) ---\n");
+                        try stderr.writeStreamingAll(zio(), log_read_buf[0..bytes_read]);
+                        try stderr.writeStreamingAll(zio(), "----------------------------------------------------\n");
+                    }
+                } else |_| {}
+            }
+
             std.process.exit(1);
         }
         try stdout.writeStreamingAll(zio(), "[join] ✓ Daemon started successfully.\n");

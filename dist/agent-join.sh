@@ -16,11 +16,11 @@ echo "================================================================"
 echo "  MeshGuard Agent Onboarding"
 echo "================================================================"
 
-# Check if meshguard is installed in PATH or present in working directory
+# Check if meshguard is installed in PATH (or local override requested)
 MESHGUARD=""
 if command -v meshguard >/dev/null 2>&1; then
   MESHGUARD="meshguard"
-elif [ -x "./meshguard" ]; then
+elif [ -n "$MESHGUARD_LOCAL" ] && [ -x "./meshguard" ]; then
   MESHGUARD="./meshguard"
 fi
 
