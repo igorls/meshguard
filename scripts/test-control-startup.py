@@ -1,9 +1,13 @@
 """Exercise startup validation using only isolated paths and no daemon starts."""
 import os
+import json
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 
 BINARY = Path(sys.argv.pop(1)).resolve()
@@ -59,6 +63,65 @@ class ControlStartup(unittest.TestCase):
         for command in ("appinfo", "status", "down"):
             with self.subTest(command=command):
                 self.rejected([command], "ExplicitControlSocketUnavailable")
+
+    def test_hyphen_prefixed_channels_are_positional(self):
+        for channel in ("-alerts", "--wait"):
+            with self.subTest(channel=channel):
+                self.rejected(["apprecv", channel], "ExplicitControlSocketUnavailable")
+
+    def receive_fixture(self, fragmented):
+        payload = "\x01" * 948 + "\U0001f680"  # exactly 952 UTF-8 bytes
+        response = (json.dumps({"ok": True, "sender": "a" * 64, "data": payload,
+                                "timestamp": 1}) + "\n").encode()
+        self.assertGreater(len(response), 4096)
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(server.close)
+        server.settimeout(3)
+        server.bind(self.env["MESHGUARD_CONTROL_PATH"])
+        server.listen(1)
+        commands = []
+
+        def serve():
+            try:
+                conn, _ = server.accept()
+                with conn:
+                    conn.settimeout(3)
+                    command = b""
+                    while not command.endswith(b"\n"):
+                        chunk = conn.recv(1024)
+                        if not chunk:
+                            return
+                        command += chunk
+                    commands.append(command)
+                    if fragmented:
+                        conn.sendall(response[:113])
+                        time.sleep(0.03)
+                        conn.sendall(response[113:])
+                    else:
+                        conn.sendall(response)
+            except OSError:
+                # A regressed client may close early; stdout assertions catch it.
+                pass
+
+        worker = threading.Thread(target=serve, daemon=True)
+        worker.start()
+        try:
+            result = subprocess.run([str(BINARY), "apprecv", "meshrooms-v1"], env=self.env,
+                                    capture_output=True, text=True, encoding="utf-8", timeout=10)
+        finally:
+            worker.join(4)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(commands, [b"APPRECV meshrooms-v1\n"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "From: " + "a" * 64 + "\nChannel: meshrooms-v1\nPayload:\n" + payload + "\n")
+
+    @unittest.skipIf(os.name == "nt", "Unix stream fixture; Windows CLI parsing is checked separately")
+    def test_worst_case_escaped_apprecv(self):
+        self.receive_fixture(False)
+
+    @unittest.skipIf(os.name == "nt", "Unix stream fixture; Windows uses message-mode pipes")
+    def test_fragmented_apprecv(self):
+        self.receive_fixture(True)
 
 
 if __name__ == "__main__":

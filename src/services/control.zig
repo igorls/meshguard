@@ -142,6 +142,8 @@ pub const CONTROL_PATH_ENV = "MESHGUARD_CONTROL_PATH";
 
 pub const MAX_QUEUED_MESSAGES: usize = 64;
 pub const MAX_MESSAGE_PAYLOAD: usize = 1024;
+// A byte can expand to six JSON characters (\u00XX), plus sender and metadata.
+pub const MAX_MESSAGE_RESPONSE: usize = MAX_MESSAGE_PAYLOAD * 6 + 256;
 pub const MAX_APP_CHANNELS: usize = 8;
 pub const MAX_APP_QUEUED_MESSAGES: usize = MAX_QUEUED_MESSAGES;
 
@@ -1249,15 +1251,20 @@ fn requestUnixPath(path: []const u8, command: []const u8, out: []u8) !usize {
         .events = posix.POLL.IN,
         .revents = 0,
     }};
-    const ready = posix.poll(&fds, poll_timeout) catch return error.ControlSocketUnavailable;
-    if (ready == 0 or (fds[0].revents & posix.POLL.IN) == 0) {
-        return error.ControlSocketUnavailable;
+    const deadline = nowMilliSecs() + poll_timeout;
+    var used: usize = 0;
+    while (used < out.len) {
+        fds[0].revents = 0;
+        const remaining: i32 = @intCast(@max(0, deadline - nowMilliSecs()));
+        const ready = posix.poll(&fds, remaining) catch return error.ControlSocketUnavailable;
+        if (ready == 0 or (fds[0].revents & posix.POLL.IN) == 0) return error.ControlSocketUnavailable;
+        const n = readSocket(sock, out[used..]) catch return error.ReadFailed;
+        if (n == 0) return error.ReadFailed;
+        used += n;
+        // Unix sockets are streams: a complete response may require several reads.
+        if (std.mem.indexOfScalar(u8, out[0..used], '\n')) |end| return end + 1;
     }
-
-    const n = readSocket(sock, out) catch return error.ReadFailed;
-    if (n == 0) return error.ReadFailed;
-    if (n == out.len) return error.ResponseTooLarge;
-    return n;
+    return error.ResponseTooLarge;
 }
 
 fn windowsPipeNameZ(path: []const u8, buf: []u16) ![:0]u16 {

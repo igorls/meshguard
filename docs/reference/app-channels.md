@@ -26,6 +26,10 @@ Newline-delimited text commands, JSON responses (same style as `SEND`/`RECV`).
 
 CLI wrappers (`meshguard appsend`, `meshguard apprecv`, `meshguard appinfo`)
 talk to the daemon through the same control socket as `send`/`recv`.
+For `apprecv`, the first argument is always the channel, including names such
+as `-alerts` or `--wait`; place an optional `--wait <ms>` after it. Receive
+buffers allow for JSON escaping of the full payload, and Unix clients assemble
+the complete newline-delimited response before decoding it.
 
 ## Wire format
 

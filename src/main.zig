@@ -5406,15 +5406,13 @@ fn cmdAppRecv(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     var wait_ms: u32 = 0;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--wait") and i + 1 < args.len) {
+        if (channel == null) {
+            channel = args[i]; // The required first argument may itself begin with '-'.
+        } else if (std.mem.eql(u8, args[i], "--wait") and i + 1 < args.len) {
             i += 1;
             wait_ms = std.fmt.parseInt(u32, args[i], 10) catch 0;
         } else if (!std.mem.startsWith(u8, args[i], "-")) {
-            if (channel == null) {
-                channel = args[i];
-            } else {
-                wait_ms = std.fmt.parseInt(u32, args[i], 10) catch wait_ms;
-            }
+            wait_ms = std.fmt.parseInt(u32, args[i], 10) catch wait_ms;
         }
     }
 
@@ -5430,7 +5428,7 @@ fn cmdAppRecv(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     var cmd_buf: [96]u8 = undefined;
     const cmd = std.fmt.bufPrint(&cmd_buf, "APPRECV {s}", .{ch}) catch unreachable;
 
-    var resp_buf: [4096]u8 = undefined;
+    var resp_buf: [lib.services.Control.MAX_MESSAGE_RESPONSE]u8 = undefined;
     const start_ms = @as(i64, @intCast(std.Io.Timestamp.now(zio(), .real).toMilliseconds()));
     const deadline_ms = start_ms + @as(i64, wait_ms);
 
@@ -5447,13 +5445,9 @@ fn cmdAppRecv(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                 std.process.exit(1);
             }
 
-            const sender = findJsonStringField(resp, "sender") orelse "unknown";
-            const data_raw = findJsonStringField(resp, "data") orelse "";
-
-            var unescaped: [2048]u8 = undefined;
-            const len = unescapeJsonString(data_raw, &unescaped);
-
-            try writeFormatted(stdout, "From: {s}\nChannel: {s}\nPayload:\n{s}\n", .{ sender, ch, unescaped[0..len] });
+            const message = try std.json.parseFromSlice(struct { sender: []const u8, data: []const u8 }, allocator, resp, .{ .ignore_unknown_fields = true });
+            defer message.deinit();
+            try writeFormatted(stdout, "From: {s}\nChannel: {s}\nPayload:\n{s}\n", .{ message.value.sender, ch, message.value.data });
             return;
         }
 

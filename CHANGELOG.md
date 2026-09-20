@@ -22,6 +22,8 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   explicit endpoint failures from falling back to the default kernel interface.
 - Validate gossip-port overrides before creating an interface; reclaim drained
   application-channel slots and reject empty application payloads consistently.
+- Preserve maximum-size JSON-escaped application messages and fragmented Unix
+  responses in `apprecv`; accept valid channel names beginning with a hyphen.
 
 ## [0.10.0] — 2026-07-05
 
