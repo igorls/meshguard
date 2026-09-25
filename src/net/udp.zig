@@ -83,6 +83,17 @@ pub const UdpSocket = struct {
     port: u16,
     ipv6: bool = false,
 
+    /// Event loops drain sockets until recvFrom returns null, as Linux sockets
+    /// (created with SOCK_NONBLOCK) do. A blocking macOS/BSD socket would instead
+    /// park the loop in recvfrom after the last datagram, starving the control
+    /// socket and timers whenever a peer is live.
+    fn setNonBlockingBsd(fd: c_int) !void {
+        const flags = std.c.fcntl(fd, posix.F.GETFL, @as(c_int, 0));
+        if (flags < 0) return error.SocketCreateFailed;
+        const nonblock: c_int = @intCast(1 << @bitOffsetOf(posix.O, "NONBLOCK"));
+        if (std.c.fcntl(fd, posix.F.SETFL, flags | nonblock) < 0) return error.SocketCreateFailed;
+    }
+
     /// Bind a UDP socket to the given port on all interfaces (or a specific address).
     pub fn bind(port: u16) !UdpSocket {
         return bindAddr(.{ 0, 0, 0, 0 }, port);
@@ -107,6 +118,7 @@ pub const UdpSocket = struct {
                 // macOS/iOS: use std.c
                 const sock = std.c.socket(std.c.AF.INET, std.c.SOCK.DGRAM, 0);
                 if (sock < 0) return error.SocketCreateFailed;
+                try setNonBlockingBsd(@intCast(sock));
                 break :blk @as(posix.socket_t, @intCast(sock));
             }
         };
@@ -173,6 +185,7 @@ pub const UdpSocket = struct {
             } else {
                 const sock = std.c.socket(std.c.AF.INET6, std.c.SOCK.DGRAM, 0);
                 if (sock < 0) return error.SocketCreateFailed;
+                if (comptime !is_windows) try setNonBlockingBsd(@intCast(sock));
                 break :blk if (comptime is_windows)
                     @as(posix.socket_t, @ptrFromInt(@as(usize, @intCast(sock))))
                 else
