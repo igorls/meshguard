@@ -4,6 +4,8 @@ Isolated MeshGuard application channels sit on top of the existing encrypted
 `0x50` payload. Meshrooms uses channel `meshrooms-v1`. Room admission and
 durable retry remain Meshrooms' responsibility.
 
+Files larger than one message use [application transfers](app-transfers.md).
+
 This API is additive. Legacy `SEND` / `RECV` / `MSGS` keep their unframed
 plaintext queue and never pop `MGAPP1` frames.
 

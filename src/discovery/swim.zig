@@ -511,9 +511,14 @@ pub const SwimProtocol = struct {
 
     /// Single iteration of the SWIM protocol.
     pub fn tick(self: *SwimProtocol) !void {
-        self.tick_count += 1;
         // 1. Process incoming messages (poll with gossip_interval timeout)
-        const poll_ms: i32 = @min(@as(i32, @intCast(self.config.gossip_interval_ms)), 200);
+        return self.tickWithTimeout(@min(@as(i32, @intCast(self.config.gossip_interval_ms)), 200));
+    }
+
+    /// One iteration waiting at most `poll_ms` for datagrams. Event loops that
+    /// already waited on several descriptors pass 0.
+    pub fn tickWithTimeout(self: *SwimProtocol, poll_ms: i32) !void {
+        self.tick_count += 1;
         if (try self.socket.pollRead(poll_ms)) {
             // Drain all available messages
             while (true) {

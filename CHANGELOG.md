@@ -8,6 +8,12 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## Unreleased
 
 ### Added
+- Verified application transfers (`XFER*` control commands, `MGXF1` frames over
+  the encrypted `0x50` path): windowed, selectively acknowledged, congestion-
+  controlled delivery of files up to 32 MiB with SHA-256 verification, opt-in
+  receiving channels, bounded memory, and resend after a receiver restart.
+  Transfer commands require the daemon owner on Unix. See
+  `docs/reference/app-transfers.md`.
 - Isolated application messaging channels over the existing encrypted `0x50`
   payload: `APPSEND` / `APPRECV` / `APPINFO`, `MGAPP1` framing, and per-channel
   queues so Meshrooms (`meshrooms-v1`) cannot be starved by legacy `RECV`.
@@ -18,6 +24,13 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   Explicit invalid values fail closed (no silent fallback to 51821).
 
 ### Fixed
+- macOS/BSD event loops no longer block forever in `recvfrom` once a peer is
+  live: UDP sockets are non-blocking as on Linux. Previously the control socket
+  stopped answering (`status`, `APPRECV`, …) in `--gossip-only` and TUN modes.
+- Control commands no longer wait out the 200 ms gossip poll: gossip-only and
+  macOS loops wake on the control socket (and TUN) as well as UDP.
+- `0x50` replay state is updated only after a packet authenticates, so forged
+  datagrams cannot evict real nonces; transfer frames are kept out of that ring.
 - Reject empty control-path overrides before startup side effects, and prevent
   explicit endpoint failures from falling back to the default kernel interface.
 - Validate gossip-port overrides before creating an interface; reclaim drained

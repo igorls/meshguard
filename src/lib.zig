@@ -49,6 +49,7 @@ pub const protocol = struct {
     pub const Messages = @import("protocol/messages.zig");
     pub const Codec = @import("protocol/codec.zig");
     pub const AppChannel = @import("protocol/app_channel.zig");
+    pub const Transfer = @import("protocol/transfer.zig");
 };
 
 pub const net = struct {
@@ -72,6 +73,7 @@ pub const config = @import("config.zig");
 pub const services = struct {
     pub const Policy = @import("services/policy.zig");
     pub const Control = @import("services/control.zig");
+    pub const Transfers = @import("services/transfers.zig");
 };
 
 test {
@@ -94,4 +96,6 @@ test {
     _ = services.Policy;
     _ = services.Control;
     _ = protocol.AppChannel;
+    _ = protocol.Transfer;
+    _ = services.Transfers;
 }
