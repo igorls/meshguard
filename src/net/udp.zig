@@ -32,6 +32,7 @@ const win = if (is_windows) struct {
 
     extern "ws2_32" fn WSAPoll(fds: [*]pollfd, nfds: u32, timeout: c_int) c_int;
     extern "ws2_32" fn closesocket(socket: SOCKET) c_int;
+    extern "ws2_32" fn ioctlsocket(socket: SOCKET, command: i32, value: *u32) c_int;
     extern "ws2_32" fn WSAStartup(wVersionRequested: u16, lpWSAData: *anyopaque) c_int;
 } else struct {};
 
@@ -61,6 +62,27 @@ pub fn ensureWinsockInit() void {
         if (win.WSAStartup(0x0202, &data) == 0) {
             wsa_ready.store(true, .release);
         }
+    }
+}
+
+// SWIM drains until recvFrom returns null. A blocking socket stalls its event
+// loop, including Unix control requests, as soon as the receive queue is empty.
+fn setNonBlocking(fd: posix.socket_t) !void {
+    if (comptime is_linux) return; // Set atomically by socket(SOCK_NONBLOCK).
+    if (comptime is_windows) {
+        // winsock2.h: FIONBIO = _IOW('f', 126, u_long).
+        const FIONBIO: i32 = @bitCast(@as(u32, 0x8004667e));
+        var enabled: u32 = 1;
+        if (win.ioctlsocket(fd, FIONBIO, &enabled) != 0) return error.SocketSetupFailed;
+    } else {
+        const flags = posix.system.fcntl(fd, posix.F.GETFL, @as(usize, 0));
+        if (posix.errno(flags) != .SUCCESS) return error.SocketSetupFailed;
+        const rc = posix.system.fcntl(
+            fd,
+            posix.F.SETFL,
+            @as(usize, @intCast(flags)) | @as(usize, 1 << @bitOffsetOf(posix.O, "NONBLOCK")),
+        );
+        if (posix.errno(rc) != .SUCCESS) return error.SocketSetupFailed;
     }
 }
 
@@ -111,6 +133,7 @@ pub const UdpSocket = struct {
             }
         };
         errdefer closeSocket(fd);
+        try setNonBlocking(fd);
 
         // Enable SO_REUSEADDR
         const one: u32 = 1;
@@ -180,6 +203,7 @@ pub const UdpSocket = struct {
             }
         };
         errdefer closeSocket(fd);
+        try setNonBlocking(fd);
 
         const one: u32 = 1;
         if (comptime is_linux) {
@@ -241,6 +265,7 @@ pub const UdpSocket = struct {
             }
         };
         errdefer closeSocket(fd);
+        try setNonBlocking(fd);
 
         if (comptime is_linux) {
             // IP_MTU_DISCOVER = IP_PMTUDISC_PROBE (3) — prevents EMSGSIZE on GSO
@@ -509,4 +534,57 @@ test "UDP bind succeeds on all platforms (Winsock init regression)" {
     var sock2 = try UdpSocket.bindAddr(.{ 127, 0, 0, 1 }, 0);
     defer sock2.close();
     try std.testing.expect(sock2.port != 0);
+}
+
+fn sendDrainProbe(socket: UdpSocket, payload: []const u8) !void {
+    if (socket.ipv6) {
+        var loopback = [_]u8{0} ** 16;
+        loopback[15] = 1;
+        _ = try socket.sendTo6(payload, loopback, socket.port);
+    } else {
+        _ = try socket.sendTo(payload, .{ 127, 0, 0, 1 }, socket.port);
+    }
+}
+
+fn expectNonBlockingDrain(comptime ipv6: bool) !void {
+    var loopback6 = [_]u8{0} ** 16;
+    loopback6[15] = 1;
+    var socket = if (ipv6)
+        try UdpSocket.bindAddr6(loopback6, 0)
+    else
+        try UdpSocket.bindAddr(.{ 127, 0, 0, 1 }, 0);
+    defer socket.close();
+    try sendDrainProbe(socket, "first");
+    try std.testing.expect(try socket.pollRead(1000));
+    var buf: [64]u8 = undefined;
+    const first = (try socket.recvFrom(&buf)) orelse return error.MissingFirstDatagram;
+    try std.testing.expectEqualStrings("first", first.data);
+
+    // Unblock a regressed blocking receive with a real datagram, so the assertion
+    // fails instead of hanging the test runner. No timing assertion is needed.
+    var done = std.atomic.Value(bool).init(false);
+    const watchdog = try std.Thread.spawn(.{}, struct {
+        fn run(sock: UdpSocket, finished: *std.atomic.Value(bool)) void {
+            var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            defer threaded.deinit();
+            for (0..10) |_| {
+                if (finished.load(.acquire)) return;
+                std.Io.sleep(threaded.io(), .fromMilliseconds(50), .awake) catch return;
+            }
+            if (!finished.load(.acquire)) sendDrainProbe(sock, "watchdog") catch {};
+        }
+    }.run, .{ socket, &done });
+    defer {
+        done.store(true, .release);
+        watchdog.join();
+    }
+    try std.testing.expect(try socket.recvFrom(&buf) == null);
+}
+
+test "UDP IPv4 drain returns when the queue becomes empty" {
+    try expectNonBlockingDrain(false);
+}
+
+test "UDP IPv6 drain returns when the queue becomes empty" {
+    try expectNonBlockingDrain(true);
 }

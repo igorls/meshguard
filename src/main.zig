@@ -2207,7 +2207,6 @@ fn wgOnAppMessage(ctx: *anyopaque, data: []const u8) void {
     // Wire format: [0x50] [32B dest] [32B sender] [12B nonce] [N ciphertext] [16B tag]
     const sender_pubkey = data[33..65];
     const nonce: [12]u8 = data[65..77].*;
-    if (isDuplicateAppNonce(nonce)) return;
     const payload_len = data.len - 77 - 16;
     if (payload_len > 1024) return;
 
@@ -2234,7 +2233,13 @@ fn wgOnAppMessage(ctx: *anyopaque, data: []const u8) void {
         enc_key,
     ) catch return;
 
-    _ = control.pushMessage(peer_key, plaintext[0..payload_len]);
+    // Replay state is updated only after authentication, so forged packets cannot
+    // evict real nonces. Transfer frames are idempotent and carry their own replay
+    // rules; keeping them out of this small ring stops bulk traffic from flushing
+    // the nonces that protect application messages.
+    const plaintext_slice = plaintext[0..payload_len];
+    if (!lib.protocol.Transfer.looksLikeTransferFrame(plaintext_slice) and isDuplicateAppNonce(nonce)) return;
+    _ = control.pushMessage(peer_key, plaintext_slice);
 }
 
 fn sendControlDatagram(ctx: *anyopaque, data: []const u8, ep: lib.protocol.Messages.Endpoint) bool {
@@ -3467,6 +3472,7 @@ fn windowsEventLoop(
 
         // ─── 5. Poll control socket for status queries ───
         _ = control_socket.poll();
+        control_socket.tickTransfers();
 
         // ─── 6. Short sleep to avoid CPU spin (10ms) ───
         std.Io.sleep(zio(), std.Io.Duration.fromNanoseconds(10 * std.time.ns_per_ms), .awake) catch {};
@@ -3478,13 +3484,33 @@ fn windowsEventLoop(
 /// This keeps SWIM gossip and the control socket alive without creating a TUN
 /// device or configuring WireGuard. It is useful for local development and for
 /// public seed nodes that only need to help peers discover each other.
+/// Wait until gossip datagrams, a control connection, or an extra fd (TUN) is
+/// ready. A control command no longer waits out the full gossip poll interval,
+/// and active transfers keep a short tick for pacing and retransmission.
+fn waitForGossipOrControl(swim: *lib.discovery.Swim.SwimProtocol, control_socket: *lib.services.Control.ControlSocket, extra_fd: posix.fd_t) void {
+    const idle_ms: i32 = @min(@as(i32, @intCast(swim.config.gossip_interval_ms)), 200);
+    const timeout: i32 = if (control_socket.transfersActive()) 5 else idle_ms;
+    var fds = [_]posix.pollfd{
+        .{ .fd = swim.socket.fd, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = control_socket.listenerFd(), .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = extra_fd, .events = posix.POLL.IN, .revents = 0 },
+    };
+    _ = posix.poll(&fds, timeout) catch {};
+}
+
 fn gossipOnlyEventLoop(
     swim: *lib.discovery.Swim.SwimProtocol,
     control_socket: *lib.services.Control.ControlSocket,
 ) !void {
     while (swim.running.load(.acquire)) {
-        try swim.tick();
+        if (comptime @import("builtin").os.tag == .windows) {
+            try swim.tick();
+        } else {
+            waitForGossipOrControl(swim, control_socket, -1);
+            try swim.tickWithTimeout(0);
+        }
         _ = control_socket.poll();
+        control_socket.tickTransfers();
     }
 }
 
@@ -3511,7 +3537,8 @@ fn macosEventLoop(
 
     while (swim.running.load(.acquire)) {
         // ─── 1. SWIM protocol tick (gossip, failure detection, NAT) ───
-        swim.tick() catch {};
+        waitForGossipOrControl(swim, control_socket, tun_dev.fd);
+        swim.tickWithTimeout(0) catch {};
 
         // ─── 2. Process incoming UDP packets (WG + SWIM multiplexed) ───
         var udp_count: u32 = 0;
@@ -3583,6 +3610,7 @@ fn macosEventLoop(
 
         // ─── 5. Poll control socket for status queries ───
         _ = control_socket.poll();
+        control_socket.tickTransfers();
     }
 }
 
@@ -3892,8 +3920,9 @@ fn userspaceEventLoop(
         } else {
             var fds = [_]posix.pollfd{
                 .{ .fd = udp_sock.fd, .events = posix.POLL.IN, .revents = 0 },
+                .{ .fd = control_socket.listenerFd(), .events = posix.POLL.IN, .revents = 0 },
             };
-            _ = posix.poll(&fds, 50) catch continue;
+            _ = posix.poll(&fds, if (control_socket.transfersActive()) 5 else 50) catch continue;
 
             if (fds[0].revents & posix.POLL.IN != 0) {
                 var n_decrypted: usize = 0;
@@ -3962,6 +3991,7 @@ fn userspaceEventLoop(
 
         // Poll control socket for external queries (non-blocking)
         _ = control_socket.poll();
+        control_socket.tickTransfers();
     }
 
     // Send leave announcement safely from the main thread

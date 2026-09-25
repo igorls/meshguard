@@ -16,7 +16,19 @@
 //!   SEND <pubkey> <msg>\n         → Encrypts unframed 0x50/Noise plaintext and sends
 //!   APPSEND <pubkey> <ch> <msg>\n → Encrypts MGAPP1-framed 0x50/Noise plaintext and sends
 //!   APPRECV <channel>\n           → Pops oldest message from that application channel only
-//!   APPINFO\n                     → {"protocol":1,"maxPayload":<conservative framed max>}
+//!   APPINFO\n                     → {"protocol":1,"maxPayload":<conservative framed max>,"transfers":1}
+//!
+//! Verified bulk transfers (owner only on Unix; see services/transfers.zig):
+//!   XFERINFO\n                              → limits
+//!   XFERLISTEN <ch> <max_bytes>\n           → accept incoming offers on a channel
+//!   XFEROFFER <pk> <ch> <size> <sha256> [meta_b64]\n → {"ok":true,"id":"<32 hex>"}
+//!   XFERPUT <id> <offset> <b64>\n           → stage bytes (contiguous offsets)
+//!   XFERSTART <id>\n                        → verify the staged hash and send
+//!   XFERSTATUS <id>\n                       → sender progress and outcome
+//!   XFERRECV <ch>\n                         → oldest verified, unreleased incoming transfer
+//!   XFERGET <id> <offset> <len>\n           → base64 bytes of a verified transfer
+//!   XFERDONE <id>\n                         → release a finished transfer
+//!   XFERCANCEL <id>\n                       → abandon a transfer
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -33,6 +45,8 @@ const ChaCha20Poly1305 = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
 const crypto = @import("../wireguard/crypto.zig");
 const Relay = @import("../nat/relay.zig");
 const app_channel = @import("../protocol/app_channel.zig");
+const transfer_wire = @import("../protocol/transfer.zig");
+const Transfers = @import("transfers.zig");
 
 const unix_peer = if (has_getpeereid) struct {
     extern "c" fn getpeereid(socket: c_int, euid: *std.c.uid_t, egid: *std.c.gid_t) c_int;
@@ -107,6 +121,29 @@ fn writeSocket(fd: posix.socket_t, data: []const u8) void {
     _ = std.c.write(fd, data.ptr, data.len);
 }
 
+/// Write a whole response; large transfer responses exceed one socket buffer.
+fn writeAllSocket(fd: posix.socket_t, data: []const u8) void {
+    var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
+    const deadline = nowMilliSecs() + 2000;
+    var sent: usize = 0;
+    while (sent < data.len) {
+        const n = std.c.write(fd, data[sent..].ptr, data.len - sent);
+        if (n > 0) {
+            sent += @intCast(n);
+            continue;
+        }
+        if (n < 0 and std.posix.errno(n) != .AGAIN and std.posix.errno(n) != .INTR) return;
+        const remaining: i32 = @intCast(@max(0, deadline - nowMilliSecs()));
+        if (remaining == 0) return;
+        fds[0].revents = 0;
+        _ = posix.poll(&fds, remaining) catch return;
+    }
+}
+
+fn nowMonotonicNs() i128 {
+    return @intCast(std.Io.Timestamp.now(zio(), .awake).toNanoseconds());
+}
+
 fn readSocket(fd: posix.socket_t, out: []u8) !usize {
     const n = std.c.read(fd, out.ptr, out.len);
     return switch (std.posix.errno(n)) {
@@ -148,6 +185,11 @@ pub const MAX_MESSAGE_PAYLOAD: usize = 1024;
 pub const MAX_MESSAGE_RESPONSE: usize = MAX_MESSAGE_PAYLOAD * 6 + 256;
 pub const MAX_APP_CHANNELS: usize = 8;
 pub const MAX_APP_QUEUED_MESSAGES: usize = MAX_QUEUED_MESSAGES;
+/// Decoded bytes carried by one XFERPUT or XFERGET command.
+pub const MAX_TRANSFER_IO: usize = 48 * 1024;
+/// Command and response lines, sized for base64 transfer payloads.
+pub const MAX_COMMAND_LINE: usize = MAX_TRANSFER_IO * 4 / 3 + 1024;
+pub const MAX_RESPONSE_LINE: usize = MAX_TRANSFER_IO * 4 / 3 + 1024;
 
 pub const QueuedMessage = struct {
     sender_pubkey: [32]u8,
@@ -468,6 +510,12 @@ pub const ControlSocket = struct {
     tick_fn: ?TickFn = null,
     tick_ctx: ?*anyopaque = null,
 
+    allocator: std.mem.Allocator,
+    transfers: Transfers.TransferManager,
+    /// Listener I/O buffers, allocated by listen() and freed by deinit().
+    command_buf: ?[]u8 = null,
+    response_buf: ?[]u8 = null,
+
     pub fn init(
         allocator: std.mem.Allocator,
         membership: *Membership.MembershipTable,
@@ -495,6 +543,8 @@ pub const ControlSocket = struct {
             .send_ctx = null,
             .tick_fn = null,
             .tick_ctx = null,
+            .allocator = allocator,
+            .transfers = Transfers.TransferManager.init(allocator, .{}),
         };
     }
 
@@ -506,6 +556,10 @@ pub const ControlSocket = struct {
     /// MGAPP1 frames go to the matching application channel (reject, no truncate).
     /// Unframed / non-MGAPP1 plaintext stays on the legacy queue (truncate as before).
     pub fn pushMessage(self: *ControlSocket, sender: [32]u8, data: []const u8) bool {
+        if (transfer_wire.looksLikeTransferFrame(data)) {
+            self.transfers.handleFrame(sender, data, nowMonotonicNs(), nowUnixSecs());
+            return true;
+        }
         if (app_channel.looksLikeAppFrame(data)) {
             const frame = app_channel.parse(data) catch return false;
             return self.pushAppMessage(sender, frame.channel, frame.payload);
@@ -635,6 +689,29 @@ pub const ControlSocket = struct {
     pub fn setSendHandler(self: *ControlSocket, ctx: *anyopaque, send_fn: SendDatagramFn) void {
         self.send_ctx = ctx;
         self.send_fn = send_fn;
+        // `self` is at its final address once the daemon wires its sender.
+        self.transfers.setSender(self, transferSend);
+    }
+
+    fn transferSend(ctx: *anyopaque, peer: [32]u8, plaintext: []const u8) bool {
+        const self: *ControlSocket = @ptrCast(@alignCast(ctx));
+        return self.seal(peer, plaintext) == null;
+    }
+
+    /// The listening descriptor for event loops that wait on several fds (-1 when none).
+    pub fn listenerFd(self: *const ControlSocket) posix.fd_t {
+        if (comptime is_windows) return -1;
+        return self.server orelse -1;
+    }
+
+    /// Whether transfers need frequent ticks for pacing and retransmission.
+    pub fn transfersActive(self: *ControlSocket) bool {
+        return self.transfers.active();
+    }
+
+    /// Drive transfer retransmission and expiry. Call from every event loop iteration.
+    pub fn tickTransfers(self: *ControlSocket) void {
+        self.transfers.tick(nowMonotonicNs());
     }
 
     pub fn setTickHandler(self: *ControlSocket, ctx: *anyopaque, tick_fn: TickFn) void {
@@ -643,6 +720,8 @@ pub const ControlSocket = struct {
     }
 
     pub fn listen(self: *ControlSocket) !void {
+        if (self.command_buf == null) self.command_buf = try self.allocator.alloc(u8, MAX_COMMAND_LINE);
+        if (self.response_buf == null) self.response_buf = try self.allocator.alloc(u8, MAX_RESPONSE_LINE);
         if (comptime is_windows) {
             try self.listenWindows();
         } else {
@@ -723,16 +802,18 @@ pub const ControlSocket = struct {
                 }
             }
 
-            var buf: [2048]u8 = undefined;
-            if (readWindowsLine(pipe_handle, &buf)) |bytes_read| {
+            const buf = self.command_buf.?;
+            if (readWindowsLine(pipe_handle, buf)) |bytes_read| {
                 const cmd = std.mem.trimEnd(u8, buf[0..bytes_read], "\r\n");
-                var resp_buf: [8192]u8 = undefined;
-                const resp_len = self.formatCommandResponse(cmd, &resp_buf, true);
-                if (resp_len > 0) {
+                const resp_buf = self.response_buf.?;
+                const resp_len = self.formatCommandResponse(cmd, resp_buf, true);
+                var written: usize = 0;
+                while (written < resp_len) {
                     var bytes_written: win.DWORD = 0;
-                    _ = win.WriteFile(pipe_handle, @ptrCast(resp_buf[0..resp_len].ptr), @intCast(resp_len), &bytes_written, null);
-                    _ = win.FlushFileBuffers(pipe_handle);
+                    if (win.WriteFile(pipe_handle, @ptrCast(resp_buf[written..resp_len].ptr), @intCast(resp_len - written), &bytes_written, null) == @as(win.BOOL, @enumFromInt(0)) or bytes_written == 0) break;
+                    written += bytes_written;
                 }
+                if (resp_len > 0) _ = win.FlushFileBuffers(pipe_handle);
             } else |_| {}
 
             _ = win.DisconnectNamedPipe(pipe_handle);
@@ -767,19 +848,21 @@ pub const ControlSocket = struct {
     }
 
     fn handleClientUnix(self: *ControlSocket, client: posix.socket_t) void {
-        var buf: [2048]u8 = undefined;
-        const n = readUnixLine(client, &buf, 1000) catch return;
+        const buf = self.command_buf.?;
+        const n = readUnixLine(client, buf, 1000) catch return;
 
         const cmd = std.mem.trimEnd(u8, buf[0..n], "\r\n");
-        var resp_buf: [8192]u8 = undefined;
-        const stop_authorized = std.mem.eql(u8, std.mem.trim(u8, cmd, " \t"), "STOP") and stopAuthorizedUnix(client);
-        const resp_len = self.formatCommandResponse(cmd, &resp_buf, stop_authorized);
+        const resp_buf = self.response_buf.?;
+        const trimmed = std.mem.trim(u8, cmd, " \t");
+        // STOP and transfers (file contents) need the daemon owner; the socket itself is world-writable.
+        const owner = (std.mem.eql(u8, trimmed, "STOP") or std.mem.startsWith(u8, trimmed, "XFER")) and stopAuthorizedUnix(client);
+        const resp_len = self.formatCommandResponse(cmd, resp_buf, owner);
         if (resp_len > 0) {
-            writeSocket(client, resp_buf[0..resp_len]);
+            writeAllSocket(client, resp_buf[0..resp_len]);
         }
     }
 
-    pub fn formatCommandResponse(self: *ControlSocket, cmd_raw: []const u8, buf: []u8, stop_authorized: bool) usize {
+    pub fn formatCommandResponse(self: *ControlSocket, cmd_raw: []const u8, buf: []u8, owner_authorized: bool) usize {
         const line = std.mem.trimStart(u8, std.mem.trimEnd(u8, cmd_raw, "\r\n"), " \t");
         // Everything after the APPSEND channel separator is application data.
         const cmd = if (std.mem.startsWith(u8, line, "APPSEND ")) line else std.mem.trimEnd(u8, line, " \t");
@@ -789,7 +872,7 @@ pub const ControlSocket = struct {
         } else if (std.mem.eql(u8, cmd, "STATUS")) {
             return self.formatStatus(buf);
         } else if (std.mem.eql(u8, cmd, "STOP")) {
-            if (!stop_authorized) {
+            if (!owner_authorized) {
                 const msg = "{\"ok\":false,\"error\":\"unauthorized\"}\n";
                 @memcpy(buf[0..msg.len], msg);
                 return msg.len;
@@ -821,6 +904,9 @@ pub const ControlSocket = struct {
             return self.handleAppRecv(channel, buf);
         } else if (std.mem.startsWith(u8, cmd, "APPSEND ")) {
             return self.handleAppSend(cmd["APPSEND ".len..], buf);
+        } else if (std.mem.startsWith(u8, cmd, "XFER")) {
+            if (!owner_authorized) return formatError(buf, "unauthorized: transfers require the daemon owner");
+            return self.handleTransferCommand(cmd, buf);
         } else {
             return formatError(buf, "unknown command");
         }
@@ -887,9 +973,10 @@ pub const ControlSocket = struct {
     }
 
     fn formatAppInfo(resp_buf: []u8) usize {
-        const written = std.fmt.bufPrint(resp_buf, "{{\"protocol\":{d},\"maxPayload\":{d}}}\n", .{
+        const written = std.fmt.bufPrint(resp_buf, "{{\"protocol\":{d},\"maxPayload\":{d},\"transfers\":{d}}}\n", .{
             app_channel.PROTOCOL_VERSION,
             app_channel.MAX_APP_PAYLOAD,
+            transfer_wire.PROTOCOL_VERSION,
         }) catch return formatError(resp_buf, "response formatting error");
         return written.len;
     }
@@ -941,6 +1028,151 @@ pub const ControlSocket = struct {
             return formatError(resp_buf, "invalid destination public key");
         };
         return self.encryptAndSend(dest_key, frame, resp_buf);
+    }
+
+    fn parseTransferId(text: []const u8) ?[16]u8 {
+        if (text.len != 32) return null;
+        var id: [16]u8 = undefined;
+        _ = std.fmt.hexToBytes(&id, text) catch return null;
+        return id;
+    }
+
+    fn transferErrorText(err: Transfers.Error) []const u8 {
+        return switch (err) {
+            error.OutOfMemory => "out of memory",
+            error.InvalidChannel => "invalid channel name",
+            error.TooLarge => "transfer exceeds the size limit",
+            error.Busy => "no transfer capacity; finish or cancel another transfer",
+            error.UnknownTransfer => "unknown transfer",
+            error.InvalidState => "transfer is not in a state that allows this",
+            error.InvalidOffset => "offset does not continue the staged bytes",
+            error.Incomplete => "transfer bytes are incomplete",
+            error.HashMismatch => "staged bytes do not match the declared sha256",
+        };
+    }
+
+    fn handleTransferCommand(self: *ControlSocket, cmd: []const u8, buf: []u8) usize {
+        var args = std.mem.tokenizeAny(u8, cmd, " \t");
+        const verb = args.next() orelse return formatError(buf, "unknown command");
+        const b64 = std.base64.standard;
+
+        if (std.mem.eql(u8, verb, "XFERINFO")) {
+            const w = std.fmt.bufPrint(buf, "{{\"protocol\":{d},\"chunk\":{d},\"maxBytes\":{d},\"maxIo\":{d}}}\n", .{
+                transfer_wire.PROTOCOL_VERSION, transfer_wire.CHUNK_SIZE, self.transfers.limits.max_transfer_bytes, MAX_TRANSFER_IO,
+            }) catch return formatError(buf, "response formatting error");
+            return w.len;
+        }
+        if (std.mem.eql(u8, verb, "XFERLISTEN")) {
+            const channel = args.next() orelse return formatError(buf, "usage: XFERLISTEN <channel> <max_bytes>");
+            const max = std.fmt.parseInt(u64, args.next() orelse "", 10) catch return formatError(buf, "usage: XFERLISTEN <channel> <max_bytes>");
+            self.transfers.listen(channel, max) catch |err| return formatError(buf, transferErrorText(err));
+            return formatOk(buf);
+        }
+        if (std.mem.eql(u8, verb, "XFEROFFER")) {
+            const usage = "usage: XFEROFFER <pubkey> <channel> <size> <sha256> [meta_b64]";
+            const peer = parsePubkey(args.next() orelse "") orelse return formatError(buf, "invalid destination public key");
+            const channel = args.next() orelse return formatError(buf, usage);
+            const size = std.fmt.parseInt(u64, args.next() orelse "", 10) catch return formatError(buf, usage);
+            const hash_text = args.next() orelse return formatError(buf, usage);
+            var sha: [32]u8 = undefined;
+            if (hash_text.len != 64) return formatError(buf, "sha256 must be 64 hex characters");
+            _ = std.fmt.hexToBytes(&sha, hash_text) catch return formatError(buf, "sha256 must be 64 hex characters");
+            var meta: [transfer_wire.MAX_META]u8 = undefined;
+            var meta_len: usize = 0;
+            if (args.next()) |meta_b64| {
+                meta_len = b64.Decoder.calcSizeForSlice(meta_b64) catch return formatError(buf, "invalid meta base64");
+                if (meta_len > meta.len) return formatError(buf, "meta exceeds 768 bytes");
+                b64.Decoder.decode(meta[0..meta_len], meta_b64) catch return formatError(buf, "invalid meta base64");
+            }
+            if (self.membership.peers.get(peer) == null) return formatError(buf, "peer not found in membership table");
+            const id = self.transfers.offer(peer, channel, size, sha, meta[0..meta_len], nowUnixSecs()) catch |err| return formatError(buf, transferErrorText(err));
+            const hex = std.fmt.bytesToHex(id, .lower);
+            const w = std.fmt.bufPrint(buf, "{{\"ok\":true,\"id\":\"{s}\"}}\n", .{&hex}) catch return formatError(buf, "response formatting error");
+            return w.len;
+        }
+        if (std.mem.eql(u8, verb, "XFERRECV")) return self.formatTransferRecv(args.next() orelse "", buf);
+        const id = parseTransferId(args.next() orelse "") orelse return formatError(buf, "invalid transfer id");
+        if (std.mem.eql(u8, verb, "XFERPUT")) {
+            const offset = std.fmt.parseInt(u64, args.next() orelse "", 10) catch return formatError(buf, "usage: XFERPUT <id> <offset> <base64>");
+            const data_b64 = args.next() orelse return formatError(buf, "usage: XFERPUT <id> <offset> <base64>");
+            const n = b64.Decoder.calcSizeForSlice(data_b64) catch return formatError(buf, "invalid base64");
+            if (n == 0 or n > MAX_TRANSFER_IO) return formatError(buf, "each XFERPUT carries 1 to 49152 bytes");
+            var bytes: [MAX_TRANSFER_IO]u8 = undefined;
+            b64.Decoder.decode(bytes[0..n], data_b64) catch return formatError(buf, "invalid base64");
+            const staged = self.transfers.put(id, offset, bytes[0..n]) catch |err| return formatError(buf, transferErrorText(err));
+            const w = std.fmt.bufPrint(buf, "{{\"ok\":true,\"staged\":{d}}}\n", .{staged}) catch return formatError(buf, "response formatting error");
+            return w.len;
+        }
+        if (std.mem.eql(u8, verb, "XFERSTART")) {
+            self.transfers.start(id, nowMonotonicNs()) catch |err| return formatError(buf, transferErrorText(err));
+            return formatOk(buf);
+        }
+        if (std.mem.eql(u8, verb, "XFERSTATUS")) {
+            const st = self.transfers.status(id) orelse return formatError(buf, "unknown transfer");
+            var pos: usize = 0;
+            const head = std.fmt.bufPrint(buf, "{{\"ok\":true,\"state\":\"{s}\",\"size\":{d},\"staged\":{d},\"ackedChunks\":{d},\"chunks\":{d},\"retransmits\":{d}", .{
+                @tagName(st.state), st.size, st.staged, st.acked_chunks, st.chunks, st.retransmits,
+            }) catch return formatError(buf, "response formatting error");
+            pos = head.len;
+            if (st.failure) |reason| {
+                const pre = ",\"error\":\"";
+                if (pos + pre.len > buf.len) return formatError(buf, "response buffer overflow");
+                @memcpy(buf[pos..][0..pre.len], pre);
+                pos += pre.len;
+                if (!appendJsonEscaped(buf, &pos, reason)) return formatError(buf, "response buffer overflow");
+                if (pos + 1 > buf.len) return formatError(buf, "response buffer overflow");
+                buf[pos] = '"';
+                pos += 1;
+            }
+            if (pos + 2 > buf.len) return formatError(buf, "response buffer overflow");
+            @memcpy(buf[pos..][0..2], "}\n");
+            return pos + 2;
+        }
+        if (std.mem.eql(u8, verb, "XFERGET")) {
+            const offset = std.fmt.parseInt(u64, args.next() orelse "", 10) catch return formatError(buf, "usage: XFERGET <id> <offset> <len>");
+            const want = std.fmt.parseInt(usize, args.next() orelse "", 10) catch return formatError(buf, "usage: XFERGET <id> <offset> <len>");
+            // Fit the base64 payload in the caller's response buffer.
+            const room = if (buf.len > 96) (buf.len - 96) / 4 * 3 else 0;
+            var bytes: [MAX_TRANSFER_IO]u8 = undefined;
+            const cap = @min(@min(want, MAX_TRANSFER_IO), room);
+            if (cap == 0) return formatError(buf, "requested length must be at least 1");
+            const n = self.transfers.read(id, offset, bytes[0..cap]) catch |err| return formatError(buf, transferErrorText(err));
+            const head = std.fmt.bufPrint(buf, "{{\"ok\":true,\"length\":{d},\"data\":\"", .{n}) catch return formatError(buf, "response formatting error");
+            var pos = head.len;
+            const encoded = b64.Encoder.encode(buf[pos..][0..b64.Encoder.calcSize(n)], bytes[0..n]);
+            pos += encoded.len;
+            @memcpy(buf[pos..][0..3], "\"}\n");
+            return pos + 3;
+        }
+        if (std.mem.eql(u8, verb, "XFERDONE")) {
+            if (!self.transfers.release(id)) return formatError(buf, "unknown or unfinished transfer");
+            return formatOk(buf);
+        }
+        if (std.mem.eql(u8, verb, "XFERCANCEL")) {
+            if (!self.transfers.cancel(id)) return formatError(buf, "unknown transfer");
+            return formatOk(buf);
+        }
+        return formatError(buf, "unknown command");
+    }
+
+    fn formatTransferRecv(self: *ControlSocket, channel: []const u8, buf: []u8) usize {
+        if (!app_channel.isValidChannel(channel)) return formatError(buf, "invalid channel name");
+        const info = self.transfers.nextComplete(channel) orelse return formatEmptyRecv(buf);
+        const id = std.fmt.bytesToHex(info.id, .lower);
+        const sender = std.fmt.bytesToHex(info.sender, .lower);
+        const sha = std.fmt.bytesToHex(info.sha256, .lower);
+        var meta_b64: [transfer_wire.MAX_META * 4 / 3 + 4]u8 = undefined;
+        const meta = std.base64.standard.Encoder.encode(&meta_b64, info.meta[0..info.meta_len]);
+        const w = std.fmt.bufPrint(buf, "{{\"ok\":true,\"id\":\"{s}\",\"sender\":\"{s}\",\"size\":{d},\"sha256\":\"{s}\",\"meta\":\"{s}\"}}\n", .{
+            &id, &sender, info.size, &sha, meta,
+        }) catch return formatError(buf, "response formatting error");
+        return w.len;
+    }
+
+    fn formatOk(buf: []u8) usize {
+        const ok = "{\"ok\":true}\n";
+        @memcpy(buf[0..ok.len], ok);
+        return ok.len;
     }
 
     fn formatMsgs(self: *ControlSocket, resp_buf: []u8) usize {
@@ -1002,28 +1234,23 @@ pub const ControlSocket = struct {
     }
 
     fn encryptAndSend(self: *ControlSocket, dest_key: [32]u8, payload: []const u8, resp_buf: []u8) usize {
-        if (payload.len > MAX_MESSAGE_PAYLOAD) {
-            return formatError(resp_buf, "payload exceeds maximum length (1024 bytes)");
-        }
+        if (self.seal(dest_key, payload)) |err| return formatError(resp_buf, err);
+        const ok_msg = "{\"ok\":true}\n";
+        const len = @min(ok_msg.len, resp_buf.len);
+        @memcpy(resp_buf[0..len], ok_msg[0..len]);
+        return len;
+    }
 
-        const peer = self.membership.peers.get(dest_key) orelse {
-            return formatError(resp_buf, "peer not found in membership table");
-        };
-
+    /// Encrypt 0x50 plaintext for `dest_key` and send it directly and/or via a relay.
+    /// Returns null on success, or the reason it could not be sent.
+    fn seal(self: *ControlSocket, dest_key: [32]u8, payload: []const u8) ?[]const u8 {
+        if (payload.len > MAX_MESSAGE_PAYLOAD) return "payload exceeds maximum length (1024 bytes)";
+        const peer = self.membership.peers.get(dest_key) orelse return "peer not found in membership table";
         const relay_opt = Relay.selectRelayForPair(&self.membership.peers, self.our_pubkey, dest_key);
-
-        if (peer.state != .alive and peer.state != .suspected and relay_opt == null) {
-            return formatError(resp_buf, "peer is not active");
-        }
-
-        const peer_wg = peer.wg_pubkey orelse {
-            return formatError(resp_buf, "peer wireguard key not known yet");
-        };
-
+        if (peer.state != .alive and peer.state != .suspected and relay_opt == null) return "peer is not active";
+        const peer_wg = peer.wg_pubkey orelse return "peer wireguard key not known yet";
         const peer_ep = peer.gossip_endpoint orelse peer.public_endpoint;
-        if (peer_ep == null and relay_opt == null) {
-            return formatError(resp_buf, "peer endpoint not known");
-        }
+        if (peer_ep == null and relay_opt == null) return "peer endpoint not known";
 
         var msg_buf: [1 + 32 + 32 + 12 + MAX_MESSAGE_PAYLOAD + 16]u8 = undefined;
         msg_buf[0] = 0x50;
@@ -1034,9 +1261,7 @@ pub const ControlSocket = struct {
         zio().random(&nonce);
         @memcpy(msg_buf[65..77], &nonce);
 
-        const shared = X25519.scalarmult(self.our_wg_private, peer_wg) catch {
-            return formatError(resp_buf, "key exchange computation failed");
-        };
+        const shared = X25519.scalarmult(self.our_wg_private, peer_wg) catch return "key exchange computation failed";
         const key_result = crypto.kdf2(shared, "meshguard-app-v1");
         const enc_key = key_result.key;
 
@@ -1052,9 +1277,7 @@ pub const ControlSocket = struct {
         @memcpy(msg_buf[77 + payload.len ..][0..16], &tag);
 
         const total_len = 77 + payload.len + 16;
-        const send_fn = self.send_fn orelse {
-            return formatError(resp_buf, "daemon sender not configured");
-        };
+        const send_fn = self.send_fn orelse return "daemon sender not configured";
 
         var sent_direct = false;
         if (peer_ep) |ep| {
@@ -1072,14 +1295,8 @@ pub const ControlSocket = struct {
             }
         }
 
-        if (!sent_direct and !sent_relay) {
-            return formatError(resp_buf, "udp transmission failed");
-        }
-
-        const ok_msg = "{\"ok\":true}\n";
-        const len = @min(ok_msg.len, resp_buf.len);
-        @memcpy(resp_buf[0..len], ok_msg[0..len]);
-        return len;
+        if (!sent_direct and !sent_relay) return "udp transmission failed";
+        return null;
     }
 
     fn formatPeers(self: *ControlSocket, buf: []u8) usize {
@@ -1183,6 +1400,11 @@ pub const ControlSocket = struct {
         if (self.socket_path_owned) {
             allocator.free(self.socket_path);
         }
+        self.transfers.deinit();
+        if (self.command_buf) |b| self.allocator.free(b);
+        if (self.response_buf) |b| self.allocator.free(b);
+        self.command_buf = null;
+        self.response_buf = null;
     }
 };
 
@@ -1790,7 +2012,7 @@ test "APPINFO reports honest framed maxPayload" {
 
     var resp_buf: [256]u8 = undefined;
     const len = control.handleCommand("APPINFO", &resp_buf);
-    try std.testing.expectEqualStrings("{\"protocol\":1,\"maxPayload\":952}\n", resp_buf[0..len]);
+    try std.testing.expectEqualStrings("{\"protocol\":1,\"maxPayload\":952,\"transfers\":1}\n", resp_buf[0..len]);
 }
 
 test "legacy RECV never sees MGAPP1 frames and APPRECV never sees legacy" {
@@ -2072,4 +2294,121 @@ test "APPSEND frames plaintext before the 0x50 encrypt path" {
     try std.testing.expect(std.mem.indexOf(u8, resp_buf[0..app_len], "hello rooms") != null);
     const legacy_empty = control.handleCommand("RECV", &resp_buf);
     try std.testing.expectEqualStrings("{\"empty\":true}\n", resp_buf[0..legacy_empty]);
+}
+
+test "XFER commands move a verified file between two control sockets over sealed 0x50 datagrams" {
+    const allocator = std.testing.allocator;
+    const a_wg_private = [_]u8{0x11} ** 32;
+    const b_wg_private = [_]u8{0x22} ** 32;
+    const a_key = [_]u8{0xa1} ** 32;
+    const b_key = [_]u8{0xb2} ** 32;
+    const a_wg = try X25519.recoverPublicKey(a_wg_private);
+    const b_wg = try X25519.recoverPublicKey(b_wg_private);
+
+    var a_members = Membership.MembershipTable.init(allocator, 10);
+    defer a_members.deinit();
+    var b_members = Membership.MembershipTable.init(allocator, 10);
+    defer b_members.deinit();
+    const peer = struct {
+        fn entry(pubkey: [32]u8, wg: [32]u8) Membership.Peer {
+            return .{ .pubkey = pubkey, .name = "", .state = .alive, .gossip_endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 1), .public_endpoint = null,
+                .wg_pubkey = wg, .mesh_ip = .{ 10, 99, 0, 2 }, .mesh_ip6 = .{0} ** 16, .wg_port = 51830, .lamport = 1, .last_seen_ns = 1,
+                .suspected_at_ns = null, .last_rtt_ns = null, .handshake_complete = false };
+        }
+    };
+    try a_members.upsert(peer.entry(b_key, b_wg));
+    try b_members.upsert(peer.entry(a_key, a_wg));
+
+    var a = try ControlSocket.init(allocator, &a_members, a_key, .{ 10, 99, 0, 1 }, a_wg_private, "a.sock");
+    defer a.deinit(allocator);
+    var b = try ControlSocket.init(allocator, &b_members, b_key, .{ 10, 99, 0, 2 }, b_wg_private, "b.sock");
+    defer b.deinit(allocator);
+
+    // Queue sealed packets like a UDP socket, then deliver them as wgOnAppMessage would.
+    const Wire = struct {
+        other: *ControlSocket,
+        other_private: [32]u8,
+        self_wg: [32]u8,
+        queue: std.ArrayList([1200]u8) = .empty,
+        lens: std.ArrayList(usize) = .empty,
+        fn send(ctx: *anyopaque, data: []const u8, ep: messages.Endpoint) bool {
+            _ = ep;
+            const w: *@This() = @ptrCast(@alignCast(ctx));
+            var packet: [1200]u8 = undefined;
+            @memcpy(packet[0..data.len], data);
+            w.queue.append(std.testing.allocator, packet) catch return false;
+            w.lens.append(std.testing.allocator, data.len) catch return false;
+            return true;
+        }
+        fn deliver(w: *@This()) void {
+            while (w.queue.items.len > 0) {
+                const data = w.queue.orderedRemove(0);
+                const n = w.lens.orderedRemove(0);
+                const payload_len = n - 77 - 16;
+                const shared = X25519.scalarmult(w.other_private, w.self_wg) catch return;
+                var plain: [1024]u8 = undefined;
+                ChaCha20Poly1305.decrypt(plain[0..payload_len], data[77..][0..payload_len], data[77 + payload_len ..][0..16].*, data[33..65], data[65..77].*, crypto.kdf2(shared, "meshguard-app-v1").key) catch return;
+                var sender: [32]u8 = undefined;
+                @memcpy(&sender, data[33..65]);
+                _ = w.other.pushMessage(sender, plain[0..payload_len]);
+            }
+        }
+        fn deinit(w: *@This()) void {
+            w.queue.deinit(std.testing.allocator);
+            w.lens.deinit(std.testing.allocator);
+        }
+    };
+    var a_wire = Wire{ .other = &b, .other_private = b_wg_private, .self_wg = a_wg };
+    defer a_wire.deinit();
+    var b_wire = Wire{ .other = &a, .other_private = a_wg_private, .self_wg = b_wg };
+    defer b_wire.deinit();
+    a.setSendHandler(&a_wire, Wire.send);
+    b.setSendHandler(&b_wire, Wire.send);
+
+    var resp: [MAX_RESPONSE_LINE]u8 = undefined;
+    var cmd: [MAX_COMMAND_LINE]u8 = undefined;
+    // Non-owner Unix clients cannot touch transfers (the socket itself is world-writable).
+    try std.testing.expect(std.mem.indexOf(u8, resp[0..b.formatCommandResponse("XFERLISTEN shots 1000000", &resp, false)], "unauthorized") != null);
+    try std.testing.expectEqualStrings("{\"ok\":true}\n", resp[0..b.handleCommand("XFERLISTEN shots 1000000", &resp)]);
+
+    var file: [5000]u8 = undefined;
+    for (&file, 0..) |*byte, i| byte.* = @truncate(i * 7);
+    var sha: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&file, &sha, .{});
+    const b_hex = std.fmt.bytesToHex(b_key, .lower);
+    const sha_hex = std.fmt.bytesToHex(sha, .lower);
+    var len = a.handleCommand(try std.fmt.bufPrint(&cmd, "XFEROFFER {s} shots {d} {s} bWV0YQ==", .{ &b_hex, file.len, &sha_hex }), &resp);
+    const id_start = std.mem.indexOf(u8, resp[0..len], "\"id\":\"").? + 6;
+    const id = resp[id_start..][0..32].*;
+
+    var b64: [8000]u8 = undefined;
+    const encoded = std.base64.standard.Encoder.encode(&b64, &file);
+    len = a.handleCommand(try std.fmt.bufPrint(&cmd, "XFERPUT {s} 0 {s}", .{ &id, encoded }), &resp);
+    try std.testing.expectEqualStrings("{\"ok\":true,\"staged\":5000}\n", resp[0..len]);
+    len = a.handleCommand(try std.fmt.bufPrint(&cmd, "XFERSTART {s}", .{&id}), &resp);
+    try std.testing.expectEqualStrings("{\"ok\":true}\n", resp[0..len]);
+    for (0..50) |_| {
+        a_wire.deliver();
+        b_wire.deliver();
+        a.tickTransfers();
+        b.tickTransfers();
+    }
+    len = a.handleCommand(try std.fmt.bufPrint(&cmd, "XFERSTATUS {s}", .{&id}), &resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp[0..len], "\"state\":\"delivered\"") != null);
+
+    len = b.handleCommand("XFERRECV shots", &resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp[0..len], &sha_hex) != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp[0..len], "\"meta\":\"bWV0YQ==\"") != null);
+    len = b.handleCommand(try std.fmt.bufPrint(&cmd, "XFERGET {s} 0 49152", .{&id}), &resp);
+    const data_start = std.mem.indexOf(u8, resp[0..len], "\"data\":\"").? + 8;
+    const data_end = std.mem.indexOfScalarPos(u8, resp[0..len], data_start, '"').?;
+    var got: [5000]u8 = undefined;
+    try std.base64.standard.Decoder.decode(&got, resp[data_start..data_end]);
+    try std.testing.expectEqualSlices(u8, &file, &got);
+    len = b.handleCommand(try std.fmt.bufPrint(&cmd, "XFERDONE {s}", .{&id}), &resp);
+    try std.testing.expectEqualStrings("{\"ok\":true}\n", resp[0..len]);
+    try std.testing.expectEqualStrings("{\"empty\":true}\n", resp[0..b.handleCommand("XFERRECV shots", &resp)]);
+    // Transfer frames never reach application or legacy queues.
+    try std.testing.expectEqual(@as(usize, 0), b.getMessageCount());
+    try std.testing.expectEqualStrings("{\"empty\":true}\n", resp[0..b.handleCommand("APPRECV shots", &resp)]);
 }
