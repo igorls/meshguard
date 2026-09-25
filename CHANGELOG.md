@@ -24,9 +24,11 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   Explicit invalid values fail closed (no silent fallback to 51821).
 
 ### Fixed
-- macOS/BSD event loops no longer block forever in `recvfrom` once a peer is
-  live: UDP sockets are non-blocking as on Linux. Previously the control socket
-  stopped answering (`status`, `APPRECV`, …) in `--gossip-only` and TUN modes.
+- Event loops no longer block forever in `recvfrom` once a peer is live: UDP
+  sockets are non-blocking on macOS/BSD (`fcntl`) and Windows (`FIONBIO`) as on
+  Linux, with IPv4/IPv6 empty-drain regression tests. Previously the control
+  socket stopped answering (`status`, `APPRECV`, …) in `--gossip-only` and TUN
+  modes. (Reviewed pilot control fix, patch `c2362fe0`.)
 - Control commands no longer wait out the 200 ms gossip poll: gossip-only and
   macOS loops wake on the control socket (and TUN) as well as UDP.
 - `0x50` replay state is updated only after a packet authenticates, so forged
