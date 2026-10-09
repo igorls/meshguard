@@ -1,0 +1,16 @@
+{
+  "capturedOn": "2026-10-09",
+  "run": "pc-web-1a1229b5f86",
+  "status": "PASS · Android and web are connected",
+  "proof": "passed",
+  "androidMessage": "Received",
+  "acknowledgement": "Verified",
+  "relayAuthentication": "Verified",
+  "messages": "2 / 2",
+  "connections": 2,
+  "returnPorts": [41407, 44346],
+  "publicKey": "wcxyGVXMcbBGhrPPrOM31wsQMpPyEJ+RJ1rg8ngaleE=",
+  "wgPublicKey": "azhXSoR4ySBHkwSnIKULlTKohx18ZeEzlc3tkRmIUVU=",
+  "consoleWarningsOrErrors": [],
+  "scope": "Browser DOM readout during a live separate Android-probe qualification; test admission was removed afterward."
+}

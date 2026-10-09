@@ -1,6 +1,7 @@
 const encoder = new TextEncoder();
 const bytes = value =>
-  typeof value === 'string' ? encoder.encode(value) : new Uint8Array(value);
+  typeof value === 'string' ? encoder.encode(value)
+    : value instanceof Uint8Array ? value : new Uint8Array(value);
 
 const statusNames = {
   '-1': 'Invalid or destroyed identity',
@@ -77,7 +78,7 @@ export class MeshguardWasm {
   createIdentity(seed) {
     const material = seed === undefined
       ? crypto.getRandomValues(new Uint8Array(32))
-      : key(seed).slice();
+      : new Uint8Array(key(seed));
     let handle;
     try {
       this.#write(0, material);
@@ -88,6 +89,7 @@ export class MeshguardWasm {
     }
 
     let destroyed = false;
+    let lastTimestamp = 0n;
     const live = () => {
       if (destroyed) throw new Error('Identity has been destroyed');
     };
@@ -113,6 +115,42 @@ export class MeshguardWasm {
     return Object.freeze({
       publicKey,
       wgPublicKey,
+      initiateHandshake: peerWgPublicKey => {
+        live();
+        const ephemeral = crypto.getRandomValues(new Uint8Array(32));
+        const indexBytes = crypto.getRandomValues(new Uint8Array(4));
+        const senderIndex = new DataView(indexBytes.buffer).getUint32(0, true) || 1;
+        const now = BigInt(Date.now()) * 1000000n;
+        lastTimestamp = now > lastTimestamp ? now : lastTimestamp + 1n;
+        const timestamp = new Uint8Array(12);
+        const view = new DataView(timestamp.buffer);
+        view.setBigUint64(0, lastTimestamp / 1000000000n + 0x400000000000000an, false);
+        view.setUint32(8, Number(lastTimestamp % 1000000000n), false);
+        try {
+          this.#write(offset.wgKey, key(peerWgPublicKey));
+          this.#write(offset.data, ephemeral);
+          this.#write(offset.nonce, timestamp);
+          const size = check(this.#exports.mg_noise_initiate(
+            handle, this.#base + offset.wgKey, this.#base + offset.data,
+            this.#base + offset.nonce, senderIndex, this.#base + offset.output,
+          ));
+          return this.#read(offset.output, size);
+        } finally {
+          ephemeral.fill(0);
+          this.#clear();
+        }
+      },
+      completeHandshake: response => {
+        live();
+        const data = bytes(response);
+        if (data.length !== 92) throw new Error('Invalid WireGuard response size');
+        try {
+          this.#write(offset.data, data);
+          check(this.#exports.mg_noise_complete(handle, this.#base + offset.data, data.length));
+        } finally {
+          this.#clear();
+        }
+      },
       seal: (peer, message) => {
         live();
         const data = bytes(message);

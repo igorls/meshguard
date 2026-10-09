@@ -6,10 +6,11 @@ browser as WebAssembly. The native FFI and desktop daemon use the same
 The JavaScript wrapper lives in `web/meshguard.mjs`.
 
 This target includes Ed25519 identity generation and signatures, X25519 key
-agreement, and ChaCha20-Poly1305 application packets. It does not yet include the
-daemon, SWIM reactor, WireGuard Noise sessions, sockets, TUN interfaces, relay
-registration, or discovery. Applications supply those transport and lifecycle
-services through a browser-compatible adapter.
+agreement, ChaCha20-Poly1305 application packets, and a WireGuard Noise IK
+initiator for authenticating relay return routes. It does not include the
+daemon, full SWIM reactor, WireGuard tunnel data, sockets, or TUN interfaces.
+The [browser relay adapter](browser-relay.md) supplies WSS transport, minimal
+SWIM liveness, and explicitly pinned peer keys.
 
 ## Build and verify
 
@@ -22,7 +23,7 @@ zig build -Dtarget=wasm32-freestanding -Doptimize=ReleaseSmall
 ```
 
 The artifact is `zig-out/bin/meshguard.wasm`. The qualified ReleaseSmall build is
-57,809 bytes, has no imports, and reserves 256 KiB of fixed linear memory with a
+63,369 bytes, has no imports, and reserves 256 KiB of fixed linear memory with a
 64 KiB stack. It needs neither WASI nor libc. Artifact size can change with
 compiler versions and source changes.
 
@@ -33,8 +34,9 @@ node tests/wasm/serve.mjs
 # Open http://127.0.0.1:14339/
 ```
 
-The server binds to loopback and exposes only the proof page, wrapper, and WASM
-artifact. The page uses public test seeds and does not connect to a relay.
+The server binds to loopback and exposes the proof assets and optional public
+relay-test configuration. The core page at `/` uses public test seeds and does
+not connect to a relay; `/relay.html` runs the separately configured adapter test.
 
 To test native interoperability, build a native FFI library first:
 
@@ -123,14 +125,17 @@ Qualification on 2026-10-09:
 - The native test suite passed 391 tests with two existing skips. The desktop
   CLI, static library, and native FFI also built successfully.
 
-These checks qualify the portable packet core. They do not establish a browser
-connection to a phone, discovery, reconnect, or background message delivery.
+These original checks qualify the portable packet core. Subsequent real
+Android-to-browser delivery and authenticated reconnect evidence is recorded in
+the [browser relay qualification](browser-relay.md). Background delivery and
+Peer Circle's browser product flows remain separate acceptance work.
 
 ## ABI and memory lifecycle
 
 ABI version 1 exports `mg_abi_version`, `mg_scratch_ptr`, `mg_scratch_size`,
 `mg_max_payload`, `mg_identity_create`, `mg_identity_destroy`, `mg_public_key`,
-`mg_wg_public_key`, `mg_seal`, `mg_open`, `mg_sign`, and `mg_verify`.
+`mg_wg_public_key`, `mg_seal`, `mg_open`, `mg_sign`, `mg_verify`,
+`mg_noise_initiate`, and `mg_noise_complete`.
 
 Pointers and lengths are unsigned 32-bit values confined to an 8 KiB scratch
 arena. Invalid ranges and overlapping packet input/output buffers are rejected.
@@ -165,9 +170,7 @@ identities in memory and does not persist them.
 
 ## Next integration step
 
-Add a browser transport and discovery adapter, then prove real browser-to-Pixel
-pairing, send/receipt, and reconnect. A WSS-to-UDP gateway can carry the existing
-encrypted MeshGuard packets to the shared relay infrastructure. Such a gateway
-must preserve native admission and replay protections and receive neither
-private identity keys nor message plaintext. The gateway and Peer Circle
-browser integration are separate follow-up work.
+The WSS-to-UDP adapter now carries existing sealed packets to native relays, with
+browser identity authentication and native Noise-based return-route updates.
+The next product step is browser-local Peer Circle storage, real profile/contact
+pairing, the shared chat/receipt protocol, and browser lifecycle handling.

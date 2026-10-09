@@ -1,7 +1,8 @@
 //! Browser ABI for the portable core. Host buffers are restricted to scratch.
 const std = @import("std");
 const packet = @import("app_packet.zig");
-const Slot = struct { identity: packet.Identity = undefined, live: bool = false, generation: u32 = 0 };
+const noise = @import("wireguard/noise.zig");
+const Slot = struct { identity: packet.Identity = undefined, live: bool = false, generation: u32 = 0, handshake: ?noise.Handshake = null };
 var slots: [16]Slot = @splat(Slot{});
 var scratch: [8192]u8 align(16) = .{0} ** 8192;
 
@@ -50,9 +51,50 @@ export fn mg_identity_create(address: u32, length: u32) i32 {
 }
 export fn mg_identity_destroy(handle: u32) i32 {
     const identity = context(handle) orelse return -1;
+    clearHandshake(&slots[(handle & 255) - 1]);
     identity.clear();
     slots[(handle & 255) - 1].live = false;
     std.crypto.secureZero(u8, &scratch);
+    return 0;
+}
+
+fn clearHandshake(slot: *Slot) void {
+    if (slot.handshake) |*handshake| handshake.deinit();
+    slot.handshake = null;
+}
+
+/// Start the existing WireGuard Noise IK handshake to authenticate a return route.
+/// This deliberately does not expose transport keys or implement tunnel data.
+export fn mg_noise_initiate(handle: u32, peer_address: u32, ephemeral_address: u32, timestamp_address: u32, sender_index: u32, output_address: u32) i32 {
+    const identity = context(handle) orelse return -1;
+    const peer = buffer(peer_address, 32) orelse return -2;
+    const ephemeral = buffer(ephemeral_address, 32) orelse return -2;
+    const timestamp = buffer(timestamp_address, 12) orelse return -2;
+    const out = buffer(output_address, @sizeOf(noise.HandshakeInitiation)) orelse return -2;
+    if (sender_index == 0) return -5;
+    const slot = &slots[(handle & 255) - 1];
+    clearHandshake(slot);
+    var handshake = noise.Handshake.init(identity.wg_private, identity.wg_public, peer[0..32].*) catch return -5;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&handshake));
+    const initiation = handshake.createInitiationWithEntropy(sender_index, ephemeral[0..32].*, timestamp[0..12].*) catch {
+        handshake.deinit();
+        return -5;
+    };
+    slot.handshake = handshake;
+    @memcpy(out, std.mem.asBytes(&initiation));
+    return @sizeOf(noise.HandshakeInitiation);
+}
+
+export fn mg_noise_complete(handle: u32, data_address: u32, length: u32) i32 {
+    _ = context(handle) orelse return -1;
+    const data = buffer(data_address, length) orelse return -2;
+    if (length != @sizeOf(noise.HandshakeResponse) or std.mem.readInt(u32, data[0..4], .little) != 2) return -3;
+    const slot = &slots[(handle & 255) - 1];
+    const handshake = if (slot.handshake) |*value| value else return -5;
+    defer clearHandshake(slot);
+    var response: noise.HandshakeResponse = undefined;
+    @memcpy(std.mem.asBytes(&response), data);
+    handshake.consumeResponse(&response) catch return -6;
     return 0;
 }
 export fn mg_public_key(handle: u32, address: u32) i32 {

@@ -34,6 +34,12 @@ try:
  end=time.monotonic()+10
  while native_endpoint is None and time.monotonic()<end:pump()
  if native_endpoint is None:raise RuntimeError('Native did not contact loopback browser adapter')
+ sock.sendto(bytes.fromhex(request['noiseInitiation']),native_endpoint)
+ end=time.monotonic()+5;noise_response=None
+ while time.monotonic()<end:
+  packet=pump()
+  if packet and packet[:4]==b'\x02\x00\x00\x00' and len(packet)==92:noise_response=packet;break
+ if noise_response is None:raise RuntimeError('Native did not authenticate the WASM Noise initiation')
  frames=[]
  for sample in request['samples']:
   data=bytes.fromhex(sample['packet']);expected=bytes.fromhex(sample['plaintext'])
@@ -54,5 +60,5 @@ try:
    if packet and packet[0]==0x50:reply=packet;break
   if reply is None:raise RuntimeError('No native encrypted reply')
   frames.append(reply.hex())
- print(json.dumps({'nativeReceived':len(frames),'nativePackets':frames}))
+ print(json.dumps({'nativeReceived':len(frames),'nativePackets':frames,'noiseResponse':noise_response.hex()}))
 finally:destroy(ctx);sock.close()

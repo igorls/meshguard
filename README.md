@@ -54,8 +54,9 @@ without a required server.
 - **Mobile and embedded FFI** for Android and iOS app-level encrypted messaging
   and tunnel data channels.
 - **Portable Zig build** with optional libsodium acceleration on Linux.
-- **Browser WASM core** for native-compatible identities, signatures, and
-  encrypted application packets, with a JavaScript wrapper.
+- **Browser WASM core** for native-compatible identities, signatures, encrypted
+  application packets, and authenticated relay routing, with a JavaScript
+  wrapper and ciphertext-only WSS gateway.
 
 ## Install
 
@@ -197,7 +198,7 @@ or `-Dcrypto-backend=std`.
 | Windows | Userspace mode through Wintun; `meshguard up` requires Administrator privileges. |
 | Android | C-ABI shared library for app embedding; no CLI TUN interface. |
 | iOS | C-ABI static library for app embedding; no CLI TUN interface. |
-| Browser / WASM | Portable identity, signature, and app-packet core; host supplies transport and discovery. |
+| Browser / WASM | Portable identity/app-packet core and Noise route authentication; optional WSS gateway and pinned-peer adapter. |
 
 ## Performance
 
@@ -215,6 +216,7 @@ history, and remaining performance work.
 - [Service access control](docs/guide/services.md)
 - [Android embedding](docs/guide/android-embedding.md)
 - [Browser WASM core](docs/reference/wasm-core.md)
+- [Browser relay and Android qualification](docs/reference/browser-relay.md)
 - [Architecture](docs/concepts/architecture.md)
 - [Wire protocol](docs/concepts/wire-protocol.md)
 - [CLI reference](docs/reference/cli.md)

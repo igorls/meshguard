@@ -18,6 +18,7 @@ docs/.vitepress/cache/
 *.dll
 
 # Environment
+.local/
 .env
 .env.*
 !.env.example
