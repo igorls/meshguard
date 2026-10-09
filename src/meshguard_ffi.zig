@@ -103,6 +103,16 @@ pub const MeshguardContext = struct {
     // without racing tick(). See meshguard_resume / eventLoop.
     resume_requested: std.atomic.Value(bool),
 
+    // App routing is configured before join and remains immutable while running.
+    app_relay_key: ?[32]u8,
+    force_app_relay: bool,
+    app_direct_sent: std.atomic.Value(u64),
+    app_relay_sent: std.atomic.Value(u64),
+    app_route_failed: std.atomic.Value(u64),
+    app_duplicate_dropped: std.atomic.Value(u64),
+    app_seen: [128]AppSeen,
+    app_seen_next: usize,
+
     // Callbacks (set by host app)
     on_message_cb: ?*const fn ([*]const u8, usize, [*]const u8) callconv(.c) void,
     on_peer_event_cb: ?*const fn (u8, [*]const u8) callconv(.c) void,
@@ -143,6 +153,14 @@ fn initContextStorage(allocator: std.mem.Allocator) MeshguardContext {
         .running = std.atomic.Value(bool).init(false),
         .suspended = std.atomic.Value(bool).init(false),
         .resume_requested = std.atomic.Value(bool).init(false),
+        .app_relay_key = null,
+        .force_app_relay = false,
+        .app_direct_sent = std.atomic.Value(u64).init(0),
+        .app_relay_sent = std.atomic.Value(u64).init(0),
+        .app_route_failed = std.atomic.Value(u64).init(0),
+        .app_duplicate_dropped = std.atomic.Value(u64).init(0),
+        .app_seen = std.mem.zeroes([128]AppSeen),
+        .app_seen_next = 0,
         .on_message_cb = null,
         .on_peer_event_cb = null,
         .on_undeliverable_cb = null,
@@ -193,6 +211,48 @@ const TunnelMessage = struct {
     len: u16,
     valid: bool,
 };
+
+const AppSeen = struct {
+    valid: bool,
+    sender: [32]u8,
+    nonce: [12]u8,
+};
+
+const AppRoute = struct {
+    direct: ?messages.Endpoint,
+    relay: ?messages.Endpoint,
+};
+
+fn appRoute(peer: Membership.Peer, relay: ?Membership.Peer, force_relay: bool) AppRoute {
+    const relay_ep = if (relay) |r| r.gossip_endpoint orelse r.public_endpoint else null;
+    if (force_relay) return .{ .direct = null, .relay = relay_ep };
+    return .{
+        .direct = if (peer.state == .alive or peer.state == .suspected) peer.gossip_endpoint orelse peer.public_endpoint else null,
+        .relay = relay_ep,
+    };
+}
+
+/// Pin a relay identity and optionally require app messages to use it exclusively.
+/// Configure before joining. A forced route fails closed while that relay is absent.
+export fn meshguard_set_app_relay(ctx: ?*MeshguardContext, relay_pubkey: ?[*]const u8, force: bool) i32 {
+    const c = ctx orelse return -1;
+    if (c.running.load(.acquire)) return -2;
+    if (force and relay_pubkey == null) return -3;
+    c.app_relay_key = if (relay_pubkey) |key| key[0..32].* else null;
+    c.force_app_relay = force;
+    return 0;
+}
+
+/// Four LE u64 counters: direct UDP sends, relay UDP sends, failed routes, duplicate drops.
+/// Counts represent socket sends, never confirmed delivery.
+export fn meshguard_app_route_stats(ctx: ?*MeshguardContext, out: [*]u8) void {
+    const c = ctx orelse {
+        @memset(out[0..32], 0);
+        return;
+    };
+    const values = [_]u64{ c.app_direct_sent.load(.acquire), c.app_relay_sent.load(.acquire), c.app_route_failed.load(.acquire), c.app_duplicate_dropped.load(.acquire) };
+    for (values, 0..) |value, i| std.mem.writeInt(u64, out[i * 8 ..][0..8], value, .little);
+}
 
 // ─── Lifecycle ───
 
@@ -584,27 +644,33 @@ export fn meshguard_send(
     var target_key: [32]u8 = undefined;
     @memcpy(&target_key, peer_pubkey[0..32]);
 
-    // SECURITY (H7): copy the peer out under a read lock vs SWIM-thread rehash.
-    const peer_entry = blk: {
+    // Copy both entries under the membership lock; never retain iterator pointers.
+    const snapshot = blk: {
         c.membership.lock.lockSharedUncancelable(zio());
         defer c.membership.lock.unlockShared(zio());
-        break :blk c.membership.peers.get(target_key);
+        const peer = c.membership.peers.get(target_key);
+        var relay: ?Membership.Peer = null;
+        if (c.app_relay_key) |pin| {
+            if (!std.mem.eql(u8, &pin, &target_key) and !std.mem.eql(u8, &pin, &c.ed25519_public)) {
+                if (c.membership.peers.get(pin)) |candidate| {
+                    if (candidate.state == .alive and candidate.nat_type == .public and candidate.is_relay_capable) relay = candidate;
+                }
+            }
+        } else if (lib.nat.Relay.selectRelayForPair(&c.membership.peers, c.ed25519_public, target_key)) |candidate| {
+            relay = candidate.*;
+        }
+        break :blk .{ .peer = peer, .relay = relay };
     };
-    if (peer_entry == null) {
-        // Peer unknown — notify host app so it can queue for offline delivery
+    const peer = snapshot.peer orelse {
         if (c.on_undeliverable_cb) |cb| cb(peer_pubkey, data, len, -4);
         return -4;
-    }
-    const peer = peer_entry.?;
-    const ep = peer.gossip_endpoint orelse {
-        if (c.on_undeliverable_cb) |cb| cb(peer_pubkey, data, len, -5);
-        return -5;
     };
-
-    // Check if peer is actually reachable
-    if (peer.state != .alive and peer.state != .suspected) {
-        if (c.on_undeliverable_cb) |cb| cb(peer_pubkey, data, len, -10);
-        return -10; // peer is dead or left
+    const route = appRoute(peer, snapshot.relay, c.force_app_relay);
+    if (route.direct == null and route.relay == null) {
+        _ = c.app_route_failed.fetchAdd(1, .release);
+        const rc: i32 = if (c.force_app_relay) -11 else -10;
+        if (c.on_undeliverable_cb) |cb| cb(peer_pubkey, data, len, rc);
+        return rc;
     }
 
     // Build encrypted message:
@@ -643,8 +709,26 @@ export fn meshguard_send(
 
     const total_len: usize = 77 + msg_len + 16;
     const socket = c.socket orelse return -8;
-    _ = socket.sendTo(msg_buf[0..total_len], ep.addr, ep.port) catch return -9;
-
+    var sent_direct = false;
+    if (route.direct) |ep| {
+        if (socket.sendToEndpoint(msg_buf[0..total_len], ep)) |_| {
+            sent_direct = true;
+            _ = c.app_direct_sent.fetchAdd(1, .release);
+        } else |_| {}
+    }
+    var sent_relay = false;
+    if (c.force_app_relay or peer.nat_type != .public or !sent_direct) {
+        if (route.relay) |ep| {
+            if (socket.sendToEndpoint(msg_buf[0..total_len], ep)) |_| {
+                sent_relay = true;
+                _ = c.app_relay_sent.fetchAdd(1, .release);
+            } else |_| {}
+        }
+    }
+    if (!sent_direct and !sent_relay) {
+        _ = c.app_route_failed.fetchAdd(1, .release);
+        return -9;
+    }
     return 0;
 }
 
@@ -1169,10 +1253,20 @@ pub fn handleAppMessage(ctx: *MeshguardContext, data: []const u8) void {
         enc_key,
     ) catch return; // Auth failed — silently drop
 
+    for (ctx.app_seen) |seen| {
+        if (seen.valid and std.mem.eql(u8, &seen.sender, sender_pubkey) and std.mem.eql(u8, &seen.nonce, &nonce)) {
+            _ = ctx.app_duplicate_dropped.fetchAdd(1, .release);
+            return;
+        }
+    }
+
     // Enqueue to inbox (Finding #8: capacity check + atomic valid)
     const read_idx = ctx.inbox_read.load(.acquire);
     const write_idx = ctx.inbox_write.load(.acquire);
     if (write_idx -% read_idx >= 64) return; // Full — drop message
+
+    ctx.app_seen[ctx.app_seen_next] = .{ .valid = true, .sender = sender_pubkey[0..32].*, .nonce = nonce };
+    ctx.app_seen_next = (ctx.app_seen_next + 1) % ctx.app_seen.len;
 
     const slot = write_idx % 64;
     ctx.inbox[slot].sender_pubkey = peer_key;
@@ -1745,4 +1839,63 @@ test "tunnel frame payload length guard widens before adding header" {
     try std.testing.expectEqual(@as(?usize, 1496), tunnelFramePayloadLen(1500, 1496));
     try std.testing.expectEqual(@as(?usize, null), tunnelFramePayloadLen(4, 65535));
     try std.testing.expectEqual(@as(?usize, null), tunnelFramePayloadLen(1500, 65535));
+}
+
+fn routeTestPeer(key: u8) Membership.Peer {
+    return .{ .pubkey = [_]u8{key} ** 32, .name = "", .state = .alive, .gossip_endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 51000 + @as(u16, key)), .wg_pubkey = [_]u8{key} ** 32, .mesh_ip = .{ 10, 99, 0, key }, .wg_port = 0, .lamport = 1, .last_seen_ns = 1, .suspected_at_ns = null, .last_rtt_ns = null, .handshake_complete = false };
+}
+
+test "forced app relay route never falls back to direct" {
+    const peer = routeTestPeer(1);
+    const absent = appRoute(peer, null, true);
+    try std.testing.expect(absent.direct == null and absent.relay == null);
+    const relay = routeTestPeer(2);
+    const forced = appRoute(peer, relay, true);
+    try std.testing.expect(forced.direct == null);
+    try std.testing.expectEqual(relay.gossip_endpoint.?, forced.relay.?);
+    const automatic = appRoute(peer, relay, false);
+    try std.testing.expect(automatic.direct != null and automatic.relay != null);
+}
+
+test "forced app relay requires an identity before join" {
+    var ctx = initContextStorage(std.testing.allocator);
+    defer ctx.membership.deinit();
+    try std.testing.expectEqual(@as(i32, -3), meshguard_set_app_relay(&ctx, null, true));
+    var pin = [_]u8{2} ** 32;
+    try std.testing.expectEqual(@as(i32, 0), meshguard_set_app_relay(&ctx, &pin, true));
+    ctx.running.store(true, .release);
+    try std.testing.expectEqual(@as(i32, -2), meshguard_set_app_relay(&ctx, null, false));
+}
+
+test "authenticated direct and relay copies enqueue only once" {
+    var seed_a = [_]u8{1} ** 32;
+    var seed_b = [_]u8{2} ** 32;
+    const sender = meshguard_init(&seed_a, 0) orelse return error.InitFailed;
+    defer meshguard_destroy(sender);
+    const receiver = meshguard_init(&seed_b, 0) orelse return error.InitFailed;
+    defer meshguard_destroy(receiver);
+    var peer = routeTestPeer(1);
+    peer.pubkey = sender.ed25519_public;
+    peer.wg_pubkey = sender.x25519_public;
+    try receiver.membership.upsert(peer);
+    const text = "native relay copy test";
+    var packet: [93 + text.len]u8 = undefined;
+    packet[0] = 0x50;
+    @memcpy(packet[1..33], &receiver.ed25519_public);
+    @memcpy(packet[33..65], &sender.ed25519_public);
+    const nonce = [_]u8{7} ** 12;
+    @memcpy(packet[65..77], &nonce);
+    const shared = try X25519.scalarmult(sender.x25519_private, receiver.x25519_public);
+    var tag: [16]u8 = undefined;
+    ChaCha20Poly1305.encrypt(packet[77..][0..text.len], &tag, text, &sender.ed25519_public, nonce, crypto.kdf2(shared, "meshguard-app-v1").key);
+    @memcpy(packet[77 + text.len ..], &tag);
+    var corrupt = packet;
+    corrupt[corrupt.len - 1] ^= 1;
+    handleAppMessage(receiver, &corrupt);
+    try std.testing.expectEqual(@as(u32, 0), receiver.inbox_write.load(.acquire));
+    handleAppMessage(receiver, &packet);
+    handleAppMessage(receiver, &packet);
+    try std.testing.expectEqual(@as(u32, 1), receiver.inbox_write.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), receiver.app_duplicate_dropped.load(.acquire));
+    try std.testing.expectEqualStrings(text, receiver.inbox[0].data[0..text.len]);
 }
