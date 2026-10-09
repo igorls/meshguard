@@ -1,4 +1,5 @@
 const std = @import("std");
+const AppPacket = @import("app_packet.zig");
 const lib = @import("lib.zig");
 
 const Config = lib.config.Config;
@@ -2210,28 +2211,12 @@ fn wgOnAppMessage(ctx: *anyopaque, data: []const u8) void {
     const payload_len = data.len - 77 - 16;
     if (payload_len > 1024) return;
 
-    const ciphertext = data[77..][0..payload_len];
-    const tag: [16]u8 = data[77 + payload_len ..][0..16].*;
-
     var peer_key: [32]u8 = undefined;
     @memcpy(&peer_key, sender_pubkey);
-
     const peer = handler.membership.peers.get(peer_key) orelse return;
     const peer_wg_pubkey = peer.wg_pubkey orelse return;
-
-    const shared = std.crypto.dh.X25519.scalarmult(handler.our_wg_private, peer_wg_pubkey) catch return;
-    const key_result = lib.wireguard.Crypto.kdf2(shared, "meshguard-app-v1");
-    const enc_key = key_result.key;
-
     var plaintext: [1024]u8 = undefined;
-    std.crypto.aead.chacha_poly.ChaCha20Poly1305.decrypt(
-        plaintext[0..payload_len],
-        ciphertext,
-        tag,
-        sender_pubkey,
-        nonce,
-        enc_key,
-    ) catch return;
+    _ = AppPacket.open(control.our_pubkey, handler.our_wg_private, peer_wg_pubkey, data, &plaintext) catch return;
 
     // Replay state is updated only after authentication, so forged packets cannot
     // evict real nonces. Transfer frames are idempotent and carry their own replay

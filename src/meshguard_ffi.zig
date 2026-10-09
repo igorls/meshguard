@@ -12,6 +12,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const lib = @import("lib.zig");
+const AppPacket = @import("app_packet.zig");
 
 const is_mobile = builtin.abi == .android or builtin.os.tag == .ios;
 
@@ -675,41 +676,14 @@ export fn meshguard_send(
         return rc;
     }
 
-    // Build encrypted message:
-    //   [1B type=0x50] [32B dest_pubkey] [32B sender_pubkey] [12B nonce] [N ciphertext] [16B tag]
-    var msg_buf: [1 + 32 + 32 + 12 + 1024 + 16]u8 = undefined;
-    msg_buf[0] = 0x50; // App message type
-    @memcpy(msg_buf[1..33], &target_key); // destination pubkey
-    @memcpy(msg_buf[33..65], &c.ed25519_public); // sender pubkey
-
-    // Nonce: random 12 bytes
+    var msg_buf: [AppPacket.max_packet]u8 = undefined;
     var nonce: [12]u8 = undefined;
     zio().random(&nonce);
-    @memcpy(msg_buf[65..77], &nonce);
-
-    // Derive shared key via X25519 + HKDF
     const peer_x25519 = peer.wg_pubkey orelse {
         if (c.on_undeliverable_cb) |cb| cb(peer_pubkey, data, len, -6);
         return -6;
     };
-    const shared = X25519.scalarmult(c.x25519_private, peer_x25519) catch return -7;
-    const key_result = crypto.kdf2(shared, "meshguard-app-v1");
-    const enc_key = key_result.key;
-
-    // Encrypt
-    const msg_len: usize = @intCast(len);
-    var tag: [16]u8 = undefined;
-    ChaCha20Poly1305.encrypt(
-        msg_buf[77..][0..msg_len],
-        &tag,
-        data[0..msg_len],
-        &c.ed25519_public, // AD = sender pubkey
-        nonce,
-        enc_key,
-    );
-    @memcpy(msg_buf[77 + msg_len ..][0..16], &tag);
-
-    const total_len: usize = 77 + msg_len + 16;
+    const total_len = AppPacket.seal(c.ed25519_public, c.x25519_private, target_key, peer_x25519, nonce, data[0..len], &msg_buf) catch return -7;
     const socket = c.socket orelse return -8;
     var sent_direct = false;
     if (route.direct) |ep| {
@@ -1257,29 +1231,12 @@ pub fn handleAppMessage(ctx: *MeshguardContext, data: []const u8) void {
     const payload_len = data.len - 77 - 16;
     if (payload_len > 1024) return;
 
-    const ciphertext = data[77..][0..payload_len];
-    const tag: [16]u8 = data[77 + payload_len ..][0..16].*;
-
-    // Derive shared key
     var peer_key: [32]u8 = undefined;
     @memcpy(&peer_key, sender_pubkey);
     const peer = ctx.membership.peers.get(peer_key) orelse return;
     const peer_x25519 = peer.wg_pubkey orelse return;
-
-    const shared = X25519.scalarmult(ctx.x25519_private, peer_x25519) catch return;
-    const key_result = crypto.kdf2(shared, "meshguard-app-v1");
-    const enc_key = key_result.key;
-
-    // Decrypt
     var plaintext: [1024]u8 = undefined;
-    ChaCha20Poly1305.decrypt(
-        plaintext[0..payload_len],
-        ciphertext,
-        tag,
-        sender_pubkey,
-        nonce,
-        enc_key,
-    ) catch return; // Auth failed — silently drop
+    _ = AppPacket.open(ctx.ed25519_public, ctx.x25519_private, peer_x25519, data, &plaintext) catch return;
 
     for (ctx.app_seen) |seen| {
         if (seen.valid and std.mem.eql(u8, &seen.sender, sender_pubkey) and std.mem.eql(u8, &seen.nonce, &nonce)) {
