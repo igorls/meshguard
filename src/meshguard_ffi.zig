@@ -106,6 +106,7 @@ pub const MeshguardContext = struct {
     // App routing is configured before join and remains immutable while running.
     app_relay_key: ?[32]u8,
     force_app_relay: bool,
+    last_relay_auth_ns: i128,
     app_direct_sent: std.atomic.Value(u64),
     app_relay_sent: std.atomic.Value(u64),
     app_route_failed: std.atomic.Value(u64),
@@ -155,6 +156,7 @@ fn initContextStorage(allocator: std.mem.Allocator) MeshguardContext {
         .resume_requested = std.atomic.Value(bool).init(false),
         .app_relay_key = null,
         .force_app_relay = false,
+        .last_relay_auth_ns = 0,
         .app_direct_sent = std.atomic.Value(u64).init(0),
         .app_relay_sent = std.atomic.Value(u64).init(0),
         .app_route_failed = std.atomic.Value(u64).init(0),
@@ -1161,6 +1163,7 @@ fn eventLoop(ctx: *MeshguardContext) void {
             } else {
                 // ACTIVE: full gossip + discovery
                 swim.tick() catch {};
+                maintainPinnedRelayAuthentication(ctx);
 
                 // Honor a pending resume() (requested from the host thread): do the
                 // immediate re-announce HERE, on the loop thread that owns SWIM/LAN
@@ -1186,6 +1189,31 @@ fn eventLoop(ctx: *MeshguardContext) void {
             // No SWIM instance — sleep briefly
             std.Io.sleep(zio(), std.Io.Duration.fromNanoseconds(100_000_000), .awake) catch {};
         }
+    }
+}
+
+/// A pinned public relay needs a fresh authenticated source endpoint after
+/// restart/network change. A bounded control handshake uses the existing WG
+/// protocol; it carries no app data and never counts as a direct app send.
+fn maintainPinnedRelayAuthentication(ctx: *MeshguardContext) void {
+    const pin = ctx.app_relay_key orelse return;
+    const now: i128 = @intCast(std.Io.Timestamp.now(zio(), .awake).toNanoseconds());
+    if (ctx.last_relay_auth_ns != 0 and now - ctx.last_relay_auth_ns < 15_000_000_000) return;
+    const peer = blk: {
+        ctx.membership.lock.lockSharedUncancelable(zio());
+        defer ctx.membership.lock.unlockShared(zio());
+        break :blk ctx.membership.peers.get(pin) orelse return;
+    };
+    if (peer.state != .alive) return;
+    const wg_key = peer.wg_pubkey orelse return;
+    const ep = peer.gossip_endpoint orelse peer.public_endpoint orelse return;
+    ctx.last_relay_auth_ns = now;
+    ctx.wg_lock.lockUncancelable(zio());
+    defer ctx.wg_lock.unlock(zio());
+    if (ctx.wg_device) |*dev| {
+        const slot = dev.addPeerWithEndpoint(pin, wg_key, ep, peer.mesh_ip, peer.mesh_ip6) catch return;
+        const initiation = dev.initiateHandshake(slot) catch return;
+        if (ctx.socket) |socket| _ = socket.sendToEndpoint(std.mem.asBytes(&initiation), ep) catch return;
     }
 }
 

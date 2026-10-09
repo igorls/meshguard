@@ -3342,7 +3342,9 @@ fn processIncomingPacket(
         .wg_handshake_init => {
             if (pkt.len >= @sizeOf(lib.wireguard.Noise.HandshakeInitiation)) {
                 const msg: *const lib.wireguard.Noise.HandshakeInitiation = @ptrCast(@alignCast(pkt.ptr));
-                if (wg_dev.handleInitiation(msg, sender_addr)) |hs_result| {
+                const source = lib.protocol.Messages.Endpoint.initV4(sender_addr, sender_port);
+                if (wg_dev.handleInitiationFromEndpoint(msg, source)) |hs_result| {
+                    _ = swim.confirmAuthenticatedEndpoint(hs_result.identity_key, source);
                     const resp_bytes = std.mem.asBytes(&hs_result.response);
                     _ = udp_sock.sendTo(resp_bytes, sender_addr, sender_port) catch 0;
                     writeFormatted(stdout, "  WG handshake: responded to initiation\n", .{}) catch {};
@@ -3352,11 +3354,9 @@ fn processIncomingPacket(
         .wg_handshake_resp => {
             if (pkt.len >= @sizeOf(lib.wireguard.Noise.HandshakeResponse)) {
                 const msg: *const lib.wireguard.Noise.HandshakeResponse = @ptrCast(@alignCast(pkt.ptr));
-                if (wg_dev.handleResponse(msg)) |slot| {
-                    if (wg_dev.peers[slot]) |*p| {
-                        p.endpoint_addr = sender_addr;
-                        p.endpoint_port = sender_port;
-                    }
+                const source = lib.protocol.Messages.Endpoint.initV4(sender_addr, sender_port);
+                if (wg_dev.handleResponseFromEndpoint(msg, source)) |result| {
+                    _ = swim.confirmAuthenticatedEndpoint(result.identity_key, source);
                     writeFormatted(stdout, "  WG handshake: completed with peer\n", .{}) catch {};
                 } else |_| {}
             }

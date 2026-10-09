@@ -40,3 +40,26 @@ configuration, and authenticated duplicate filtering after a rejected forged
 copy. An isolated native integration test also exchanges two-way encrypted
 messages via a normal MeshGuard gossip-only relay and asserts zero direct sends.
 This test does not change the production relay or application identities.
+
+## Authenticated endpoint mobility
+
+An observed ping/ACK does not move a known peer's endpoint: these discovery
+messages are not origin-authenticated. Keeping that protection exposed a stale
+relay route after a mobile peer restarted or changed from cellular to Wi-Fi.
+
+The userspace daemon now refreshes membership from a successful **direct** Noise
+handshake. WG endpoint mutation and its identity snapshot occur together under
+the device lock; relayed handshakes do not advertise the relay as the peer's
+direct endpoint. Admission remains enforced. Invalid handshake packets leave
+the prior endpoint unchanged.
+
+A mobile client with a pinned app relay periodically re-authenticates that
+relay using the existing WG protocol (at most once per 15 seconds while active).
+This carries no application data and does not alter the app-send counters.
+It gives a WG-capable public relay a verifiable current return address after
+an app restart or network change. A gossip-only relay without a WG responder
+can still forward application packets, but cannot confirm this mobility proof.
+
+Tests cover admitted endpoint confirmation, refusal to move a known endpoint
+from unsigned observation, invalid initiation/response packets, and successful
+authenticated updates in both handshake directions.
