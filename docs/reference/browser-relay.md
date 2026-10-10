@@ -144,6 +144,14 @@ checked against the shared fixtures in `src/identity/testdata/passes.json`.
 - A full gateway closes new sessions with `1013`; the client retries with
   jittered backoff.
 
+## Several relays
+
+One browser identity can hold a session on each of several relays: create a
+`MeshguardRelayClient` per relay, each with its own identity handle made from
+the same seed (`core.createIdentity(seed)`). A handle holds one Noise handshake
+at a time, so two clients sharing a handle would cancel each other's
+handshakes. The WASM core holds 16 handles.
+
 ## Contacts and delivery status
 
 Behind an opaque relay a browser learns no peers from gossip. Register the ones

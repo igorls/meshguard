@@ -102,6 +102,25 @@ delivery statuses a client learns when its endpoint must be proven again, so
 both can be longer to save battery and relay capacity. Changes apply on the
 event loop.
 
+## Several relays
+
+A context talks through one pinned relay at a time.
+
+- **Switching.** `meshguard_switch_relay(ctx, relay_pubkey, force, seed_ip,
+  seed_port)` leaves the current network, pins the new relay and joins through
+  it. Leaving forgets the old network: its peers, the WireGuard sessions with
+  them and the relay proof state. The identity, contacts, certificate and
+  timers carry over, so a host can move a running context without rebuilding
+  it. `meshguard_leave` followed by `meshguard_set_app_relay` and
+  `meshguard_join` does the same in steps.
+- **At once.** To reach people on several relays simultaneously, create one
+  context per relay from the same identity seed. Each binds its own socket,
+  proves its own endpoint and has its own contacts; a relay pass is per
+  organization, so each context installs the pass for its relay.
+
+`meshguard_last_recv_time` and the other host-thread queries do not read SWIM
+state, so they are safe to call while another thread leaves or joins.
+
 ## Relay passes
 
 A relay that trusts an organization admits any holder of that organization's

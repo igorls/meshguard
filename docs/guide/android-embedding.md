@@ -91,6 +91,9 @@ object MeshGuardFFI {
     external fun meshguard_set_on_delivery_status(ctx: Long, callback: Long)
     external fun meshguard_set_keepalive_interval(ctx: Long, ms: Int): Int
     external fun meshguard_set_relay_proof_interval(ctx: Long, ms: Int): Int
+
+    // Move to another relay (identity, contacts and certificate carry over)
+    external fun meshguard_switch_relay(ctx: Long, relayPubkey: ByteArray, force: Boolean, seedIp: ByteArray, seedPort: Int): Int
 }
 ```
 

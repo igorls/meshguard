@@ -8,6 +8,11 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## Unreleased
 
 ### Added
+- Relay switching: `meshguard_switch_relay` moves a mobile context to another
+  relay, and leaving now forgets the old network (peers, WireGuard sessions,
+  relay proof) while keeping the identity, contacts and certificate. Several
+  relays at once take one context per relay (mobile) or one identity handle per
+  relay client (browser); both are covered by end-to-end tests.
 - Contacts and delivery status for mobile and browser clients, needed behind
   opaque relays: `meshguard_add_contact` / `remove` / `clear` / `count`,
   `meshguard_set_contacts_only`, `meshguard_send_ex` (returns the nonce),
@@ -95,6 +100,8 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   peers instead of once per peer.
 
 ### Fixed
+- `meshguard_last_recv_time` no longer reads SWIM state from the host thread,
+  which could race with `meshguard_leave`.
 - Event loops no longer block forever in `recvfrom` once a peer is live: UDP
   sockets are non-blocking on macOS/BSD (`fcntl`) and Windows (`FIONBIO`) as on
   Linux, with IPv4/IPv6 empty-drain regression tests. Previously the control

@@ -41,6 +41,7 @@ set_contacts_only = bind("meshguard_set_contacts_only", [c.c_void_p, c.c_bool])
 send_ex = bind("meshguard_send_ex", [c.c_void_p, c.c_void_p, c.c_void_p, c.c_uint32, c.c_void_p], c.c_int)
 STATUS_CALLBACK = c.CFUNCTYPE(None, c.c_void_p, c.c_void_p, c.c_uint8)
 set_on_delivery_status = bind("meshguard_set_on_delivery_status", [c.c_void_p, STATUS_CALLBACK])
+switch_relay = bind("meshguard_switch_relay", [c.c_void_p, c.c_void_p, c.c_bool, c.c_void_p, c.c_uint16], c.c_int)
 peer_count = bind("meshguard_peer_count", [c.c_void_p], c.c_uint32)
 route_stats = bind("meshguard_app_route_stats", [c.c_void_p, c.c_void_p])
 destroy = bind("meshguard_destroy", [c.c_void_p])
@@ -297,6 +298,51 @@ class OpaqueRelay(unittest.TestCase):
         status = next(s for s in statuses if s[1] == nonce.raw)
         self.assertEqual(status[0], carol.pubkey)
         self.assertEqual(status[2], 1)  # offline
+
+
+class SeveralRelays(unittest.TestCase):
+    """One identity can hold a context per relay, or move between relays."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="meshguard-relays-")
+        self.addCleanup(self.temp.cleanup)
+
+    def relay(self, name):
+        relay = Relay(Path(self.temp.name) / name, "--opaque")
+        self.addCleanup(relay.stop)
+        return relay
+
+    def client(self, seed, relay, *contacts):
+        client = Client(seed, relay)
+        self.addCleanup(client.close)
+        return client
+
+    def test_contexts_per_relay_and_switching(self):
+        first, second = self.relay("first"), self.relay("second")
+        alice = self.client(0x61, first)
+        bob = self.client(0x62, second)
+        carol_first = self.client(0x63, first)
+        carol_second = self.client(0x63, second)  # same identity, other relay
+        dave = self.client(0x64, first)
+        self.assertEqual(carol_first.pubkey, carol_second.pubkey)
+        for client, relay in ((alice, first), (bob, second), (carol_first, first), (carol_second, second), (dave, first)):
+            client.join(relay)
+        wait_for(lambda: first.status()["relay"]["proven"] >= 3 and second.status()["relay"]["proven"] >= 2, 40, "clients on both relays to prove their endpoints")
+
+        def befriend(a, b):
+            self.assertEqual(add_contact(a.ctx, b.pubkey, b.wg_pubkey), 0)
+            self.assertEqual(add_contact(b.ctx, a.pubkey, a.wg_pubkey), 0)
+
+        befriend(alice, carol_first)
+        befriend(bob, carol_second)
+        befriend(bob, dave)
+        self.assertEqual(alice.send_until_received(carol_first, b"via the first relay"), (alice.pubkey, b"via the first relay"))
+        self.assertEqual(bob.send_until_received(carol_second, b"via the second relay"), (bob.pubkey, b"via the second relay"))
+
+        # Dave moves to the second relay, keeping his contacts, and reaches Bob there.
+        self.assertEqual(switch_relay(dave.ctx, second.pubkey, True, bytes([127, 0, 0, 1]), second.port), 0)
+        wait_for(lambda: second.status()["relay"]["proven"] >= 3, 40, "the moved client to prove its endpoint on the second relay")
+        self.assertEqual(dave.send_until_received(bob, b"after switching"), (dave.pubkey, b"after switching"))
 
 
 if __name__ == "__main__":
