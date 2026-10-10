@@ -80,6 +80,17 @@ object MeshGuardFFI {
     // Organization certificate (for example a relay pass), before or after join
     external fun meshguard_set_org_cert(ctx: Long, cert: ByteArray, len: Int): Int
     external fun meshguard_clear_org_cert(ctx: Long): Int
+
+    // Contacts (needed behind opaque relays) and delivery status
+    external fun meshguard_add_contact(ctx: Long, ed25519: ByteArray, wg: ByteArray): Int
+    external fun meshguard_remove_contact(ctx: Long, ed25519: ByteArray): Int
+    external fun meshguard_clear_contacts(ctx: Long)
+    external fun meshguard_contact_count(ctx: Long): Int
+    external fun meshguard_set_contacts_only(ctx: Long, enabled: Boolean)
+    external fun meshguard_send_ex(ctx: Long, peerPubkey: ByteArray, data: ByteArray, len: Int, outNonce: ByteArray): Int
+    external fun meshguard_set_on_delivery_status(ctx: Long, callback: Long)
+    external fun meshguard_set_keepalive_interval(ctx: Long, ms: Int): Int
+    external fun meshguard_set_relay_proof_interval(ctx: Long, ms: Int): Int
 }
 ```
 

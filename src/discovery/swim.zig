@@ -95,6 +95,8 @@ pub const EventHandler = struct {
     onAppMessage: ?*const fn (ctx: *anyopaque, data: []const u8) void = null,
     onWgPacket: ?*const fn (ctx: *anyopaque, data: []const u8, addr: [4]u8, port: u16) void = null,
     onRelayWgPacket: ?*const fn (ctx: *anyopaque, data: []const u8, sender_pubkey: [32]u8, relay_endpoint: messages.Endpoint) void = null,
+    /// A relay's 0x51 delivery status for a frame we sent (see protocol/app_status.zig).
+    onAppStatus: ?*const fn (ctx: *anyopaque, data: []const u8, sender_endpoint: messages.Endpoint) void = null,
     /// Query whether a live WireGuard session currently exists for `wg_pubkey`.
     /// Used as an origin-authentication signal for restart detection (S2): SWIM
     /// ping/ack are not origin-authenticated, but holding a live tunnel proves the
@@ -881,6 +883,13 @@ pub const SwimProtocol = struct {
 
         if (data.len > 0 and data[0] == @intFromEnum(messages.MessageType.relay_data)) {
             self.handleRelayData(data, sender_endpoint);
+            return;
+        }
+
+        if (data.len > 0 and data[0] == AppStatus.TYPE) {
+            if (self.handler) |h| {
+                if (h.onAppStatus) |cb| cb(h.ctx, data, sender_endpoint);
+            }
             return;
         }
 

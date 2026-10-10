@@ -36,6 +36,11 @@ recv = bind("meshguard_recv", [c.c_void_p] * 4, c.c_int)
 pubkey = bind("meshguard_get_pubkey", [c.c_void_p, c.c_void_p])
 wg_pubkey = bind("meshguard_get_wg_pubkey", [c.c_void_p, c.c_void_p])
 set_org_cert = bind("meshguard_set_org_cert", [c.c_void_p, c.c_void_p, c.c_uint32], c.c_int)
+add_contact = bind("meshguard_add_contact", [c.c_void_p, c.c_void_p, c.c_void_p], c.c_int)
+set_contacts_only = bind("meshguard_set_contacts_only", [c.c_void_p, c.c_bool])
+send_ex = bind("meshguard_send_ex", [c.c_void_p, c.c_void_p, c.c_void_p, c.c_uint32, c.c_void_p], c.c_int)
+STATUS_CALLBACK = c.CFUNCTYPE(None, c.c_void_p, c.c_void_p, c.c_uint8)
+set_on_delivery_status = bind("meshguard_set_on_delivery_status", [c.c_void_p, STATUS_CALLBACK])
 peer_count = bind("meshguard_peer_count", [c.c_void_p], c.c_uint32)
 route_stats = bind("meshguard_app_route_stats", [c.c_void_p, c.c_void_p])
 destroy = bind("meshguard_destroy", [c.c_void_p])
@@ -247,6 +252,51 @@ class RelayPasses(unittest.TestCase):
         carol.join(relay)
         time.sleep(3)
         self.assertEqual(relay.status()["relay"]["proven"], 2)
+
+
+class OpaqueRelay(unittest.TestCase):
+    """Clients of an opaque relay learn nothing about each other from it and talk as contacts."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="meshguard-opaque-")
+        self.addCleanup(self.temp.cleanup)
+
+    def test_contacts_reach_each_other_and_absent_contacts_report_offline(self):
+        relay = Relay(self.temp.name, "--opaque")
+        self.addCleanup(relay.stop)
+        alice = Client(0x51, relay)
+        self.addCleanup(alice.close)
+        bob = Client(0x52, relay)
+        self.addCleanup(bob.close)
+        carol = Client(0x53, relay)  # registered as a contact but never joins
+        self.addCleanup(carol.close)
+        statuses = []
+        callback = STATUS_CALLBACK(lambda dest, nonce, code: statuses.append((c.string_at(dest, 32), c.string_at(nonce, 12), code)))
+        set_on_delivery_status(alice.ctx, callback)
+        alice.join(relay)
+        bob.join(relay)
+        wait_for(lambda: relay.status()["relay"]["proven"] >= 2, 40, "both clients to prove their endpoints")
+
+        # The relay describes only itself: nobody sees the other client.
+        time.sleep(1)
+        self.assertEqual(peer_count(alice.ctx), 1)
+        self.assertEqual(peer_count(bob.ctx), 1)
+        self.assertEqual(relay.status()["peers"]["alive"], 0)
+
+        for me, other in ((alice, bob), (bob, alice), (alice, carol)):
+            self.assertEqual(add_contact(me.ctx, other.pubkey, other.wg_pubkey), 0)
+        set_contacts_only(bob.ctx, True)
+        got = alice.send_until_received(bob, b"hello as a contact")
+        self.assertEqual(got, (alice.pubkey, b"hello as a contact"))
+        self.assertEqual(alice.direct_sends(), 0)
+
+        nonce = c.create_string_buffer(12)
+        payload = c.create_string_buffer(b"are you there")
+        self.assertEqual(send_ex(alice.ctx, carol.pubkey, payload, 13, nonce), 0)
+        wait_for(lambda: any(s[1] == nonce.raw for s in statuses), 10, "an offline status for the absent contact")
+        status = next(s for s in statuses if s[1] == nonce.raw)
+        self.assertEqual(status[0], carol.pubkey)
+        self.assertEqual(status[2], 1)  # offline
 
 
 if __name__ == "__main__":

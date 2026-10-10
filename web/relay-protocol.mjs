@@ -45,6 +45,15 @@ export function selfAdvertisement(identity, endpoint, type, sequence, incarnatio
   return out;
 }
 
+// Relay delivery status (0x51): [0x51][32B destination][12B nonce][1B code][1B reserved].
+export const STATUS_CODES = { 1: 'offline', 2: 'destination-not-admitted', 3: 'rate-limited',
+  4: 'handshake-again', 5: 'not-admitted', 6: 'overloaded' };
+export function parseStatus(frame) {
+  if (frame.length !== 47 || frame[0] !== 0x51) return null;
+  return { destination: frame.slice(1, 33), nonce: frame.slice(33, 45), code: frame[45],
+    reason: STATUS_CODES[frame[45]] ?? 'unknown' };
+}
+
 export function gossipKeys(frame) {
   if (frame.length < 50 || ![1, 3].includes(frame[0]) || frame.length < 50 + frame[49] * 115) return [];
   const peers = [];
@@ -65,6 +74,7 @@ export class MeshguardRelayClient extends EventTarget {
     this.peers = new Map(trustedPeers.map(peer => [b64(peer.publicKey), peer]));
     this.stats = { sent: 0, received: 0, duplicates: 0, rejected: 0, handshakes: 0, connections: 0 };
     this.seen = new Map(); this.sequence = 1n; this.incarnation = BigInt(Date.now()) * 1000000n;
+    this.sent = new Map(); // destination|nonce of recent frames, to match delivery statuses
     this.ready = false; this.closed = true; this.retry = 0;
   }
   emit(type, detail) { this.dispatchEvent(new CustomEvent(type, { detail })); }
@@ -151,6 +161,15 @@ export class MeshguardRelayClient extends EventTarget {
       }
       return;
     }
+    const status = parseStatus(frame);
+    if (status) {
+      // Only statuses for frames this client sent count; the relay is the only other end.
+      const key = b64(status.destination) + b64(status.nonce);
+      if (!this.sent.delete(key)) return;
+      if (status.code === 4) this.handshake(); // prove the endpoint again now
+      this.emit('status', { ...status, peer: this.peers.get(b64(status.destination)) ?? null });
+      return;
+    }
     if (frame[0] !== 0x50 || frame.length < 93 || frame.length > 1117) return;
     const peer = this.peers.get(b64(frame.slice(33, 65)));
     if (!peer) { this.stats.rejected++; return; }
@@ -163,11 +182,24 @@ export class MeshguardRelayClient extends EventTarget {
     while (this.seen.size > 512) this.seen.delete(this.seen.keys().next().value);
     this.stats.received++; this.emit('message', { peer, data: plaintext });
   }
+  /** Seals and sends; returns the frame's 12-byte nonce (truthy), or false. */
   send(peer, message) {
     if (!this.ready || this.peers.get(b64(peer.publicKey)) !== peer) return false;
-    if (!this.sendRaw(this.identity.seal(peer, message))) return false;
-    this.stats.sent++; return true;
+    const frame = this.identity.seal(peer, message);
+    if (!this.sendRaw(frame)) return false;
+    const nonce = frame.slice(65, 77);
+    this.sent.set(b64(peer.publicKey) + b64(nonce), Date.now());
+    while (this.sent.size > 256) this.sent.delete(this.sent.keys().next().value);
+    this.stats.sent++; return nonce;
   }
+  /** Registers (or replaces) a contact the relay does not describe; returns the peer object. */
+  addContact(publicKey, wgPublicKey) {
+    if (publicKey?.length !== 32 || wgPublicKey?.length !== 32) throw new Error('Invalid contact keys');
+    const peer = { publicKey: Uint8Array.from(publicKey), wgPublicKey: Uint8Array.from(wgPublicKey) };
+    this.peers.set(b64(peer.publicKey), peer);
+    return peer;
+  }
+  removeContact(publicKey) { return this.peers.delete(b64(publicKey)); }
   reconnect() {
     this.closed = true; clearTimeout(this.reconnectTimer); clearInterval(this.timer);
     this.socket?.close(); this.connect();

@@ -4,7 +4,7 @@ import { createPrivateKey, createPublicKey, sign } from 'node:crypto';
 import { startGateway, validateOutbound, clientAddress } from '../../gateway/server.mjs';
 import { verifyPass } from '../../gateway/pass.mjs';
 import { MeshguardWasm } from '../../web/meshguard.mjs';
-import { authPayload, bindingPayload, b64, fromB64, selfAdvertisement, MeshguardRelayClient } from '../../web/relay-protocol.mjs';
+import { authPayload, bindingPayload, b64, fromB64, selfAdvertisement, parseStatus, MeshguardRelayClient } from '../../web/relay-protocol.mjs';
 
 const core = new MeshguardWasm((await WebAssembly.instantiate(readFileSync('zig-out/bin/meshguard.wasm'), {})).instance);
 const a = core.createIdentity(new Uint8Array(32).fill(1));
@@ -393,7 +393,7 @@ test('a session ends when its pass expires and can renew before that', async () 
   const f = await fixture({ ...passConfig, passSkewSeconds: 0 });
   try {
     const now = Math.floor(Date.now() / 1000);
-    const { c, reply } = await admitWithPass(f.url, b, issuePass(b, { expiresAt: now + 2 }));
+    const { c, reply } = await admitWithPass(f.url, b, issuePass(b, { expiresAt: now + 60 }));
     expect(reply.type).toBe('ready');
 
     const renewed = issuePass(b, { expiresAt: now + 3600 });
@@ -408,7 +408,7 @@ test('a session ends when its pass expires and can renew before that', async () 
     expect(JSON.parse(await c.next())).toEqual({ type: 'renew-rejected', reason: 'wrong-identity' });
     c.ws.close();
 
-    const short = await admitWithPass(f.url, b, issuePass(b, { expiresAt: now + 1 }));
+    const short = await admitWithPass(f.url, b, issuePass(b, { expiresAt: Math.ceil(Date.now() / 1000) + 1 }));
     expect(short.reply.type).toBe('ready');
     const ended = await closing(short.c);
     expect(ended.code).toBe(4004);
@@ -464,4 +464,32 @@ test('the relay client presents its pass and renews it in the live session', () 
   client.advertise();
   expect(Array.from(sent[4].slice(166, 166 + 314))).toEqual(Array.from(next));
   clearInterval(client.timer);
+});
+
+test('the relay client matches delivery statuses to frames it sent and re-handshakes on request', () => {
+  const client = new MeshguardRelayClient({ identity: a, url: 'ws://fixture.invalid', relay: bPeer });
+  const sent = [];
+  client.sendRaw = frame => { sent.push(frame); return true; };
+  client.ready = true;
+  const contact = client.addContact(bPeer.publicKey, bPeer.wgPublicKey);
+  const nonce = client.send(contact, 'are you there');
+  expect(nonce.length).toBe(12);
+
+  const statuses = [];
+  client.addEventListener('status', event => statuses.push(event.detail));
+  const frame = code => { const f = new Uint8Array(47); f[0] = 0x51; f.set(bPeer.publicKey, 1); f.set(nonce, 33); f[45] = code; return f; };
+  const stray = frame(1); stray[40] ^= 1;
+  client.packet(stray);
+  expect(statuses).toHaveLength(0); // not a frame we sent
+
+  client.packet(frame(4));
+  expect(statuses[0].reason).toBe('handshake-again');
+  expect(statuses[0].peer).toBe(contact);
+  expect(sent.at(-1).length).toBe(148); // a fresh handshake initiation
+  client.packet(frame(4));
+  expect(statuses).toHaveLength(1); // each frame is matched once
+
+  expect(parseStatus(frame(6)).reason).toBe('overloaded');
+  expect(client.removeContact(bPeer.publicKey)).toBe(true);
+  expect(client.send(contact, 'gone')).toBe(false);
 });
