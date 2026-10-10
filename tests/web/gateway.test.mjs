@@ -393,7 +393,7 @@ test('a session ends when its pass expires and can renew before that', async () 
   const f = await fixture({ ...passConfig, passSkewSeconds: 0 });
   try {
     const now = Math.floor(Date.now() / 1000);
-    const { c, reply } = await admitWithPass(f.url, b, issuePass(b, { expiresAt: now + 2 }));
+    const { c, reply } = await admitWithPass(f.url, b, issuePass(b, { expiresAt: now + 60 }));
     expect(reply.type).toBe('ready');
 
     const renewed = issuePass(b, { expiresAt: now + 3600 });
@@ -408,7 +408,7 @@ test('a session ends when its pass expires and can renew before that', async () 
     expect(JSON.parse(await c.next())).toEqual({ type: 'renew-rejected', reason: 'wrong-identity' });
     c.ws.close();
 
-    const short = await admitWithPass(f.url, b, issuePass(b, { expiresAt: now + 1 }));
+    const short = await admitWithPass(f.url, b, issuePass(b, { expiresAt: Math.ceil(Date.now() / 1000) + 1 }));
     expect(short.reply.type).toBe('ready');
     const ended = await closing(short.c);
     expect(ended.code).toBe(4004);
