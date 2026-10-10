@@ -912,6 +912,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     var open_mode: bool = false; // --open: skip trust, accept any peer
     var gossip_only: bool = false; // --gossip-only/--no-tun: seed/rendezvous mode
     var relay_flags = RelayFlags{};
+    var trust_reload: TrustReload = undefined;
     var control_path_flag: ?[]const u8 = null;
     // Collect raw seed strings for hostname resolution
     var seed_strs: [16][]const u8 = undefined;
@@ -1252,6 +1253,20 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
             if (!swim.enforce_trust) swim.enableTrust();
             try writeFormatted(stdout, "  org trust: {d} trusted org(s)\n", .{trusted_orgs.len});
         }
+
+        if (!swim.enforce_trust) {
+            if (relay_flags.relay) {
+                // A relay never opens because its trust lists are empty.
+                swim.enableTrust();
+                try stdout.writeStreamingAll(zio(), "  trust: closed, no authorized keys or trusted orgs yet (add them, then reload)\n");
+            } else {
+                try stdout.writeStreamingAll(zio(), "  trust: open, no authorized keys or trusted orgs (--relay refuses everyone instead)\n");
+            }
+        }
+
+        trust_reload = .{ .allocator = allocator, .config_dir = config_dir, .stdout = stdout };
+        swim.reload_hook = .{ .ctx = &trust_reload, .run = TrustReload.run };
+        control.reload_flag = &swim.reload_requested;
     } else {
         try stdout.writeStreamingAll(zio(), "  trust: OPEN (accepting all peers)\n");
     }
@@ -2006,6 +2021,14 @@ fn signalHandler(sig: posix.SIG) callconv(.c) void {
     }
 }
 
+/// SIGHUP: re-read trust lists on the event loop (see TrustReload).
+fn reloadSignalHandler(sig: posix.SIG) callconv(.c) void {
+    _ = sig;
+    if (g_swim_stop) |swim_ref| {
+        swim_ref.reload_requested.store(true, .release);
+    }
+}
+
 fn installSignalHandler(swim_ref: *lib.discovery.Swim.SwimProtocol) void {
     g_swim_stop = swim_ref;
 
@@ -2017,6 +2040,12 @@ fn installSignalHandler(swim_ref: *lib.discovery.Swim.SwimProtocol) void {
         };
         posix.sigaction(posix.SIG.INT, &sa, null);
         posix.sigaction(posix.SIG.TERM, &sa, null);
+        const reload_sa: posix.Sigaction = .{
+            .handler = .{ .handler = &reloadSignalHandler },
+            .mask = std.mem.zeroes(@TypeOf(@as(posix.Sigaction, undefined).mask)),
+            .flags = 0,
+        };
+        posix.sigaction(posix.SIG.HUP, &reload_sa, null);
     } else if (comptime @import("builtin").os.tag == .windows) {
         // SetConsoleCtrlHandler for Ctrl+C / console close
         const k32 = struct {
@@ -3304,6 +3333,57 @@ fn decryptRxWorker(
 
 /// Process a single incoming UDP packet: classify and dispatch to the appropriate handler.
 /// Shared by both GRO (single coalesced buffer) and legacy batch (recvmmsg) receive paths.
+/// Re-reads authorized_keys/, trusted_orgs/ and node.cert on SIGHUP or the
+/// owner's control RELOAD, on the event loop. A read failure keeps the current
+/// lists. Enforcement only ever tightens: a node that enforced trust keeps
+/// enforcing even if its lists become empty.
+const TrustReload = struct {
+    allocator: std.mem.Allocator,
+    config_dir: []const u8,
+    stdout: std.Io.File,
+
+    fn run(raw: *anyopaque, swim: *lib.discovery.Swim.SwimProtocol) void {
+        const self: *TrustReload = @ptrCast(@alignCast(raw));
+        self.reload(swim) catch |err| {
+            writeFormatted(self.stdout, "  trust reload failed ({s}); keeping the current lists\n", .{@errorName(err)}) catch {};
+        };
+    }
+
+    fn reload(self: *TrustReload, swim: *lib.discovery.Swim.SwimProtocol) !void {
+        const Trust = lib.identity.Trust;
+        const peers = try Trust.loadAuthorizedKeys(self.allocator, self.config_dir);
+        defer {
+            for (peers) |peer| self.allocator.free(peer.name);
+            self.allocator.free(peers);
+        }
+        const orgs = try Trust.loadTrustedOrgs(self.allocator, self.config_dir);
+        defer {
+            for (orgs) |org| self.allocator.free(org.name);
+            self.allocator.free(orgs);
+        }
+        const keys = try self.allocator.alloc([32]u8, peers.len);
+        defer self.allocator.free(keys);
+        for (peers, keys) |peer, *key| key.* = peer.public_key.toBytes();
+        const org_keys = try self.allocator.alloc([32]u8, orgs.len);
+        defer self.allocator.free(org_keys);
+        for (orgs, org_keys) |org, *key| key.* = org.public_key;
+
+        swim.replaceTrust(keys, org_keys);
+        if (!swim.enforce_trust and (keys.len > 0 or org_keys.len > 0)) swim.enableTrust();
+
+        // Our own certificate may have been renewed.
+        const cert_path = try std.fs.path.join(self.allocator, &.{ self.config_dir, "node.cert" });
+        defer self.allocator.free(cert_path);
+        if (lib.identity.Org.loadCertificate(self.allocator, cert_path)) |cert| {
+            var wire: [lib.protocol.Messages.ORG_CERT_WIRE_SIZE]u8 = undefined;
+            cert.serialize(&wire);
+            swim.setOrgCert(wire);
+        } else |_| {}
+
+        try writeFormatted(self.stdout, "  trust reloaded: {d} authorized peer(s), {d} trusted org(s)\n", .{ keys.len, org_keys.len });
+    }
+};
+
 /// `meshguard up` relay options.
 const RelayFlags = struct {
     relay: bool = false,

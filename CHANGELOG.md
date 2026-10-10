@@ -8,6 +8,14 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## Unreleased
 
 ### Added
+- Trust lifecycle for relays: `meshguard up --relay` fails closed when it has
+  no authorized keys or trusted orgs; `SIGHUP` and the owner-only control
+  command `RELOAD` re-read `authorized_keys/`, `trusted_orgs/` and `node.cert`
+  without a restart and re-check relay clients; certificates tolerate five
+  minutes of clock skew with their issuer. Mobile contexts install and replace
+  certificates such as relay passes at any time with `meshguard_set_org_cert`
+  (`meshguard_clear_org_cert`, `meshguard_get_wg_pubkey`).
+
 - Relay load harness (`bench/relay-load`, `zig build relay-loadgen`):
   simulates thousands of mobile-style relay clients on loopback, with
   flooders, spoofers and reconnect storms, and reports loss, latency and the
@@ -47,6 +55,12 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `/run/meshguard/meshguard.sock` or `\\.\pipe\meshguard`.
 - Gossip/listen UDP port override via `--gossip-port` and `MESHGUARD_GOSSIP_PORT`.
   Explicit invalid values fail closed (no silent fallback to 51821).
+
+### Changed
+- Retained org revocations are re-sent once every five minutes
+  (`org_revoke_readvertise_interval_ms`) instead of as fresh broadcasts every
+  five seconds, and revoking walks the membership once per batch of affected
+  peers instead of once per peer.
 
 ### Fixed
 - Event loops no longer block forever in `recvfrom` once a peer is live: UDP

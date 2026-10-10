@@ -92,6 +92,12 @@ pub const MeshguardContext = struct {
     x25519_public: [32]u8,
     /// Our Ed25519 signature over x25519_public, advertised on pings and acks.
     wg_binding: messages.WgBinding,
+    /// Organization certificate (for example a relay pass) set by the host.
+    /// Written under `org_cert_lock` on the host thread; the event loop
+    /// applies it to SWIM when `org_cert_dirty` is set.
+    org_cert: ?[messages.ORG_CERT_WIRE_SIZE]u8,
+    org_cert_lock: std.Io.Mutex,
+    org_cert_dirty: std.atomic.Value(bool),
 
     // Networking
     membership: Membership.MembershipTable,
@@ -151,6 +157,9 @@ fn initContextStorage(ctx: *MeshguardContext, allocator: std.mem.Allocator) void
     ctx.x25519_private = undefined;
     ctx.x25519_public = undefined;
     ctx.wg_binding = undefined;
+    ctx.org_cert = null;
+    ctx.org_cert_lock = .init;
+    ctx.org_cert_dirty = std.atomic.Value(bool).init(false);
     ctx.membership = Membership.MembershipTable.init(allocator, 15000);
     ctx.swim = null;
     ctx.socket = null;
@@ -236,6 +245,75 @@ fn appRoute(peer: Membership.Peer, relay: ?Membership.Peer, force_relay: bool) A
         .direct = if (peer.state == .alive or peer.state == .suspected) peer.gossip_endpoint orelse peer.public_endpoint else null,
         .relay = relay_ep,
     };
+}
+
+/// Advertise our binding and any certificate on a freshly created SWIM.
+fn prepareSwim(c: *MeshguardContext) void {
+    const swim = if (c.swim) |*s| s else return;
+    swim.setWgBinding(c.wg_binding);
+    c.org_cert_lock.lockUncancelable(zio());
+    defer c.org_cert_lock.unlock(zio());
+    if (c.org_cert) |cert| swim.setOrgCert(cert);
+    c.org_cert_dirty.store(false, .release);
+}
+
+/// Validates a certificate for this context: v1 (186 bytes) or v2 (314),
+/// issued to our Ed25519 key, binding our WireGuard key if v2, correctly
+/// signed by its issuer, and valid now (allowing the usual clock skew).
+/// Whether the issuer is trusted is for the relay to decide.
+fn checkOwnCertificate(c: *const MeshguardContext, cert: []const u8) ?[messages.ORG_CERT_WIRE_SIZE]u8 {
+    const Org = lib.identity.Org;
+    if (cert.len != Org.V1_CERT_WIRE_SIZE and cert.len != messages.ORG_CERT_WIRE_SIZE) return null;
+    var wire = std.mem.zeroes([messages.ORG_CERT_WIRE_SIZE]u8);
+    @memcpy(wire[0..cert.len], cert);
+    const parsed = Org.NodeCertificate.deserialize(&wire);
+    if (!std.mem.eql(u8, &parsed.node_pubkey, &c.ed25519_public)) return null;
+    if (parsed.boundWgPubkey()) |wg| {
+        if (!std.mem.eql(u8, &wg, &c.x25519_public)) return null;
+    } else if (parsed.version == Org.CERT_VERSION_V2) return null;
+    const now: i64 = @intCast(std.Io.Timestamp.now(zio(), .real).toSeconds());
+    if (!parsed.isValidAt(now, Org.DEFAULT_CERT_SKEW_S)) return null;
+    if (!Org.verifyCertificate(&parsed)) return null;
+    return wire;
+}
+
+/// Install or replace this context's organization certificate, such as a
+/// relay pass, while stopped or running. A running context advertises it from
+/// its next ping and pings its peers and re-proves its relay endpoint at once.
+/// Returns 0, -1 (no context), -3 (wrong length), or -4 (not this identity's,
+/// badly signed, or not valid now).
+export fn meshguard_set_org_cert(ctx: ?*MeshguardContext, cert: ?[*]const u8, len: u32) i32 {
+    const c = ctx orelse return -1;
+    const bytes = cert orelse return -3;
+    if (len != lib.identity.Org.V1_CERT_WIRE_SIZE and len != messages.ORG_CERT_WIRE_SIZE) return -3;
+    const wire = checkOwnCertificate(c, bytes[0..len]) orelse return -4;
+    c.org_cert_lock.lockUncancelable(zio());
+    c.org_cert = wire;
+    c.org_cert_lock.unlock(zio());
+    c.org_cert_dirty.store(true, .release);
+    return 0;
+}
+
+/// Stop advertising an organization certificate. Returns 0 or -1.
+export fn meshguard_clear_org_cert(ctx: ?*MeshguardContext) i32 {
+    const c = ctx orelse return -1;
+    c.org_cert_lock.lockUncancelable(zio());
+    c.org_cert = null;
+    c.org_cert_lock.unlock(zio());
+    c.org_cert_dirty.store(true, .release);
+    return 0;
+}
+
+/// On the event loop: apply a certificate the host changed.
+fn applyPendingOrgCert(c: *MeshguardContext, swim: *SwimProtocol) void {
+    if (!c.org_cert_dirty.swap(false, .acq_rel)) return;
+    c.org_cert_lock.lockUncancelable(zio());
+    const cert = c.org_cert;
+    c.org_cert_lock.unlock(zio());
+    if (cert) |wire| swim.setOrgCert(wire) else swim.clearOrgCert();
+    // Present it now, and prove the relay endpoint again under it.
+    swim.pingAllAlive();
+    c.last_relay_auth_ns = 0;
 }
 
 /// Pin a relay identity and optionally require app messages to use it exclusively.
@@ -379,6 +457,13 @@ export fn meshguard_get_pubkey(ctx: ?*MeshguardContext, out: [*]u8) void {
 }
 
 /// Get our Ed25519 public key as base64 (44 bytes + null terminator).
+/// Get our WireGuard (X25519) public key (32 bytes), for example to request
+/// a certificate that binds it.
+export fn meshguard_get_wg_pubkey(ctx: ?*MeshguardContext, out: [*]u8) void {
+    const c = ctx orelse return;
+    @memcpy(out[0..32], &c.x25519_public);
+}
+
 export fn meshguard_get_pubkey_b64(ctx: ?*MeshguardContext, out: [*]u8) void {
     const c = ctx orelse return;
     var buf: [44]u8 = undefined;
@@ -449,7 +534,7 @@ export fn meshguard_join(
         our_port, // Our port for SWIM to advertise
         handler,
     );
-    c.swim.?.setWgBinding(c.wg_binding);
+    prepareSwim(c);
 
     // Seed the mesh — use the SEED's port for the seed endpoint
     var seed_addr: [4]u8 = undefined;
@@ -509,7 +594,7 @@ export fn meshguard_join_ipv6(
         our_port,
         handler,
     );
-    c.swim.?.setWgBinding(c.wg_binding);
+    prepareSwim(c);
 
     var seed_addr6: [16]u8 = undefined;
     @memcpy(&seed_addr6, seed_ip[0..16]);
@@ -571,7 +656,7 @@ export fn meshguard_join_lan(
         our_port,
         handler,
     );
-    c.swim.?.setWgBinding(c.wg_binding);
+    prepareSwim(c);
 
     // Trust is open by default (enforce_trust = false)
     // For production, add authorized keys before join
@@ -1147,6 +1232,7 @@ fn eventLoop(ctx: *MeshguardContext) void {
                 std.Io.sleep(zio(), std.Io.Duration.fromNanoseconds(800_000_000), .awake) catch {};
             } else {
                 // ACTIVE: full gossip + discovery
+                applyPendingOrgCert(ctx, swim);
                 swim.tick() catch {};
                 maintainPinnedRelayAuthentication(ctx);
 
@@ -1947,6 +2033,60 @@ test "pinned relay WireGuard key is used only when signed or derived" {
     peer.wg_pubkey = derived;
     peer.wg_key_source = .gossip;
     try std.testing.expectEqualSlices(u8, &derived, &trustedRelayWgKey(pin, peer).?);
+}
+
+test "certificates are checked against this context before they are installed" {
+    var seed = [_]u8{6} ** 32;
+    const ctx = meshguard_init(&seed, 0) orelse return error.InitFailed;
+    defer meshguard_destroy(ctx);
+    const Org = lib.identity.Org;
+    const org = Org.generateOrgKeyPair();
+    const now: i64 = @intCast(std.Io.Timestamp.now(zio(), .real).toSeconds());
+    var wire: [messages.ORG_CERT_WIRE_SIZE]u8 = undefined;
+
+    const good = try Org.issueCertificateV2(org, ctx.ed25519_public, ctx.x25519_public, "", now + 3600);
+    good.serialize(&wire);
+    try std.testing.expectEqual(@as(i32, 0), meshguard_set_org_cert(ctx, &wire, wire.len));
+    try std.testing.expect(ctx.org_cert != null and ctx.org_cert_dirty.load(.acquire));
+
+    const other_wg = try Org.issueCertificateV2(org, ctx.ed25519_public, [_]u8{9} ** 32, "", now + 3600);
+    other_wg.serialize(&wire);
+    try std.testing.expectEqual(@as(i32, -4), meshguard_set_org_cert(ctx, &wire, wire.len));
+
+    const other_node = try Org.issueCertificateV2(org, [_]u8{8} ** 32, ctx.x25519_public, "", now + 3600);
+    other_node.serialize(&wire);
+    try std.testing.expectEqual(@as(i32, -4), meshguard_set_org_cert(ctx, &wire, wire.len));
+
+    const expired = try Org.issueCertificateV2(org, ctx.ed25519_public, ctx.x25519_public, "", now - 3600);
+    expired.serialize(&wire);
+    try std.testing.expectEqual(@as(i32, -4), meshguard_set_org_cert(ctx, &wire, wire.len));
+
+    good.serialize(&wire);
+    wire[200] ^= 1;
+    try std.testing.expectEqual(@as(i32, -4), meshguard_set_org_cert(ctx, &wire, wire.len));
+    try std.testing.expectEqual(@as(i32, -3), meshguard_set_org_cert(ctx, &wire, 100));
+
+    try std.testing.expectEqual(@as(i32, 0), meshguard_clear_org_cert(ctx));
+    try std.testing.expect(ctx.org_cert == null);
+}
+
+test "a certificate set before join is advertised once the context runs" {
+    var seed = [_]u8{7} ** 32;
+    const ctx = meshguard_init(&seed, 0) orelse return error.InitFailed;
+    defer meshguard_destroy(ctx);
+    const Org = lib.identity.Org;
+    const org = Org.generateOrgKeyPair();
+    const now: i64 = @intCast(std.Io.Timestamp.now(zio(), .real).toSeconds());
+    var wire: [messages.ORG_CERT_WIRE_SIZE]u8 = undefined;
+    const cert = try Org.issueCertificateV2(org, ctx.ed25519_public, ctx.x25519_public, "", now + 3600);
+    cert.serialize(&wire);
+    try std.testing.expectEqual(@as(i32, 0), meshguard_set_org_cert(ctx, &wire, wire.len));
+
+    const loopback = [_]u8{ 127, 0, 0, 1 };
+    try std.testing.expectEqual(@as(i32, 0), meshguard_join(ctx, &loopback, 9));
+    defer meshguard_leave(ctx);
+    try std.testing.expectEqualSlices(u8, &wire, &ctx.swim.?.our_org_cert.?);
+    try std.testing.expectEqualSlices(u8, &ctx.wg_binding.signature, &ctx.swim.?.our_wg_binding.?.signature);
 }
 
 test "contexts advertise a binding for their own WireGuard key" {

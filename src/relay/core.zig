@@ -44,6 +44,10 @@ fn zio() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
 }
 
+fn wallSeconds() i64 {
+    return @intCast(std.Io.Timestamp.now(zio(), .real).toSeconds());
+}
+
 pub const Config = struct {
     /// Connections (WireGuard keys) tracked at once, proven or not.
     max_clients: u32 = 16384,
@@ -79,6 +83,8 @@ pub const Config = struct {
     /// Accept a WireGuard key learned from unsigned gossip for an admitted
     /// identity. Only for closed-trust relays during migration.
     legacy_wg_binding: bool = false,
+    /// Clock difference tolerated with certificate issuers, in seconds.
+    cert_skew_s: i64 = Org.DEFAULT_CERT_SKEW_S,
 };
 
 pub const DropReason = enum {
@@ -427,6 +433,9 @@ pub const RelayCore = struct {
             c.wg = vouched.wg;
             c.key_source = vouched.source;
             if (vouched.cert_expires_at != 0) c.cert_expires_at = vouched.cert_expires_at;
+            // The caller just admitted this identity (a renewed pass, a
+            // reload that still trusts it), so the cached decision is fresh.
+            c.trust_epoch = self.trust_epoch;
             c.last_seen_ns = now_ns;
             const i = self.by_identity.getContext(input.identity, self.keyCtx()).?;
             self.claim_lru.remove(self.claims.items, i);
@@ -463,7 +472,8 @@ pub const RelayCore = struct {
             const cert = Org.NodeCertificate.deserialize(cert_wire);
             if (cert.boundWgPubkey()) |wg| {
                 const seen = if (current) |c| c.key_source == .certificate and std.mem.eql(u8, &c.wg, &wg) else false;
-                if (seen or (std.mem.eql(u8, &cert.node_pubkey, &input.identity) and cert.isValid() and Org.verifyCertificate(&cert))) {
+                const valid = cert.isValidAt(wallSeconds(), self.config.cert_skew_s);
+                if (valid and (seen or (std.mem.eql(u8, &cert.node_pubkey, &input.identity) and Org.verifyCertificate(&cert)))) {
                     return .{ .wg = wg, .source = .certificate, .cert_expires_at = cert.expires_at };
                 }
             }
@@ -677,9 +687,8 @@ pub const RelayCore = struct {
     }
 
     fn stillAdmitted(self: *RelayCore, c: *Claim) bool {
-        if (c.cert_expires_at != 0) {
-            const now_s: i64 = @intCast(std.Io.Timestamp.now(zio(), .real).toSeconds());
-            if (now_s >= c.cert_expires_at) return self.recheck(c);
+        if (c.cert_expires_at != 0 and wallSeconds() >= c.cert_expires_at +| self.config.cert_skew_s) {
+            return self.recheck(c);
         }
         if (c.trust_epoch == self.trust_epoch) return true;
         return self.recheck(c);
@@ -1148,6 +1157,40 @@ test "revoked identities stop forwarding after a trust change" {
     try testing.expect(core.route(bob.identity, alice.identity, 100, addr(2, 4000), 2) == .forward);
     core.forget(alice.identity);
     try testing.expectEqual(Route{ .drop = .unknown_destination }, core.route(bob.identity, alice.identity, 100, addr(2, 4000), 3));
+}
+
+test "a fresh claim re-admits an identity after a trust change" {
+    var relay = try TestRelay.init();
+    var core = try relay.core(smallConfig());
+    defer core.deinit();
+    var alice = try TestClient.init(1);
+    var bob = try TestClient.init(2);
+    try proveClient(&core, relay.public, &alice, addr(1, 4000), 0);
+    try proveClient(&core, relay.public, &bob, addr(2, 4000), 0);
+    relay.admission.denied = alice.identity;
+    core.bumpTrustEpoch();
+    try testing.expectEqual(Route{ .drop = .not_admitted }, core.route(alice.identity, bob.identity, 100, addr(1, 4000), 1));
+    // Her next ping passed the caller's admission check (say, with a renewed pass).
+    try testing.expect(core.claim(alice.claimInput(), 2));
+    try testing.expect(core.route(alice.identity, bob.identity, 100, addr(1, 4000), 3) == .forward);
+}
+
+test "expired certificates stop vouching once past the skew" {
+    var relay = try TestRelay.init();
+    var core = try relay.core(smallConfig());
+    defer core.deinit();
+    const org = Org.generateOrgKeyPair();
+    const node = try TestClient.init(4);
+    const now = wallSeconds();
+    var wire: [messages.ORG_CERT_WIRE_SIZE]u8 = undefined;
+
+    const recent = try Org.issueCertificateV2(org, node.identity, node.wg_public, "n", now - 10);
+    recent.serialize(&wire);
+    try testing.expect(core.claim(.{ .identity = node.identity, .org_cert = &wire }, 0));
+
+    const stale = try Org.issueCertificateV2(org, (try TestClient.init(5)).identity, node.wg_public, "n", now - 1000);
+    stale.serialize(&wire);
+    try testing.expect(!core.claim(.{ .identity = (try TestClient.init(5)).identity, .org_cert = &wire }, 0));
 }
 
 test "handshakes are limited per source address except a trusted gateway" {

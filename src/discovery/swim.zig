@@ -68,6 +68,16 @@ pub const SwimConfig = struct {
     // that missed the one-shot registration-time advertisement still learns our WG
     // key (issue #114). 0 disables. Default 5s.
     self_readvertise_interval_ms: u32 = 5000,
+    // How often retained org revocations are re-sent, once each, so peers that
+    // missed the original broadcast learn them. 0 disables.
+    org_revoke_readvertise_interval_ms: u32 = 300_000,
+};
+
+/// Runs on the event loop after `reload_requested` is set (SIGHUP, control
+/// RELOAD): the daemon re-reads its trust files and calls `replaceTrust`.
+pub const ReloadHook = struct {
+    ctx: *anyopaque,
+    run: *const fn (ctx: *anyopaque, swim: *SwimProtocol) void,
 };
 
 /// Callback interface for SWIM events (e.g. WireGuard peer management).
@@ -273,6 +283,14 @@ pub const SwimProtocol = struct {
     forwarding: Forwarding = .none,
     relay_core: ?*RelayCore.RelayCore = null,
 
+    // Certificates are accepted this many seconds before issue and after
+    // expiry, for clock differences with the issuer.
+    cert_skew_s: i64 = Org.DEFAULT_CERT_SKEW_S,
+
+    // Set from a signal handler or the control thread; consumed on the loop.
+    reload_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    reload_hook: ?ReloadHook = null,
+
     // Control-plane send rate limiting (token bucket). A hard ceiling on
     // SWIM/gossip packets/sec so a pathological inbound rate (e.g. a NAT
     // retransmit storm) can never be amplified into a network-melting flood.
@@ -349,16 +367,20 @@ pub const SwimProtocol = struct {
         return false;
     }
 
-    fn certExpiryValid(expires_at: i64) bool {
+    fn wallSeconds() i64 {
+        return @intCast(std.Io.Timestamp.now(zio(), .real).toSeconds());
+    }
+
+    fn certExpiryValid(self: *const SwimProtocol, expires_at: i64) bool {
         if (expires_at == 0) return true;
-        return @as(i64, @intCast(std.Io.Timestamp.now(zio(), .real).toSeconds())) < expires_at;
+        return wallSeconds() < expires_at +| self.cert_skew_s;
     }
 
     fn certAuthorizesPeer(self: *const SwimProtocol, pubkey: [32]u8, cert_wire: [messages.ORG_CERT_WIRE_SIZE]u8) bool {
         const cert = Org.NodeCertificate.deserialize(&cert_wire);
         if (!std.mem.eql(u8, &cert.node_pubkey, &pubkey)) return false;
+        if (!cert.isValidAt(wallSeconds(), self.cert_skew_s)) return false;
         if (!Org.verifyCertificate(&cert)) return false;
-        if (!cert.isValid()) return false;
         if (!self.isOrgAuthorizedPeer(cert.org_pubkey)) return false;
         if (self.orgRevokesNode(cert.org_pubkey, pubkey)) return false;
         if (cert.isDelegated() and self.orgRevokesNode(cert.org_pubkey, cert.issuer_pubkey)) return false;
@@ -370,7 +392,7 @@ pub const SwimProtocol = struct {
         const org_pubkey = peer.org_pubkey orelse return false;
         const expires_at = peer.cert_expires_at orelse return false;
         if (!self.isOrgAuthorizedPeer(org_pubkey)) return false;
-        if (!certExpiryValid(expires_at)) return false;
+        if (!self.certExpiryValid(expires_at)) return false;
         if (self.orgRevokesNode(org_pubkey, pubkey)) return false;
         if (peer.cert_issuer_pubkey) |issuer| {
             if (self.orgRevokesNode(org_pubkey, issuer)) return false;
@@ -527,6 +549,27 @@ pub const SwimProtocol = struct {
         self.our_wg_binding = binding;
     }
 
+    /// Replaces the authorized keys and trusted organizations, as on a trust
+    /// reload. Revocations, vouches and our own certificate are kept, and
+    /// enforcement stays as configured, so emptied lists never open a node
+    /// that enforced trust. Relay clients are re-checked on their next frame.
+    pub fn replaceTrust(self: *SwimProtocol, authorized: []const [32]u8, orgs: []const [32]u8) void {
+        self.authorized_count = 0;
+        for (authorized) |key| self.addAuthorizedKey(key);
+        self.trusted_org_count = 0;
+        for (orgs) |org| self.addTrustedOrg(org);
+        if (self.relay_core) |core| core.bumpTrustEpoch();
+    }
+
+    fn runPendingReload(self: *SwimProtocol) void {
+        if (!self.reload_requested.swap(false, .acq_rel)) return;
+        if (self.reload_hook) |hook| hook.run(hook.ctx, self);
+    }
+
+    pub fn clearOrgCert(self: *SwimProtocol) void {
+        self.our_org_cert = null;
+    }
+
     pub fn setOrgCert(self: *SwimProtocol, cert_wire: [messages.ORG_CERT_WIRE_SIZE]u8) void {
         self.our_org_cert = cert_wire;
     }
@@ -609,6 +652,7 @@ pub const SwimProtocol = struct {
 
         // 3. Expire suspected peers
         if (self.relay_core) |core| core.expire(nowNs(), 256);
+        self.runPendingReload();
         var expired_buf: [256][32]u8 = undefined;
         const expired_n = self.membership.expireSuspected(&expired_buf);
         for (expired_buf[0..expired_n]) |pubkey| {
@@ -695,7 +739,7 @@ pub const SwimProtocol = struct {
     /// Queue a signed org revocation for local application and peer broadcast.
     pub fn queueOrgCertRevoke(self: *SwimProtocol, rev: messages.OrgCertRevoke) void {
         self.rememberOrgRevoke(rev);
-        self.enqueueOrgRevokeBroadcast(rev);
+        self.enqueueOrgRevokeBroadcast(rev, self.config.max_gossip_broadcasts);
         if (self.isOrgAuthorizedPeer(rev.org_pubkey)) {
             self.applyOrgRevoke(rev, false);
         }
@@ -711,6 +755,7 @@ pub const SwimProtocol = struct {
 
         // 2. Expire suspected peers
         if (self.relay_core) |core| core.expire(nowNs(), 256);
+        self.runPendingReload();
         var expired_buf: [256][32]u8 = undefined;
         const expired_n = self.membership.expireSuspected(&expired_buf);
         for (expired_buf[0..expired_n]) |pubkey| {
@@ -1063,27 +1108,33 @@ pub const SwimProtocol = struct {
             // If the revoked node, or any leaf cert issued by that node, is
             // currently authorized only by this org's cert/vouch, mark it dead.
             // Other orgs or explicit key trust are independent authorization
-            // boundaries.
+            // boundaries. Affected peers are collected in batches, so the
+            // membership is walked once per batch, not once per peer.
+            var batch: [256][32]u8 = undefined;
             while (true) {
-                var dead_key: ?[32]u8 = null;
+                var n: usize = 0;
                 var iter = self.membership.peers.iterator();
                 while (iter.next()) |entry| {
                     const peer = entry.value_ptr.*;
                     if (peer.state != .alive and peer.state != .suspected) continue;
                     if (!revokedOrgGrantAffectsPeer(rev, entry.key_ptr.*, peer)) continue;
                     if (self.isAuthorizedPeer(entry.key_ptr.*, null)) continue;
-                    dead_key = entry.key_ptr.*;
-                    break;
+                    batch[n] = entry.key_ptr.*;
+                    n += 1;
+                    if (n == batch.len) break;
                 }
-                const key = dead_key orelse break;
-                self.membership.markDead(key);
-                if (self.handler) |h| {
-                    h.onPeerDead(h.ctx, key);
+                for (batch[0..n]) |key| {
+                    self.membership.markDead(key);
+                    if (self.handler) |h| {
+                        h.onPeerDead(h.ctx, key);
+                    }
                 }
+                if (n < batch.len) break;
             }
+            if (self.relay_core) |core| core.bumpTrustEpoch();
         }
         if (rebroadcast) {
-            self.enqueueOrgRevokeBroadcast(rev);
+            self.enqueueOrgRevokeBroadcast(rev, self.config.max_gossip_broadcasts);
         }
     }
 
@@ -1792,13 +1843,13 @@ pub const SwimProtocol = struct {
         self.org_revoke_count += 1;
     }
 
-    fn enqueueOrgRevokeBroadcast(self: *SwimProtocol, rev: messages.OrgCertRevoke) void {
+    fn enqueueOrgRevokeBroadcast(self: *SwimProtocol, rev: messages.OrgCertRevoke, broadcasts: u32) void {
         var buf: [Org.ORG_REVOKE_WIRE_SIZE]u8 = undefined;
         const written = codec.encodeOrgCertRevoke(&buf, rev) catch return;
-        self.enqueueOrgControl(buf[0..written]);
+        self.enqueueOrgControl(buf[0..written], broadcasts);
     }
 
-    fn enqueueOrgControl(self: *SwimProtocol, data: []const u8) void {
+    fn enqueueOrgControl(self: *SwimProtocol, data: []const u8, broadcasts: u32) void {
         if (data.len > Org.ORG_REVOKE_WIRE_SIZE) return;
         for (self.org_control_queue[0..self.org_control_count]) |slot| {
             if (slot.len == data.len and std.mem.eql(u8, slot.data[0..slot.len], data)) return;
@@ -1808,7 +1859,7 @@ pub const SwimProtocol = struct {
         var slot = OrgControlSlot{
             .data = std.mem.zeroes([Org.ORG_REVOKE_WIRE_SIZE]u8),
             .len = @intCast(data.len),
-            .remaining = self.config.max_gossip_broadcasts,
+            .remaining = broadcasts,
             .next_peer_index = 0,
         };
         @memcpy(slot.data[0..data.len], data);
@@ -1871,15 +1922,18 @@ pub const SwimProtocol = struct {
         self.org_control_count = write;
     }
 
+    /// Re-sends each retained revocation once per interval. The original
+    /// broadcast already went out `max_gossip_broadcasts` times; this only
+    /// reaches peers that joined or missed it since.
     fn readvertiseOrgRevokes(self: *SwimProtocol, now: i128) void {
         if (self.org_revoke_count == 0) return;
-        const interval_ns: i128 = @as(i128, self.config.self_readvertise_interval_ms) * 1_000_000;
+        const interval_ns: i128 = @as(i128, self.config.org_revoke_readvertise_interval_ms) * 1_000_000;
         if (interval_ns <= 0) return;
         if (now - self.last_org_revoke_readvertise_ns < interval_ns) return;
         self.last_org_revoke_readvertise_ns = now;
 
         for (self.org_revokes[0..self.org_revoke_count]) |rev| {
-            self.enqueueOrgRevokeBroadcast(rev);
+            self.enqueueOrgRevokeBroadcast(rev, 1);
         }
     }
 
@@ -3156,7 +3210,7 @@ test "retained org revoke can be re-advertised without duplicate queue entries" 
     var membership = Membership.MembershipTable.init(allocator, 5000);
     defer membership.deinit();
 
-    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{ .self_readvertise_interval_ms = 1 }, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{ .org_revoke_readvertise_interval_ms = 1 }, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
 
     const org_kp = Org.generateOrgKeyPair();
     const victim = [_]u8{0x7a} ** 32;
@@ -3192,7 +3246,7 @@ test "org revoke fan-out resumes after rate-limit drops" {
     }
 
     const data = [_]u8{0x42} ** Org.ORG_REVOKE_WIRE_SIZE;
-    swim.enqueueOrgControl(&data);
+    swim.enqueueOrgControl(&data, swim.config.max_gossip_broadcasts);
     try std.testing.expectEqual(@as(usize, 1), swim.org_control_count);
 
     swim.send_tokens = 1;
@@ -3749,4 +3803,73 @@ test "authenticated relays forward only for senders proven by handshake" {
     try std.testing.expect(testReceive(f.bob_socket, &buf, 0x50) == null);
     try std.testing.expectEqual(@as(u64, 1), core.stats.droppedFor(.spoofed_sender));
     try std.testing.expectEqual(@as(u64, 1), core.stats.droppedFor(.unproven_sender));
+}
+
+test "a trust reload replaces keys and never opens a node that enforced trust" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 100);
+    defer membership.deinit();
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    const alice = [_]u8{0xA1} ** 32;
+    const bob = [_]u8{0xB0} ** 32;
+    const org = [_]u8{0x0C} ** 32;
+    swim.addAuthorizedKey(alice);
+    swim.enableTrust();
+
+    swim.replaceTrust(&.{}, &.{});
+    try std.testing.expect(swim.enforce_trust);
+    try std.testing.expect(!swim.isAuthorizedPeer(alice, null));
+
+    swim.replaceTrust(&.{bob}, &.{org});
+    try std.testing.expect(swim.isAuthorizedPeer(bob, null));
+    try std.testing.expect(!swim.isAuthorizedPeer(alice, null));
+    try std.testing.expect(swim.isOrgAuthorizedPeer(org));
+}
+
+test "reload requests run once on the event loop and re-check relay clients" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 100);
+    defer membership.deinit();
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    var core = try RelayCore.RelayCore.init(allocator, .{ .max_clients = 16, .max_unproven = 4, .max_claims = 16, .max_handshake_sources = 16 }, [_]u8{0x40} ** 32, [_]u8{0x41} ** 32, swim.relayAdmission(), 0);
+    defer core.deinit();
+    swim.relay_core = &core;
+
+    const Counter = struct {
+        runs: usize = 0,
+        fn run(raw: *anyopaque, s: *SwimProtocol) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.runs += 1;
+            s.replaceTrust(&.{}, &.{});
+        }
+    };
+    var counter = Counter{};
+    swim.reload_hook = .{ .ctx = &counter, .run = Counter.run };
+
+    swim.tickTimersOnly();
+    try std.testing.expectEqual(@as(usize, 0), counter.runs);
+    const epoch = core.trust_epoch;
+    swim.reload_requested.store(true, .release);
+    swim.tickTimersOnly();
+    swim.tickTimersOnly();
+    try std.testing.expectEqual(@as(usize, 1), counter.runs);
+    try std.testing.expect(core.trust_epoch != epoch);
+}
+
+test "retained revocations are re-sent once per interval, not as fresh broadcasts" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 100);
+    defer membership.deinit();
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{ .org_revoke_readvertise_interval_ms = 1 }, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    const org_kp = Org.generateOrgKeyPair();
+    const rev = try Org.issueOrgRevoke(org_kp, [_]u8{0x7b} ** 32, 2, 12);
+    swim.queueOrgCertRevoke(rev);
+    try std.testing.expectEqual(swim.config.max_gossip_broadcasts, swim.org_control_queue[0].remaining);
+
+    swim.org_control_count = 0;
+    swim.readvertiseOrgRevokes(2_000_000);
+    try std.testing.expectEqual(@as(usize, 1), swim.org_control_count);
+    try std.testing.expectEqual(@as(u32, 1), swim.org_control_queue[0].remaining);
+    // The default interval is minutes, not the self re-advertise seconds.
+    try std.testing.expect((SwimConfig{}).org_revoke_readvertise_interval_ms >= 60_000);
 }
