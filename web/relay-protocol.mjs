@@ -111,9 +111,11 @@ export class MeshguardRelayClient extends EventTarget {
     if (frame[0] !== 0x50 || frame.length < 93 || frame.length > 1117) return;
     const peer = this.peers.get(b64(frame.slice(33, 65)));
     if (!peer) { this.stats.rejected++; return; }
-    const plaintext = this.identity.open(peer, frame);
+    // Known replays are dropped before any X25519/AEAD work. Tokens enter `seen` only after
+    // authentication succeeds, so forged input can neither poison nor evict the cache.
     const token = b64(frame.slice(33, 77));
     if (this.seen.has(token)) { this.stats.duplicates++; return; }
+    const plaintext = this.identity.open(peer, frame);
     this.seen.set(token, Date.now());
     while (this.seen.size > 512) this.seen.delete(this.seen.keys().next().value);
     this.stats.received++; this.emit('message', { peer, data: plaintext });
