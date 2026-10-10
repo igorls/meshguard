@@ -1307,6 +1307,12 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     defer relay_core.deinit();
     swim.relay_core = &relay_core;
     swim.forwarding = if (relay_flags.relay) .authenticated else .endpoint_match;
+    if (relay_flags.relay) {
+        // A relay absorbs bursts from many clients on one socket: queue them.
+        if (gossip_socket.setBufferSizes(8 * 1024 * 1024)) |bytes| {
+            try writeFormatted(stdout, "  relay socket buffers: {d} KiB\n", .{bytes / 1024});
+        }
+    }
     swim.opaque_relay = relay_flags.opaque_relay;
     swim.delivery_status = relay_flags.delivery_status;
     if (relay_flags.reply_pps) |n| {

@@ -41,6 +41,22 @@ Findings:
   are lost: the storm row's loss. The global handshake budget (1,000/s) is
   the limit, and the 15 s mobile re-proof interval alone uses two thirds of
   it at 10,000 clients.
+### Browser sessions
+
+`bench/relay-load/browser.mjs`: WASM browser identities with passes, each with
+its own WebSocket session through a gateway process, to an opaque `--relay`
+daemon. Same host, 200 sessions at 0.5 msg/s and 2,000 at 0.2 msg/s.
+
+| Sessions | Ready | Loss | Latency p50 / p99 | Gateway CPU | Gateway peak RSS | Relay peak RSS |
+|---|---|---|---|---|---|---|
+| 200 | all, in 1.1 s | 0 | 0.9 ms / 3.8 ms | 0.16 core | 65 MiB | 6 MiB |
+| 2,000 | all, in 11 s (ramped at 200/s) | 0 | 1.2 ms / 76 ms | 0.31 core | 81 MiB | 7 MiB |
+
+Each session holds a WebSocket and a UDP socket, so the gateway's file
+descriptor limit bounds it first: the previous unit file (`LimitNOFILE=256`,
+`MemoryMax=128M`, `CPUQuota=50%`) allowed about 120 browsers. The unit file now
+allows 65,536 descriptors, 1 GiB and two cores.
+
 - **Answers need their own budget.** Mobile contexts ping their relay every
   3 s: 3,300 pings/s at 10,000 clients. While answers shared the 500 packets/s
   discovery budget, only 15% were answered, enough for clients to mark the
