@@ -42,15 +42,15 @@ path uses `0x50` outside this codec.
 ## Ping
 
 ```
-[0x01][32B sender_pubkey][8B seq (LE)][8B incarnation (LE)][1B gossip_count][N × gossip_entry][optional org cert extension]
+[0x01][32B sender_pubkey][8B seq (LE)][8B incarnation (LE)][1B gossip_count][N × gossip_entry][optional extensions]
 ```
 
-Minimum size: **50 bytes** (no gossip, no org cert extension).
+Minimum size: **50 bytes** (no gossip, no extensions).
 
 ## Ack
 
 ```
-[0x03][32B sender_pubkey][8B seq (LE)][8B incarnation (LE)][1B gossip_count][N × gossip_entry][optional org cert extension]
+[0x03][32B sender_pubkey][8B seq (LE)][8B incarnation (LE)][1B gossip_count][N × gossip_entry][optional extensions]
 ```
 
 Same format as Ping. The `seq` echoes the Ping's sequence number.
@@ -78,18 +78,40 @@ Piggybacked on Ping and Ack messages:
 ```
 
 Fixed size: **115 bytes** per entry. Up to 8 entries are decoded per message.
-A fully loaded Ping/Ack with 8 gossip entries is 970 bytes before the optional
-org certificate extension.
 
-The optional org certificate extension is appended to Ping/Ack after gossip as:
+## Ping/Ack extensions
+
+Optional extensions follow the last gossip entry, in this order:
 
 ```
-[1B present=1][314B NodeCertificate max]
+[0x01][314B NodeCertificate]                    org certificate
+[0x02][32B wg_pubkey][64B Ed25519 signature]    signed WireGuard binding
 ```
 
 New encoders emit the full 314-byte v2-sized certificate slot. Decoders also
-accept the legacy `[1B present=1][186B NodeCertificate]` extension and zero-fill
-the v2-only fields so v1 certificates continue to work during rollout.
+accept the legacy `[0x01][186B NodeCertificate]` extension and zero-fill the
+v2-only fields so v1 certificates continue to work during rollout; nothing
+follows a legacy certificate.
+
+The binding is the sender's own signature over its WireGuard key:
+
+```
+Ed25519.sign("meshguard-wg-binding-v1\0" || sender_pubkey || wg_pubkey)
+```
+
+Gossip carries WireGuard keys for third parties without any signature, so a
+key learned that way could belong to anyone. A receiver that gets a valid
+binding from the key's owner adopts that key in place of a gossip-learned one;
+a key bound by a trusted v2 certificate still takes precedence, and gossip
+never replaces a signed key. Mobile clients use a pinned relay's WireGuard key
+only when the relay signed it or it is the X25519 form of the relay's identity
+(daemon keys are derived that way). Decoders that predate the binding read
+only a leading `0x01` and copy at most 314 bytes, so they ignore it.
+
+Encoders keep a Ping/Ack within **1200 bytes** (below the 1280-byte IPv6
+minimum MTU once IP and UDP headers are added) by sending fewer gossip
+entries next to the extensions: 8 with none or only a binding, 7 with only a
+certificate, 6 with both.
 
 ## HandshakeInitiation (Type 1)
 

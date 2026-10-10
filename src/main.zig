@@ -1258,6 +1258,17 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
         });
     }
 
+    // Advertise our WireGuard key under our own signature. Daemon keys are
+    // also derivable from the identity, but signing keeps one rule for all.
+    const kp_signer = std.crypto.sign.Ed25519.KeyPair.fromSecretKey(kp.secret_key) catch {
+        try stderr.writeStreamingAll(zio(), "error: invalid identity key\n");
+        std.process.exit(1);
+    };
+    swim.setWgBinding(lib.identity.Binding.sign(kp_signer, wg_public_key) catch {
+        try stderr.writeStreamingAll(zio(), "error: failed to sign WireGuard binding\n");
+        std.process.exit(1);
+    });
+
     // Load our own org certificate (if present)
     const cert_path = try std.fs.path.join(allocator, &.{ config_dir, "node.cert" });
     defer allocator.free(cert_path);
