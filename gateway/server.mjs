@@ -26,6 +26,18 @@ export function validateOutbound(frame, session, destinations) {
     && frame.slice(144, 164).every(byte => byte === 0) && frame[164] === 3;
 }
 
+const LOOPBACK = ['127.0.0.1', '::1', '::ffff:127.0.0.1'];
+const normalizeIp = value => (typeof value === 'string' && value.startsWith('::ffff:') && isIP(value.slice(7)) === 4) ? value.slice(7) : value;
+
+// Source address for per-IP limits. X-Forwarded-For is honored only when the TCP peer is a
+// configured trusted proxy, and then only its right-most entry (the one the proxy appended).
+export function clientAddress(peer, forwardedFor, trustedProxies) {
+  const socketAddress = normalizeIp(peer);
+  if (!trustedProxies.has(socketAddress) || typeof forwardedFor !== 'string') return socketAddress;
+  const candidate = normalizeIp(forwardedFor.split(',').pop().trim());
+  return isIP(candidate) ? candidate : socketAddress;
+}
+
 export function startGateway(config) {
   if (isIP(config.relayHost) !== 4 || isIP(config.udpBindHost ?? '127.0.0.1') !== 4) throw new Error('Gateway requires configured IPv4 endpoints');
   if (!Number.isInteger(config.relayPort) || config.relayPort < 1 || config.relayPort > 65535) throw new Error('Invalid relay port');
@@ -33,7 +45,32 @@ export function startGateway(config) {
   const destinations = new Set(config.allowedDestinations.map(value => b64(keyBytes(value))));
   const origins = new Set(config.allowedOrigins);
   const active = new Map(), sockets = new Set();
-  const counters = { authenticated: 0, rejected: 0, forwarded: 0, received: 0 };
+  // Unauthenticated connections get their own small budget so they cannot consume capacity needed by
+  // admitted identities. Authenticated sessions are bounded by the allowlist (one per identity).
+  const limits = { pending: config.maxPending ?? 8, pendingPerIp: config.maxPendingPerIp ?? 2,
+    burst: config.upgradeBurst ?? 5, refillMs: config.upgradeRefillMs ?? 2000, tracked: 4096,
+    authTimeoutMs: config.authTimeoutMs ?? 10000 };
+  const trustedProxies = new Set((config.trustedProxies ?? LOOPBACK).map(normalizeIp));
+  const sources = new Map(); // ip -> { tokens, refill, pending }
+  let pending = 0;
+  const source = (ip, now) => {
+    let entry = sources.get(ip);
+    if (!entry) {
+      if (sources.size >= limits.tracked) {
+        for (const [key, value] of sources) if (value.pending === 0 && now - value.refill > limits.refillMs * limits.burst) sources.delete(key);
+        if (sources.size >= limits.tracked) return null;
+      }
+      entry = { tokens: limits.burst, refill: now, pending: 0 }; sources.set(ip, entry);
+    }
+    entry.tokens = Math.min(limits.burst, entry.tokens + (now - entry.refill) / limits.refillMs); entry.refill = now;
+    return entry;
+  };
+  const releasePending = session => {
+    if (!session.counted) return;
+    session.counted = false; pending--;
+    const entry = sources.get(session.ip); if (entry) entry.pending--;
+  };
+  const counters = { authenticated: 0, rejected: 0, forwarded: 0, received: 0, limited: 0 };
   const prefix = config.pathPrefix ?? '/meshguard-web';
   const server = Bun.serve({
     hostname: config.listenHost ?? '127.0.0.1', port: config.listenPort ?? 4321,
@@ -42,16 +79,22 @@ export function startGateway(config) {
       if (path === `${prefix}/health`) return Response.json({ status: 'ok', protocol: 1 });
       if (path !== `${prefix}/ws`) return new Response('Not found', { status: 404 });
       if (!origins.has(request.headers.get('origin'))) return new Response('Origin not allowed', { status: 403 });
-      if (sockets.size >= 32) return new Response('Gateway full', { status: 503 });
-      return server.upgrade(request, { data: { challenge: randomBytes(32), phase: 'pending', tokens: 60, refill: Date.now() } })
-        ? undefined : new Response('Upgrade required', { status: 426 });
+      const ip = clientAddress(server.requestIP(request)?.address, request.headers.get('x-forwarded-for'), trustedProxies);
+      const now = Date.now(), entry = ip ? source(ip, now) : null;
+      if (!entry) return new Response('Gateway busy', { status: 503 });
+      if (entry.tokens < 1 || entry.pending >= limits.pendingPerIp) { counters.limited++; return new Response('Too many requests', { status: 429, headers: { 'Retry-After': '2' } }); }
+      if (pending >= limits.pending) { counters.limited++; return new Response('Gateway busy', { status: 503, headers: { 'Retry-After': '2' } }); }
+      entry.tokens--; entry.pending++; pending++;
+      const data = { challenge: randomBytes(32), phase: 'pending', tokens: 60, refill: now, ip, counted: true };
+      if (server.upgrade(request, { data })) return undefined;
+      releasePending(data); return new Response('Upgrade required', { status: 426 });
     },
     websocket: {
       maxPayloadLength: 2048, backpressureLimit: 65536, closeOnBackpressureLimit: true,
       perMessageDeflate: false, idleTimeout: 45,
       open(ws) {
         sockets.add(ws);
-        ws.data.deadline = setTimeout(() => ws.close(4003, 'Authentication timeout'), 10000);
+        ws.data.deadline = setTimeout(() => ws.close(4003, 'Authentication timeout'), limits.authTimeoutMs);
         ws.send(JSON.stringify({ type: 'challenge', challenge: b64(ws.data.challenge) }));
       },
       async message(ws, message) {
@@ -83,7 +126,7 @@ export function startGateway(config) {
             session.endpoint = { address: config.udpBindHost ?? '127.0.0.1', port: session.udp.port };
             const old = active.get(b64(publicKey));
             active.set(b64(publicKey), ws); old?.close(4001, 'Replaced by a new authenticated connection');
-            session.phase = 'ready'; counters.authenticated++;
+            session.phase = 'ready'; releasePending(session); counters.authenticated++;
             ws.send(JSON.stringify({ type: 'ready', endpoint: session.endpoint }));
           } catch { counters.rejected++; ws.close(4003, 'Identity not admitted'); }
           return;
@@ -95,7 +138,7 @@ export function startGateway(config) {
         session.tokens--; if (session.udp.send(frame)) counters.forwarded++;
       },
       close(ws) {
-        sockets.delete(ws); clearTimeout(ws.data.deadline); ws.data.phase = 'closed'; ws.data.udp?.close();
+        sockets.delete(ws); releasePending(ws.data); clearTimeout(ws.data.deadline); ws.data.phase = 'closed'; ws.data.udp?.close();
         if (ws.data.publicKey && active.get(b64(ws.data.publicKey)) === ws) active.delete(b64(ws.data.publicKey));
       },
     },

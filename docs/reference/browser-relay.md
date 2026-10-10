@@ -29,9 +29,21 @@ substitute for it.
 The packet gate accepts only the authenticated browser's own SWIM self entry,
 WireGuard initiations, and size-bounded sealed app packets to configured
 destinations. It rejects claimed third-party app senders and gossip subjects.
-It limits connection count, pre-authentication time, packet rate, frame size,
-and output backpressure. Reconnecting the same identity replaces its prior
-gateway session. Ingress is restricted to the configured relay by the connected
+It limits pre-authentication time, packet rate, frame size, and output
+backpressure. Unauthenticated upgrades have their own budget, separate from
+admitted sessions: a global pending cap (`maxPending`, default 8), a per-source
+pending cap (`maxPendingPerIp`, default 2), and a per-source upgrade token bucket
+(`upgradeBurst` 5, refilled every `upgradeRefillMs` 2000); excess upgrades get
+429/503 before any socket is created. Admitted sessions are bounded by the
+allowlist (one per identity), so a flood of unauthenticated sockets cannot
+consume their capacity. Reconnecting the same identity replaces its prior
+gateway session; the replacement needs only a pending slot, never an extra
+authenticated one. The per-source key is the socket address, or the
+right-most `X-Forwarded-For` entry only when the TCP peer is in `trustedProxies`
+(default: loopback). The nginx template overwrites that header and adds
+`limit_conn`/`limit_req`. Residual risk: an attacker with many source addresses
+can still occupy the small pending budget for up to the 10 s authentication
+timeout; nginx limits and network-level controls are the mitigation. Ingress is restricted to the configured relay by the connected
 UDP socket.
 
 The browser pins the relay's WG key and each intended peer's Ed25519/WG keys.
@@ -111,8 +123,7 @@ The host application owns message IDs, receipts, history, and retry persistence.
 
 Run `pc-web-1a1229b5f86` used the real Pixel 7 Pro, the Codex in-app browser, and
 the shared public relay at `meshrooms.wormdb.dev:51821/UDP`. Browser traffic used
-`wss://meshrooms.wormdb.dev/meshguard-web/ws`; Tailscale was used for server
-administration only. The Pixel's active default network was **Wi-Fi** for this
+`wss://meshrooms.wormdb.dev/meshguard-web/ws`. The Pixel's active default network was **Wi-Fi** for this
 run. This is public-relay delivery with direct app sends disabled, not a cellular
 qualification.
 
@@ -154,11 +165,7 @@ returned to Peer Circle Preview. The loopback gateway and TLS health route remai
 available with no admitted test identities. Repeating the test requires fresh
 or explicitly re-admitted development keys.
 
-The native relay stayed at SHA-256
-`a6e0cd0398a2bf928395432d14cecc45b0b59c02ed99fce80f42c3b5b4333df8`.
-Meshrooms browser PID 551523 remained active. Server backup and rollback assets
-are under `/var/backups/meshguard-web/20261009-browser`; the sidecar release is
-under `/opt/meshguard-web/releases/20261009-browser`.
+The native relay binary and its admission policy were left unchanged.
 
 Checks: WASM smoke and forged-Noise-response rejection passed with zero imports
 and a 63,369-byte artifact. Real native FFI Noise response and six sealed-packet
