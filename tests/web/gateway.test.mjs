@@ -1,6 +1,6 @@
 import { test, expect } from 'bun:test';
 import { readFileSync } from 'node:fs';
-import { startGateway, validateOutbound } from '../../gateway/server.mjs';
+import { startGateway, validateOutbound, clientAddress } from '../../gateway/server.mjs';
 import { MeshguardWasm } from '../../web/meshguard.mjs';
 import { authPayload, b64, fromB64, selfAdvertisement, MeshguardRelayClient } from '../../web/relay-protocol.mjs';
 
@@ -11,8 +11,8 @@ const peer = identity => ({ publicKey: identity.publicKey(), wgPublicKey: identi
 const aPeer = peer(a), bPeer = peer(b);
 const origin = 'http://gateway-test.invalid';
 
-function channel(url) {
-  const ws = new WebSocket(url, { headers: { Origin: origin } });
+function channel(url, headers = {}) {
+  const ws = new WebSocket(url, { headers: { Origin: origin, ...headers } });
   ws.binaryType = 'arraybuffer';
   const queue = [], waiters = [];
   ws.addEventListener('message', event => waiters.length ? waiters.shift()(event.data) : queue.push(event.data));
@@ -21,18 +21,19 @@ function channel(url) {
     waiters.push(value => { clearTimeout(timeout); resolve(value); });
   }) };
 }
-async function fixture() {
+async function fixture(overrides = {}) {
   const packets = [];
   const udp = await Bun.udpSocket({ hostname: '127.0.0.1', port: 0, socket: {
     data(socket, frame, port, address) {
       packets.push(new Uint8Array(frame));
-      if (frame[0] === 0x50) socket.send(b.seal(aPeer, 'native-shaped reply'), port, address);
+      if (frame[0] === 0x50) { try { socket.send(b.seal(aPeer, 'native-shaped reply'), port, address); } catch {} }
     },
+    error() {}, // ICMP refusals after a gateway session closes are expected in flood/timeout tests
   } });
   const gateway = startGateway({ listenPort: 0, relayHost: '127.0.0.1', relayPort: udp.port,
     allowedOrigins: [origin], allowedIdentities: [{ publicKey: b64(aPeer.publicKey), wgPublicKey: b64(aPeer.wgPublicKey) }],
-    allowedDestinations: [b64(bPeer.publicKey)] });
-  return { gateway, packets, url: `ws://127.0.0.1:${gateway.server.port}/meshguard-web/ws`, stop() { gateway.stop(); udp.close(); } };
+    allowedDestinations: [b64(bPeer.publicKey)], ...overrides });
+  return { gateway, packets, url: `ws://127.0.0.1:${gateway.server.port}/meshguard-web/ws`, stop() { gateway.stop(); setTimeout(() => udp.close(), 300); } };
 }
 function authentication(challenge, identity = a, wg = identity.wgPublicKey()) {
   return { type: 'authenticate', publicKey: b64(identity.publicKey()), wgPublicKey: b64(wg),
@@ -92,6 +93,8 @@ test('gateway requires an explicitly allowed browser Origin', async () => {
 
 test('client authenticates before remembering nonces and never changes pinned peer keys from gossip', () => {
   const client = new MeshguardRelayClient({ identity: a, url: 'ws://fixture.invalid', relay: bPeer, trustedPeers: [bPeer] });
+  const pinnedWg = Uint8Array.from(bPeer.wgPublicKey), peerEvents = [];
+  client.addEventListener('peer', event => peerEvents.push(event.detail));
   const received = [];
   client.addEventListener('message', event => received.push(event.detail.data));
   const valid = b.seal(aPeer, 'authenticated once'), forged = valid.slice(); forged[forged.length - 1] ^= 1;
@@ -101,5 +104,140 @@ test('client authenticates before remembering nonces and never changes pinned pe
   const gossip = selfAdvertisement(b, { address: '127.0.0.1', port: 51000 }, 3, 1n, 1n);
   gossip.set(aPeer.wgPublicKey, 112);
   client.packet(gossip);
-  expect(client.peers.get(b64(bPeer.publicKey)).wgPublicKey).toEqual(bPeer.wgPublicKey);
+  expect(Array.from(client.peers.get(b64(bPeer.publicKey)).wgPublicKey)).toEqual(Array.from(pinnedWg));
+  expect(peerEvents).toHaveLength(0); // a gossip claim with a different WG key is not even surfaced
+});
+
+const settle = ms => new Promise(resolve => setTimeout(resolve, ms));
+const closing = c => new Promise(resolve => c.ws.addEventListener('close', resolve, { once: true }));
+// Resolves 'open' or 'refused' for a raw WebSocket attempt.
+const attempt = (url, headers = {}) => new Promise(resolve => {
+  const c = channel(url, headers);
+  c.ws.addEventListener('open', () => resolve({ c, result: 'open' }), { once: true });
+  c.ws.addEventListener('error', () => resolve({ c, result: 'refused' }), { once: true });
+});
+async function admit(url, identity = a) {
+  const c = channel(url); const challenge = JSON.parse(await c.next());
+  c.ws.send(JSON.stringify(authentication(challenge.challenge, identity)));
+  expect(JSON.parse(await c.next()).type).toBe('ready'); return c;
+}
+
+test('pending cap refuses unauthenticated sockets without touching admitted sessions', async () => {
+  const f = await fixture({ maxPending: 2, maxPendingPerIp: 10, upgradeBurst: 100 }); const opened = [];
+  try {
+    const admitted = await admit(f.url);
+    for (let i = 0; i < 2; i++) opened.push((await attempt(f.url)).c);
+    const third = await attempt(f.url); opened.push(third.c);
+    expect(third.result).toBe('refused'); expect(f.gateway.counters.limited).toBe(1);
+    admitted.ws.send(a.seal(bPeer, 'still served')); await settle(100);
+    expect(f.gateway.counters.forwarded).toBe(1);
+    opened[0].ws.close(); await settle(100);
+    const again = await attempt(f.url); opened.push(again.c); expect(again.result).toBe('open');
+    admitted.ws.close();
+  } finally { for (const c of opened) c.ws.close(); f.stop(); }
+});
+
+test('same identity replaces its session even when the pending budget is small', async () => {
+  const f = await fixture({ maxPending: 1 });
+  try {
+    const first = await admit(f.url); const firstClosed = closing(first);
+    const second = await admit(f.url);
+    expect((await firstClosed).code).toBe(4001);
+    second.ws.send(a.seal(bPeer, 'from replacement')); expect(new Uint8Array(await second.next())).toBeTruthy();
+    second.ws.close();
+  } finally { f.stop(); }
+});
+
+test('per-source pending cap uses X-Forwarded-For only from a trusted proxy', async () => {
+  const forwarded = ip => ({ 'X-Forwarded-For': ip });
+  const trusted = await fixture({ maxPendingPerIp: 1, upgradeBurst: 100 }); const opened = [];
+  try {
+    const one = await attempt(trusted.url, forwarded('198.51.100.1')), same = await attempt(trusted.url, forwarded('198.51.100.1'));
+    const other = await attempt(trusted.url, forwarded('198.51.100.2'));
+    opened.push(one.c, same.c, other.c);
+    expect([one.result, same.result, other.result]).toEqual(['open', 'refused', 'open']);
+  } finally { for (const c of opened) c.ws.close(); trusted.stop(); }
+  const untrusted = await fixture({ maxPendingPerIp: 1, upgradeBurst: 100, trustedProxies: ['203.0.113.9'] }); const more = [];
+  try {
+    const one = await attempt(untrusted.url, forwarded('198.51.100.1')), two = await attempt(untrusted.url, forwarded('198.51.100.2'));
+    more.push(one.c, two.c);
+    expect([one.result, two.result]).toEqual(['open', 'refused']); // spoofed header ignored
+  } finally { for (const c of more) c.ws.close(); untrusted.stop(); }
+});
+
+test('clientAddress ignores X-Forwarded-For from untrusted peers and malformed values', () => {
+  const trusted = new Set(['127.0.0.1']);
+  expect(clientAddress('127.0.0.1', '9.9.9.9, 198.51.100.7', trusted)).toBe('198.51.100.7');
+  expect(clientAddress('::ffff:127.0.0.1', '198.51.100.7', trusted)).toBe('198.51.100.7');
+  expect(clientAddress('127.0.0.1', 'not-an-ip', trusted)).toBe('127.0.0.1');
+  expect(clientAddress('127.0.0.1', undefined, trusted)).toBe('127.0.0.1');
+  expect(clientAddress('192.0.2.5', '198.51.100.7', trusted)).toBe('192.0.2.5');
+});
+
+test('per-source upgrade rate limit refuses reconnect floods', async () => {
+  const f = await fixture({ upgradeBurst: 2, upgradeRefillMs: 60000, maxPendingPerIp: 10 });
+  try {
+    const results = [];
+    for (let i = 0; i < 4; i++) { const r = await attempt(f.url); results.push(r.result); r.c.ws.close(); await settle(50); }
+    expect(results).toEqual(['open', 'open', 'refused', 'refused']);
+    expect(f.gateway.counters.limited).toBe(2);
+  } finally { f.stop(); }
+});
+
+test('oversized WebSocket frames are refused by the payload limit', async () => {
+  const f = await fixture();
+  try {
+    const c = await admit(f.url); const closed = closing(c);
+    c.ws.send(new Uint8Array(2049)); expect([1006, 1009]).toContain((await closed).code); // dropped by the 2048-byte payload limit
+    expect(f.packets).toHaveLength(0);
+  } finally { f.stop(); }
+});
+
+test('packet rate limit closes a session that floods valid frames', async () => {
+  const f = await fixture();
+  try {
+    const c = await admit(f.url); const closed = closing(c); const frame = a.seal(bPeer, 'flood');
+    for (let i = 0; i < 100; i++) c.ws.send(frame);
+    expect((await closed).code).toBe(1008);
+    expect(f.gateway.counters.forwarded).toBeLessThan(100); expect(f.gateway.counters.rejected).toBeGreaterThan(0);
+  } finally { f.stop(); }
+});
+
+test('authentication timeout closes silent sockets and a late signature is never accepted', async () => {
+  const f = await fixture({ authTimeoutMs: 150 }); const c = channel(f.url);
+  try {
+    const challenge = JSON.parse(await c.next()); const closed = closing(c);
+    const event = await closed; expect(event.code).toBe(4003); expect(event.reason).toBe('Authentication timeout');
+    try { c.ws.send(JSON.stringify(authentication(challenge.challenge))); } catch {}
+    await settle(100); expect(f.gateway.counters.authenticated).toBe(0); expect(f.packets).toHaveLength(0);
+  } finally { f.stop(); }
+});
+
+test('truncated or extended gossip and app packets never reach the relay', async () => {
+  const session = { ...aPeer, endpoint: { address: '127.0.0.1', port: 51000 } };
+  const destinations = new Set([b64(bPeer.publicKey)]);
+  const gossip = selfAdvertisement(a, session.endpoint, 1, 1n, 1n);
+  expect(validateOutbound(gossip, session, destinations)).toBe(true);
+  for (const length of [0, 1, 49, 148, 164]) expect(validateOutbound(gossip.slice(0, length), session, destinations)).toBe(false);
+  expect(validateOutbound(Uint8Array.from([...gossip, 0]), session, destinations)).toBe(false);
+  const f = await fixture();
+  try {
+    const c = await admit(f.url); const closed = closing(c);
+    c.ws.send(gossip.slice(0, 164)); expect((await closed).code).toBe(1008);
+    expect(f.packets).toHaveLength(0); expect(f.gateway.counters.forwarded).toBe(0);
+  } finally { f.stop(); }
+});
+
+test('client drops known replays before decrypting and forged input cannot poison the replay cache', () => {
+  const client = new MeshguardRelayClient({ identity: a, url: 'ws://fixture.invalid', relay: bPeer, trustedPeers: [bPeer] });
+  let opens = 0; const real = client.identity;
+  client.identity = { open: (...args) => { opens++; return real.open(...args); } };
+  const received = []; client.addEventListener('message', event => received.push(event.detail.data));
+  const valid = b.seal(aPeer, 'first'), forged = valid.slice(); forged[forged.length - 1] ^= 1;
+  expect(() => client.packet(forged)).toThrow('Authentication');
+  expect(client.seen.size).toBe(0);                       // failed authentication never enters the cache
+  client.packet(valid); expect(received).toHaveLength(1); expect(client.seen.size).toBe(1);
+  expect(opens).toBe(2);
+  client.packet(valid); client.packet(forged);            // known token: no decryption at all
+  expect(opens).toBe(2); expect(client.stats.duplicates).toBe(2); expect(received).toHaveLength(1);
 });
