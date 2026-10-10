@@ -2,7 +2,7 @@
 import { createPublicKey, verify, randomBytes } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { isIP } from 'node:net';
-import { authPayload, fromB64, b64, same } from '../web/relay-protocol.mjs';
+import { authPayload, bindingPayload, fromB64, b64, same } from '../web/relay-protocol.mjs';
 
 const keyBytes = value => {
   if (typeof value !== 'string' || !/^[A-Za-z0-9+/]{43}=$/.test(value)) throw new Error('Invalid public key');
@@ -16,7 +16,12 @@ export function validateOutbound(frame, session, destinations) {
     return frame.length >= 93 && frame.length <= 1117 && same(frame.slice(33, 65), session.publicKey)
       && destinations.has(b64(frame.slice(1, 33)));
   }
-  if (![1, 3].includes(frame[0]) || frame.length !== 165 || frame[49] !== 1) return false;
+  if (![1, 3].includes(frame[0]) || frame[49] !== 1) return false;
+  // A self-advertisement may carry the session's own binding, verified at authentication.
+  if (frame.length === 262) {
+    if (!session.binding || frame[165] !== 2 || !same(frame.slice(166, 198), session.wgPublicKey)
+      || !same(frame.slice(198, 262), session.binding)) return false;
+  } else if (frame.length !== 165) return false;
   const view = new DataView(frame.buffer, frame.byteOffset);
   return same(frame.slice(1, 33), session.publicKey) && same(frame.slice(50, 82), session.publicKey)
     && frame[82] === 1 && frame[91] === 1 && frame[92] === 4
@@ -109,8 +114,15 @@ export function startGateway(config) {
             const signature = fromB64(auth.signature);
             if (auth.type !== 'authenticate' || !expectedWg || !same(wgPublicKey, expectedWg) || signature.length !== 64
               || !verify(null, authPayload(session.challenge, publicKey, wgPublicKey), edKey(publicKey), signature)) throw new Error('Identity not admitted');
+            // Optional: the identity's signature over its WireGuard key, which its
+            // self-advertisements may then carry to the relay.
+            let binding = null;
+            if (auth.binding !== undefined) {
+              binding = fromB64(auth.binding);
+              if (binding.length !== 64 || !verify(null, bindingPayload(publicKey, wgPublicKey), edKey(publicKey), binding)) throw new Error('Invalid binding');
+            }
             session.challenge.fill(0); clearTimeout(session.deadline);
-            session.publicKey = publicKey; session.wgPublicKey = wgPublicKey;
+            session.publicKey = publicKey; session.wgPublicKey = wgPublicKey; session.binding = binding;
             session.udp = await Bun.udpSocket({ hostname: config.udpBindHost ?? '127.0.0.1', port: 0,
               connect: { hostname: config.relayHost, port: config.relayPort },
               socket: {

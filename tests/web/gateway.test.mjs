@@ -2,7 +2,7 @@ import { test, expect } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { startGateway, validateOutbound, clientAddress } from '../../gateway/server.mjs';
 import { MeshguardWasm } from '../../web/meshguard.mjs';
-import { authPayload, b64, fromB64, selfAdvertisement, MeshguardRelayClient } from '../../web/relay-protocol.mjs';
+import { authPayload, bindingPayload, b64, fromB64, selfAdvertisement, MeshguardRelayClient } from '../../web/relay-protocol.mjs';
 
 const core = new MeshguardWasm((await WebAssembly.instantiate(readFileSync('zig-out/bin/meshguard.wasm'), {})).instance);
 const a = core.createIdentity(new Uint8Array(32).fill(1));
@@ -240,4 +240,65 @@ test('client drops known replays before decrypting and forged input cannot poiso
   expect(opens).toBe(2);
   client.packet(valid); client.packet(forged);            // known token: no decryption at all
   expect(opens).toBe(2); expect(client.stats.duplicates).toBe(2); expect(received).toHaveLength(1);
+});
+
+const bindingOf = identity => identity.sign(bindingPayload(identity.publicKey(), identity.wgPublicKey()));
+
+test('self-advertisements carry only the binding verified at authentication', () => {
+  const binding = bindingOf(a);
+  const session = { ...aPeer, endpoint: { address: '127.0.0.1', port: 51000 }, binding };
+  const destinations = new Set();
+  const frame = selfAdvertisement(a, session.endpoint, 1, 1n, 1n, binding);
+  expect(frame.length).toBe(262);
+  expect(validateOutbound(frame, session, destinations)).toBe(true);
+  expect(validateOutbound(frame, { ...session, binding: null }, destinations)).toBe(false);
+  const otherSignature = frame.slice(); otherSignature.set(bindingOf(b), 198);
+  expect(validateOutbound(otherSignature, session, destinations)).toBe(false);
+  const otherKey = frame.slice(); otherKey.set(b.wgPublicKey(), 166);
+  expect(validateOutbound(otherKey, session, destinations)).toBe(false);
+  const wrongTag = frame.slice(); wrongTag[165] = 1;
+  expect(validateOutbound(wrongTag, session, destinations)).toBe(false);
+  expect(validateOutbound(frame.slice(0, 200), session, destinations)).toBe(false);
+});
+
+test('gateway verifies the binding at authentication and forwards bound advertisements', async () => {
+  const f = await fixture(); const c = channel(f.url);
+  try {
+    const challenge = JSON.parse(await c.next());
+    c.ws.send(JSON.stringify({ ...authentication(challenge.challenge), binding: b64(bindingOf(a)) }));
+    const ready = JSON.parse(await c.next()); expect(ready.type).toBe('ready');
+    const frame = selfAdvertisement(a, ready.endpoint, 1, 1n, 1n, bindingOf(a));
+    c.ws.send(frame); await settle(100);
+    expect(f.packets.at(-1)).toEqual(frame);
+  } finally { c.ws.close(); f.stop(); }
+});
+
+test('gateway rejects a binding signed for another key', async () => {
+  const f = await fixture(); const c = channel(f.url);
+  try {
+    const challenge = JSON.parse(await c.next());
+    const forged = a.sign(bindingPayload(a.publicKey(), b.wgPublicKey()));
+    const closed = closing(c);
+    c.ws.send(JSON.stringify({ ...authentication(challenge.challenge), binding: b64(forged) }));
+    expect((await closed).code).toBe(4003);
+    expect(f.gateway.counters.authenticated).toBe(0);
+  } finally { c.ws.close(); f.stop(); }
+});
+
+test('the relay client signs its binding once and sends it with every advertisement', () => {
+  const client = new MeshguardRelayClient({ identity: a, url: 'ws://fixture.invalid', relay: bPeer });
+  expect(Array.from(client.binding)).toEqual(Array.from(bindingOf(a)));
+  const sent = [];
+  client.sendRaw = frame => { sent.push(frame); return true; };
+  client.endpoint = { address: '127.0.0.1', port: 51000 };
+  client.advertise();
+  expect(sent[0].length).toBe(262);
+  expect(Array.from(sent[0].slice(198))).toEqual(Array.from(client.binding));
+});
+
+test('binding signatures match the native core byte for byte', () => {
+  // src/identity/binding.zig checks the same known answer.
+  const identity = core.createIdentity(new Uint8Array(32).fill(7));
+  const signature = identity.sign(bindingPayload(identity.publicKey(), new Uint8Array(32).fill(9)));
+  expect(Buffer.from(signature).toString('hex')).toBe('16718f492c54ffe80a79fa28e66054faf3f94527239b0305f2b1787d05a718492025daade823f5f0ad24455594702627525cd3c51e82dbc759162537e2a00701');
 });

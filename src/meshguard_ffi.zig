@@ -90,6 +90,8 @@ pub const MeshguardContext = struct {
     ed25519_public: [32]u8,
     x25519_private: [32]u8,
     x25519_public: [32]u8,
+    /// Our Ed25519 signature over x25519_public, advertised on pings and acks.
+    wg_binding: messages.WgBinding,
 
     // Networking
     membership: Membership.MembershipTable,
@@ -148,6 +150,7 @@ fn initContextStorage(ctx: *MeshguardContext, allocator: std.mem.Allocator) void
     ctx.ed25519_public = undefined;
     ctx.x25519_private = undefined;
     ctx.x25519_public = undefined;
+    ctx.wg_binding = undefined;
     ctx.membership = Membership.MembershipTable.init(allocator, 15000);
     ctx.swim = null;
     ctx.socket = null;
@@ -307,6 +310,10 @@ export fn meshguard_init(
         destroyContext(ctx);
         return null;
     };
+    ctx.wg_binding = lib.identity.Binding.signWithSeed(ctx.ed25519_seed, ctx.x25519_public) catch {
+        destroyContext(ctx);
+        return null;
+    };
 
     // Initialize WireGuard device for tunnel support
     ctx.wg_device = @as(WgDevice, undefined);
@@ -442,6 +449,7 @@ export fn meshguard_join(
         our_port, // Our port for SWIM to advertise
         handler,
     );
+    c.swim.?.setWgBinding(c.wg_binding);
 
     // Seed the mesh — use the SEED's port for the seed endpoint
     var seed_addr: [4]u8 = undefined;
@@ -501,6 +509,7 @@ export fn meshguard_join_ipv6(
         our_port,
         handler,
     );
+    c.swim.?.setWgBinding(c.wg_binding);
 
     var seed_addr6: [16]u8 = undefined;
     @memcpy(&seed_addr6, seed_ip[0..16]);
@@ -562,6 +571,7 @@ export fn meshguard_join_lan(
         our_port,
         handler,
     );
+    c.swim.?.setWgBinding(c.wg_binding);
 
     // Trust is open by default (enforce_trust = false)
     // For production, add authorized keys before join
@@ -1167,6 +1177,16 @@ fn eventLoop(ctx: *MeshguardContext) void {
     }
 }
 
+/// The pinned relay's WireGuard key, if the relay vouched for it: signed with
+/// its identity (binding or certificate) or derived from it. A key that only
+/// third-party gossip claimed could belong to anyone impersonating the relay.
+fn trustedRelayWgKey(pin: [32]u8, peer: Membership.Peer) ?[32]u8 {
+    const wg_key = peer.wg_pubkey orelse return null;
+    if (peer.wg_key_source != .gossip) return wg_key;
+    if (lib.identity.Binding.isDerived(pin, wg_key)) return wg_key;
+    return null;
+}
+
 /// A pinned public relay needs a fresh authenticated source endpoint after
 /// restart/network change. A bounded control handshake uses the existing WG
 /// protocol; it carries no app data and never counts as a direct app send.
@@ -1180,7 +1200,7 @@ fn maintainPinnedRelayAuthentication(ctx: *MeshguardContext) void {
         break :blk ctx.membership.peers.get(pin) orelse return;
     };
     if (peer.state != .alive) return;
-    const wg_key = peer.wg_pubkey orelse return;
+    const wg_key = trustedRelayWgKey(pin, peer) orelse return;
     const ep = peer.gossip_endpoint orelse peer.public_endpoint orelse return;
     ctx.last_relay_auth_ns = now;
     ctx.wg_lock.lockUncancelable(zio());
@@ -1909,4 +1929,30 @@ test "FFI lifecycle fits a small mobile host thread stack" {
     const stack_size: usize = if (builtin.mode == .Debug) 1024 * 1024 else 256 * 1024;
     const thread = try std.Thread.spawn(.{ .stack_size = stack_size }, smallStackLifecycle, .{});
     thread.join();
+}
+
+test "pinned relay WireGuard key is used only when signed or derived" {
+    const relay = try Ed25519.KeyPair.generateDeterministic([_]u8{5} ** 32);
+    const pin = relay.public_key.toBytes();
+    var peer = routeTestPeer(3);
+
+    peer.wg_pubkey = [_]u8{0x66} ** 32;
+    peer.wg_key_source = .gossip;
+    try std.testing.expect(trustedRelayWgKey(pin, peer) == null);
+
+    peer.wg_key_source = .binding;
+    try std.testing.expectEqualSlices(u8, &peer.wg_pubkey.?, &trustedRelayWgKey(pin, peer).?);
+
+    const derived = try X25519.publicKeyFromEd25519(relay.public_key);
+    peer.wg_pubkey = derived;
+    peer.wg_key_source = .gossip;
+    try std.testing.expectEqualSlices(u8, &derived, &trustedRelayWgKey(pin, peer).?);
+}
+
+test "contexts advertise a binding for their own WireGuard key" {
+    var seed = [_]u8{4} ** 32;
+    const ctx = meshguard_init(&seed, 0) orelse return error.InitFailed;
+    defer meshguard_destroy(ctx);
+    try std.testing.expectEqualSlices(u8, &ctx.x25519_public, &ctx.wg_binding.wg_pubkey);
+    try std.testing.expect(lib.identity.Binding.verify(ctx.ed25519_public, ctx.wg_binding));
 }

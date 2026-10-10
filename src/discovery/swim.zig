@@ -14,6 +14,7 @@ const messages = @import("../protocol/messages.zig");
 const codec = @import("../protocol/codec.zig");
 const keys = @import("../identity/keys.zig");
 const Org = @import("../identity/org.zig");
+const Binding = @import("../identity/binding.zig");
 const Udp = @import("../net/udp.zig");
 const Holepuncher = @import("../nat/holepunch.zig").Holepuncher;
 const Relay = @import("../nat/relay.zig");
@@ -252,6 +253,9 @@ pub const SwimProtocol = struct {
     // Node's own org certificate (if any, loaded at init)
     our_org_cert: ?[messages.ORG_CERT_WIRE_SIZE]u8 = null,
 
+    // Our own signed WireGuard binding, sent on every ping and ack.
+    our_wg_binding: ?messages.WgBinding = null,
+
     // Control-plane send rate limiting (token bucket). A hard ceiling on
     // SWIM/gossip packets/sec so a pathological inbound rate (e.g. a NAT
     // retransmit storm) can never be amplified into a network-melting flood.
@@ -367,20 +371,40 @@ pub const SwimProtocol = struct {
         return false;
     }
 
-    fn bindPeerWgKeyFromCert(self: *SwimProtocol, pubkey: [32]u8, signed_wg: [32]u8) void {
+    fn bindPeerWgKey(self: *SwimProtocol, pubkey: [32]u8, signed_wg: [32]u8, source: Membership.WgKeySource) void {
         const current = self.membership.peers.get(pubkey) orelse return;
         if (current.wg_pubkey) |existing| {
-            if (std.mem.eql(u8, &existing, &signed_wg)) return;
+            if (std.mem.eql(u8, &existing, &signed_wg)) {
+                if (self.membership.peers.getPtr(pubkey)) |peer| {
+                    if (@intFromEnum(source) > @intFromEnum(peer.wg_key_source)) peer.wg_key_source = source;
+                }
+                return;
+            }
             if (self.handler) |h| {
                 h.onPeerDead(h.ctx, pubkey);
             }
         }
         if (self.membership.peers.getPtr(pubkey)) |peer| {
             peer.wg_pubkey = signed_wg;
+            peer.wg_key_source = source;
             if (self.handler) |h| {
                 h.onPeerJoin(h.ctx, peer);
             }
         }
+    }
+
+    /// Adopts the WireGuard key a peer signed itself. It replaces a key that
+    /// third-party gossip claimed for the peer, never one that a trusted
+    /// certificate binds. Verification runs only when the key would change.
+    fn recordWgBinding(self: *SwimProtocol, pubkey: [32]u8, binding: messages.WgBinding) void {
+        const peer = self.membership.peers.get(pubkey) orelse return;
+        if (peer.wg_pubkey) |existing| {
+            const same = std.mem.eql(u8, &existing, &binding.wg_pubkey);
+            if (same and peer.wg_key_source != .gossip) return;
+            if (!same and peer.wg_key_source == .certificate) return;
+        }
+        if (!Binding.verify(pubkey, binding)) return;
+        self.bindPeerWgKey(pubkey, binding.wg_pubkey, .binding);
     }
 
     fn recordPeerCertificate(self: *SwimProtocol, pubkey: [32]u8, cert_wire: [messages.ORG_CERT_WIRE_SIZE]u8) void {
@@ -394,7 +418,7 @@ pub const SwimProtocol = struct {
             peer.cert_expires_at = cert.expires_at;
         }
         if (signed_wg) |wg| {
-            self.bindPeerWgKeyFromCert(pubkey, wg);
+            self.bindPeerWgKey(pubkey, wg, .certificate);
         }
     }
 
@@ -455,6 +479,12 @@ pub const SwimProtocol = struct {
     }
 
     /// Set this node's org certificate.
+    /// Advertise our WireGuard key with our own signature over it, so peers can
+    /// tell it from a key claimed for us by third-party gossip.
+    pub fn setWgBinding(self: *SwimProtocol, binding: messages.WgBinding) void {
+        self.our_wg_binding = binding;
+    }
+
     pub fn setOrgCert(self: *SwimProtocol, cert_wire: [messages.ORG_CERT_WIRE_SIZE]u8) void {
         self.our_org_cert = cert_wire;
     }
@@ -492,6 +522,7 @@ pub const SwimProtocol = struct {
             .gossip = &leave_gossip,
             .org_cert = self.our_org_cert orelse std.mem.zeroes([messages.ORG_CERT_WIRE_SIZE]u8),
             .has_org_cert = self.our_org_cert != null,
+            .wg_binding = self.our_wg_binding,
         };
 
         var buf: [1500]u8 = undefined;
@@ -1021,6 +1052,9 @@ pub const SwimProtocol = struct {
             if (ping.has_org_cert) {
                 self.recordPeerCertificate(ping.sender_pubkey, ping.org_cert);
             }
+            if (ping.wg_binding) |binding| {
+                self.recordWgBinding(ping.sender_pubkey, binding);
+            }
             self.removeCandidatePeer(ping.sender_pubkey);
             // Authenticated contact: detect + heal a peer restart.
             self.handleSenderIncarnation(ping.sender_pubkey, ping.incarnation);
@@ -1040,6 +1074,7 @@ pub const SwimProtocol = struct {
             .gossip = gossip,
             .org_cert = self.our_org_cert orelse std.mem.zeroes([messages.ORG_CERT_WIRE_SIZE]u8),
             .has_org_cert = self.our_org_cert != null,
+            .wg_binding = self.our_wg_binding,
         };
 
         var buf: [1500]u8 = undefined;
@@ -1058,6 +1093,9 @@ pub const SwimProtocol = struct {
             self.registerOrUpdatePeerEndpoint(ack.sender_pubkey, sender_endpoint);
             if (ack.has_org_cert) {
                 self.recordPeerCertificate(ack.sender_pubkey, ack.org_cert);
+            }
+            if (ack.wg_binding) |binding| {
+                self.recordWgBinding(ack.sender_pubkey, binding);
             }
             self.removeCandidatePeer(ack.sender_pubkey);
             // Authenticated contact: detect + heal a peer restart.
@@ -1085,6 +1123,7 @@ pub const SwimProtocol = struct {
                     .gossip = &.{},
                     .org_cert = std.mem.zeroes([messages.ORG_CERT_WIRE_SIZE]u8),
                     .has_org_cert = false,
+                    .wg_binding = self.our_wg_binding,
                 };
                 var ack_buf: [1500]u8 = undefined;
                 if (codec.encodeAck(&ack_buf, relay_ack)) |written| {
@@ -1407,6 +1446,7 @@ pub const SwimProtocol = struct {
             .gossip = gossip,
             .org_cert = self.our_org_cert orelse std.mem.zeroes([messages.ORG_CERT_WIRE_SIZE]u8),
             .has_org_cert = self.our_org_cert != null,
+            .wg_binding = self.our_wg_binding,
         };
 
         var buf: [1500]u8 = undefined;
@@ -1610,7 +1650,9 @@ pub const SwimProtocol = struct {
         // Clamp to the snapshot buffer size as well: max_gossip_per_message is an
         // operator-settable config value and could exceed gossip_snap.len, which
         // would overflow the fixed buffer in the copy loop below.
-        const count = @min(@min(self.gossip_count, self.config.max_gossip_per_message), self.gossip_snap.len);
+        // Leave room for our certificate and binding within one datagram.
+        const fits = codec.maxGossipEntries(self.our_org_cert != null, self.our_wg_binding != null);
+        const count = @min(@min(@min(self.gossip_count, self.config.max_gossip_per_message), self.gossip_snap.len), fits);
 
         // Copy entries into snapshot buffer
         for (0..count) |i| {
@@ -3332,4 +3374,124 @@ test "S2: genuine rejoin proceeds when no live tunnel (not over-gated)" {
     try std.testing.expectEqual(@as(usize, 1), tctx.join_count);
     try std.testing.expectEqual(@as(usize, 0), tctx.reinit_count); // rebuild path, not re-init
     try std.testing.expectEqual(@as(u64, 200), membership.peers.get(v).?.incarnation);
+}
+
+fn testBinding(node_kp: keys.KeyPair, wg_pubkey: [32]u8) !messages.WgBinding {
+    return Binding.sign(try std.crypto.sign.Ed25519.KeyPair.fromSecretKey(node_kp.secret_key), wg_pubkey);
+}
+
+fn ackWithBinding(buf: []u8, sender: [32]u8, binding: messages.WgBinding, cert: ?[messages.ORG_CERT_WIRE_SIZE]u8) ![]const u8 {
+    const written = try codec.encodeAck(buf, .{
+        .sender_pubkey = sender,
+        .seq = 2,
+        .gossip = &.{},
+        .org_cert = cert orelse std.mem.zeroes([messages.ORG_CERT_WIRE_SIZE]u8),
+        .has_org_cert = cert != null,
+        .wg_binding = binding,
+    });
+    return buf[0..written];
+}
+
+test "a peer's own signed WireGuard key replaces one claimed by gossip" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+    var joins = JoinCounter{};
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, .{
+        .ctx = &joins,
+        .onPeerJoin = countPeerJoin,
+        .onPeerDead = countPeerDead,
+    });
+
+    const node_kp = keys.generate();
+    const node_pubkey = node_kp.public_key.toBytes();
+    const claimed_wg = [_]u8{0xF0} ** 32;
+    const own_wg = [_]u8{0x92} ** 32;
+    const endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 43102);
+
+    swim.applyGossip(.{ .subject_pubkey = node_pubkey, .event = .join, .lamport = 1, .endpoint = endpoint, .wg_pubkey = claimed_wg });
+    try std.testing.expectEqualSlices(u8, &claimed_wg, &membership.peers.get(node_pubkey).?.wg_pubkey.?);
+
+    var buf: [1500]u8 = undefined;
+    swim.handleMessage(try ackWithBinding(&buf, node_pubkey, try testBinding(node_kp, own_wg), null), endpoint);
+
+    const peer = membership.peers.get(node_pubkey).?;
+    try std.testing.expectEqualSlices(u8, &own_wg, &peer.wg_pubkey.?);
+    try std.testing.expectEqual(Membership.WgKeySource.binding, peer.wg_key_source);
+    try std.testing.expectEqual(@as(usize, 1), joins.dead_count);
+    try std.testing.expectEqual(@as(usize, 2), joins.count);
+
+    // Repeating the binding changes nothing; gossip can no longer replace it.
+    swim.handleMessage(try ackWithBinding(&buf, node_pubkey, try testBinding(node_kp, own_wg), null), endpoint);
+    swim.applyGossip(.{ .subject_pubkey = node_pubkey, .event = .alive, .lamport = 2, .endpoint = endpoint, .wg_pubkey = claimed_wg });
+    try std.testing.expectEqualSlices(u8, &own_wg, &membership.peers.get(node_pubkey).?.wg_pubkey.?);
+    try std.testing.expectEqual(@as(usize, 1), joins.dead_count);
+}
+
+test "a binding signed by someone else is ignored" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+
+    const victim = keys.generate().public_key.toBytes();
+    const attacker_kp = keys.generate();
+    const victim_wg = [_]u8{0x31} ** 32;
+    const endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 43103);
+    swim.applyGossip(.{ .subject_pubkey = victim, .event = .join, .lamport = 1, .endpoint = endpoint, .wg_pubkey = victim_wg });
+
+    // The attacker claims the victim's identity with its own key, signed by itself.
+    var buf: [1500]u8 = undefined;
+    swim.handleMessage(try ackWithBinding(&buf, victim, try testBinding(attacker_kp, [_]u8{0x66} ** 32), null), endpoint);
+
+    const peer = membership.peers.get(victim).?;
+    try std.testing.expectEqualSlices(u8, &victim_wg, &peer.wg_pubkey.?);
+    try std.testing.expectEqual(Membership.WgKeySource.gossip, peer.wg_key_source);
+}
+
+test "a self-signed binding never overrides a certificate-bound key" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    swim.enableTrust();
+    const org_kp = Org.generateOrgKeyPair();
+    swim.addTrustedOrg(org_kp.public_key.toBytes());
+
+    const node_kp = keys.generate();
+    const node_pubkey = node_kp.public_key.toBytes();
+    const cert_wg = [_]u8{0x92} ** 32;
+    const other_wg = [_]u8{0x93} ** 32;
+    const endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 43104);
+
+    var buf: [1500]u8 = undefined;
+    const cert_wire = try issueCertV2Wire(org_kp, node_pubkey, cert_wg, "node");
+    swim.handleMessage(try ackWithBinding(&buf, node_pubkey, try testBinding(node_kp, cert_wg), cert_wire), endpoint);
+    try std.testing.expectEqual(Membership.WgKeySource.certificate, membership.peers.get(node_pubkey).?.wg_key_source);
+
+    swim.handleMessage(try ackWithBinding(&buf, node_pubkey, try testBinding(node_kp, other_wg), null), endpoint);
+    const peer = membership.peers.get(node_pubkey).?;
+    try std.testing.expectEqualSlices(u8, &cert_wg, &peer.wg_pubkey.?);
+    try std.testing.expectEqual(Membership.WgKeySource.certificate, peer.wg_key_source);
+}
+
+test "our pings and acks advertise our binding and fit one datagram" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    swim.setWgBinding(.{ .wg_pubkey = [_]u8{2} ** 32, .signature = [_]u8{9} ** 64 });
+    swim.setOrgCert([_]u8{0xC7} ** messages.ORG_CERT_WIRE_SIZE);
+
+    for (0..12) |i| {
+        swim.enqueueGossip(.{
+            .subject_pubkey = [_]u8{@intCast(i + 10)} ** 32,
+            .event = .alive,
+            .lamport = i,
+            .endpoint = messages.Endpoint.initV4(.{ 10, 0, 0, @intCast(i) }, 51821),
+            .wg_pubkey = [_]u8{@intCast(i + 40)} ** 32,
+        });
+    }
+    const gossip = swim.collectGossip();
+    try std.testing.expectEqual(codec.maxGossipEntries(true, true), gossip.len);
 }

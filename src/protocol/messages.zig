@@ -7,6 +7,15 @@ const std = @import("std");
 
 pub const ORG_CERT_WIRE_SIZE: usize = 314;
 
+/// A node's WireGuard key with its own Ed25519 signature over it
+/// (see identity/binding.zig). Optional trailer on Ping and Ack.
+pub const WgBinding = struct {
+    wg_pubkey: [32]u8,
+    signature: [64]u8,
+
+    pub const WIRE_SIZE: usize = 32 + 64;
+};
+
 /// Message type tag — first byte of every wire message.
 pub const MessageType = enum(u8) {
     // ─── SWIM protocol ───
@@ -59,6 +68,8 @@ pub const Ping = struct {
     org_cert: [ORG_CERT_WIRE_SIZE]u8 = std.mem.zeroes([ORG_CERT_WIRE_SIZE]u8),
     /// Whether org_cert contains a valid certificate.
     has_org_cert: bool = false,
+    /// Sender's signed WireGuard key, appended after the certificate.
+    wg_binding: ?WgBinding = null,
 };
 
 /// SWIM Ping-Req: ask another node to probe a target.
@@ -79,6 +90,8 @@ pub const Ack = struct {
     org_cert: [ORG_CERT_WIRE_SIZE]u8 = std.mem.zeroes([ORG_CERT_WIRE_SIZE]u8),
     /// Whether org_cert contains a valid certificate.
     has_org_cert: bool = false,
+    /// Sender's signed WireGuard key, appended after the certificate.
+    wg_binding: ?WgBinding = null,
 };
 
 /// Handshake initiation: sent when two nodes first discover each other.

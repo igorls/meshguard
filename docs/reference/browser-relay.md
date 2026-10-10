@@ -26,6 +26,12 @@ Both keys must match an explicit operator allowlist. Signatures use the domain
 allowed. Origin filtering complements identity authentication; it is not a
 substitute for it.
 
+The authentication message may also carry `binding`: the browser's signature
+over its WireGuard key in the wire format's binding domain (see
+`docs/concepts/wire-protocol.md`), which `MeshguardRelayClient` always sends.
+The gateway verifies it once and then accepts the 262-byte self entry that
+carries exactly that binding, as well as the 165-byte entry without one.
+
 The packet gate accepts only the authenticated browser's own SWIM self entry,
 WireGuard initiations, and size-bounded sealed app packets to configured
 destinations. It rejects claimed third-party app senders and gossip subjects.

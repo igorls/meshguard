@@ -3,6 +3,7 @@ export const b64 = bytes => btoa(String.fromCharCode(...new Uint8Array(bytes)));
 export const fromB64 = value => Uint8Array.from(atob(value), char => char.charCodeAt(0));
 export const same = (a, b) => a.length === b.length && a.every((byte, i) => byte === b[i]);
 export const authDomain = new TextEncoder().encode('meshguard-browser-gateway-v1\0');
+export const bindingDomain = new TextEncoder().encode('meshguard-wg-binding-v1\0');
 export function authPayload(challenge, publicKey, wgPublicKey) {
   const out = new Uint8Array(authDomain.length + 96);
   out.set(authDomain); out.set(challenge, authDomain.length);
@@ -10,9 +11,18 @@ export function authPayload(challenge, publicKey, wgPublicKey) {
   return out;
 }
 
-// Native SWIM header (50 bytes) followed by exactly one 115-byte self entry.
-export function selfAdvertisement(identity, endpoint, type, sequence, incarnation) {
-  const out = new Uint8Array(165);
+// The identity's signature over its own WireGuard key (identity/binding.zig), so
+// relays and peers can tell it from a key that gossip claims for this identity.
+export function bindingPayload(publicKey, wgPublicKey) {
+  const out = new Uint8Array(bindingDomain.length + 64);
+  out.set(bindingDomain); out.set(publicKey, bindingDomain.length); out.set(wgPublicKey, bindingDomain.length + 32);
+  return out;
+}
+
+// Native SWIM header (50 bytes) followed by exactly one 115-byte self entry, then
+// the optional 97-byte binding extension: [0x02][wg key][signature].
+export function selfAdvertisement(identity, endpoint, type, sequence, incarnation, binding) {
+  const out = new Uint8Array(binding ? 262 : 165);
   const view = new DataView(out.buffer);
   out[0] = type; out.set(identity.publicKey(), 1);
   view.setBigUint64(33, sequence, true); view.setBigUint64(41, incarnation, true);
@@ -22,6 +32,7 @@ export function selfAdvertisement(identity, endpoint, type, sequence, incarnatio
   out.set(endpoint.address.split('.').map(Number), 93);
   view.setUint16(109, endpoint.port, true);
   out[111] = 1; out.set(identity.wgPublicKey(), 112); out[164] = 3;
+  if (binding) { out[165] = 2; out.set(identity.wgPublicKey(), 166); out.set(binding, 198); }
   return out;
 }
 
@@ -40,6 +51,7 @@ export function gossipKeys(frame) {
 export class MeshguardRelayClient extends EventTarget {
   constructor({ identity, url, relay, trustedPeers = [] }) {
     super(); this.identity = identity; this.url = url; this.relay = relay;
+    this.binding = identity.sign(bindingPayload(identity.publicKey(), identity.wgPublicKey()));
     this.peers = new Map(trustedPeers.map(peer => [b64(peer.publicKey), peer]));
     this.stats = { sent: 0, received: 0, duplicates: 0, rejected: 0, handshakes: 0, connections: 0 };
     this.seen = new Map(); this.sequence = 1n; this.incarnation = BigInt(Date.now()) * 1000000n;
@@ -70,7 +82,7 @@ export class MeshguardRelayClient extends EventTarget {
       const challenge = fromB64(message.challenge);
       if (challenge.length !== 32) throw new Error('Invalid gateway challenge');
       this.socket.send(JSON.stringify({ type: 'authenticate', publicKey: b64(this.identity.publicKey()),
-        wgPublicKey: b64(this.identity.wgPublicKey()),
+        wgPublicKey: b64(this.identity.wgPublicKey()), binding: b64(this.binding),
         signature: b64(this.identity.sign(authPayload(challenge, this.identity.publicKey(), this.identity.wgPublicKey()))) }));
     } else if (message.type === 'ready') {
       this.endpoint = message.endpoint; this.stats.connections++; this.retry = 0;
@@ -88,7 +100,7 @@ export class MeshguardRelayClient extends EventTarget {
     this.socket.send(frame); return true;
   }
   advertise(type = 1, sequence = this.sequence++) {
-    if (this.endpoint) this.sendRaw(selfAdvertisement(this.identity, this.endpoint, type, sequence, this.incarnation));
+    if (this.endpoint) this.sendRaw(selfAdvertisement(this.identity, this.endpoint, type, sequence, this.incarnation, this.binding));
   }
   handshake() {
     this.lastHandshake = Date.now();

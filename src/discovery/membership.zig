@@ -26,6 +26,16 @@ pub const PeerState = enum {
     left, // graceful departure
 };
 
+/// Where a peer's WireGuard key came from, weakest first.
+pub const WgKeySource = enum(u8) {
+    /// Third-party gossip; unauthenticated.
+    gossip,
+    /// The peer's own signed binding (identity/binding.zig).
+    binding,
+    /// A trusted organization certificate that binds the key.
+    certificate,
+};
+
 pub const Peer = struct {
     /// Ed25519 public key — the peer's identity
     pubkey: [32]u8,
@@ -37,6 +47,8 @@ pub const Peer = struct {
     gossip_endpoint: ?messages.Endpoint,
     /// WireGuard public key (exchanged during handshake)
     wg_pubkey: ?[32]u8,
+    /// Who vouched for `wg_pubkey`. Signed keys are never replaced by gossip.
+    wg_key_source: WgKeySource = .gossip,
     /// Deterministic mesh IP
     mesh_ip: [4]u8,
     /// Deterministic mesh IPv6 address

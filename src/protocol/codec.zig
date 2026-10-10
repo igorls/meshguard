@@ -2,11 +2,17 @@
 //!
 //! Format: [1B type][payload...]
 //!
-//! Ping:     [0x01][32B pubkey][8B seq][8B incarnation][1B gossip_count][N × gossip_entry][opt org_cert ext]
-//! Ack:      [0x03][32B pubkey][8B seq][8B incarnation][1B gossip_count][N × gossip_entry][opt org_cert ext]
+//! Ping:     [0x01][32B pubkey][8B seq][8B incarnation][1B gossip_count][N × gossip_entry][extensions]
+//! Ack:      [0x03][32B pubkey][8B seq][8B incarnation][1B gossip_count][N × gossip_entry][extensions]
 //! PingReq:  [0x02][32B sender][32B target][8B seq]
 //!
 //! GossipEntry endpoints: [1B has_ep][1B family: 4/6][16B addr][2B port]
+//!
+//! Ping/Ack extensions, in this order, each optional:
+//!   [0x01][314B org certificate]     (legacy senders may send a 186-byte v1 cert)
+//!   [0x02][32B wg_pubkey][64B sig]   signed WireGuard binding (identity/binding.zig)
+//! Older decoders read only a leading 0x01 and copy at most 314 bytes, so they
+//! ignore the binding.
 
 const std = @import("std");
 const messages = @import("messages.zig");
@@ -15,13 +21,54 @@ const ENDPOINT_SIZE = 1 + 1 + 16 + 2;
 const GOSSIP_ENTRY_SIZE = 32 + 1 + 8 + ENDPOINT_SIZE + 1 + 32 + ENDPOINT_SIZE + 1; // 115 bytes
 const ORG_CERT_EXTENSION_SIZE = 1 + messages.ORG_CERT_WIRE_SIZE;
 const ORG_CERT_V1_EXTENSION_SIZE = 1 + 186;
+const WG_BINDING_EXTENSION_SIZE = 1 + messages.WgBinding.WIRE_SIZE;
+const EXT_ORG_CERT: u8 = 0x01;
+const EXT_WG_BINDING: u8 = 0x02;
+const PING_HEADER_SIZE = 1 + 32 + 8 + 8 + 1;
+
+/// Ping/Ack datagrams stay within this size, below the 1280-byte IPv6
+/// minimum MTU once IP and UDP headers are added.
+pub const MAX_SWIM_DATAGRAM: usize = 1200;
+/// Decoders keep at most this many gossip entries per message.
+pub const MAX_DECODED_GOSSIP: usize = 8;
+
+/// How many gossip entries fit next to the given extensions.
+pub fn maxGossipEntries(has_org_cert: bool, has_wg_binding: bool) usize {
+    const extensions = (if (has_org_cert) ORG_CERT_EXTENSION_SIZE else 0) +
+        (if (has_wg_binding) WG_BINDING_EXTENSION_SIZE else 0);
+    return @min(MAX_DECODED_GOSSIP, (MAX_SWIM_DATAGRAM - PING_HEADER_SIZE - extensions) / GOSSIP_ENTRY_SIZE);
+}
+
+fn extensionsSize(has_org_cert: bool, wg_binding: ?messages.WgBinding) usize {
+    return (if (has_org_cert) ORG_CERT_EXTENSION_SIZE else 0) +
+        (if (wg_binding != null) WG_BINDING_EXTENSION_SIZE else 0);
+}
+
+fn encodeExtensions(buf: []u8, has_org_cert: bool, org_cert: *const [messages.ORG_CERT_WIRE_SIZE]u8, wg_binding: ?messages.WgBinding) usize {
+    var pos: usize = 0;
+    if (has_org_cert) {
+        buf[pos] = EXT_ORG_CERT;
+        pos += 1;
+        @memcpy(buf[pos..][0..messages.ORG_CERT_WIRE_SIZE], org_cert);
+        pos += messages.ORG_CERT_WIRE_SIZE;
+    }
+    if (wg_binding) |binding| {
+        buf[pos] = EXT_WG_BINDING;
+        pos += 1;
+        @memcpy(buf[pos..][0..32], &binding.wg_pubkey);
+        pos += 32;
+        @memcpy(buf[pos..][0..64], &binding.signature);
+        pos += 64;
+    }
+    return pos;
+}
 
 // ─── Encoding ───
 
 /// Encode a Ping message into a buffer. Returns bytes written.
 pub fn encodePing(buf: []u8, ping: messages.Ping) !usize {
-    const required = 1 + 32 + 8 + 8 + 1 + ping.gossip.len * GOSSIP_ENTRY_SIZE +
-        if (ping.has_org_cert) ORG_CERT_EXTENSION_SIZE else 0;
+    const required = PING_HEADER_SIZE + @as(usize, @min(ping.gossip.len, 255)) * GOSSIP_ENTRY_SIZE +
+        extensionsSize(ping.has_org_cert, ping.wg_binding);
     if (buf.len < required) return error.BufferTooShort;
 
     var pos: usize = 0;
@@ -51,20 +98,14 @@ pub fn encodePing(buf: []u8, ping: messages.Ping) !usize {
         pos += try encodeGossipEntry(buf[pos..], entry);
     }
 
-    if (ping.has_org_cert) {
-        buf[pos] = 1;
-        pos += 1;
-        @memcpy(buf[pos..][0..messages.ORG_CERT_WIRE_SIZE], &ping.org_cert);
-        pos += messages.ORG_CERT_WIRE_SIZE;
-    }
-
+    pos += encodeExtensions(buf[pos..], ping.has_org_cert, &ping.org_cert, ping.wg_binding);
     return pos;
 }
 
 /// Encode an Ack message into a buffer. Returns bytes written.
 pub fn encodeAck(buf: []u8, ack: messages.Ack) !usize {
-    const required = 1 + 32 + 8 + 8 + 1 + ack.gossip.len * GOSSIP_ENTRY_SIZE +
-        if (ack.has_org_cert) ORG_CERT_EXTENSION_SIZE else 0;
+    const required = PING_HEADER_SIZE + @as(usize, @min(ack.gossip.len, 255)) * GOSSIP_ENTRY_SIZE +
+        extensionsSize(ack.has_org_cert, ack.wg_binding);
     if (buf.len < required) return error.BufferTooShort;
 
     var pos: usize = 0;
@@ -90,13 +131,7 @@ pub fn encodeAck(buf: []u8, ack: messages.Ack) !usize {
         pos += try encodeGossipEntry(buf[pos..], entry);
     }
 
-    if (ack.has_org_cert) {
-        buf[pos] = 1;
-        pos += 1;
-        @memcpy(buf[pos..][0..messages.ORG_CERT_WIRE_SIZE], &ack.org_cert);
-        pos += messages.ORG_CERT_WIRE_SIZE;
-    }
-
+    pos += encodeExtensions(buf[pos..], ack.has_org_cert, &ack.org_cert, ack.wg_binding);
     return pos;
 }
 
@@ -360,6 +395,7 @@ pub const DecodedPing = struct {
     gossip_count: u8 = 0,
     org_cert: [messages.ORG_CERT_WIRE_SIZE]u8 = std.mem.zeroes([messages.ORG_CERT_WIRE_SIZE]u8),
     has_org_cert: bool = false,
+    wg_binding: ?messages.WgBinding = null,
 
     pub fn gossip(self: *const DecodedPing) []const messages.GossipEntry {
         return self.gossip_buf[0..self.gossip_count];
@@ -375,6 +411,7 @@ pub const DecodedAck = struct {
     gossip_count: u8 = 0,
     org_cert: [messages.ORG_CERT_WIRE_SIZE]u8 = std.mem.zeroes([messages.ORG_CERT_WIRE_SIZE]u8),
     has_org_cert: bool = false,
+    wg_binding: ?messages.WgBinding = null,
 
     pub fn gossip(self: *const DecodedAck) []const messages.GossipEntry {
         return self.gossip_buf[0..self.gossip_count];
@@ -414,19 +451,8 @@ fn decodePing(data: []const u8) DecodeError!DecodedPing {
     result.seq = std.mem.readInt(u64, data[32..40], .little);
     result.incarnation = std.mem.readInt(u64, data[40..48], .little);
 
-    const advertised_gossip_count = @min(data[48], 8);
-
-    var pos: usize = 49;
-    var parsed_gossip_count: u8 = 0;
-    for (0..advertised_gossip_count) |i| {
-        if (pos + GOSSIP_ENTRY_SIZE > data.len) break;
-        result.gossip_buf[i] = decodeGossipEntry(data[pos..]) catch break;
-        pos += GOSSIP_ENTRY_SIZE;
-        parsed_gossip_count += 1;
-    }
-    result.gossip_count = parsed_gossip_count;
-
-    try decodeOrgCertExtension(data, pos, &result.org_cert, &result.has_org_cert);
+    result.gossip_count = decodeGossipEntries(data, &result.gossip_buf);
+    decodeExtensions(data, &result.org_cert, &result.has_org_cert, &result.wg_binding);
 
     return result;
 }
@@ -443,40 +469,55 @@ fn decodeAck(data: []const u8) DecodeError!DecodedAck {
     result.seq = std.mem.readInt(u64, data[32..40], .little);
     result.incarnation = std.mem.readInt(u64, data[40..48], .little);
 
-    const advertised_gossip_count = @min(data[48], 8);
-
-    var pos: usize = 49;
-    var parsed_gossip_count: u8 = 0;
-    for (0..advertised_gossip_count) |i| {
-        if (pos + GOSSIP_ENTRY_SIZE > data.len) break;
-        result.gossip_buf[i] = decodeGossipEntry(data[pos..]) catch break;
-        pos += GOSSIP_ENTRY_SIZE;
-        parsed_gossip_count += 1;
-    }
-    result.gossip_count = parsed_gossip_count;
-
-    try decodeOrgCertExtension(data, pos, &result.org_cert, &result.has_org_cert);
+    result.gossip_count = decodeGossipEntries(data, &result.gossip_buf);
+    decodeExtensions(data, &result.org_cert, &result.has_org_cert, &result.wg_binding);
 
     return result;
 }
 
-fn decodeOrgCertExtension(
+/// Decodes up to MAX_DECODED_GOSSIP entries that follow the Ping/Ack header.
+fn decodeGossipEntries(data: []const u8, out: *[MAX_DECODED_GOSSIP]messages.GossipEntry) u8 {
+    const advertised: usize = @min(data[48], MAX_DECODED_GOSSIP);
+    var pos: usize = PING_HEADER_SIZE - 1;
+    var parsed: u8 = 0;
+    for (0..advertised) |i| {
+        if (pos + GOSSIP_ENTRY_SIZE > data.len) break;
+        out[i] = decodeGossipEntry(data[pos..]) catch break;
+        pos += GOSSIP_ENTRY_SIZE;
+        parsed += 1;
+    }
+    return parsed;
+}
+
+/// Reads the optional extensions after every advertised gossip entry. `data`
+/// excludes the type byte. A truncated or malformed extension never
+/// invalidates the packet: its liveness and gossip are already parsed.
+fn decodeExtensions(
     data: []const u8,
-    pos: usize,
     cert: *[messages.ORG_CERT_WIRE_SIZE]u8,
     has_cert: *bool,
-) DecodeError!void {
+    wg_binding: *?messages.WgBinding,
+) void {
+    var pos: usize = PING_HEADER_SIZE - 1 + @as(usize, data[48]) * GOSSIP_ENTRY_SIZE;
     if (pos >= data.len) return;
-    if (data[pos] != 1) return;
-    // A truncated/malformed trailing extension must not nullify an otherwise-valid
-    // SWIM packet (its liveness + gossip already parsed). Accept legacy v1
-    // 186-byte certs and zero-fill the v2 extension fields.
-    if (pos + ORG_CERT_V1_EXTENSION_SIZE > data.len) return;
-    @memset(cert, 0);
-    const available = data.len - pos - 1;
-    const copy_len = @min(available, messages.ORG_CERT_WIRE_SIZE);
-    @memcpy(cert[0..copy_len], data[pos + 1 ..][0..copy_len]);
-    has_cert.* = true;
+    if (data[pos] == EXT_ORG_CERT) {
+        // Accept legacy v1 186-byte certs and zero-fill the v2 fields.
+        if (pos + ORG_CERT_V1_EXTENSION_SIZE > data.len) return;
+        @memset(cert, 0);
+        const available = data.len - pos - 1;
+        const copy_len = @min(available, messages.ORG_CERT_WIRE_SIZE);
+        @memcpy(cert[0..copy_len], data[pos + 1 ..][0..copy_len]);
+        has_cert.* = true;
+        // Only a full-size certificate can be followed by another extension.
+        if (available < messages.ORG_CERT_WIRE_SIZE) return;
+        pos += ORG_CERT_EXTENSION_SIZE;
+    }
+    if (pos + WG_BINDING_EXTENSION_SIZE <= data.len and data[pos] == EXT_WG_BINDING) {
+        wg_binding.* = .{
+            .wg_pubkey = data[pos + 1 ..][0..32].*,
+            .signature = data[pos + 33 ..][0..64].*,
+        };
+    }
 }
 
 fn decodePingReq(data: []const u8) DecodeError!messages.PingReq {
@@ -918,4 +959,112 @@ test "truncated trailing org-cert flag does not drop the whole packet (C4)" {
         .ping => |p| try std.testing.expect(!p.has_org_cert),
         else => return error.InvalidMessageType,
     }
+}
+
+fn testGossipEntry(i: u8) messages.GossipEntry {
+    return .{
+        .subject_pubkey = [_]u8{i} ** 32,
+        .event = .alive,
+        .lamport = i,
+        .endpoint = messages.Endpoint.initV4(.{ 10, 0, 0, i }, 51821),
+        .wg_pubkey = [_]u8{i +% 1} ** 32,
+    };
+}
+
+test "ping and ack carry a WireGuard binding with or without a certificate" {
+    const binding = messages.WgBinding{ .wg_pubkey = [_]u8{0x5A} ** 32, .signature = [_]u8{0xB5} ** 64 };
+    const cert = [_]u8{0xC7} ** messages.ORG_CERT_WIRE_SIZE;
+    const gossip = [_]messages.GossipEntry{testGossipEntry(3)};
+
+    for ([_]bool{ false, true }) |with_cert| {
+        var buf: [1500]u8 = undefined;
+        const ping_len = try encodePing(&buf, .{
+            .sender_pubkey = [_]u8{0x42} ** 32,
+            .seq = 5,
+            .gossip = &gossip,
+            .org_cert = if (with_cert) cert else std.mem.zeroes([messages.ORG_CERT_WIRE_SIZE]u8),
+            .has_org_cert = with_cert,
+            .wg_binding = binding,
+        });
+        const ping = (try decode(buf[0..ping_len])).ping;
+        try std.testing.expectEqual(with_cert, ping.has_org_cert);
+        if (with_cert) try std.testing.expectEqualSlices(u8, &cert, &ping.org_cert);
+        try std.testing.expectEqual(@as(u8, 1), ping.gossip_count);
+        try std.testing.expectEqualSlices(u8, &binding.wg_pubkey, &ping.wg_binding.?.wg_pubkey);
+        try std.testing.expectEqualSlices(u8, &binding.signature, &ping.wg_binding.?.signature);
+
+        const ack_len = try encodeAck(&buf, .{
+            .sender_pubkey = [_]u8{0x43} ** 32,
+            .seq = 6,
+            .gossip = &gossip,
+            .org_cert = cert,
+            .has_org_cert = with_cert,
+            .wg_binding = binding,
+        });
+        const ack = (try decode(buf[0..ack_len])).ack;
+        try std.testing.expectEqual(with_cert, ack.has_org_cert);
+        try std.testing.expectEqualSlices(u8, &binding.signature, &ack.wg_binding.?.signature);
+    }
+}
+
+test "packets without a binding decode as before" {
+    var buf: [1500]u8 = undefined;
+    const len = try encodePing(&buf, .{ .sender_pubkey = [_]u8{1} ** 32, .seq = 1, .gossip = &.{} });
+    const ping = (try decode(buf[0..len])).ping;
+    try std.testing.expect(ping.wg_binding == null);
+    try std.testing.expect(!ping.has_org_cert);
+}
+
+test "a legacy decoder reading the certificate ignores the binding behind it" {
+    // Pre-binding decoders copy at most 314 bytes after a 0x01 flag; the
+    // binding must start exactly there so they never mistake it for a cert.
+    const cert = [_]u8{0xC7} ** messages.ORG_CERT_WIRE_SIZE;
+    var buf: [1500]u8 = undefined;
+    const len = try encodePing(&buf, .{
+        .sender_pubkey = [_]u8{1} ** 32,
+        .seq = 1,
+        .gossip = &.{},
+        .org_cert = cert,
+        .has_org_cert = true,
+        .wg_binding = .{ .wg_pubkey = [_]u8{2} ** 32, .signature = [_]u8{3} ** 64 },
+    });
+    try std.testing.expectEqual(@as(usize, PING_HEADER_SIZE + ORG_CERT_EXTENSION_SIZE + WG_BINDING_EXTENSION_SIZE), len);
+    try std.testing.expectEqual(EXT_ORG_CERT, buf[PING_HEADER_SIZE]);
+    try std.testing.expectEqual(EXT_WG_BINDING, buf[PING_HEADER_SIZE + ORG_CERT_EXTENSION_SIZE]);
+}
+
+test "a truncated binding is ignored without dropping the packet" {
+    var buf: [1500]u8 = undefined;
+    const len = try encodePing(&buf, .{
+        .sender_pubkey = [_]u8{1} ** 32,
+        .seq = 1,
+        .gossip = &.{},
+        .wg_binding = .{ .wg_pubkey = [_]u8{2} ** 32, .signature = [_]u8{3} ** 64 },
+    });
+    const ping = (try decode(buf[0 .. len - 1])).ping;
+    try std.testing.expect(ping.wg_binding == null);
+}
+
+test "maximum gossip with every extension stays within the datagram budget" {
+    var entries: [MAX_DECODED_GOSSIP]messages.GossipEntry = undefined;
+    for (&entries, 0..) |*entry, i| entry.* = testGossipEntry(@intCast(i + 1));
+
+    for ([_]bool{ false, true }) |with_cert| {
+        for ([_]bool{ false, true }) |with_binding| {
+            const count = maxGossipEntries(with_cert, with_binding);
+            var buf: [1500]u8 = undefined;
+            const len = try encodePing(&buf, .{
+                .sender_pubkey = [_]u8{1} ** 32,
+                .seq = 1,
+                .gossip = entries[0..count],
+                .has_org_cert = with_cert,
+                .wg_binding = if (with_binding) messages.WgBinding{ .wg_pubkey = [_]u8{2} ** 32, .signature = [_]u8{3} ** 64 } else null,
+            });
+            try std.testing.expect(len <= MAX_SWIM_DATAGRAM);
+            const ping = (try decode(buf[0..len])).ping;
+            try std.testing.expectEqual(@as(u8, @intCast(count)), ping.gossip_count);
+            try std.testing.expectEqual(with_binding, ping.wg_binding != null);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 6), maxGossipEntries(true, true));
 }

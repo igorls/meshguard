@@ -15,6 +15,7 @@ pub const identity = struct {
     pub const Keys = @import("identity/keys.zig");
     pub const Trust = @import("identity/trust.zig");
     pub const Org = @import("identity/org.zig");
+    pub const Binding = @import("identity/binding.zig");
 };
 
 pub const discovery = struct {

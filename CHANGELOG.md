@@ -8,6 +8,15 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## Unreleased
 
 ### Added
+- Signed WireGuard bindings: every node, mobile context and browser client
+  advertises its WireGuard key with its own Ed25519 signature as an optional
+  Ping/Ack extension (`0x02`, 97 bytes). Receivers replace a gossip-claimed key
+  with the owner's signed one, certificate-bound keys keep precedence, and
+  mobile clients only handshake with a pinned relay whose key is signed or
+  derived from its identity. The browser gateway verifies a client's binding
+  once at authentication and forwards 262-byte self-advertisements that carry
+  it. Older decoders ignore the extension. See
+  `docs/concepts/wire-protocol.md`.
 - Verified application transfers (`XFER*` control commands, `MGXF1` frames over
   the encrypted `0x50` path): windowed, selectively acknowledged, congestion-
   controlled delivery of files up to 32 MiB with SHA-256 verification, opt-in
