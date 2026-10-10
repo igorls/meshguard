@@ -56,9 +56,13 @@ the prior endpoint unchanged.
 A mobile client with a pinned app relay periodically re-authenticates that
 relay using the existing WG protocol (at most once per 15 seconds while active).
 This carries no application data and does not alter the app-send counters.
-It gives a WG-capable public relay a verifiable current return address after
-an app restart or network change. A gossip-only relay without a WG responder
-can still forward application packets, but cannot confirm this mobility proof.
+It gives the relay a verifiable current return address after an app restart
+or network change. Every daemon answers these handshakes, gossip-only relays
+included, without using a WireGuard peer slot (see `relay-forwarding.md`).
+The client handshakes only when the relay's WireGuard key is signed by the
+relay or derived from its identity.
+
+Mobile contexts never forward frames addressed to others.
 
 Tests cover admitted endpoint confirmation, refusal to move a known endpoint
 from unsigned observation, invalid initiation/response packets, and successful

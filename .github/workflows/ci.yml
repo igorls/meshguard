@@ -54,6 +54,11 @@ jobs:
       - name: Test
         run: zig build test
 
+      - name: Relay forwarding between mobile contexts
+        run: |
+          zig build -Doptimize=ReleaseSafe
+          python3 scripts/test-relay.py zig-out/bin/meshguard zig-out/lib/libmeshguard-ffi.so -v
+
   no-sodium-linux:
     name: Build + Test (ubuntu, std.crypto / no libsodium)
     runs-on: ubuntu-latest

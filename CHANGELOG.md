@@ -8,6 +8,17 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## Unreleased
 
 ### Added
+- Authenticated relay forwarding (`src/relay/core.zig`). A relay forwards
+  sealed `0x50` and `0x31` frames only from an endpoint where the sender's
+  signed WireGuard key is proven by a Noise handshake, only to a destination
+  proven the same way, within per-key packet and byte budgets and a global
+  forwarding budget that no longer shares the discovery send budget. Every
+  daemon answers proof handshakes statelessly, gossip-only relays included,
+  without WireGuard peer slots. `meshguard up --relay` requires proof for all
+  forwarding; other daemons still forward for senders seen at their known
+  endpoint; mobile contexts never forward. New `up` flags set client and
+  forwarding limits, and `status` reports relay counters. See
+  `docs/reference/relay-forwarding.md`.
 - Signed WireGuard bindings: every node, mobile context and browser client
   advertises its WireGuard key with its own Ed25519 signature as an optional
   Ping/Ack extension (`0x02`, 97 bytes). Receivers replace a gossip-claimed key

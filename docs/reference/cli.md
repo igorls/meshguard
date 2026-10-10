@@ -86,6 +86,17 @@ meshguard up [options]
 | `--open`            | `false`  | Accept all peers (skip trust enforcement)   |
 | `--gossip-port`     | `51821`  | Gossip/listen UDP port                      |
 | `--control-path`    | _(auto)_ | Control socket / named-pipe path            |
+| `--relay`           | `false`  | Forward sealed frames only for clients proven by handshake |
+| `--max-clients`     | `16384` with `--relay`, else `1024` | Relay clients tracked at once |
+| `--client-pps`      | `50`     | Frames per second each relay client may send |
+| `--client-kbps`     | `256`    | KiB per second each relay client may send   |
+| `--forward-pps`     | `20000`  | Frames per second forwarded for all clients |
+| `--trusted-handshake-source` | _(none)_ | Address whose handshakes are limited per port, such as a co-located browser gateway |
+| `--legacy-wg-binding` | `false` | Accept gossip-learned WireGuard keys for admitted clients (migration only) |
+
+Relay forwarding is described in `docs/reference/relay-forwarding.md`.
+`meshguard status` includes a `relay` object with client counts, frames
+forwarded, and frames dropped by reason.
 
 **Startup sequence**:
 

@@ -15,6 +15,7 @@ const codec = @import("../protocol/codec.zig");
 const keys = @import("../identity/keys.zig");
 const Org = @import("../identity/org.zig");
 const Binding = @import("../identity/binding.zig");
+const RelayCore = @import("../relay/core.zig");
 const Udp = @import("../net/udp.zig");
 const Holepuncher = @import("../nat/holepunch.zig").Holepuncher;
 const Relay = @import("../nat/relay.zig");
@@ -152,6 +153,17 @@ const CandidatePeer = struct {
     probe_count: u8 = 0,
 };
 
+/// How a node treats sealed frames (`0x50`, `0x31`) addressed to others.
+pub const Forwarding = enum {
+    /// Deliver frames addressed to us; forward nothing (mobile contexts).
+    none,
+    /// Forward for senders proven to the relay core, and otherwise only when
+    /// the frame arrives from the endpoint we know for its sender.
+    endpoint_match,
+    /// Forward only for senders proven to the relay core (`--relay`).
+    authenticated,
+};
+
 /// SWIM protocol state machine with event loop.
 pub const SwimProtocol = struct {
     config: SwimConfig,
@@ -255,6 +267,11 @@ pub const SwimProtocol = struct {
 
     // Our own signed WireGuard binding, sent on every ping and ack.
     our_wg_binding: ?messages.WgBinding = null,
+
+    // Forwarding for others. Mobile contexts never forward; daemons install a
+    // relay core that authenticates senders (see relay/core.zig).
+    forwarding: Forwarding = .none,
+    relay_core: ?*RelayCore.RelayCore = null,
 
     // Control-plane send rate limiting (token bucket). A hard ceiling on
     // SWIM/gossip packets/sec so a pathological inbound rate (e.g. a NAT
@@ -453,6 +470,31 @@ pub const SwimProtocol = struct {
         return false;
     }
 
+    /// Admission callback for the relay core.
+    pub fn relayAdmission(self: *SwimProtocol) RelayCore.Admission {
+        return .{ .ctx = self, .admits = admitsForRelay };
+    }
+
+    fn admitsForRelay(ctx: *anyopaque, identity: [32]u8) bool {
+        const self: *SwimProtocol = @ptrCast(@alignCast(ctx));
+        return self.isAuthorizedPeer(identity, null);
+    }
+
+    /// Answers a Noise initiation for a relay client the WireGuard device does
+    /// not know. Returns true when it was answered.
+    pub fn answerRelayInitiation(self: *SwimProtocol, packet: []const u8, src: messages.Endpoint) bool {
+        const core = self.relay_core orelse return false;
+        const response = core.handleInitiation(packet, src, nowNs()) orelse return false;
+        _ = self.socket.sendToEndpoint(std.mem.asBytes(&response), src) catch return false;
+        return true;
+    }
+
+    fn claimForRelay(self: *SwimProtocol, sender: [32]u8, binding: ?messages.WgBinding, cert: ?*const [messages.ORG_CERT_WIRE_SIZE]u8) void {
+        const core = self.relay_core orelse return;
+        const known_wg = if (self.membership.peers.get(sender)) |p| p.wg_pubkey else null;
+        _ = core.claim(.{ .identity = sender, .wg_binding = binding, .org_cert = cert, .known_wg = known_wg }, nowNs());
+    }
+
     pub fn isKnownRelayParticipant(self: *const SwimProtocol, pubkey: [32]u8) bool {
         if (std.mem.eql(u8, &pubkey, &self.our_pubkey)) return true;
         return self.membership.peers.contains(pubkey);
@@ -566,6 +608,7 @@ pub const SwimProtocol = struct {
         self.checkTimeouts();
 
         // 3. Expire suspected peers
+        if (self.relay_core) |core| core.expire(nowNs(), 256);
         var expired_buf: [256][32]u8 = undefined;
         const expired_n = self.membership.expireSuspected(&expired_buf);
         for (expired_buf[0..expired_n]) |pubkey| {
@@ -667,6 +710,7 @@ pub const SwimProtocol = struct {
         const now_ns = nowNs();
 
         // 2. Expire suspected peers
+        if (self.relay_core) |core| core.expire(nowNs(), 256);
         var expired_buf: [256][32]u8 = undefined;
         const expired_n = self.membership.expireSuspected(&expired_buf);
         for (expired_buf[0..expired_n]) |pubkey| {
@@ -790,6 +834,7 @@ pub const SwimProtocol = struct {
         // These are handled by the tunnel FFI layer via onWgPacket callback.
         if (data.len >= 4) {
             const msg_type = std.mem.readInt(u32, data[0..4], .little);
+            if (msg_type == 1 and self.answerRelayInitiation(data, sender_endpoint)) return;
             if (msg_type >= 1 and msg_type <= 4) {
                 if (self.handler) |h| {
                     if (h.onWgPacket) |cb| {
@@ -840,31 +885,68 @@ pub const SwimProtocol = struct {
 
     fn handleRelayData(self: *SwimProtocol, data: []const u8, sender_endpoint: messages.Endpoint) void {
         const frame = Relay.decodeRelayData(data) catch return;
-        if (!self.isAllowedRelayParticipant(frame.sender_pubkey)) return;
-        if (!self.isAllowedRelayParticipant(frame.target_pubkey)) return;
-        if (!self.relay_limiter.allow(frame.sender_pubkey, nowNs())) return;
-
-        if (std.mem.eql(u8, &frame.target_pubkey, &self.our_pubkey)) {
-            if (self.handler) |h| {
-                if (h.onRelayWgPacket) |cb| {
-                    cb(h.ctx, frame.payload, frame.sender_pubkey, sender_endpoint);
-                } else if (h.onWgPacket) |cb| {
-                    const msg_type = if (frame.payload.len >= 4) std.mem.readInt(u32, frame.payload[0..4], .little) else 0;
-                    if (msg_type == 4) cb(h.ctx, frame.payload, sender_endpoint.addr, sender_endpoint.port);
-                }
+        if (!std.mem.eql(u8, &frame.target_pubkey, &self.our_pubkey)) {
+            if (self.forwardingEndpoint(frame.sender_pubkey, frame.target_pubkey, data.len, sender_endpoint)) |ep| {
+                self.forwardSend(data, ep);
             }
             return;
         }
+        if (!self.isAllowedRelayParticipant(frame.sender_pubkey)) return;
+        if (!self.relay_limiter.allow(frame.sender_pubkey, nowNs())) return;
 
-        const peer = self.membership.peers.get(frame.target_pubkey) orelse return;
-        const ep = peer.gossip_endpoint orelse peer.public_endpoint orelse return;
-        self.gossipSend(data, ep);
+        if (self.handler) |h| {
+            if (h.onRelayWgPacket) |cb| {
+                cb(h.ctx, frame.payload, frame.sender_pubkey, sender_endpoint);
+            } else if (h.onWgPacket) |cb| {
+                const msg_type = if (frame.payload.len >= 4) std.mem.readInt(u32, frame.payload[0..4], .little) else 0;
+                if (msg_type == 4) cb(h.ctx, frame.payload, sender_endpoint.addr, sender_endpoint.port);
+            }
+        }
+    }
+
+    /// Where a frame for someone else should go, or null to drop it. See
+    /// `Forwarding`. Frames forwarded by the relay core are budgeted there.
+    fn forwardingEndpoint(self: *SwimProtocol, sender: [32]u8, destination: [32]u8, len: usize, src: messages.Endpoint) ?ForwardTarget {
+        if (self.forwarding == .none) return null;
+        if (self.relay_core) |core| {
+            switch (core.route(sender, destination, len, src, nowNs())) {
+                .forward => |ep| return .{ .endpoint = ep, .budgeted = true },
+                .drop => |reason| {
+                    if (self.forwarding == .authenticated) return null;
+                    // Only "not known to the core" may fall back to the legacy check.
+                    if (reason != .unproven_sender and reason != .unknown_destination) return null;
+                },
+            }
+        } else if (self.forwarding == .authenticated) return null;
+
+        // Legacy: the sender must be an admitted member whose known endpoint
+        // is where the frame came from. Ping/ack never move a known endpoint,
+        // so this rejects third parties naming someone else as sender.
+        if (!self.isAllowedRelayParticipant(sender)) return null;
+        if (!self.isAllowedRelayParticipant(destination)) return null;
+        const from = self.membership.peers.get(sender) orelse return null;
+        const known = from.gossip_endpoint orelse return null;
+        if (!known.eql(src)) return null;
+        if (!self.relay_limiter.allow(sender, nowNs())) return null;
+        const to = self.membership.peers.get(destination) orelse return null;
+        return .{ .endpoint = to.gossip_endpoint orelse to.public_endpoint orelse return null, .budgeted = false };
+    }
+
+    const ForwardTarget = struct { endpoint: messages.Endpoint, budgeted: bool };
+
+    fn forwardSend(self: *SwimProtocol, data: []const u8, target: ForwardTarget) void {
+        if (target.budgeted) {
+            // The relay core already charged the sender and the global
+            // forwarding budget; discovery keeps its own budget.
+            _ = self.socket.sendToEndpoint(data, target.endpoint) catch {};
+            return;
+        }
+        self.gossipSend(data, target.endpoint);
     }
 
     /// Handle an incoming 0x50 app message: deliver locally or relay.
     /// Wire: [0x50][32B dest_pubkey][32B sender_pubkey][12B nonce][N ciphertext][16B tag]
     fn handleAppMessage(self: *SwimProtocol, data: []const u8, sender_endpoint: messages.Endpoint) void {
-        _ = sender_endpoint;
         // Min size: 1 + 32 + 32 + 12 + 0 + 16 = 93 (empty payload)
         if (data.len < 93) return;
 
@@ -881,15 +963,10 @@ pub const SwimProtocol = struct {
             return;
         }
 
-        // Not for us — relay to destination peer (rate-limited; no per-message
-        // logging in this hot path).
-        var dest_key: [32]u8 = undefined;
-        @memcpy(&dest_key, dest_pubkey);
-        const peer = self.membership.peers.get(dest_key) orelse return;
-        const ep = peer.gossip_endpoint orelse peer.public_endpoint orelse return;
-
-        // Forward the entire message as-is (encrypted, we can't read it)
-        self.gossipSend(data, ep);
+        // Not for us: forward the sealed frame unchanged if its sender is
+        // authentic (no per-message logging in this hot path).
+        const target = self.forwardingEndpoint(data[33..65].*, dest_pubkey.*, data.len, sender_endpoint) orelse return;
+        self.forwardSend(data, target);
     }
 
     /// Verify an org control message before acting on it.
@@ -1055,6 +1132,7 @@ pub const SwimProtocol = struct {
             if (ping.wg_binding) |binding| {
                 self.recordWgBinding(ping.sender_pubkey, binding);
             }
+            self.claimForRelay(ping.sender_pubkey, ping.wg_binding, if (ping.has_org_cert) &ping.org_cert else null);
             self.removeCandidatePeer(ping.sender_pubkey);
             // Authenticated contact: detect + heal a peer restart.
             self.handleSenderIncarnation(ping.sender_pubkey, ping.incarnation);
@@ -1097,6 +1175,7 @@ pub const SwimProtocol = struct {
             if (ack.wg_binding) |binding| {
                 self.recordWgBinding(ack.sender_pubkey, binding);
             }
+            self.claimForRelay(ack.sender_pubkey, ack.wg_binding, if (ack.has_org_cert) &ack.org_cert else null);
             self.removeCandidatePeer(ack.sender_pubkey);
             // Authenticated contact: detect + heal a peer restart.
             self.handleSenderIncarnation(ack.sender_pubkey, ack.incarnation);
@@ -1385,6 +1464,9 @@ pub const SwimProtocol = struct {
             self.membership.lock.lockUncancelable(zio());
             defer self.membership.lock.unlock(zio());
             const peer = self.membership.peers.getPtr(pubkey) orelse return false;
+            if (self.relay_core) |core| {
+                if (peer.wg_pubkey) |wg| core.markProven(wg, endpoint, nowNs());
+            }
             if (peer.gossip_endpoint) |old| {
                 if (std.meta.eql(old, endpoint)) return true;
             }
@@ -3494,4 +3576,177 @@ test "our pings and acks advertise our binding and fit one datagram" {
     }
     const gossip = swim.collectGossip();
     try std.testing.expectEqual(codec.maxGossipEntries(true, true), gossip.len);
+}
+
+fn testSleepMs(ms: u64) void {
+    std.Io.sleep(zio(), std.Io.Duration.fromNanoseconds(ms * std.time.ns_per_ms), .awake) catch {};
+}
+
+/// Receives the next datagram whose first byte is `kind` within a short
+/// wait; other datagrams are skipped.
+fn testReceive(socket: Udp.UdpSocket, buf: []u8, kind: u8) ?[]const u8 {
+    var tries: usize = 0;
+    while (tries < 50) : (tries += 1) {
+        while (socket.recvFrom(buf) catch null) |r| {
+            if (r.data.len > 0 and r.data[0] == kind) return r.data;
+        }
+        testSleepMs(2);
+    }
+    return null;
+}
+
+fn loopback(socket: Udp.UdpSocket) messages.Endpoint {
+    return messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, socket.port);
+}
+
+fn testAppFrame(buf: []u8, dest: [32]u8, sender: [32]u8) []const u8 {
+    buf[0] = 0x50;
+    @memcpy(buf[1..33], &dest);
+    @memcpy(buf[33..65], &sender);
+    @memset(buf[65..120], 0xAB);
+    return buf[0..120];
+}
+
+/// A relay with real loopback sockets for itself and two clients.
+const ForwardFixture = struct {
+    membership: Membership.MembershipTable,
+    relay_socket: Udp.UdpSocket,
+    alice_socket: Udp.UdpSocket,
+    bob_socket: Udp.UdpSocket,
+
+    fn init() !ForwardFixture {
+        var relay_socket = try Udp.UdpSocket.bind(0);
+        errdefer relay_socket.close();
+        var alice_socket = try Udp.UdpSocket.bind(0);
+        errdefer alice_socket.close();
+        const bob_socket = try Udp.UdpSocket.bind(0);
+        return .{
+            .membership = Membership.MembershipTable.init(std.testing.allocator, 5000),
+            .relay_socket = relay_socket,
+            .alice_socket = alice_socket,
+            .bob_socket = bob_socket,
+        };
+    }
+
+    fn deinit(self: *ForwardFixture) void {
+        self.membership.deinit();
+        self.relay_socket.close();
+        self.alice_socket.close();
+        self.bob_socket.close();
+    }
+};
+
+test "mobile contexts never forward frames addressed to others" {
+    var f = ForwardFixture.init() catch return;
+    defer f.deinit();
+    var swim = SwimProtocol.init(&f.membership, f.relay_socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    try std.testing.expectEqual(Forwarding.none, swim.forwarding);
+
+    const alice = [_]u8{0xA1} ** 32;
+    const bob = [_]u8{0xB0} ** 32;
+    swim.registerOrUpdatePeerEndpoint(alice, loopback(f.alice_socket));
+    swim.registerOrUpdatePeerEndpoint(bob, loopback(f.bob_socket));
+
+    var frame_buf: [256]u8 = undefined;
+    swim.handleMessage(testAppFrame(&frame_buf, bob, alice), loopback(f.alice_socket));
+    var buf: [1500]u8 = undefined;
+    try std.testing.expect(testReceive(f.bob_socket, &buf, 0x50) == null);
+}
+
+test "endpoint-match forwarding refuses frames from anywhere but the sender's endpoint" {
+    var f = ForwardFixture.init() catch return;
+    defer f.deinit();
+    var swim = SwimProtocol.init(&f.membership, f.relay_socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    swim.forwarding = .endpoint_match;
+
+    const alice = [_]u8{0xA1} ** 32;
+    const bob = [_]u8{0xB0} ** 32;
+    swim.registerOrUpdatePeerEndpoint(alice, loopback(f.alice_socket));
+    swim.registerOrUpdatePeerEndpoint(bob, loopback(f.bob_socket));
+
+    var frame_buf: [256]u8 = undefined;
+    var buf: [1500]u8 = undefined;
+    const frame = testAppFrame(&frame_buf, bob, alice);
+    // A third party naming Alice as sender is dropped.
+    swim.handleMessage(frame, messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 9));
+    try std.testing.expect(testReceive(f.bob_socket, &buf, 0x50) == null);
+    // Alice's own endpoint is forwarded.
+    swim.handleMessage(frame, loopback(f.alice_socket));
+    const got = testReceive(f.bob_socket, &buf, 0x50) orelse return error.NotForwarded;
+    try std.testing.expectEqualSlices(u8, frame, got);
+}
+
+const TestRelayClient = struct {
+    identity: [32]u8,
+    wg_private: [32]u8,
+    wg_public: [32]u8,
+    binding: messages.WgBinding,
+
+    fn init(seed_byte: u8) !TestRelayClient {
+        const seed = [_]u8{seed_byte} ** 32;
+        const kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+        var private = seed;
+        private[0] &= 248;
+        private[31] &= 127;
+        private[31] |= 64;
+        const public = try std.crypto.dh.X25519.recoverPublicKey(private);
+        return .{ .identity = kp.public_key.toBytes(), .wg_private = private, .wg_public = public, .binding = try Binding.signWithSeed(seed, public) };
+    }
+
+    /// Pings the relay with its binding, then proves its endpoint with a
+    /// Noise handshake, checking the relay's response.
+    fn join(self: *const TestRelayClient, swim: *SwimProtocol, socket: Udp.UdpSocket, relay_wg: [32]u8) !void {
+        var buf: [1500]u8 = undefined;
+        const ping_len = try codec.encodePing(&buf, .{ .sender_pubkey = self.identity, .seq = 1, .gossip = &.{}, .wg_binding = self.binding });
+        swim.handleMessage(buf[0..ping_len], loopback(socket));
+
+        var hs = try WgNoise.Handshake.init(self.wg_private, self.wg_public, relay_wg);
+        defer hs.deinit();
+        const initiation = try hs.createInitiation(11);
+        swim.handleMessage(std.mem.asBytes(&initiation), loopback(socket));
+        const response = testReceive(socket, &buf, 2) orelse return error.NoHandshakeResponse;
+        if (response.len != @sizeOf(WgNoise.HandshakeResponse)) return error.BadResponse;
+        var msg: WgNoise.HandshakeResponse = undefined;
+        @memcpy(std.mem.asBytes(&msg), response);
+        try hs.consumeResponse(&msg);
+    }
+};
+
+const WgNoise = @import("../wireguard/noise.zig");
+
+test "authenticated relays forward only for senders proven by handshake" {
+    var f = ForwardFixture.init() catch return;
+    defer f.deinit();
+    var relay_private = [_]u8{0x77} ** 32;
+    relay_private[0] &= 248;
+    relay_private[31] &= 127;
+    relay_private[31] |= 64;
+    const relay_public = try std.crypto.dh.X25519.recoverPublicKey(relay_private);
+
+    var swim = SwimProtocol.init(&f.membership, f.relay_socket, .{}, [_]u8{1} ** 32, relay_public, .{ 127, 0, 0, 1 }, 51821, null);
+    var core = try RelayCore.RelayCore.init(std.testing.allocator, .{ .max_clients = 64, .max_unproven = 16, .max_claims = 64, .max_handshake_sources = 64 }, relay_private, relay_public, swim.relayAdmission(), nowNs());
+    defer core.deinit();
+    swim.relay_core = &core;
+    swim.forwarding = .authenticated;
+
+    const alice = try TestRelayClient.init(0x11);
+    const bob = try TestRelayClient.init(0x22);
+    try alice.join(&swim, f.alice_socket, relay_public);
+    try bob.join(&swim, f.bob_socket, relay_public);
+    try std.testing.expectEqual(@as(u32, 2), core.provenCount());
+
+    var frame_buf: [256]u8 = undefined;
+    var buf: [1500]u8 = undefined;
+    const frame = testAppFrame(&frame_buf, bob.identity, alice.identity);
+    swim.handleMessage(frame, loopback(f.alice_socket));
+    const got = testReceive(f.bob_socket, &buf, 0x50) orelse return error.NotForwarded;
+    try std.testing.expectEqualSlices(u8, frame, got);
+
+    // Alice's identity from Bob's endpoint, and from an unproven endpoint.
+    var spoof_buf: [256]u8 = undefined;
+    swim.handleMessage(testAppFrame(&spoof_buf, bob.identity, alice.identity), loopback(f.bob_socket));
+    swim.handleMessage(frame, messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 9));
+    try std.testing.expect(testReceive(f.bob_socket, &buf, 0x50) == null);
+    try std.testing.expectEqual(@as(u64, 1), core.stats.droppedFor(.spoofed_sender));
+    try std.testing.expectEqual(@as(u64, 1), core.stats.droppedFor(.unproven_sender));
 }

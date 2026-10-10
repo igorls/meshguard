@@ -56,6 +56,7 @@ export default defineConfig({
           { text: 'Module Map', link: '/reference/modules' },
           { text: 'Browser WASM Core', link: '/reference/wasm-core' },
           { text: 'Browser Relay', link: '/reference/browser-relay' },
+          { text: 'Relay Forwarding', link: '/reference/relay-forwarding' },
         ],
       },
     ],
