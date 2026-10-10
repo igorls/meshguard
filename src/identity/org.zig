@@ -834,3 +834,52 @@ test "org revoke reason parser" {
     try std.testing.expectEqual(@as(?u8, 2), parseRevokeReason("admin_removed"));
     try std.testing.expectEqual(@as(?u8, null), parseRevokeReason("mystery"));
 }
+
+test "certificate verdicts match the shared fixtures" {
+    // The browser gateway checks the same file (tests/web/gateway.test.mjs).
+    const Fixture = struct {
+        trusted_orgs: []const []const u8,
+        skew: i64,
+        cases: []const struct {
+            name: []const u8,
+            pass: []const u8,
+            public_key: []const u8,
+            wg_public_key: []const u8,
+            now: i64,
+            expect: []const u8,
+        },
+    };
+    const parsed = try std.json.parseFromSlice(Fixture, std.testing.allocator, @embedFile("testdata/passes.json"), .{});
+    defer parsed.deinit();
+    var trusted: [32]u8 = undefined;
+    try std.base64.standard.Decoder.decode(&trusted, parsed.value.trusted_orgs[0]);
+
+    for (parsed.value.cases) |case| {
+        var raw: [NodeCertificate.WIRE_SIZE]u8 = std.mem.zeroes([NodeCertificate.WIRE_SIZE]u8);
+        const bytes = try std.fmt.hexToBytes(&raw, case.pass);
+        try std.testing.expect(bytes.len == V1_CERT_WIRE_SIZE or bytes.len == NodeCertificate.WIRE_SIZE);
+        var node: [32]u8 = undefined;
+        var wg: [32]u8 = undefined;
+        try std.base64.standard.Decoder.decode(&node, case.public_key);
+        try std.base64.standard.Decoder.decode(&wg, case.wg_public_key);
+
+        const cert = NodeCertificate.deserialize(&raw);
+        // Same order of checks as gateway/pass.mjs verifyPass.
+        const verdict: []const u8 = if (!std.mem.eql(u8, &cert.org_pubkey, &trusted))
+            "untrusted-org"
+        else if (!std.mem.eql(u8, &cert.node_pubkey, &node))
+            "wrong-identity"
+        else if (cert.version == CERT_VERSION_V2 and !std.mem.eql(u8, &cert.wg_pubkey, &wg))
+            "wrong-wireguard-key"
+        else if (!cert.isValidAt(case.now, parsed.value.skew))
+            "expired"
+        else if (!verifyCertificate(&cert))
+            "bad-signature"
+        else
+            "ok";
+        std.testing.expectEqualStrings(case.expect, verdict) catch |err| {
+            std.debug.print("fixture \"{s}\"\n", .{case.name});
+            return err;
+        };
+    }
+}

@@ -8,6 +8,7 @@ Type=simple
 DynamicUser=yes
 WorkingDirectory=/opt/meshguard-web/current
 ExecStart=/opt/meshrooms/bin/bun gateway/server.mjs /etc/meshguard-web/config.json
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=3
 UMask=0077
