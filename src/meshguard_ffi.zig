@@ -141,42 +141,42 @@ pub const MeshguardContext = struct {
     alloc: std.mem.Allocator,
 };
 
-fn initContextStorage(allocator: std.mem.Allocator) MeshguardContext {
-    return .{
-        .ed25519_seed = undefined,
-        .ed25519_public = undefined,
-        .x25519_private = undefined,
-        .x25519_public = undefined,
-        .membership = Membership.MembershipTable.init(allocator, 15000),
-        .swim = null,
-        .socket = null,
-        .lan_discovery = null,
-        .event_loop_thread = null,
-        .running = std.atomic.Value(bool).init(false),
-        .suspended = std.atomic.Value(bool).init(false),
-        .resume_requested = std.atomic.Value(bool).init(false),
-        .app_relay_key = null,
-        .force_app_relay = false,
-        .last_relay_auth_ns = 0,
-        .app_direct_sent = std.atomic.Value(u64).init(0),
-        .app_relay_sent = std.atomic.Value(u64).init(0),
-        .app_route_failed = std.atomic.Value(u64).init(0),
-        .app_duplicate_dropped = std.atomic.Value(u64).init(0),
-        .app_seen = std.mem.zeroes([128]AppSeen),
-        .app_seen_next = 0,
-        .on_message_cb = null,
-        .on_peer_event_cb = null,
-        .on_undeliverable_cb = null,
-        .inbox = std.mem.zeroes([64]AppMessage),
-        .inbox_write = std.atomic.Value(u32).init(0),
-        .inbox_read = std.atomic.Value(u32).init(0),
-        .wg_device = null,
-        .wg_lock = .init,
-        .tunnel_inbox = std.mem.zeroes([256]TunnelMessage),
-        .tunnel_inbox_write = std.atomic.Value(u32).init(0),
-        .tunnel_inbox_read = std.atomic.Value(u32).init(0),
-        .alloc = allocator,
-    };
+// Initialize the heap allocation directly. Returning this large aggregate by
+// value can create stack temporaries larger than a physical iOS host thread.
+fn initContextStorage(ctx: *MeshguardContext, allocator: std.mem.Allocator) void {
+    ctx.ed25519_seed = undefined;
+    ctx.ed25519_public = undefined;
+    ctx.x25519_private = undefined;
+    ctx.x25519_public = undefined;
+    ctx.membership = Membership.MembershipTable.init(allocator, 15000);
+    ctx.swim = null;
+    ctx.socket = null;
+    ctx.lan_discovery = null;
+    ctx.event_loop_thread = null;
+    ctx.running = std.atomic.Value(bool).init(false);
+    ctx.suspended = std.atomic.Value(bool).init(false);
+    ctx.resume_requested = std.atomic.Value(bool).init(false);
+    ctx.app_relay_key = null;
+    ctx.force_app_relay = false;
+    ctx.last_relay_auth_ns = 0;
+    ctx.app_direct_sent = std.atomic.Value(u64).init(0);
+    ctx.app_relay_sent = std.atomic.Value(u64).init(0);
+    ctx.app_route_failed = std.atomic.Value(u64).init(0);
+    ctx.app_duplicate_dropped = std.atomic.Value(u64).init(0);
+    @memset(std.mem.asBytes(&ctx.app_seen), 0);
+    ctx.app_seen_next = 0;
+    ctx.on_message_cb = null;
+    ctx.on_peer_event_cb = null;
+    ctx.on_undeliverable_cb = null;
+    @memset(std.mem.asBytes(&ctx.inbox), 0);
+    ctx.inbox_write = std.atomic.Value(u32).init(0);
+    ctx.inbox_read = std.atomic.Value(u32).init(0);
+    ctx.wg_device = null;
+    ctx.wg_lock = .init;
+    @memset(std.mem.asBytes(&ctx.tunnel_inbox), 0);
+    ctx.tunnel_inbox_write = std.atomic.Value(u32).init(0);
+    ctx.tunnel_inbox_read = std.atomic.Value(u32).init(0);
+    ctx.alloc = allocator;
 }
 
 fn closeContextSocket(ctx: *MeshguardContext) void {
@@ -278,7 +278,7 @@ export fn meshguard_init(
     };
 
     const ctx = allocator.create(MeshguardContext) catch return null;
-    ctx.* = initContextStorage(allocator);
+    initContextStorage(ctx, allocator);
 
     // Identity: use provided seed or generate.
     var identity_seed_bytes: [32]u8 = undefined;
@@ -309,7 +309,8 @@ export fn meshguard_init(
     };
 
     // Initialize WireGuard device for tunnel support
-    ctx.wg_device = WgDevice.init(ctx.x25519_private, ctx.x25519_public);
+    ctx.wg_device = @as(WgDevice, undefined);
+    WgDevice.initInPlace(&ctx.wg_device.?, ctx.x25519_private, ctx.x25519_public);
 
     // Bind UDP socket — use ephemeral port (0) on mobile for reliability
     ctx.socket = Udp.UdpSocket.bind(listen_port) catch {
@@ -1798,7 +1799,7 @@ export fn meshguard_tunnel_close(
 test "destroyContext releases FFI-owned membership allocations" {
     const allocator = std.testing.allocator;
     const ctx = try allocator.create(MeshguardContext);
-    ctx.* = initContextStorage(allocator);
+    initContextStorage(ctx, allocator);
 
     const peer_name = try allocator.dupe(u8, "ffi-peer");
     try ctx.membership.upsert(.{
@@ -1843,7 +1844,8 @@ test "forced app relay route never falls back to direct" {
 }
 
 test "forced app relay requires an identity before join" {
-    var ctx = initContextStorage(std.testing.allocator);
+    var ctx: MeshguardContext = undefined;
+    initContextStorage(&ctx, std.testing.allocator);
     defer ctx.membership.deinit();
     try std.testing.expectEqual(@as(i32, -3), meshguard_set_app_relay(&ctx, null, true));
     var pin = [_]u8{2} ** 32;
@@ -1883,4 +1885,28 @@ test "authenticated direct and relay copies enqueue only once" {
     try std.testing.expectEqual(@as(u32, 1), receiver.inbox_write.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), receiver.app_duplicate_dropped.load(.acquire));
     try std.testing.expectEqualStrings(text, receiver.inbox[0].data[0..text.len]);
+}
+
+fn smallStackLifecycle() !void {
+    var seed = [_]u8{0x37} ** 32;
+    for (0..3) |_| {
+        const ctx = meshguard_init(&seed, 0) orelse return error.InitFailed;
+        defer meshguard_destroy(ctx);
+        if (ctx.wg_device == null or ctx.wg_device.?.peer_count != 0)
+            return error.InvalidDevice;
+        if (ctx.wg_device.?.next_index == 0) return error.InvalidIndex;
+        for (ctx.wg_device.?.ip_to_slot) |slot| {
+            if (slot != 0xff) return error.InvalidRoute;
+        }
+    }
+    const random_ctx = meshguard_init(null, 0) orelse return error.InitFailed;
+    meshguard_destroy(random_ctx);
+}
+
+test "FFI lifecycle fits a small mobile host thread stack" {
+    // Unoptimized std.crypto arithmetic needs more stack than the ReleaseFast
+    // mobile artifacts. Both limits remain below the old initializer's frame.
+    const stack_size: usize = if (builtin.mode == .Debug) 1024 * 1024 else 256 * 1024;
+    const thread = try std.Thread.spawn(.{ .stack_size = stack_size }, smallStackLifecycle, .{});
+    thread.join();
 }

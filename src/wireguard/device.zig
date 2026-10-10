@@ -338,16 +338,28 @@ pub const WgDevice = struct {
     hs_limiter: HandshakeLimiter = .{},
 
     pub fn init(static_private: [32]u8, static_public: [32]u8) WgDevice {
-        // Start with a random sender index for unpredictability
+        var device: WgDevice = undefined;
+        device.initInPlace(static_private, static_public);
+        return device;
+    }
+
+    /// Initialize caller-owned storage without a large by-value temporary.
+    /// Mobile FFI callers keep this device inside their heap context.
+    pub fn initInPlace(self: *WgDevice, static_private: [32]u8, static_public: [32]u8) void {
+        self.static_private = static_private;
+        self.static_public = static_public;
+        for (&self.peers) |*peer| peer.* = null;
+        self.peer_count = 0;
+        self.index_map = .{};
+        self.static_map = .{};
+        @memset(&self.ip_to_slot, 0xff);
+        self.lock = .init;
+        self.hs_limiter = .{};
+
+        // Start with a random sender index for unpredictability.
         var seed: [4]u8 = undefined;
         zio().random(&seed);
-        const start_index = std.mem.readInt(u32, &seed, .little) | 1; // ensure non-zero
-
-        return .{
-            .static_private = static_private,
-            .static_public = static_public,
-            .next_index = start_index,
-        };
+        self.next_index = std.mem.readInt(u32, &seed, .little) | 1;
     }
 
     /// Allocate a new random-ish sender index.
