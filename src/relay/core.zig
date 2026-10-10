@@ -36,6 +36,7 @@ const messages = @import("../protocol/messages.zig");
 const Noise = @import("../wireguard/noise.zig");
 const Binding = @import("../identity/binding.zig");
 const Org = @import("../identity/org.zig");
+const AppStatus = @import("../protocol/app_status.zig");
 
 const ns_per_s: i128 = std.time.ns_per_s;
 const NONE: u32 = std.math.maxInt(u32);
@@ -74,8 +75,15 @@ pub const Config = struct {
     handshake_source_burst: f64 = 8,
     handshake_pps: f64 = 1_000,
     handshake_burst: f64 = 200,
-    /// Source addresses tracked by the handshake limiter.
+    /// Source addresses tracked by the handshake limiter (and, separately,
+    /// by the delivery-status limiter).
     max_handshake_sources: u32 = 8192,
+    /// Delivery statuses (`0x51`) for frames the relay does not forward: per
+    /// source address and overall. Zero `status_pps` turns them off.
+    statuses_per_source_per_s: f64 = 2,
+    status_source_burst: f64 = 4,
+    status_pps: f64 = 2_000,
+    status_burst: f64 = 400,
     /// An address whose handshakes are limited per endpoint (address and
     /// port) instead of per address, such as a co-located browser gateway
     /// whose sessions all share one loopback address.
@@ -184,6 +192,58 @@ fn KeyContext(comptime K: type) type {
 }
 
 const KeyMap = std.HashMapUnmanaged([32]u8, u32, KeyContext([32]u8), std.hash_map.default_max_load_percentage);
+
+/// Token buckets per source address (IPv4 address or IPv6 /64) under an
+/// overall budget. One `trusted` address is limited per port instead, for a
+/// co-located gateway whose sessions all share it. A bounded table: when full,
+/// refilled entries are dropped, and new sources are refused until room frees.
+const SourceLimiter = struct {
+    map: SourceMap = .{},
+    per_source: f64,
+    source_burst: f64,
+    overall: f64,
+    overall_bucket: TokenBucket,
+    overall_burst: f64,
+    max_sources: u32,
+    trusted: ?[16]u8,
+
+    fn allow(self: *SourceLimiter, allocator: std.mem.Allocator, ctx: KeyContext(EndpointKey), src: messages.Endpoint, now_ns: i128) bool {
+        if (!self.overall_bucket.take(self.overall, self.overall_burst, 1, now_ns)) return false;
+        const key = if (self.isTrusted(src)) EndpointKey.of(src) else EndpointKey.sourceOf(src);
+        if (self.map.getPtrContext(key, ctx)) |bucket| {
+            return bucket.take(self.per_source, self.source_burst, 1, now_ns);
+        }
+        if (self.map.count() >= self.max_sources) {
+            self.prune(ctx, now_ns);
+            if (self.map.count() >= self.max_sources) return false;
+        }
+        var bucket = TokenBucket.full(self.source_burst, now_ns);
+        _ = bucket.take(self.per_source, self.source_burst, 1, now_ns);
+        self.map.putContext(allocator, key, bucket, ctx) catch return false;
+        return true;
+    }
+
+    fn isTrusted(self: *const SourceLimiter, src: messages.Endpoint) bool {
+        const trusted = self.trusted orelse return false;
+        return std.mem.eql(u8, EndpointKey.of(src).bytes[1..17], &trusted);
+    }
+
+    /// Forgets sources whose buckets have refilled completely.
+    fn prune(self: *SourceLimiter, ctx: KeyContext(EndpointKey), now_ns: i128) void {
+        const refill_ns: i128 = @intFromFloat(self.source_burst / self.per_source * @as(f64, @floatFromInt(ns_per_s)));
+        var stale: [256]EndpointKey = undefined;
+        var n: usize = 0;
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            if (now_ns - entry.value_ptr.updated_ns >= refill_ns) {
+                stale[n] = entry.key_ptr.*;
+                n += 1;
+                if (n == stale.len) break;
+            }
+        }
+        for (stale[0..n]) |key| _ = self.map.removeContext(key, ctx);
+    }
+};
 const EndpointMap = std.HashMapUnmanaged(EndpointKey, u32, KeyContext(EndpointKey), std.hash_map.default_max_load_percentage);
 const SourceMap = std.HashMapUnmanaged(EndpointKey, TokenBucket, KeyContext(EndpointKey), std.hash_map.default_max_load_percentage);
 
@@ -297,9 +357,9 @@ pub const RelayCore = struct {
     claim_lru: Lru(Claim) = .{},
     by_identity: KeyMap = .{},
 
-    handshake_sources: SourceMap = .{},
+    handshake_sources: SourceLimiter,
+    status_sources: SourceLimiter,
     forward_budget: TokenBucket,
-    handshake_budget: TokenBucket,
     next_index: u32,
     trust_epoch: u64 = 1,
     stats: Stats = .{},
@@ -329,14 +389,32 @@ pub const RelayCore = struct {
             .conns = conns,
             .claims = claims,
             .forward_budget = TokenBucket.full(config.forward_burst, now_ns),
-            .handshake_budget = TokenBucket.full(config.handshake_burst, now_ns),
+            .handshake_sources = .{
+                .per_source = config.handshakes_per_source_per_s,
+                .source_burst = config.handshake_source_burst,
+                .overall = config.handshake_pps,
+                .overall_bucket = TokenBucket.full(config.handshake_burst, now_ns),
+                .overall_burst = config.handshake_burst,
+                .max_sources = config.max_handshake_sources,
+                .trusted = config.trusted_handshake_source,
+            },
+            .status_sources = .{
+                .per_source = config.statuses_per_source_per_s,
+                .source_burst = config.status_source_burst,
+                .overall = config.status_pps,
+                .overall_bucket = TokenBucket.full(config.status_burst, now_ns),
+                .overall_burst = config.status_burst,
+                .max_sources = config.max_handshake_sources,
+                .trusted = null,
+            },
             .next_index = std.mem.readInt(u32, seed_bytes[8..12], .little),
         };
         errdefer core.deinitMaps();
         try core.by_wg.ensureTotalCapacityContext(allocator, config.max_clients, core.keyCtx());
         try core.by_endpoint.ensureTotalCapacityContext(allocator, config.max_clients, core.epCtx());
         try core.by_identity.ensureTotalCapacityContext(allocator, config.max_claims, core.keyCtx());
-        try core.handshake_sources.ensureTotalCapacityContext(allocator, config.max_handshake_sources, core.epCtx());
+        try core.handshake_sources.map.ensureTotalCapacityContext(allocator, config.max_handshake_sources, core.epCtx());
+        try core.status_sources.map.ensureTotalCapacityContext(allocator, config.max_handshake_sources, core.epCtx());
         return core;
     }
 
@@ -344,7 +422,8 @@ pub const RelayCore = struct {
         self.by_wg.deinit(self.allocator);
         self.by_endpoint.deinit(self.allocator);
         self.by_identity.deinit(self.allocator);
-        self.handshake_sources.deinit(self.allocator);
+        self.handshake_sources.map.deinit(self.allocator);
+        self.status_sources.map.deinit(self.allocator);
     }
 
     pub fn deinit(self: *RelayCore) void {
@@ -559,7 +638,7 @@ pub const RelayCore = struct {
         var msg: Noise.HandshakeInitiation = undefined;
         @memcpy(std.mem.asBytes(&msg), packet);
         if (!Noise.verifyMac1(self.static_public, &msg)) return null;
-        if (!self.allowHandshake(src, now_ns)) {
+        if (!self.handshake_sources.allow(self.allocator, self.epCtx(), src, now_ns)) {
             self.stats.handshakes_refused += 1;
             return null;
         }
@@ -617,42 +696,21 @@ pub const RelayCore = struct {
         self.unproven.pushBack(self.conns.items, i);
     }
 
-    fn allowHandshake(self: *RelayCore, src: messages.Endpoint, now_ns: i128) bool {
-        if (!self.handshake_budget.take(self.config.handshake_pps, self.config.handshake_burst, 1, now_ns)) return false;
-        const key = if (self.isTrustedSource(src)) EndpointKey.of(src) else EndpointKey.sourceOf(src);
-        if (self.handshake_sources.getPtrContext(key, self.epCtx())) |bucket| {
-            return bucket.take(self.config.handshakes_per_source_per_s, self.config.handshake_source_burst, 1, now_ns);
-        }
-        if (self.handshake_sources.count() >= self.config.max_handshake_sources) {
-            self.pruneHandshakeSources(now_ns);
-            if (self.handshake_sources.count() >= self.config.max_handshake_sources) return false;
-        }
-        var bucket = TokenBucket.full(self.config.handshake_source_burst, now_ns);
-        _ = bucket.take(self.config.handshakes_per_source_per_s, self.config.handshake_source_burst, 1, now_ns);
-        self.handshake_sources.putContext(self.allocator, key, bucket, self.epCtx()) catch return false;
-        return true;
-    }
-
-    fn isTrustedSource(self: *const RelayCore, src: messages.Endpoint) bool {
-        const trusted = self.config.trusted_handshake_source orelse return false;
-        const key = EndpointKey.of(src);
-        return std.mem.eql(u8, key.bytes[1..17], &trusted);
-    }
-
-    /// Forgets sources whose buckets have refilled completely.
-    fn pruneHandshakeSources(self: *RelayCore, now_ns: i128) void {
-        const refill_ns: i128 = @intFromFloat(self.config.handshake_source_burst / self.config.handshakes_per_source_per_s * @as(f64, @floatFromInt(ns_per_s)));
-        var stale: [256]EndpointKey = undefined;
-        var n: usize = 0;
-        var it = self.handshake_sources.iterator();
-        while (it.next()) |entry| {
-            if (now_ns - entry.value_ptr.updated_ns >= refill_ns) {
-                stale[n] = entry.key_ptr.*;
-                n += 1;
-                if (n == stale.len) break;
-            }
-        }
-        for (stale[0..n]) |key| _ = self.handshake_sources.removeContext(key, self.epCtx());
+    /// The delivery status to send for a frame dropped for `reason`, or null
+    /// when none applies or the status limits are spent.
+    pub fn statusFor(self: *RelayCore, reason: DropReason, src: messages.Endpoint, now_ns: i128) ?AppStatus.Code {
+        const code: AppStatus.Code = switch (reason) {
+            .malformed => return null,
+            // The endpoint is not (or no longer) proven for the sender's key.
+            .unproven_sender, .spoofed_sender => .handshake_again,
+            .not_admitted => .not_admitted,
+            .rate_limited => .rate_limited,
+            .unknown_destination => .offline,
+            .overloaded => .overloaded,
+        };
+        if (self.config.status_pps <= 0) return null;
+        if (!self.status_sources.allow(self.allocator, self.epCtx(), src, now_ns)) return null;
+        return code;
     }
 
     // ─── Forwarding ───
@@ -1241,6 +1299,26 @@ test "the handshake response completes the client's Noise session" {
     const response = core.handleInitiation(std.mem.asBytes(&msg), addr(1, 4000), 0) orelse return error.NoResponse;
     try hs.consumeResponse(&response);
     try testing.expectEqual(@as(u32, 42), std.mem.readInt(u32, std.mem.asBytes(&response)[8..12], .little));
+}
+
+test "dropped frames get rate-limited delivery statuses with matching codes" {
+    var relay = try TestRelay.init();
+    var config = smallConfig();
+    config.statuses_per_source_per_s = 1;
+    config.status_source_burst = 2;
+    var core = try relay.core(config);
+    defer core.deinit();
+    try testing.expectEqual(AppStatus.Code.handshake_again, core.statusFor(.unproven_sender, addr(1, 4000), 0).?);
+    try testing.expectEqual(AppStatus.Code.offline, core.statusFor(.unknown_destination, addr(1, 4001), 0).?);
+    // The third status for one address in the same instant is suppressed.
+    try testing.expect(core.statusFor(.rate_limited, addr(1, 4002), 0) == null);
+    try testing.expectEqual(AppStatus.Code.not_admitted, core.statusFor(.not_admitted, addr(2, 4000), 0).?);
+    try testing.expect(core.statusFor(.malformed, addr(3, 4000), 0) == null);
+
+    config.status_pps = 0;
+    var silent = try relay.core(config);
+    defer silent.deinit();
+    try testing.expect(silent.statusFor(.unproven_sender, addr(1, 4000), 0) == null);
 }
 
 test "endpoint keys distinguish ports and fold IPv6 sources to /64" {

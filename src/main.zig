@@ -66,6 +66,9 @@ const usage =
     \\  --trusted-handshake-source <ip>
     \\                            Limit handshakes from this address per port (a local gateway)
     \\  --legacy-wg-binding       Accept gossip-learned WireGuard keys for admitted clients
+    \\  --opaque                  Relay that tells clients nothing about other clients (implies --relay)
+    \\  --no-delivery-status      Do not tell senders why a frame was not forwarded
+    \\  --reply-pps <n>           Answers to pings per second (default 5000)
     \\  --gossip-port <port>      Override gossip/listen UDP port (default 51821)
     \\  --control-path <path>     Override control socket path for this daemon
     \\  -h, --help               Show this help
@@ -1304,10 +1307,17 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     defer relay_core.deinit();
     swim.relay_core = &relay_core;
     swim.forwarding = if (relay_flags.relay) .authenticated else .endpoint_match;
+    swim.opaque_relay = relay_flags.opaque_relay;
+    swim.delivery_status = relay_flags.delivery_status;
+    if (relay_flags.reply_pps) |n| {
+        swim.config.reply_pps = n;
+        swim.config.reply_burst = @max(10, n / 5);
+    }
     control.relay_core = &relay_core;
     control.relay_forwarding = @tagName(swim.forwarding);
-    try writeFormatted(stdout, "  relay: {s}, up to {d} clients\n", .{
+    try writeFormatted(stdout, "  relay: {s}{s}, up to {d} clients\n", .{
         if (relay_flags.relay) @as([]const u8, "authenticated forwarding") else @as([]const u8, "forwarding for known endpoints"),
+        if (relay_flags.opaque_relay) @as([]const u8, ", opaque") else @as([]const u8, ""),
         relay_core.config.max_clients,
     });
 
@@ -3387,6 +3397,9 @@ const TrustReload = struct {
 /// `meshguard up` relay options.
 const RelayFlags = struct {
     relay: bool = false,
+    opaque_relay: bool = false,
+    delivery_status: bool = true,
+    reply_pps: ?u32 = null,
     max_clients: ?u32 = null,
     client_pps: ?f64 = null,
     client_kbps: ?f64 = null,
@@ -3406,9 +3419,18 @@ const RelayFlags = struct {
             self.legacy_wg_binding = true;
             return true;
         }
+        if (std.mem.eql(u8, arg, "--opaque")) {
+            self.opaque_relay = true;
+            self.relay = true;
+            return true;
+        }
+        if (std.mem.eql(u8, arg, "--no-delivery-status")) {
+            self.delivery_status = false;
+            return true;
+        }
         const takes_value = std.mem.eql(u8, arg, "--max-clients") or std.mem.eql(u8, arg, "--client-pps") or
             std.mem.eql(u8, arg, "--client-kbps") or std.mem.eql(u8, arg, "--forward-pps") or
-            std.mem.eql(u8, arg, "--trusted-handshake-source");
+            std.mem.eql(u8, arg, "--trusted-handshake-source") or std.mem.eql(u8, arg, "--reply-pps");
         if (!takes_value) return false;
         if (i.* + 1 >= args.len) return error.MissingValue;
         const value = args[i.* + 1];
@@ -3416,6 +3438,10 @@ const RelayFlags = struct {
             const n = try std.fmt.parseInt(u32, value, 10);
             if (n < 16 or n > 1 << 20) return error.OutOfRange;
             self.max_clients = n;
+        } else if (std.mem.eql(u8, arg, "--reply-pps")) {
+            const n = try std.fmt.parseInt(u32, value, 10);
+            if (n < 10 or n > 1_000_000) return error.OutOfRange;
+            self.reply_pps = n;
         } else if (std.mem.eql(u8, arg, "--trusted-handshake-source")) {
             var addr = std.mem.zeroes([16]u8);
             if (parseIpv4(value)) |v4| {

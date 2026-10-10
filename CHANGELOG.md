@@ -8,6 +8,13 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## Unreleased
 
 ### Added
+- Opaque relays (`meshguard up --opaque`): clients stay out of the relay's
+  membership and gossip, and a client's ACK describes only the relay, so no
+  client learns about another; no ping-req or rendezvous on clients' behalf.
+- Delivery status (`0x51`, 47 bytes): a relay answers a sealed frame it does not
+  forward with why (offline, rate limited, handshake again, not admitted,
+  overloaded), echoing the frame's nonce, limited per source address;
+  `--no-delivery-status` turns it off.
 - Browser gateway passes: the gateway admits a browser presenting a valid
   pass (organization certificate) from `trustedOrgs`, in addition to
   `allowedIdentities`; `allowedDestinations` becomes optional. Sessions end with
@@ -66,6 +73,9 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   Explicit invalid values fail closed (no silent fallback to 51821).
 
 ### Changed
+- Answers to pings use their own budget (`--reply-pps`, default 5,000/s) instead
+  of the 500/s discovery budget. At 10,000 mobile clients pinging every 3 s only
+  15% of pings were answered before; now all are.
 - Retained org revocations are re-sent once every five minutes
   (`org_revoke_readvertise_interval_ms`) instead of as fresh broadcasts every
   five seconds, and revoking walks the membership once per batch of affected
