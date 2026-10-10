@@ -179,6 +179,21 @@ pub fn build(b: *std.Build) void {
             b.installArtifact(interop_exe);
         }
 
+        // ─── Relay load generator (Linux only — epoll) ───
+        if (resolved_os == .linux and !is_android) {
+            const loadgen_mod = b.createModule(.{
+                .root_source_file = b.path("bench/relay-load/loadgen.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            });
+            loadgen_mod.addImport("meshguard", lib_mod);
+            const loadgen = b.addExecutable(.{ .name = "relay-loadgen", .root_module = loadgen_mod });
+            if (use_libsodium) loadgen_mod.linkSystemLibrary("sodium", .{});
+            const install_loadgen = b.addInstallArtifact(loadgen, .{});
+            b.step("relay-loadgen", "Build the relay load generator (bench/relay-load)").dependOn(&install_loadgen.step);
+        }
+
         // ─── Run step ───
         const run_cmd = b.addRunArtifact(exe);
         run_cmd.step.dependOn(b.getInstallStep());

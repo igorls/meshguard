@@ -8,6 +8,11 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## Unreleased
 
 ### Added
+- Relay load harness (`bench/relay-load`, `zig build relay-loadgen`):
+  simulates thousands of mobile-style relay clients on loopback, with
+  flooders, spoofers and reconnect storms, and reports loss, latency and the
+  relay's CPU and memory. Baseline numbers are in `PERFORMANCE.md`; CI runs a
+  small smoke scenario.
 - Authenticated relay forwarding (`src/relay/core.zig`). A relay forwards
   sealed `0x50` and `0x31` frames only from an endpoint where the sender's
   signed WireGuard key is proven by a Noise handshake, only to a destination

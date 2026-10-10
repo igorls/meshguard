@@ -59,6 +59,11 @@ jobs:
           zig build -Doptimize=ReleaseSafe
           python3 scripts/test-relay.py zig-out/bin/meshguard zig-out/lib/libmeshguard-ffi.so -v
 
+      - name: Relay load smoke test
+        run: |
+          zig build relay-loadgen -Doptimize=ReleaseSafe
+          python3 bench/relay-load/run.py --clients 300 --rate 1 --duration 5 --warmup 30 --spoofers 2 --max-loss 0.01
+
   no-sodium-linux:
     name: Build + Test (ubuntu, std.crypto / no libsodium)
     runs-on: ubuntu-latest
