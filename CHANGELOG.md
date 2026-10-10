@@ -17,7 +17,9 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   opaque relays: `meshguard_add_contact` / `remove` / `clear` / `count`,
   `meshguard_set_contacts_only`, `meshguard_send_ex` (returns the nonce),
   `meshguard_set_on_delivery_status` (accepted only from the pinned relay for a
-  recently sent frame; `handshake again` re-proves the endpoint at once), and
+  recently sent frame; `handshake again` re-proves the endpoint at once),
+  `meshguard_recv_delivery_status` (the same statuses for hosts that poll from
+  another thread, since the callback's pointers last only for the call), and
   `meshguard_set_keepalive_interval` / `meshguard_set_relay_proof_interval`.
   The browser client gains `addContact`, `removeContact`, `status` events and
   `send` returning the nonce.

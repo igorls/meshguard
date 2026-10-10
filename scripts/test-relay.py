@@ -41,6 +41,7 @@ set_contacts_only = bind("meshguard_set_contacts_only", [c.c_void_p, c.c_bool])
 send_ex = bind("meshguard_send_ex", [c.c_void_p, c.c_void_p, c.c_void_p, c.c_uint32, c.c_void_p], c.c_int)
 STATUS_CALLBACK = c.CFUNCTYPE(None, c.c_void_p, c.c_void_p, c.c_uint8)
 set_on_delivery_status = bind("meshguard_set_on_delivery_status", [c.c_void_p, STATUS_CALLBACK])
+recv_delivery_status = bind("meshguard_recv_delivery_status", [c.c_void_p, c.c_void_p, c.c_void_p, c.c_void_p], c.c_int)
 switch_relay = bind("meshguard_switch_relay", [c.c_void_p, c.c_void_p, c.c_bool, c.c_void_p, c.c_uint16], c.c_int)
 peer_count = bind("meshguard_peer_count", [c.c_void_p], c.c_uint32)
 route_stats = bind("meshguard_app_route_stats", [c.c_void_p, c.c_void_p])
@@ -298,6 +299,13 @@ class OpaqueRelay(unittest.TestCase):
         status = next(s for s in statuses if s[1] == nonce.raw)
         self.assertEqual(status[0], carol.pubkey)
         self.assertEqual(status[2], 1)  # offline
+
+        # Polling hosts see the same statuses.
+        dest, polled_nonce, code = c.create_string_buffer(32), c.create_string_buffer(12), c.c_uint8()
+        polled = []
+        while recv_delivery_status(alice.ctx, dest, polled_nonce, c.byref(code)) == 0:
+            polled.append((dest.raw, polled_nonce.raw, code.value))
+        self.assertIn((carol.pubkey, nonce.raw, 1), polled)
 
 
 class SeveralRelays(unittest.TestCase):

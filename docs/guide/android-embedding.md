@@ -89,6 +89,7 @@ object MeshGuardFFI {
     external fun meshguard_set_contacts_only(ctx: Long, enabled: Boolean)
     external fun meshguard_send_ex(ctx: Long, peerPubkey: ByteArray, data: ByteArray, len: Int, outNonce: ByteArray): Int
     external fun meshguard_set_on_delivery_status(ctx: Long, callback: Long)
+    external fun meshguard_recv_delivery_status(ctx: Long, outDestination: ByteArray, outNonce: ByteArray, outCode: ByteArray): Int
     external fun meshguard_set_keepalive_interval(ctx: Long, ms: Int): Int
     external fun meshguard_set_relay_proof_interval(ctx: Long, ms: Int): Int
 
