@@ -4,6 +4,28 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
+    const wasm = b.addExecutable(.{
+        .name = "meshguard",
+        .root_module = b.createModule(.{ .root_source_file = b.path("src/meshguard_wasm.zig"), .target = wasm_target, .optimize = optimize, .strip = true }),
+    });
+    wasm.entry = .disabled;
+    wasm.rdynamic = true;
+    wasm.export_memory = true;
+    wasm.stack_size = 65536;
+    wasm.initial_memory = 4 * 65536;
+    wasm.max_memory = 4 * 65536;
+    const install_wasm = b.addInstallArtifact(wasm, .{});
+    b.step("wasm", "Build the browser-compatible portable MeshGuard core").dependOn(&install_wasm.step);
+    const wasm_check = b.addSystemCommand(&.{ "node", b.pathFromRoot("tests/wasm/smoke.mjs") });
+    wasm_check.addArtifactArg(wasm);
+    b.step("wasm-test", "Run the portable core in a JavaScript WebAssembly runtime").dependOn(&wasm_check.step);
+    if (target.result.cpu.arch == .wasm32) {
+        if (target.result.os.tag != .freestanding) @panic("Use wasm32-freestanding for the browser core");
+        b.getInstallStep().dependOn(&install_wasm.step);
+        return;
+    }
+
     // Detect target OS — works for both native and cross-compilation.
     // target.query.os_tag is null for native builds, so fall back to the
     // resolved target's os.tag.

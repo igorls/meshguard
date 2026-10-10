@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MeshGuard WASM proof</title>
+<style>
+body{margin:0;background:#f8f8f4;color:#131a2e;font:16px system-ui;line-height:1.6}main{max-width:820px;margin:60px auto;padding:28px}h1{font-size:42px;line-height:1.15;letter-spacing:-1.6px}p{color:#536071}#status{background:#fff;border-radius:20px;padding:24px;border:1px solid #d8e2dc;font-size:24px;font-weight:750}.pass{color:#08734c}.error{color:#a52915}ul{padding:0;list-style:none}li{padding:16px 0;border-bottom:1px solid #dfe4e3}small{display:block;color:#536071}code{font:13px ui-monospace,monospace;overflow-wrap:anywhere}.label{color:#b84308;font-size:13px;font-weight:750;letter-spacing:1px}
+</style><main><div class="label">MESHGUARD · BROWSER CORE</div><h1>Native-compatible encryption.<br>Running in your browser.</h1><p>The same MeshGuard packet code runs as WebAssembly. Keys and plaintext stay in this test page; no networking relay is involved in this local proof.</p><div id="status" role="status">Loading WebAssembly…</div><ul id="checks"></ul><small>Public test identities only. This page qualifies the portable core. Discovery and browser-to-relay networking are separate work.</small></main>
+<script type="module">
+import {MeshguardWasm} from './meshguard.mjs';
+const status=document.querySelector('#status'),checks=document.querySelector('#checks');
+const assert=(condition,label)=>{if(!condition)throw new Error(label);const li=document.createElement('li');li.textContent='✓ '+label;checks.append(li);};
+try {
+ const response=await fetch('/meshguard.wasm');if(!response.ok)throw new Error('WASM artifact unavailable');
+ const binary=await response.arrayBuffer(),module=await WebAssembly.compile(binary);
+ assert(WebAssembly.Module.imports(module).length===0,'No native, socket, or WASI dependencies');
+ const core=new MeshguardWasm(await WebAssembly.instantiate(module,{}));
+ const a=core.createIdentity(new Uint8Array(32).fill(1)),b=core.createIdentity(new Uint8Array(32).fill(2));
+ const peer=i=>({publicKey:i.publicKey(),wgPublicKey:i.wgPublicKey()});
+ const enc=new TextEncoder(),dec=new TextDecoder(),message='Olá 🌎 — browser MeshGuard';
+ const sealed=a.seal(peer(b),message);
+ assert(dec.decode(b.open(peer(a),sealed))===message,'Authenticated encrypted UTF-8 round trip');
+ const reply=b.seal(peer(a),'Reply from the second identity');
+ assert(dec.decode(a.open(peer(b),reply))==='Reply from the second identity','Encrypted reply in the opposite direction');
+ const damaged=sealed.slice();damaged[damaged.length-1]^=1;let rejected=false;
+ try{b.open(peer(a),damaged);}catch{rejected=true;}
+ assert(rejected,'Modified ciphertext is rejected');
+ const signature=a.sign(message);
+ assert(core.verify(a.publicKey(),message,signature)&&!core.verify(a.publicKey(),'changed',signature),'Identity signatures verify and detect changes');
+ assert(b.open(peer(a),a.seal(peer(b),new Uint8Array(1024))).length===1024,'Maximum-size native app packet');
+ a.destroy();b.destroy();let invalid=false;try{a.publicKey();}catch{invalid=true;}
+ assert(invalid,'Destroyed identities cannot be reused');
+ status.textContent='PASS · MeshGuard WASM is working';status.className='pass';
+ const line=document.createElement('small');line.textContent=`${binary.byteLength.toLocaleString()} bytes · ABI 1 · ${checks.children.length} checks passed`;status.append(line);
+ document.documentElement.dataset.proof='passed';
+} catch(e){status.textContent='FAIL · '+e.message;status.className='error';document.documentElement.dataset.proof='failed';}
+</script></html>

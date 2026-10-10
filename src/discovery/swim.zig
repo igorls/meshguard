@@ -1338,6 +1338,29 @@ pub const SwimProtocol = struct {
         }
     }
 
+    /// Owner-loop entry point after a DIRECT authenticated WG handshake.
+    /// Unsigned ping/ACK and third-party gossip never move a known endpoint.
+    pub fn confirmAuthenticatedEndpoint(self: *SwimProtocol, pubkey: [32]u8, endpoint: messages.Endpoint) bool {
+        if (!self.isAuthorizedPeer(pubkey, null)) return false;
+        const snapshot = blk: {
+            self.membership.lock.lockUncancelable(zio());
+            defer self.membership.lock.unlock(zio());
+            const peer = self.membership.peers.getPtr(pubkey) orelse return false;
+            if (peer.gossip_endpoint) |old| {
+                if (std.meta.eql(old, endpoint)) return true;
+            }
+            peer.gossip_endpoint = endpoint;
+            peer.state = .alive;
+            peer.last_seen_ns = nowNs();
+            peer.suspected_at_ns = null;
+            self.membership.lamport +|= 1;
+            peer.lamport = self.membership.lamport;
+            break :blk peer.*;
+        };
+        self.enqueueGossip(.{ .subject_pubkey = pubkey, .event = .alive, .lamport = snapshot.lamport, .endpoint = endpoint, .wg_pubkey = snapshot.wg_pubkey, .public_endpoint = snapshot.public_endpoint, .nat_type = snapshot.nat_type });
+        return true;
+    }
+
     // ─── PING/timeout management ───
 
     /// Rate-limited control-plane send (token bucket). ALL SWIM gossip/ping/
@@ -2217,6 +2240,26 @@ fn issueVouch(org_kp: Org.OrgKeyPair, node_pubkey: [32]u8, lamport: u64) message
     const signed = codec.orgVouchSignedBytes(vouch);
     vouch.signature = keys.sign(&signed, org_kp.secret_key) catch unreachable;
     return vouch;
+}
+
+test "only an admitted authenticated endpoint confirmation moves a known peer" {
+    var membership = Membership.MembershipTable.init(std.testing.allocator, 5000);
+    defer membership.deinit();
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    swim.enableTrust();
+    const key = [_]u8{3} ** 32;
+    const old = messages.Endpoint.initV4(.{ 198, 51, 100, 1 }, 10001);
+    const changed = messages.Endpoint.initV4(.{ 203, 0, 113, 1 }, 20001);
+    var peer = aliveTestPeer(key);
+    peer.gossip_endpoint = old;
+    try membership.upsert(peer);
+    try std.testing.expect(!swim.confirmAuthenticatedEndpoint(key, changed));
+    swim.addAuthorizedKey(key);
+    swim.registerOrUpdatePeerEndpoint(key, changed); // unsigned observation
+    try std.testing.expectEqual(old, membership.peers.get(key).?.gossip_endpoint.?);
+    try std.testing.expect(swim.confirmAuthenticatedEndpoint(key, changed));
+    try std.testing.expectEqual(changed, membership.peers.get(key).?.gossip_endpoint.?);
+    try std.testing.expect(!swim.confirmAuthenticatedEndpoint([_]u8{4} ** 32, changed));
 }
 
 test "peer restart is detected by incarnation and steady state is not" {

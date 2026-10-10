@@ -1,0 +1,42 @@
+name: WASM
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main, codex/mobile-app-relay]
+  workflow_dispatch:
+
+jobs:
+  wasm:
+    name: Portable core and native packet interoperability
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Build WASM and exercise the ABI
+        run: zig build wasm wasm-test -Doptimize=ReleaseSmall
+      - name: Build native FFI without libsodium
+        run: zig build -Dcrypto-backend=std -Doptimize=ReleaseSafe
+      - name: Verify authenticated browser gateway and replay filtering
+        run: bun test tests/web
+      - name: Exchange packets between WASM and native FFI over UDP
+        env:
+          MESHGUARD_NATIVE_LIBRARY: ${{ github.workspace }}/zig-out/lib/libmeshguard-ffi.so
+        run: node tests/wasm/native-interop.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: meshguard-wasm
+          path: |
+            zig-out/bin/meshguard.wasm
+            web/meshguard.mjs
+            web/relay-protocol.mjs
+          if-no-files-found: error

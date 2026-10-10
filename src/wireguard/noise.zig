@@ -168,6 +168,12 @@ pub const Handshake = struct {
     /// Create a Handshake Initiation message (Type 1).
     /// We are the initiator: -> e, es, s, ss, {t}
     pub fn createInitiation(self: *Handshake, sender_index: u32) !HandshakeInitiation {
+        return self.createInitiationWithEntropy(sender_index, generateSecret(), tai64nNow());
+    }
+
+    /// Portable initiator path: the host supplies fresh entropy and TAI64N time.
+    /// This shares the native transcript and wire format without OS dependencies.
+    pub fn createInitiationWithEntropy(self: *Handshake, sender_index: u32, ephemeral_secret: [32]u8, timestamp: [TIMESTAMP_LEN]u8) !HandshakeInitiation {
         var msg: HandshakeInitiation = undefined;
         msg.message_type = std.mem.nativeToLittle(u32, 1);
         msg.sender_index = std.mem.nativeToLittle(u32, sender_index);
@@ -185,7 +191,10 @@ pub const Handshake = struct {
         crypto.mixHash(&self.hash, &self.remote_static);
 
         // e: Generate ephemeral keypair
-        self.ephemeral_private = generateSecret();
+        self.ephemeral_private = ephemeral_secret;
+        self.ephemeral_private[0] &= 248;
+        self.ephemeral_private[31] &= 127;
+        self.ephemeral_private[31] |= 64;
         const ephemeral_public = try X25519.recoverPublicKey(self.ephemeral_private);
         msg.ephemeral = ephemeral_public;
 
@@ -210,7 +219,6 @@ pub const Handshake = struct {
         key = ck_ss.key;
 
         // {t}: Encrypt TAI64N timestamp
-        const timestamp = tai64nNow();
         msg.encrypted_timestamp = aead_encrypt_ts(&key, &self.hash, &timestamp);
         crypto.mixHash(&self.hash, &msg.encrypted_timestamp);
 
@@ -530,7 +538,6 @@ fn tai64nNow() [TIMESTAMP_LEN]u8 {
     std.mem.writeInt(u32, output[8..12], now_ns, .big);
     return output;
 }
-
 
 /// Generate a random 32-byte secret (clamped for X25519).
 fn generateSecret() [32]u8 {

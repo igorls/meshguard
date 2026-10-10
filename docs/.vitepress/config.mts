@@ -54,6 +54,8 @@ export default defineConfig({
         items: [
           { text: 'CLI Commands', link: '/reference/cli' },
           { text: 'Module Map', link: '/reference/modules' },
+          { text: 'Browser WASM Core', link: '/reference/wasm-core' },
+          { text: 'Browser Relay', link: '/reference/browser-relay' },
         ],
       },
     ],

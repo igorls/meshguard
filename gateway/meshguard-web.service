@@ -1,0 +1,29 @@
+[Unit]
+Description=MeshGuard authenticated browser transport gateway
+After=network-online.target meshguard.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+WorkingDirectory=/opt/meshguard-web/current
+ExecStart=/opt/meshrooms/bin/bun gateway/server.mjs /etc/meshguard-web/config.json
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+MemoryMax=128M
+CPUQuota=50%
+LimitNOFILE=256
+
+[Install]
+WantedBy=multi-user.target

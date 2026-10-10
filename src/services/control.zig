@@ -31,6 +31,7 @@
 //!   XFERCANCEL <id>\n                       → abandon a transfer
 
 const std = @import("std");
+const AppPacket = @import("../app_packet.zig");
 const builtin = @import("builtin");
 const is_windows = builtin.os.tag == .windows;
 const is_linux = builtin.os.tag == .linux;
@@ -1253,30 +1254,9 @@ pub const ControlSocket = struct {
         if (peer_ep == null and relay_opt == null) return "peer endpoint not known";
 
         var msg_buf: [1 + 32 + 32 + 12 + MAX_MESSAGE_PAYLOAD + 16]u8 = undefined;
-        msg_buf[0] = 0x50;
-        @memcpy(msg_buf[1..33], &dest_key);
-        @memcpy(msg_buf[33..65], &self.our_pubkey);
-
         var nonce: [12]u8 = undefined;
         zio().random(&nonce);
-        @memcpy(msg_buf[65..77], &nonce);
-
-        const shared = X25519.scalarmult(self.our_wg_private, peer_wg) catch return "key exchange computation failed";
-        const key_result = crypto.kdf2(shared, "meshguard-app-v1");
-        const enc_key = key_result.key;
-
-        var tag: [16]u8 = undefined;
-        ChaCha20Poly1305.encrypt(
-            msg_buf[77..][0..payload.len],
-            &tag,
-            payload,
-            &self.our_pubkey,
-            nonce,
-            enc_key,
-        );
-        @memcpy(msg_buf[77 + payload.len ..][0..16], &tag);
-
-        const total_len = 77 + payload.len + 16;
+        const total_len = AppPacket.seal(self.our_pubkey, self.our_wg_private, dest_key, peer_wg, nonce, payload, &msg_buf) catch return "key exchange computation failed";
         const send_fn = self.send_fn orelse return "daemon sender not configured";
 
         var sent_direct = false;
@@ -2311,9 +2291,7 @@ test "XFER commands move a verified file between two control sockets over sealed
     defer b_members.deinit();
     const peer = struct {
         fn entry(pubkey: [32]u8, wg: [32]u8) Membership.Peer {
-            return .{ .pubkey = pubkey, .name = "", .state = .alive, .gossip_endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 1), .public_endpoint = null,
-                .wg_pubkey = wg, .mesh_ip = .{ 10, 99, 0, 2 }, .mesh_ip6 = .{0} ** 16, .wg_port = 51830, .lamport = 1, .last_seen_ns = 1,
-                .suspected_at_ns = null, .last_rtt_ns = null, .handshake_complete = false };
+            return .{ .pubkey = pubkey, .name = "", .state = .alive, .gossip_endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 1), .public_endpoint = null, .wg_pubkey = wg, .mesh_ip = .{ 10, 99, 0, 2 }, .mesh_ip6 = .{0} ** 16, .wg_port = 51830, .lamport = 1, .last_seen_ns = 1, .suspected_at_ns = null, .last_rtt_ns = null, .handshake_complete = false };
         }
     };
     try a_members.upsert(peer.entry(b_key, b_wg));

@@ -14,9 +14,11 @@ docs/.vitepress/cache/
 *.a
 *.so
 *.dylib
+*.wasm
 *.dll
 
 # Environment
+.local/
 .env
 .env.*
 !.env.example

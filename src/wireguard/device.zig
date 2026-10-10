@@ -289,7 +289,10 @@ const HandshakeLimiter = struct {
 pub const InitiationResult = struct {
     response: noise.HandshakeResponse,
     slot: usize,
+    identity_key: [32]u8,
 };
+
+pub const AuthenticatedPeerResult = struct { slot: usize, identity_key: [32]u8 };
 
 /// Userspace WireGuard device.
 pub const WgDevice = struct {
@@ -514,12 +517,23 @@ pub const WgDevice = struct {
         return self.handleInitiationAdmitted(msg);
     }
 
+    /// Direct path only: bind a fresh endpoint after authenticated Noise succeeds.
+    pub fn handleInitiationFromEndpoint(self: *WgDevice, msg: *const noise.HandshakeInitiation, endpoint: messages.Endpoint) !InitiationResult {
+        if (!noise.verifyMac1(self.static_public, msg)) return error.InvalidMac;
+        if (!self.hs_limiter.allow(endpoint.addr, nowNs())) return error.HandshakeRateLimited;
+        return self.handleInitiationAdmittedAt(msg, endpoint);
+    }
+
     /// Process a handshake initiation that has ALREADY passed admission control
     /// (MAC1 + rate limit). Used by the FFI auto-register path to retry after
     /// registering the peer, WITHOUT charging the rate limiter a second time for
     /// the same legitimate handshake (the first attempt already consumed a token
     /// before failing with UnknownPeer).
     pub fn handleInitiationAdmitted(self: *WgDevice, msg: *const noise.HandshakeInitiation) !InitiationResult {
+        return self.handleInitiationAdmittedAt(msg, null);
+    }
+
+    fn handleInitiationAdmittedAt(self: *WgDevice, msg: *const noise.HandshakeInitiation, endpoint: ?messages.Endpoint) !InitiationResult {
         // The expensive crypto + peer-table mutation below run under the
         // exclusive device lock (H6).
         self.lock.lockUncancelable(zio());
@@ -561,11 +575,24 @@ pub const WgDevice = struct {
         // The index_map only contains indices WE generated. Remote indices
         // could be attacker-controlled and cause tunnel hijacking.
 
-        return .{ .response = response, .slot = slot };
+        if (endpoint) |ep| {
+            peer.endpoint_addr = ep.addr;
+            peer.endpoint_addr6 = ep.addr6;
+            peer.endpoint_port = ep.port;
+        }
+        return .{ .response = response, .slot = slot, .identity_key = peer.identity_key };
     }
 
     /// Handle an incoming handshake response (we are initiator).
     pub fn handleResponse(self: *WgDevice, msg: *const noise.HandshakeResponse) !usize {
+        return (try self.handleResponseAt(msg, null)).slot;
+    }
+
+    pub fn handleResponseFromEndpoint(self: *WgDevice, msg: *const noise.HandshakeResponse, endpoint: messages.Endpoint) !AuthenticatedPeerResult {
+        return self.handleResponseAt(msg, endpoint);
+    }
+
+    fn handleResponseAt(self: *WgDevice, msg: *const noise.HandshakeResponse, endpoint: ?messages.Endpoint) !AuthenticatedPeerResult {
         self.lock.lockUncancelable(zio()); // H6: exclusive — sets active_tunnel
         defer self.lock.unlock(zio());
         // Look up by receiver_index (which is our sender_index)
@@ -583,7 +610,12 @@ pub const WgDevice = struct {
         // NOTE: We do NOT insert remote sender_index into our index_map.
         // Only locally-generated indices belong in the map.
 
-        return peer_slot;
+        if (endpoint) |ep| {
+            peer.endpoint_addr = ep.addr;
+            peer.endpoint_addr6 = ep.addr6;
+            peer.endpoint_port = ep.port;
+        }
+        return .{ .slot = peer_slot, .identity_key = peer.identity_key };
     }
 
     /// Encrypt an IP packet for a specific peer.
@@ -690,6 +722,39 @@ fn innerSourceAllowed(peer_mesh_ip: [4]u8, peer_mesh_ip6: [16]u8, plaintext: []c
 }
 
 // ─── Tests ───
+
+test "direct authenticated handshakes refresh endpoint without accepting invalid packets" {
+    const X = std.crypto.dh.X25519;
+    const secret_a = [_]u8{1} ** 32;
+    const secret_b = [_]u8{2} ** 32;
+    const pub_a = try X.recoverPublicKey(secret_a);
+    const pub_b = try X.recoverPublicKey(secret_b);
+    var a = WgDevice.init(secret_a, pub_a);
+    var b = WgDevice.init(secret_b, pub_b);
+    const identity_a = [_]u8{10} ** 32;
+    const identity_b = [_]u8{20} ** 32;
+    const old_a = messages.Endpoint.initV4(.{ 198, 51, 100, 1 }, 10001);
+    const old_b = messages.Endpoint.initV4(.{ 198, 51, 100, 2 }, 10002);
+    const new_a = messages.Endpoint.initV4(.{ 203, 0, 113, 1 }, 20001);
+    const new_b = messages.Endpoint.initV4(.{ 203, 0, 113, 2 }, 20002);
+    const sa = try a.addPeerWithEndpoint(identity_b, pub_b, old_b, .{0} ** 4, .{0} ** 16);
+    const sb = try b.addPeerWithEndpoint(identity_a, pub_a, old_a, .{0} ** 4, .{0} ** 16);
+    const initiation = try a.initiateHandshake(sa);
+    var forged = initiation;
+    forged.mac1[0] ^= 1;
+    try std.testing.expectError(error.InvalidMac, b.handleInitiationFromEndpoint(&forged, new_a));
+    try std.testing.expectEqual(old_a, b.peers[sb].?.endpoint().?);
+    const accepted = try b.handleInitiationFromEndpoint(&initiation, new_a);
+    try std.testing.expectEqual(identity_a, accepted.identity_key);
+    try std.testing.expectEqual(new_a, b.peers[sb].?.endpoint().?);
+    var invalid_response = accepted.response;
+    invalid_response.receiver_index = 0xffffffff;
+    try std.testing.expectError(error.UnknownIndex, a.handleResponseFromEndpoint(&invalid_response, new_b));
+    try std.testing.expectEqual(old_b, a.peers[sa].?.endpoint().?);
+    const response = try a.handleResponseFromEndpoint(&accepted.response, new_b);
+    try std.testing.expectEqual(identity_b, response.identity_key);
+    try std.testing.expectEqual(new_b, a.peers[sa].?.endpoint().?);
+}
 
 test "WgDevice add/remove peer" {
     const X25519 = std.crypto.dh.X25519;
