@@ -23,6 +23,7 @@ const is_windows = builtin.os.tag == .windows;
 const is_macos = builtin.os.tag == .macos;
 const is_ios = builtin.os.tag == .ios;
 const is_darwin = is_macos or is_ios;
+const udp = @import("../net/udp.zig");
 const win = if (is_windows) struct {
     extern "ws2_32" fn ioctlsocket(socket: posix.socket_t, cmd: i32, argp: *u32) c_int;
     extern "ws2_32" fn closesocket(socket: posix.socket_t) c_int;
@@ -42,6 +43,10 @@ const IP_MULTICAST_LOOP: u32 = if (is_linux) 34 else if (is_windows) 11 else if 
 
 fn linuxSocket(domain: u32, sock_type: u32, protocol: u32) !std.posix.socket_t {
     const fd = std.c.socket(@intCast(domain), @intCast(sock_type), @intCast(protocol));
+    // Winsock reports failure as INVALID_SOCKET and never sets the C errno.
+    if (comptime is_windows) {
+        if (fd < 0) return error.SocketCreateFailed;
+    }
     switch (std.posix.errno(fd)) {
         .SUCCESS => {
             if (comptime is_windows) {
@@ -78,6 +83,7 @@ pub const LanDiscovery = struct {
 
     /// Initialize LAN discovery: create multicast socket, join group.
     pub fn init(our_pubkey: [32]u8, gossip_port: u16, app_id: u16, on_peer: OnLanPeerFn, ctx: *anyopaque) !LanDiscovery {
+        udp.ensureWinsockInit(); // No-op outside Windows.
         // On Linux, set SOCK_NONBLOCK at creation. On Windows, we'll use ioctlsocket.
         const sock_fd = blk: {
             if (comptime is_linux) {
@@ -92,8 +98,11 @@ pub const LanDiscovery = struct {
 
         // On Windows, set non-blocking via ioctlsocket
         if (comptime is_windows) {
+            // winsock2.h: FIONBIO = _IOW('f', 126, u_long). A blocking socket
+            // would stall the event loop in recvBeacons().
+            const FIONBIO: i32 = @bitCast(@as(u32, 0x8004667e));
             var mode: u32 = 1; // non-blocking
-            _ = win.ioctlsocket(sock_fd, @bitCast(@as(i32, 0x4004667e)), &mode); // FIONBIO
+            if (win.ioctlsocket(sock_fd, FIONBIO, &mode) != 0) return error.SocketCreateFailed;
         } else if (comptime is_darwin) {
             // On Darwin (macOS/iOS), set non-blocking via fcntl (no SOCK_NONBLOCK at creation)
             const flags = posix.system.fcntl(sock_fd, posix.F.GETFL, @as(usize, 0));
@@ -122,11 +131,18 @@ pub const LanDiscovery = struct {
         } else {
             try posix.setsockopt(sock_fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one));
         }
-        if (comptime @hasDecl(posix.SO, "REUSEPORT")) {
-            try posix.setsockopt(sock_fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, std.mem.asBytes(&one));
-        }
-        if (comptime @hasDecl(posix.SO, "BROADCAST")) {
-            try posix.setsockopt(sock_fd, posix.SOL.SOCKET, posix.SO.BROADCAST, std.mem.asBytes(&one));
+        if (comptime is_windows) {
+            // Winsock has no SO_REUSEPORT; SO_REUSEADDR above covers sharing the port.
+            if (std.c.setsockopt(sock_fd, posix.SOL.SOCKET, posix.SO.BROADCAST, @ptrCast(&one), @sizeOf(c_int)) != 0) {
+                return error.SocketCreateFailed;
+            }
+        } else {
+            if (comptime @hasDecl(posix.SO, "REUSEPORT")) {
+                try posix.setsockopt(sock_fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, std.mem.asBytes(&one));
+            }
+            if (comptime @hasDecl(posix.SO, "BROADCAST")) {
+                try posix.setsockopt(sock_fd, posix.SOL.SOCKET, posix.SO.BROADCAST, std.mem.asBytes(&one));
+            }
         }
 
         // Bind to multicast port

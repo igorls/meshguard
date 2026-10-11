@@ -74,6 +74,8 @@ jobs:
             artifact: meshguard-windows-amd64
             ext: ".exe"
             build_args: ""
+            # Embedding library: meshguard-ffi.dll and its import library.
+            ffi_artifact: meshguard-ffi-windows-amd64
           - target: x86_64-freebsd
             artifact: meshguard-freebsd-amd64
             ext: ""
@@ -106,6 +108,22 @@ jobs:
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}${{ matrix.ext }}
+
+      - name: Rename FFI library
+        if: matrix.ffi_artifact
+        run: |
+          mv zig-out/bin/meshguard-ffi.dll ${{ matrix.ffi_artifact }}.dll
+          mv zig-out/lib/meshguard-ffi.lib ${{ matrix.ffi_artifact }}.lib
+
+      - name: Upload FFI library
+        if: matrix.ffi_artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.ffi_artifact }}
+          path: |
+            ${{ matrix.ffi_artifact }}.dll
+            ${{ matrix.ffi_artifact }}.lib
+          if-no-files-found: error
 
   apple:
     name: Apple FFI release artifacts

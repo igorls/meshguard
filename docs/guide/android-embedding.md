@@ -2,6 +2,8 @@
 
 meshguard provides a **C-ABI shared library** (`libmeshguard-ffi.so`) for embedding mesh networking in mobile apps. The library exposes SWIM gossip discovery, LAN multicast, end-to-end encrypted messaging, and WireGuard-encrypted data tunnels (suitable for VoIP audio or real-time data).
 
+The same library builds for desktop hosts with the same exports: `libmeshguard-ffi.so` on Linux, `libmeshguard-ffi.dylib` on macOS and `meshguard-ffi.dll` on Windows (see [Embedding MeshGuard on Windows](/guide/windows-support#embedding-meshguard-meshguard-ffi-dll)).
+
 ## What's Included
 
 | Feature                  | CLI (`meshguard`) | FFI (`libmeshguard-ffi.so`) |
@@ -57,7 +59,7 @@ object MeshGuardFFI {
     // Mesh join/leave
     external fun meshguard_join(ctx: Long, seedIp: ByteArray, seedPort: Int): Int
     external fun meshguard_join_ipv6(ctx: Long, seedIp: ByteArray, seedPort: Int): Int
-    external fun meshguard_join_host(ctx: Long, host: String, seedPort: Int): Int
+    external fun meshguard_join_host(ctx: Long, hostAndPort: String): Int // "host:port"
     external fun meshguard_join_lan(ctx: Long): Int
     external fun meshguard_leave(ctx: Long)
 
@@ -194,7 +196,7 @@ MeshGuardFFI.meshguard_tunnel_close(ctx, peerPubkey)
 | ----------------------------------------- | --------------------------------------------- | ------------------------------------- |
 | `meshguard_join(ctx, seed_ip, seed_port)` | `0` success, `-1` error, `-2` already running | Join via seed peer.                   |
 | `meshguard_join_ipv6(ctx, seed_ip6, seed_port)` | `0` success, `-1` error, `-2` already running | Join via IPv6 seed peer. |
-| `meshguard_join_host(ctx, host, seed_port)` | `0` success, `-1` error, `-2` already running | Resolve DNS A record, then join. |
+| `meshguard_join_host(ctx, "host:port")` | `0` success, `-1` error, `-2` already running, `-11` bad name or DNS failure | Resolve DNS A record, then join. |
 | `meshguard_join_lan(ctx)`                 | `0` success, `-1` error                       | Join via LAN multicast (239.99.99.1). |
 | `meshguard_leave(ctx)`                    | `void`                                        | Broadcast leave and stop event loop.  |
 
