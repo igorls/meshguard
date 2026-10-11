@@ -10,6 +10,7 @@
 //! Commands:
 //!   PEERS\n                       → JSON array of alive peers with mesh IPs
 //!   STATUS\n                      → JSON object with daemon status summary
+//!                                      (with relay counters when forwarding)
 //!   STOP\n                        → request graceful daemon shutdown
 //!   MSGS\n                        → JSON object with queued legacy message count and previews
 //!   RECV [timeout_ms]\n           → Pops oldest *legacy* message; returns JSON
@@ -45,6 +46,7 @@ const X25519 = std.crypto.dh.X25519;
 const ChaCha20Poly1305 = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
 const crypto = @import("../wireguard/crypto.zig");
 const Relay = @import("../nat/relay.zig");
+const RelayCore = @import("../relay/core.zig");
 const app_channel = @import("../protocol/app_channel.zig");
 const transfer_wire = @import("../protocol/transfer.zig");
 const Transfers = @import("transfers.zig");
@@ -493,6 +495,10 @@ pub const ControlSocket = struct {
     our_mesh_ip: [4]u8,
     stop_flag: ?*std.atomic.Value(bool) = null,
     our_wg_private: [32]u8,
+    /// Relay forwarding counters for STATUS. Read without the event loop's
+    /// cooperation on Windows, so values may be momentarily stale.
+    relay_core: ?*const RelayCore.RelayCore = null,
+    relay_forwarding: []const u8 = "none",
 
     // In-memory incoming legacy message queue (unframed / non-MGAPP1 plaintext)
     queue: [MAX_QUEUED_MESSAGES]QueuedMessage = undefined,
@@ -1335,7 +1341,9 @@ pub const ControlSocket = struct {
         }
 
         const our_pubkey_hex = std.fmt.bytesToHex(self.our_pubkey, .lower);
-        const written = std.fmt.bufPrint(buf, "{{\"running\":true,\"pubkey\":\"{s}\",\"mesh_ip\":\"{d}.{d}.{d}.{d}\",\"peers\":{{\"alive\":{d},\"suspected\":{d},\"dead\":{d}}},\"queued_msgs\":{d}}}\n", .{
+        var relay_buf: [512]u8 = undefined;
+        const relay = self.formatRelayStatus(&relay_buf);
+        const written = std.fmt.bufPrint(buf, "{{\"running\":true,\"pubkey\":\"{s}\",\"mesh_ip\":\"{d}.{d}.{d}.{d}\",\"peers\":{{\"alive\":{d},\"suspected\":{d},\"dead\":{d}}},\"queued_msgs\":{d}{s}}}\n", .{
             &our_pubkey_hex,
             self.our_mesh_ip[0],
             self.our_mesh_ip[1],
@@ -1345,9 +1353,31 @@ pub const ControlSocket = struct {
             suspected,
             dead,
             self.queue_count,
+            relay,
         }) catch return 0;
 
         return written.len;
+    }
+
+    /// `,"relay":{...}` with forwarding counters, or empty without a relay core.
+    fn formatRelayStatus(self: *ControlSocket, buf: []u8) []const u8 {
+        const core = self.relay_core orelse return "";
+        const s = core.stats;
+        return std.fmt.bufPrint(buf, ",\"relay\":{{\"forwarding\":\"{s}\",\"clients\":{d},\"proven\":{d},\"claims\":{d},\"forwarded\":{d},\"proofs\":{d},\"handshakes_refused\":{d},\"dropped\":{{\"unproven_sender\":{d},\"spoofed_sender\":{d},\"not_admitted\":{d},\"rate_limited\":{d},\"unknown_destination\":{d},\"overloaded\":{d}}}}}", .{
+            self.relay_forwarding,
+            core.connCount(),
+            core.provenCount(),
+            core.claimCount(),
+            s.forwarded,
+            s.proofs,
+            s.handshakes_refused,
+            s.droppedFor(.unproven_sender),
+            s.droppedFor(.spoofed_sender),
+            s.droppedFor(.not_admitted),
+            s.droppedFor(.rate_limited),
+            s.droppedFor(.unknown_destination),
+            s.droppedFor(.overloaded),
+        }) catch "";
     }
 
     pub fn deinit(self: *ControlSocket, allocator: std.mem.Allocator) void {
@@ -1697,6 +1727,23 @@ test "control STATUS response includes peer counts" {
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "\"running\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "\"mesh_ip\":\"10.99.3.4\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "\"alive\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "\"relay\"") == null);
+
+    const Admit = struct {
+        fn all(_: *anyopaque, _: [32]u8) bool {
+            return true;
+        }
+    };
+    var dummy: u8 = 0;
+    var core = try RelayCore.RelayCore.init(allocator, .{ .max_clients = 16, .max_unproven = 4, .max_claims = 16, .max_handshake_sources = 16 }, [_]u8{0x40} ** 32, [_]u8{0x41} ** 32, .{ .ctx = &dummy, .admits = Admit.all }, 0);
+    defer core.deinit();
+    core.stats.dropped[@intFromEnum(RelayCore.DropReason.spoofed_sender)] = 3;
+    control.relay_core = &core;
+    control.relay_forwarding = "authenticated";
+    const m = control.formatCommandResponse("STATUS", &buf, false);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..m], "\"relay\":{\"forwarding\":\"authenticated\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..m], "\"spoofed_sender\":3") != null);
+    try std.testing.expect(std.mem.endsWith(u8, buf[0..m], "}}\n"));
 }
 
 test "ControlSocket message queue push and pop" {

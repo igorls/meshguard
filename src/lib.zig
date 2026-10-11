@@ -25,6 +25,10 @@ pub const discovery = struct {
     pub const Lan = @import("discovery/lan.zig");
 };
 
+pub const relay = struct {
+    pub const Core = @import("relay/core.zig");
+};
+
 pub const nat = struct {
     pub const Stun = @import("nat/stun.zig");
     pub const Holepunch = @import("nat/holepunch.zig");
@@ -86,6 +90,8 @@ test {
     _ = wireguard.Crypto;
     _ = wireguard.Ip;
     _ = discovery.Swim;
+    _ = relay.Core;
+    _ = identity.Binding;
     @import("std").testing.refAllDecls(net.Dns);
     @import("std").testing.refAllDecls(nat.Stun);
     if (is_linux) {

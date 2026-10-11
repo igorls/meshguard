@@ -111,7 +111,7 @@ Trigger: any time >=1 peer transitions SUSPECTED->DEAD on timeout (attacker-forc
 - H8: eliminate the stack-slice return from expireSuspected.
 - M1/M2: cross-validate STUN/UPnP endpoints; reject reserved addresses; two-source agreement.
 - M3: validate SSDP source; sanitize controlURL/host for CRLF.
-- M4: authenticate + rate-limit the 0x50 relay behind the gate.
+- M4: authenticate + rate-limit the 0x50 relay behind the gate. **Addressed:** relays forward `0x50` and `0x31` only for senders whose endpoint is proven by a Noise handshake for a WireGuard key they signed (or, by default outside `--relay`, from the sender's known endpoint), within per-key and global budgets; mobile contexts no longer forward. See `docs/reference/relay-forwarding.md`.
 - M6: Lamport-order liveness transitions.
 - M7/L5: bind punch/NTP responses to expected source/nonce.
 - Global: consider ReleaseSafe for the parse/dispatch path; move all authorization ahead of handler dispatch; make enforce_trust default-on/fail-closed.

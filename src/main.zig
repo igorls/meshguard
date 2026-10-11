@@ -58,6 +58,14 @@ const usage =
     \\  --gossip-only             Run discovery/rendezvous only, without TUN/WireGuard
     \\  --no-tun                  Alias for --gossip-only
     \\  --open                    Accept all peers (skip trust enforcement)
+    \\  --relay                   Forward sealed frames only for clients proven by handshake
+    \\  --max-clients <n>         Relay clients tracked at once (default 16384 with --relay)
+    \\  --client-pps <n>          Frames per second each relay client may send (default 50)
+    \\  --client-kbps <n>         KiB per second each relay client may send (default 256)
+    \\  --forward-pps <n>         Frames per second forwarded for all clients (default 20000)
+    \\  --trusted-handshake-source <ip>
+    \\                            Limit handshakes from this address per port (a local gateway)
+    \\  --legacy-wg-binding       Accept gossip-learned WireGuard keys for admitted clients
     \\  --gossip-port <port>      Override gossip/listen UDP port (default 51821)
     \\  --control-path <path>     Override control socket path for this daemon
     \\  -h, --help               Show this help
@@ -903,6 +911,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     var encrypt_workers: usize = 0; // 0 = auto (CPU count)
     var open_mode: bool = false; // --open: skip trust, accept any peer
     var gossip_only: bool = false; // --gossip-only/--no-tun: seed/rendezvous mode
+    var relay_flags = RelayFlags{};
     var control_path_flag: ?[]const u8 = null;
     // Collect raw seed strings for hostname resolution
     var seed_strs: [16][]const u8 = undefined;
@@ -951,7 +960,10 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
                 open_mode = true;
             } else if (std.mem.eql(u8, extra_args[i], "--gossip-only") or std.mem.eql(u8, extra_args[i], "--no-tun")) {
                 gossip_only = true;
-            }
+            } else if (relay_flags.parse(extra_args, &i) catch |err| {
+                try writeFormatted(stderr, "error: invalid value for {s}: {s}\n", .{ extra_args[i], @errorName(err) });
+                std.process.exit(1);
+            }) {}
         }
     }
 
@@ -1267,6 +1279,21 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     swim.setWgBinding(lib.identity.Binding.sign(kp_signer, wg_public_key) catch {
         try stderr.writeStreamingAll(zio(), "error: failed to sign WireGuard binding\n");
         std.process.exit(1);
+    });
+
+    // Relay core: forwards sealed frames only for authenticated senders.
+    var relay_core = lib.relay.Core.RelayCore.init(allocator, relay_flags.config(), wg_private_key, wg_public_key, swim.relayAdmission(), 0) catch |err| {
+        try writeFormatted(stderr, "error: failed to allocate relay core: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer relay_core.deinit();
+    swim.relay_core = &relay_core;
+    swim.forwarding = if (relay_flags.relay) .authenticated else .endpoint_match;
+    control.relay_core = &relay_core;
+    control.relay_forwarding = @tagName(swim.forwarding);
+    try writeFormatted(stdout, "  relay: {s}, up to {d} clients\n", .{
+        if (relay_flags.relay) @as([]const u8, "authenticated forwarding") else @as([]const u8, "forwarding for known endpoints"),
+        relay_core.config.max_clients,
     });
 
     // Load our own org certificate (if present)
@@ -3277,6 +3304,91 @@ fn decryptRxWorker(
 
 /// Process a single incoming UDP packet: classify and dispatch to the appropriate handler.
 /// Shared by both GRO (single coalesced buffer) and legacy batch (recvmmsg) receive paths.
+/// `meshguard up` relay options.
+const RelayFlags = struct {
+    relay: bool = false,
+    max_clients: ?u32 = null,
+    client_pps: ?f64 = null,
+    client_kbps: ?f64 = null,
+    forward_pps: ?f64 = null,
+    trusted_handshake_source: ?[16]u8 = null,
+    legacy_wg_binding: bool = false,
+
+    /// Consumes a relay flag at `args[i.*]` (and its value). Returns false
+    /// for anything else.
+    fn parse(self: *RelayFlags, args: []const []const u8, i: *usize) !bool {
+        const arg = args[i.*];
+        if (std.mem.eql(u8, arg, "--relay")) {
+            self.relay = true;
+            return true;
+        }
+        if (std.mem.eql(u8, arg, "--legacy-wg-binding")) {
+            self.legacy_wg_binding = true;
+            return true;
+        }
+        const takes_value = std.mem.eql(u8, arg, "--max-clients") or std.mem.eql(u8, arg, "--client-pps") or
+            std.mem.eql(u8, arg, "--client-kbps") or std.mem.eql(u8, arg, "--forward-pps") or
+            std.mem.eql(u8, arg, "--trusted-handshake-source");
+        if (!takes_value) return false;
+        if (i.* + 1 >= args.len) return error.MissingValue;
+        const value = args[i.* + 1];
+        if (std.mem.eql(u8, arg, "--max-clients")) {
+            const n = try std.fmt.parseInt(u32, value, 10);
+            if (n < 16 or n > 1 << 20) return error.OutOfRange;
+            self.max_clients = n;
+        } else if (std.mem.eql(u8, arg, "--trusted-handshake-source")) {
+            var addr = std.mem.zeroes([16]u8);
+            if (parseIpv4(value)) |v4| {
+                addr[0..4].* = v4;
+            } else if (parseIpv6Endpoint(value, 0)) |v6| {
+                addr = v6.addr6 orelse return error.InvalidAddress;
+            } else return error.InvalidAddress;
+            self.trusted_handshake_source = addr;
+        } else {
+            const n = try std.fmt.parseFloat(f64, value);
+            if (!(n > 0) or n > 1e9) return error.OutOfRange;
+            if (std.mem.eql(u8, arg, "--client-pps")) self.client_pps = n;
+            if (std.mem.eql(u8, arg, "--client-kbps")) self.client_kbps = n;
+            if (std.mem.eql(u8, arg, "--forward-pps")) self.forward_pps = n;
+        }
+        i.* += 1;
+        return true;
+    }
+
+    /// Relays get room for many clients; other daemons keep a small table
+    /// for the few clients that may use them.
+    fn config(self: RelayFlags) lib.relay.Core.Config {
+        var c = lib.relay.Core.Config{};
+        if (!self.relay) {
+            c.max_clients = 1024;
+            c.max_unproven = 256;
+            c.max_claims = 2048;
+            c.max_handshake_sources = 1024;
+        }
+        if (self.max_clients) |n| {
+            c.max_clients = n;
+            c.max_unproven = @max(16, n / 4);
+            c.max_claims = n * 2;
+            c.max_handshake_sources = @max(64, n / 2);
+        }
+        if (self.client_pps) |n| {
+            c.client_pps = n;
+            c.client_burst = n * 2;
+        }
+        if (self.client_kbps) |n| {
+            c.client_bytes_per_s = n * 1024;
+            c.client_byte_burst = n * 2048;
+        }
+        if (self.forward_pps) |n| {
+            c.forward_pps = n;
+            c.forward_burst = n / 5;
+        }
+        c.trusted_handshake_source = self.trusted_handshake_source;
+        c.legacy_wg_binding = self.legacy_wg_binding;
+        return c;
+    }
+};
+
 fn processIncomingPacket(
     pkt: []const u8,
     sender_addr: [4]u8,
@@ -3344,7 +3456,12 @@ fn processIncomingPacket(
                     const resp_bytes = std.mem.asBytes(&hs_result.response);
                     _ = udp_sock.sendTo(resp_bytes, sender_addr, sender_port) catch 0;
                     writeFormatted(stdout, "  WG handshake: responded to initiation\n", .{}) catch {};
-                } else |_| {}
+                } else |err| switch (err) {
+                    // Not one of our WireGuard peers: a relay client proving its
+                    // endpoint. The relay core has its own limits.
+                    error.UnknownPeer, error.HandshakeRateLimited => _ = swim.answerRelayInitiation(pkt, source),
+                    else => {},
+                }
             }
         },
         .wg_handshake_resp => {
