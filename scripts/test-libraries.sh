@@ -7,6 +7,9 @@
 #
 # Usage: scripts/test-libraries.sh [output-directory]
 # Needs binutils (readelf, nm) and Zig; runs the Linux x86_64 hosts with cc.
+# Runs the 32-bit ARM Linux hosts too when qemu-arm (or qemu-arm-static) and an
+# armhf glibc (ARMHF_SYSROOT, default /usr/arm-linux-gnueabihf, as installed by
+# Debian/Ubuntu libc6-armhf-cross) are available.
 set -euo pipefail
 if [[ $# -gt 1 ]]; then
   echo 'Usage: scripts/test-libraries.sh [output-directory]' >&2
@@ -81,9 +84,10 @@ int main(void) {
 }
 C
 
-# link_hosts <package> <zig target> <run: yes|no>
+# link_hosts <package> <zig target> <run: yes|no> [runner command...]
 link_hosts() {
   local package="$output/$1" target="$2" run="$3" kind
+  local runner=("${@:4}")
   for kind in dynamic static; do
     local exe="$scratch/$1-$kind" lib=(-L "$package/lib" -lmeshguard-ffi -Wl,-rpath,"$package/lib")
     [[ "$kind" == static ]] && lib=("$package/lib/libmeshguard-ffi.a")
@@ -93,7 +97,7 @@ link_hosts() {
       continue
     fi
     if [[ "$run" == yes ]]; then
-      "$exe" > /dev/null || fail "$1: $kind C host failed"
+      "${runner[@]}" "$exe" > /dev/null || fail "$1: $kind C host failed"
     fi
     echo "ok $1 $kind C host ($target$([[ "$run" == yes ]] && echo ', ran'))"
   done
@@ -102,14 +106,25 @@ link_hosts() {
 native_amd64=no
 [[ "$(uname -s)-$(uname -m)" == Linux-x86_64 ]] && native_amd64=yes
 
-if [[ -d "$output/linux-amd64" || -d "$output/linux-arm64" ]]; then
-  glibc='libc\.so\.6|libpthread\.so\.0|ld-linux-x86-64\.so\.2|ld-linux-aarch64\.so\.1'
+# 32-bit ARM Linux hosts run under qemu-user with an armhf glibc, when present.
+armhf_run=(no)
+qemu_arm="$(command -v qemu-arm || command -v qemu-arm-static || true)"
+armhf_sysroot="${ARMHF_SYSROOT:-/usr/arm-linux-gnueabihf}"
+if [[ -n "$qemu_arm" && -f "$armhf_sysroot/lib/ld-linux-armhf.so.3" ]]; then
+  armhf_run=(yes "$qemu_arm" -L "$armhf_sysroot")
+fi
+
+if [[ -d "$output/linux-amd64" || -d "$output/linux-arm64" || -d "$output/linux-armhf" ]]; then
+  glibc='libc\.so\.6|libpthread\.so\.0|ld-linux-x86-64\.so\.2|ld-linux-aarch64\.so\.1|ld-linux-armhf\.so\.3'
   check_shared "$output/linux-amd64/lib/libmeshguard-ffi.so" 'Advanced Micro Devices X86-64' "$glibc"
   check_static "$output/linux-amd64/lib/libmeshguard-ffi.a"
   check_shared "$output/linux-arm64/lib/libmeshguard-ffi.so" AArch64 "$glibc"
   check_static "$output/linux-arm64/lib/libmeshguard-ffi.a"
   link_hosts linux-amd64 x86_64-linux-gnu.2.28 "$native_amd64"
   link_hosts linux-arm64 aarch64-linux-gnu.2.28 no
+  check_shared "$output/linux-armhf/lib/libmeshguard-ffi.so" ARM "$glibc"
+  check_static "$output/linux-armhf/lib/libmeshguard-ffi.a"
+  link_hosts linux-armhf arm-linux-gnueabihf.2.28 "${armhf_run[@]}"
   # The packages are meant for the system toolchain too, not only zig cc.
   if [[ "$native_amd64" == yes ]] && command -v cc > /dev/null; then
     package="$output/linux-amd64"
@@ -133,9 +148,15 @@ fi
 
 if [[ -d "$output/android" ]]; then
   bionic='libc\.so'
-  for abi in arm64-v8a:AArch64 'x86_64:Advanced Micro Devices X86-64'; do
+  # <ABI>:<minimum LOAD alignment>:<readelf machine>. 64-bit ABIs must suit
+  # 16 KB page devices; 32-bit devices use 4 KB pages.
+  for abi in arm64-v8a:16384:AArch64 armeabi-v7a:4096:ARM 'x86_64:16384:Advanced Micro Devices X86-64'; do
     file="$output/android/jniLibs/${abi%%:*}/libmeshguard-ffi.so"
-    check_shared "$file" "${abi#*:}" "$bionic" 16384
+    align="${abi#*:}"
+    check_shared "$file" "${align#*:}" "$bionic" "${align%%:*}"
+    if readelf -SW "$file" | grep -q ' \.symtab '; then
+      fail "${abi%%:*}: library is not stripped"
+    fi
     # Every libc import must resolve against the NDK stubs of the minimum API.
     if nm -D --undefined-only "$file" | grep -v '@' | grep -q .; then
       fail "${abi%%:*}: unversioned undefined symbols: $(nm -D --undefined-only "$file" | grep -v '@' | tr '\n' ' ')"

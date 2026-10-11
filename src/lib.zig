@@ -85,6 +85,7 @@ pub const services = struct {
 test {
     // Run all module tests
     @import("std").testing.refAllDecls(@This());
+    _ = @import("atomic64.zig");
     _ = wireguard.Tunnel;
     _ = wireguard.Device;
     _ = wireguard.Noise;

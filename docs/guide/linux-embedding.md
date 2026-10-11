@@ -22,6 +22,7 @@ assets, listed in `checksums.txt`:
 |---|---|---|
 | `meshguard-ffi-linux-amd64.tar.gz` | `linux-amd64/lib/libmeshguard-ffi.so`, `lib/libmeshguard-ffi.a`, `include/meshguard.h`, `LICENSE` | x86_64 Linux with glibc 2.28 or newer |
 | `meshguard-ffi-linux-arm64.tar.gz` | The same layout under `linux-arm64/` | aarch64 Linux with glibc 2.28 or newer |
+| `meshguard-ffi-linux-armhf.tar.gz` | The same layout under `linux-armhf/` | 32-bit ARM Linux (ARMv7-A with NEON, hard-float, such as `armhf` distributions on Raspberry Pi 2 and newer) with glibc 2.28 or newer |
 | `meshguard-ffi-freebsd-amd64.tar.gz` | The same layout under `freebsd-amd64/` | x86_64 FreeBSD 14.0 or newer |
 
 The libraries use Zig `std.crypto`, so they need no libsodium. They depend only
@@ -29,7 +30,13 @@ on the C library: `libc.so.6` and `libpthread.so.0` (plus the dynamic loader) on
 Linux, `libc.so.7` and `libthr.so.3` on FreeBSD. The shared library's soname is
 `libmeshguard-ffi.so`. The packages target glibc; for a musl system such as
 Alpine, build from source with `-Dtarget=x86_64-linux-musl` (or
-`aarch64-linux-musl`).
+`aarch64-linux-musl`, `arm-linux-musleabihf`).
+
+Zig has no 64-bit atomic operations on 32-bit ARM, so there the library guards
+its 64-bit values (the WireGuard send counter, route statistics and the last
+receive time) with a short mutex. The send counter is read and advanced as one
+step under the lock and never wraps, so no nonce is ever used twice. 64-bit
+builds use lock-free atomics.
 
 ## Building from source
 
@@ -48,6 +55,13 @@ checks that each library exports exactly the `export fn` entry points of
 `src/meshguard_ffi.zig`, that `include/meshguard.h` declares them all, and that
 the libraries need nothing beyond the C library. It then compiles C hosts against
 the shared and static library of each package, and runs the x86_64 Linux hosts.
+It also runs the 32-bit ARM hosts when `qemu-arm` and an armhf glibc are
+installed (`ARMHF_SYSROOT`, by default `/usr/arm-linux-gnueabihf` from the
+`libc6-armhf-cross` package). The unit tests run on 32-bit ARM the same way:
+
+```bash
+zig build test -Dtarget=arm-linux-musleabihf -Dno-sodium=true -fqemu
+```
 
 A single library for the host machine:
 

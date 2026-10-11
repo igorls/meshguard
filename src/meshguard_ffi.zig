@@ -18,15 +18,18 @@ const builtin = @import("builtin");
 const lib = @import("lib.zig");
 const AppPacket = @import("app_packet.zig");
 const AppStatus = @import("protocol/app_status.zig");
+const atomic64 = @import("atomic64.zig");
 
-const is_mobile = builtin.abi == .android or builtin.os.tag == .ios;
+// 32-bit ARM Android is .androideabi; isAndroid() covers every Android ABI.
+const is_android = builtin.abi.isAndroid();
+const is_mobile = is_android or builtin.os.tag == .ios;
 
 // Mobile panic handler: Zig's default panic handler tries to load debug info
 // from the library. On Android the library is embedded inside the APK, and on
 // iOS simulator the default Mach-O unwinder can reference unavailable dyld
 // private symbols. Override to simply abort.
 pub const std_options: std.Options = .{
-    .logFn = if (builtin.abi == .android) androidLogFn else std.log.defaultLog,
+    .logFn = if (is_android) androidLogFn else std.log.defaultLog,
 };
 
 fn androidLogFn(
@@ -123,7 +126,7 @@ pub const MeshguardContext = struct {
 
     // Last packet time (ns), mirrored from SWIM by the event loop so host
     // threads never read SWIM while leave() replaces it.
-    last_recv_ns: std.atomic.Value(i64),
+    last_recv_ns: atomic64.Value(i64),
 
     // Host-tunable timers (0 = default), read by the event loop.
     keepalive_ms: std.atomic.Value(u32),
@@ -146,10 +149,10 @@ pub const MeshguardContext = struct {
     app_relay_key: ?[32]u8,
     force_app_relay: bool,
     last_relay_auth_ns: i128,
-    app_direct_sent: std.atomic.Value(u64),
-    app_relay_sent: std.atomic.Value(u64),
-    app_route_failed: std.atomic.Value(u64),
-    app_duplicate_dropped: std.atomic.Value(u64),
+    app_direct_sent: atomic64.Value(u64),
+    app_relay_sent: atomic64.Value(u64),
+    app_route_failed: atomic64.Value(u64),
+    app_duplicate_dropped: atomic64.Value(u64),
     app_seen: [128]AppSeen,
     app_seen_next: usize,
 
@@ -201,7 +204,7 @@ fn initContextStorage(ctx: *MeshguardContext, allocator: std.mem.Allocator) void
     ctx.status_write = std.atomic.Value(u32).init(0);
     ctx.status_read = std.atomic.Value(u32).init(0);
     ctx.keepalive_ms = std.atomic.Value(u32).init(0);
-    ctx.last_recv_ns = std.atomic.Value(i64).init(0);
+    ctx.last_recv_ns = atomic64.Value(i64).init(0);
     ctx.relay_proof_ms = std.atomic.Value(u32).init(0);
     ctx.membership = Membership.MembershipTable.init(allocator, 15000);
     ctx.swim = null;
@@ -214,10 +217,10 @@ fn initContextStorage(ctx: *MeshguardContext, allocator: std.mem.Allocator) void
     ctx.app_relay_key = null;
     ctx.force_app_relay = false;
     ctx.last_relay_auth_ns = 0;
-    ctx.app_direct_sent = std.atomic.Value(u64).init(0);
-    ctx.app_relay_sent = std.atomic.Value(u64).init(0);
-    ctx.app_route_failed = std.atomic.Value(u64).init(0);
-    ctx.app_duplicate_dropped = std.atomic.Value(u64).init(0);
+    ctx.app_direct_sent = atomic64.Value(u64).init(0);
+    ctx.app_relay_sent = atomic64.Value(u64).init(0);
+    ctx.app_route_failed = atomic64.Value(u64).init(0);
+    ctx.app_duplicate_dropped = atomic64.Value(u64).init(0);
     @memset(std.mem.asBytes(&ctx.app_seen), 0);
     ctx.app_seen_next = 0;
     ctx.on_message_cb = null;
@@ -412,7 +415,7 @@ export fn meshguard_init(
     listen_port: u16,
 ) ?*MeshguardContext {
     // Use c_allocator on Android (Bionic's malloc), GPA elsewhere
-    const allocator = if (builtin.abi == .android)
+    const allocator = if (is_android)
         std.heap.c_allocator
     else blk: {
         // For non-Android, use GPA for debug safety

@@ -6,9 +6,11 @@
 # Writes, under the output directory (default zig-out/libraries):
 #   meshguard-ffi-linux-amd64.tar.gz    shared and static library, header
 #   meshguard-ffi-linux-arm64.tar.gz    shared and static library, header
+#   meshguard-ffi-linux-armhf.tar.gz    shared and static library, header
+#                                       (32-bit ARMv7-A with NEON, hard-float)
 #   meshguard-ffi-freebsd-amd64.tar.gz  shared and static library, header
 #   meshguard-ffi-android.zip           jniLibs/<abi>/libmeshguard-ffi.so, header
-#                                       (arm64-v8a and x86_64)
+#                                       (arm64-v8a, armeabi-v7a and x86_64)
 #
 # Android needs only the NDK sysroot (Bionic headers and libc stubs). Set
 # ANDROID_NDK_HOME or ANDROID_NDK_ROOT to the NDK. MESHGUARD_LIBRARY_PLATFORMS
@@ -58,6 +60,7 @@ package_desktop() {
 if wants linux; then
   package_desktop linux-amd64 "x86_64-linux-gnu.$glibc"
   package_desktop linux-arm64 "aarch64-linux-gnu.$glibc"
+  package_desktop linux-armhf "arm-linux-gnueabihf.$glibc"
 fi
 if wants freebsd; then
   package_desktop freebsd-amd64 x86_64-freebsd.14.0
@@ -96,6 +99,7 @@ EOF
     cp "$output/build/android-$abi/lib/libmeshguard-ffi.so" "$package/jniLibs/$abi/"
   done <<'ABIS'
 arm64-v8a aarch64-linux-android aarch64-linux-android
+armeabi-v7a arm-linux-androideabi arm-linux-androideabi
 x86_64 x86_64-linux-android x86_64-linux-android
 ABIS
   cp include/meshguard.h "$package/include/"

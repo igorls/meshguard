@@ -100,12 +100,24 @@ jobs:
         with:
           version: 0.16.0
 
+      # qemu-user runs 32-bit ARM code: the unit tests (static musl) and the
+      # linux-armhf C hosts (with the armhf glibc from libc6-armhf-cross).
+      - name: Install qemu-user and the armhf C library
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-user libc6-armhf-cross
+
       # The runner image provides the Android NDK (ANDROID_NDK_HOME).
       - name: Build library packages
         run: ./scripts/build-libraries.sh
 
       - name: Check exports, dependencies, Android alignment and C hosts
         run: ./scripts/test-libraries.sh
+
+      # Zig has no 64-bit atomics on 32-bit ARM: this runs the locked counter path
+      # and every other unit test on a 32-bit target.
+      - name: Unit tests on 32-bit ARM (qemu)
+        run: zig build test -Dtarget=arm-linux-musleabihf -Dno-sodium=true -fqemu --summary all
 
       - name: Relay forwarding with the packaged Linux library
         run: |
