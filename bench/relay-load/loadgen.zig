@@ -104,6 +104,9 @@ const Metrics = struct {
     handshakes_sent: u64 = 0,
     proofs: u64 = 0,
     send_errors: u64 = 0,
+    pings_sent: u64 = 0,
+    acks_received: u64 = 0,
+    statuses_received: u64 = 0,
     latencies_us: std.ArrayListUnmanaged(u32) = .empty,
     storm_reproven_ms: ?u64 = null,
 };
@@ -279,6 +282,7 @@ const Generator = struct {
         c.ping_seq += 1;
         const len = Codec.encodePing(&buf, .{ .sender_pubkey = c.identity, .seq = c.ping_seq, .gossip = &.{}, .wg_binding = c.binding }) catch return;
         self.send(c, buf[0..len]);
+        if (self.measuring) self.m.pings_sent += 1;
     }
 
     fn startProof(self: *Generator, c: *Client) void {
@@ -397,6 +401,14 @@ const Generator = struct {
                         }
                     } else |_| {}
                 }
+                continue;
+            }
+            if (d.len >= 50 and d[0] == 0x03) {
+                if (self.measuring) self.m.acks_received += 1;
+                continue;
+            }
+            if (d.len == 47 and d[0] == 0x51) {
+                if (self.measuring) self.m.statuses_received += 1;
                 continue;
             }
             if (d.len >= 50 and d[0] == 0x01) {
@@ -558,16 +570,17 @@ const Generator = struct {
         const seconds = @as(f64, @floatFromInt(self.measured_ms)) / 1000.0;
         var text: [2048]u8 = undefined;
         const json = try std.fmt.bufPrint(&text,
-            \\{{"clients":{d},"flooders":{d},"spoofers":{d},"proven":{d},"proof_ms":{{"p50":{d},"p99":{d},"max":{d}}},"warmup_ms":{d},"measured_ms":{d},"sent":{d},"sent_to_unproven":{d},"received":{d},"duplicates":{d},"loss":{d:.6},"throughput_per_s":{d:.1},"latency_us":{{"p50":{d},"p95":{d},"p99":{d},"max":{d}}},"handshakes_sent":{d},"proofs":{d},"flood_sent":{d},"flood_received":{d},"spoof_sent":{d},"spoof_delivered":{d},"storm_reproven_ms":{?d},"send_errors":{d}}}
+            \\{{"clients":{d},"flooders":{d},"spoofers":{d},"proven":{d},"proof_ms":{{"p50":{d},"p99":{d},"max":{d}}},"warmup_ms":{d},"measured_ms":{d},"sent":{d},"sent_to_unproven":{d},"received":{d},"duplicates":{d},"loss":{d:.6},"throughput_per_s":{d:.1},"latency_us":{{"p50":{d},"p95":{d},"p99":{d},"max":{d}}},"handshakes_sent":{d},"proofs":{d},"flood_sent":{d},"flood_received":{d},"spoof_sent":{d},"spoof_delivered":{d},"storm_reproven_ms":{?d},"pings_sent":{d},"acks_received":{d},"statuses_received":{d},"send_errors":{d}}}
             \\
         , .{
-            self.honest,            self.o.flooders,          self.o.spoofers,                                    proven,
-            pct(proofs, 0.50),      pct(proofs, 0.99),        if (proofs.len > 0) proofs[proofs.len - 1] else 0,  self.warmup_ms,
-            self.measured_ms,       self.m.sent,              self.m.sent_to_unproven,                            self.m.received,
-            self.m.duplicates,      loss,                     @as(f64, @floatFromInt(self.m.received)) / seconds, pct(lat, 0.50),
-            pct(lat, 0.95),         pct(lat, 0.99),           if (lat.len > 0) lat[lat.len - 1] else 0,           self.m.handshakes_sent,
-            self.m.proofs,          self.m.flood_sent,        self.m.flood_received,                              self.m.spoof_sent,
-            self.m.spoof_delivered, self.m.storm_reproven_ms, self.m.send_errors,
+            self.honest,              self.o.flooders,          self.o.spoofers,                                    proven,
+            pct(proofs, 0.50),        pct(proofs, 0.99),        if (proofs.len > 0) proofs[proofs.len - 1] else 0,  self.warmup_ms,
+            self.measured_ms,         self.m.sent,              self.m.sent_to_unproven,                            self.m.received,
+            self.m.duplicates,        loss,                     @as(f64, @floatFromInt(self.m.received)) / seconds, pct(lat, 0.50),
+            pct(lat, 0.95),           pct(lat, 0.99),           if (lat.len > 0) lat[lat.len - 1] else 0,           self.m.handshakes_sent,
+            self.m.proofs,            self.m.flood_sent,        self.m.flood_received,                              self.m.spoof_sent,
+            self.m.spoof_delivered,   self.m.storm_reproven_ms, self.m.pings_sent,                                  self.m.acks_received,
+            self.m.statuses_received, self.m.send_errors,
         });
         try out.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), json);
     }

@@ -26,6 +26,8 @@ generator and the relay share the host.
 | Steady | 10,000 | 1,000 msg/s | 0 | 88 µs / 2.5 ms | 0.32 core | 17 MiB |
 | 10 flooders at 5,000 pps + 20 spoofers at 500 pps | 2,000 | 1,000 msg/s | 0.1% | 53 µs / 402 µs | 0.25 core | 9 MiB |
 | Reconnect storm (all clients change port) | 5,000 | 1,000 msg/s | 8.4% over 40 s | 92 µs / 2.4 ms | 0.23 core | 13 MiB |
+| Pings every 3 s, as mobile contexts do | 10,000 | 1,000 msg/s | 0 | — / 684 µs | 0.44 core | 17 MiB |
+| `--opaque`, pings every 3 s, 5 spoofers | 10,000 | 1,000 msg/s | 0 | 68 µs / 680 µs | 0.32 core | 13 MiB |
 
 Findings:
 
@@ -39,8 +41,14 @@ Findings:
   are lost: the storm row's loss. The global handshake budget (1,000/s) is
   the limit, and the 15 s mobile re-proof interval alone uses two thirds of
   it at 10,000 clients.
-- Next: answer unproven senders with a re-handshake status instead of
-  periodic re-proof, and batch receives on the relay socket.
+- **Answers need their own budget.** Mobile contexts ping their relay every
+  3 s: 3,300 pings/s at 10,000 clients. While answers shared the 500 packets/s
+  discovery budget, only 15% were answered, enough for clients to mark the
+  relay dead. With a separate reply budget (`--reply-pps`, 5,000) all were.
+- **Opaque relays are cheaper.** Keeping clients out of membership and gossip
+  saved a quarter of the CPU and memory at 10,000 clients.
+- Next: clients re-prove on a `handshake again` status instead of every 15 s,
+  and the relay batches receives on its socket.
 
 ## Architecture Overview
 

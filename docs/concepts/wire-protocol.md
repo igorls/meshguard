@@ -113,6 +113,21 @@ minimum MTU once IP and UDP headers are added) by sending fewer gossip
 entries next to the extensions: 8 with none or only a binding, 7 with only a
 certificate, 6 with both.
 
+## Delivery status (0x51)
+
+A relay that does not forward a sealed `0x50` frame may answer its sender:
+
+```
+[0x51][32B destination][12B nonce of the dropped frame][1B code][1B reserved]   47 bytes
+```
+
+Codes: `1` offline (destination not reachable here), `2` destination not
+admitted, `3` sender rate limited, `4` handshake again (the sender's endpoint is
+not proven for its key), `5` sender not admitted, `6` relay overloaded. A
+status goes only to the frame's source address and is never larger than the
+frame. Clients should accept statuses only from their relay's endpoint and only
+for a frame they recently sent (matching destination and nonce).
+
 ## HandshakeInitiation (Type 1)
 
 Standard Noise_IKpsk2 initiation message.
