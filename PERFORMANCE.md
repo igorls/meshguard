@@ -11,6 +11,37 @@ This document captures the current performance profile, what has been tried, wha
 | **Latency (avg)** | 0.194 ms                                          |
 | **Test setup**    | LXC containers, localhost veth, 8 encrypt workers |
 
+## Relay Forwarding
+
+Authenticated relay forwarding (`meshguard up --gossip-only --relay`) measured
+with `bench/relay-load` on loopback: an x86_64 Linux host (32 threads, WSL2),
+ReleaseSafe builds, 200-byte frames, each client sending to random contacts
+among 4, re-proving its endpoint every 15 s and pinging every 25 s. The
+generator and the relay share the host.
+
+| Scenario | Clients | Offered | Loss | Latency p50 / p99 | Relay CPU | Relay peak RSS |
+|---|---|---|---|---|---|---|
+| Steady | 200 | 200 msg/s | 0 | 134 µs / 427 µs | 0.03 core | 6 MiB |
+| Steady | 2,000 | 1,000 msg/s | 0 | 80 µs / 593 µs | 0.10 core | 9 MiB |
+| Steady | 10,000 | 1,000 msg/s | 0 | 88 µs / 2.5 ms | 0.32 core | 17 MiB |
+| 10 flooders at 5,000 pps + 20 spoofers at 500 pps | 2,000 | 1,000 msg/s | 0.1% | 53 µs / 402 µs | 0.25 core | 9 MiB |
+| Reconnect storm (all clients change port) | 5,000 | 1,000 msg/s | 8.4% over 40 s | 92 µs / 2.4 ms | 0.23 core | 13 MiB |
+
+Findings:
+
+- **Abuse is contained.** The flooders sent 1.31 M frames; the relay forwarded
+  16 k of them (their 50 frames/s budgets) and dropped the rest. Of 296 k
+  spoofed frames, none was delivered. Honest loss rose to 0.1%, consistent
+  with kernel receive-buffer drops at ~44 k packets/s on one socket.
+- **Handshakes bound recovery.** All 10,000 clients proved within 15 s of a
+  simultaneous start; 5,000 clients that changed port at once were re-proven
+  within 4.9 s. Frames sent in that gap from unproven ports, or to old ports,
+  are lost: the storm row's loss. The global handshake budget (1,000/s) is
+  the limit, and the 15 s mobile re-proof interval alone uses two thirds of
+  it at 10,000 clients.
+- Next: answer unproven senders with a re-handshake status instead of
+  periodic re-proof, and batch receives on the relay socket.
+
 ## Architecture Overview
 
 ```
