@@ -8,6 +8,9 @@ const Udp = @import("udp.zig");
 
 const UDP_RECV_USER_DATA: u64 = 0x1000_0000_0000_0000;
 const UDP_SEND_USER_DATA: u64 = 0x2000_0000_0000_0000;
+/// Completions the ring queues for its own waiting (`UdpRing.waitCompletions`).
+const UDP_TIMEOUT_USER_DATA: u64 = 0x4000_0000_0000_0000;
+const UDP_WAKE_USER_DATA: u64 = 0x8000_0000_0000_0000;
 const UDP_SLOT_MASK: u64 = 0x0000_0000_0000_ffff;
 
 const UDP_GRO = 104;
@@ -23,12 +26,12 @@ const Cmsghdr = extern struct {
     type: i32,
 };
 
-fn initRing(entries: u16, use_sqpoll: bool) !IoUring {
-    const flags: u32 = if (use_sqpoll) linux.IORING_SETUP_SQPOLL else 0;
-    return IoUring.init(entries, flags) catch |err| {
-        if (!use_sqpoll) return err;
-        return try IoUring.init(entries, 0);
-    };
+/// Rings are created without SQPOLL. Its kernel thread polls the submission
+/// queue for a second after every submission, so a node that sends or re-arms
+/// a wait at least once a second keeps a core busy (measured: a full core for
+/// an idle daemon) to save one syscall per batch.
+fn initRing(entries: u16) !IoUring {
+    return IoUring.init(entries, 0);
 }
 
 pub const UdpFallbackReason = enum {
@@ -68,7 +71,7 @@ pub const TunRingReader = struct {
     /// Initialize the io_uring and pre-submit read SQEs for the TUN fd.
     pub fn init(tun_fd: posix.fd_t) !TunRingReader {
         var self = TunRingReader{
-            .ring = try initRing(RING_DEPTH, true),
+            .ring = try initRing(RING_DEPTH),
             .slots = undefined,
         };
 
@@ -124,10 +127,10 @@ pub const TunRingReader = struct {
 };
 
 /// UDP receive/send event loop backed by io_uring.
-/// Keeps receive SQEs in flight and uses registered fixed buffers plus SQPOLL
-/// when the kernel/container permits it. UDP payload buffers are stable for the
-/// lifetime of the ring (until deinit), so callers can process completions
-/// without a copy.
+/// Keeps receive SQEs in flight and uses registered fixed buffers when the
+/// kernel/container permits it. The event loop blocks in `waitCompletions`
+/// rather than polling an empty ring. UDP payload buffers are stable for the lifetime of the ring (until
+/// deinit), so callers can process completions without a copy.
 pub const UdpRing = struct {
     pub const RECV_DEPTH: u16 = 32;
     pub const SEND_DEPTH: u16 = 32;
@@ -226,22 +229,24 @@ pub const UdpRing = struct {
     fd: posix.fd_t,
     original_status_flags: ?usize,
     registered_buffers: bool,
-    sqpoll: bool,
+    /// The wait's own timeout and wake-up poll, while in the ring.
+    timeout_armed: bool,
+    timeout_ts: linux.kernel_timespec,
+    wake_armed: bool,
 
     pub fn init(self: *UdpRing, fd: posix.fd_t) !void {
         self.* = UdpRing{
-            .ring = try initRing(RING_DEPTH, true),
+            .ring = try initRing(RING_DEPTH),
             .recv_slots = undefined,
             .send_slots = undefined,
             .registered_iovecs = undefined,
             .fd = fd,
             .original_status_flags = null,
             .registered_buffers = false,
-            .sqpoll = false,
+            .timeout_armed = false,
+            .timeout_ts = .{ .sec = 0, .nsec = 0 },
+            .wake_armed = false,
         };
-        // initRing may fall back when SQPOLL is denied by permissions/seccomp;
-        // the kernel-returned flags are the source of truth for runtime logging.
-        self.sqpoll = (self.ring.flags & linux.IORING_SETUP_SQPOLL) != 0;
         errdefer {
             self.restoreFdFlags();
             self.ring.deinit();
@@ -310,6 +315,49 @@ pub const UdpRing = struct {
         wait_nr: u32,
     ) !u32 {
         return try self.ring.copy_cqes(cqes, wait_nr);
+    }
+
+    /// Waits until at least one completion is ready, `timeout_ns` passes, or
+    /// `wake_fd` (-1 for none) becomes readable, so an idle loop sleeps in the
+    /// kernel instead of spinning. Returns the number of completions copied;
+    /// pass each to `noteWaitCompletion` first.
+    pub fn waitCompletions(
+        self: *UdpRing,
+        cqes: []linux.io_uring_cqe,
+        timeout_ns: u64,
+        wake_fd: posix.fd_t,
+    ) !u32 {
+        const ready = try self.ring.copy_cqes(cqes, 0);
+        if (ready > 0) return ready;
+        if (!self.timeout_armed) {
+            self.timeout_ts = .{
+                .sec = @intCast(timeout_ns / std.time.ns_per_s),
+                .nsec = @intCast(timeout_ns % std.time.ns_per_s),
+            };
+            // count 1: the timeout also completes with the next other completion,
+            // so it never outlives the wait that armed it.
+            _ = try self.ring.timeout(UDP_TIMEOUT_USER_DATA, &self.timeout_ts, 1, 0);
+            self.timeout_armed = true;
+        }
+        if (wake_fd >= 0 and !self.wake_armed) {
+            _ = try self.ring.poll_add(UDP_WAKE_USER_DATA, wake_fd, linux.POLL.IN);
+            self.wake_armed = true;
+        }
+        _ = try self.ring.submit_and_wait(1);
+        return try self.ring.copy_cqes(cqes, 0);
+    }
+
+    /// True (and forgets it) when `cqe` is the wait's own timeout or wake-up.
+    pub fn noteWaitCompletion(self: *UdpRing, cqe: linux.io_uring_cqe) bool {
+        if (cqe.user_data == UDP_TIMEOUT_USER_DATA) {
+            self.timeout_armed = false;
+            return true;
+        }
+        if (cqe.user_data == UDP_WAKE_USER_DATA) {
+            self.wake_armed = false;
+            return true;
+        }
+        return false;
     }
 
     pub fn recvSlotFromUserData(user_data: u64) ?u16 {
@@ -386,11 +434,26 @@ pub const UdpRing = struct {
 /// Check whether the UDP io_uring path should be attempted. This is intentionally
 /// independent from the TUN-reader gate: UDP sockets can use recvmsg/sendmsg rings
 /// even while TUN character-device reads remain disabled pending validation.
+///
+/// The ring path waits with IORING_OP_TIMEOUT (Linux 5.4). On older kernels
+/// that still create rings, the timeout would complete at once with -EINVAL
+/// and the loop would spin re-arming it (and before 5.3 recvmsg fails the same
+/// way), so the gate submits a 1 ns timeout and requires it to expire. Kernels
+/// that pass also have recvmsg, sendmsg and poll, which are older.
 pub fn isUdpRingAvailable() bool {
     if (builtin.os.tag != .linux) return false;
-    var ring = initRing(8, true) catch return false;
-    ring.deinit();
-    return true;
+    var ring = initRing(8) catch return false;
+    defer ring.deinit();
+    return timeoutExpires(&ring);
+}
+
+fn timeoutExpires(ring: *IoUring) bool {
+    const ts: linux.kernel_timespec = .{ .sec = 0, .nsec = 1 };
+    _ = ring.timeout(0, &ts, 0, 0) catch return false;
+    _ = ring.submit_and_wait(1) catch return false;
+    var cqes: [1]linux.io_uring_cqe = undefined;
+    const n = ring.copy_cqes(&cqes, 0) catch return false;
+    return n == 1 and cqes[0].err() == .TIME;
 }
 
 /// Check if io_uring is available AND compatible with TUN devices.
@@ -479,8 +542,89 @@ test "UdpRing receives loopback datagram when runtime available" {
             try ring.resubmitRecv(recv.slot, rx.fd);
             return;
         }
-        std.Thread.sleep(1 * std.time.ns_per_ms);
+        _ = linux.nanosleep(&.{ .sec = 0, .nsec = std.time.ns_per_ms }, null);
     }
 
     return error.UdpRingProbeTimedOut;
+}
+
+test "the ring gate requires timeouts that expire" {
+    if (builtin.os.tag != .linux) return;
+    var ring = initRing(8) catch return;
+    defer ring.deinit();
+    // Every kernel this runs on in CI has IORING_OP_TIMEOUT; the gate must agree.
+    try std.testing.expect(timeoutExpires(&ring));
+    try std.testing.expect(isUdpRingAvailable());
+}
+
+test "UdpRing waits in the kernel until a datagram or its timeout" {
+    if (!isUdpRingAvailable()) return;
+
+    var rx = try Udp.UdpSocket.bindAddr(.{ 127, 0, 0, 1 }, 0);
+    defer rx.close();
+    var tx = try Udp.UdpSocket.bindAddr(.{ 127, 0, 0, 1 }, 0);
+    defer tx.close();
+
+    var ring: UdpRing = undefined;
+    ring.init(rx.fd) catch return;
+    defer ring.deinit();
+
+    var cqes: [UdpRing.RECV_DEPTH + UdpRing.SEND_DEPTH + 2]linux.io_uring_cqe = undefined;
+
+    // Nothing arrives: the wait returns only the timeout, after it elapsed.
+    var start: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &start);
+    const idle = try ring.waitCompletions(&cqes, 30 * std.time.ns_per_ms, -1);
+    var end: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &end);
+    const elapsed_ns = (end.sec - start.sec) * std.time.ns_per_s + (end.nsec - start.nsec);
+    try std.testing.expect(elapsed_ns >= 25 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(u32, 1), idle);
+    try std.testing.expect(ring.noteWaitCompletion(cqes[0]));
+    try std.testing.expect(!ring.timeout_armed);
+
+    // A datagram ends the wait long before its timeout.
+    const payload = "meshguard-udp-ring-wait";
+    try std.testing.expectEqual(payload.len, try tx.sendTo(payload, .{ 127, 0, 0, 1 }, rx.port));
+    var received = false;
+    var waits: usize = 0;
+    while (!received and waits < 4) : (waits += 1) {
+        const n = try ring.waitCompletions(&cqes, 5 * std.time.ns_per_s, -1);
+        for (cqes[0..n]) |cqe| {
+            if (ring.noteWaitCompletion(cqe)) continue;
+            const recv = ring.recvCompletion(cqe) orelse continue;
+            try std.testing.expectEqualSlices(u8, payload, recv.data);
+            received = true;
+        }
+    }
+    try std.testing.expect(received);
+}
+
+test "UdpRing wakes when the wake descriptor becomes readable" {
+    if (!isUdpRingAvailable()) return;
+
+    var rx = try Udp.UdpSocket.bindAddr(.{ 127, 0, 0, 1 }, 0);
+    defer rx.close();
+    var wake = try Udp.UdpSocket.bindAddr(.{ 127, 0, 0, 1 }, 0);
+    defer wake.close();
+    var tx = try Udp.UdpSocket.bindAddr(.{ 127, 0, 0, 1 }, 0);
+    defer tx.close();
+
+    var ring: UdpRing = undefined;
+    ring.init(rx.fd) catch return;
+    defer ring.deinit();
+
+    _ = try tx.sendTo("wake", .{ 127, 0, 0, 1 }, wake.port);
+    var cqes: [UdpRing.RECV_DEPTH + UdpRing.SEND_DEPTH + 2]linux.io_uring_cqe = undefined;
+    var woke = false;
+    var waits: usize = 0;
+    while (!woke and waits < 4) : (waits += 1) {
+        const n = try ring.waitCompletions(&cqes, 5 * std.time.ns_per_s, wake.fd);
+        for (cqes[0..n]) |cqe| {
+            if (cqe.user_data == UDP_WAKE_USER_DATA) woke = true;
+            _ = ring.noteWaitCompletion(cqe);
+        }
+    }
+    try std.testing.expect(woke);
+    try std.testing.expect(!ring.wake_armed);
 }

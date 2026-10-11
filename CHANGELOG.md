@@ -102,6 +102,14 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   peers instead of once per peer.
 
 ### Fixed
+- Idle daemons in full mode no longer keep a core busy. The io_uring UDP loop
+  slept 100 µs whenever the ring was empty (about 5,000 wakeups a second) and
+  its rings used SQPOLL, whose kernel thread polls for a second after every
+  submission, so any node that sent at least once a second used half to a full
+  core. The loop now waits in the kernel for a datagram, a control connection
+  or the same 50 ms/5 ms timeouts as the poll() path, and rings no longer use
+  SQPOLL: an idle daemon went from 48% of a core to under 1%. The io_uring
+  module's tests now run in `zig build test` (they were never referenced).
 - `meshguard_last_recv_time` no longer reads SWIM state from the host thread,
   which could race with `meshguard_leave`.
 - Event loops no longer block forever in `recvfrom` once a peer is live: UDP

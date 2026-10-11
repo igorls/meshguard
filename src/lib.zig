@@ -101,6 +101,7 @@ test {
         _ = wireguard.Netlink;
         _ = wireguard.RtNetlink;
         _ = wireguard.NlSocket;
+        _ = net.IoUring;
     }
     _ = services.Policy;
     _ = services.Control;
