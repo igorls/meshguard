@@ -35,6 +35,7 @@ export default defineConfig({
           { text: 'macOS', link: '/guide/macos-support' },
           { text: 'FreeBSD', link: '/guide/freebsd-support' },
           { text: 'Android / Mobile', link: '/guide/android-embedding' },
+          { text: 'iOS / Apple Embedding', link: '/guide/ios-embedding' },
         ],
       },
       {

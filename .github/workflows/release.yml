@@ -107,8 +107,34 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}${{ matrix.ext }}
 
+  apple:
+    name: Apple FFI release artifacts
+    needs: validate
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build Apple libraries and XCFramework
+        run: ./scripts/build-apple.sh
+
+      - name: Upload Apple artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: meshguard-ffi-apple
+          if-no-files-found: error
+          path: |
+            zig-out/apple/meshguard-ffi-macos-arm64.tar.gz
+            zig-out/apple/meshguard-ffi-macos-x86_64.tar.gz
+            zig-out/apple/meshguard-ffi-macos-universal.tar.gz
+            zig-out/apple/meshguard-ffi-ios-xcframework.zip
+
   release:
-    needs: build
+    needs: [build, apple]
     runs-on: [self-hosted, zig]
     steps:
       - uses: actions/checkout@v4

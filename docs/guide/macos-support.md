@@ -47,6 +47,60 @@ meshguard up --gossip-only --seed 1.2.3.4:51821
 # --no-tun is an alias
 ```
 
+## Embedding in a macOS application
+
+The C ABI is also available as static and dynamic libraries for macOS 13 or
+later. It embeds UDP discovery, encrypted application messages, relay routing,
+contacts and userspace WireGuard data tunnels. It does not create a `utun`
+interface and does not need the daemon's interface-configuration privileges.
+
+Build and verify the Apple packages on macOS with Zig 0.16 and Xcode tools:
+
+```bash
+./scripts/build-apple.sh
+./scripts/test-apple-link.sh
+```
+
+The default output is `zig-out/apple`; either script accepts an output directory
+as its first argument. Each of `macos-arm64`, `macos-x86_64`, and
+`macos-universal` contains `lib/libmeshguard-ffi.dylib`,
+`lib/libmeshguard-ffi.a`, `include/meshguard.h`, and `include/module.modulemap`.
+The universal package includes both architectures. Release archives are named
+`meshguard-ffi-macos-arm64.tar.gz`, `meshguard-ffi-macos-x86_64.tar.gz`, and
+`meshguard-ffi-macos-universal.tar.gz`.
+
+For Swift, add the package's `include` directory to the compiler's import search
+path and link the chosen library. The module name is `MeshGuardFFI`:
+
+```bash
+swiftc -I zig-out/apple/macos-universal/include \
+  Host.swift zig-out/apple/macos-universal/lib/libmeshguard-ffi.a \
+  -o meshguard-host
+```
+
+```swift
+import MeshGuardFFI
+```
+
+The static library becomes part of the executable. For dynamic linking, bundle
+`libmeshguard-ffi.dylib` in the app's `Contents/Frameworks`, configure the loader's
+runpath for that location, and include the library in the app's signing process.
+A sandboxed app needs both
+[`com.apple.security.network.client`](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.security.network.client)
+and `com.apple.security.network.server` entitlements for sending and receiving
+UDP mesh traffic. On macOS 15 and later, local-network discovery also needs
+`NSLocalNetworkUsageDescription` and the user's local-network permission. The
+iOS multicast entitlement is not required on macOS. See Apple's
+[local network privacy guidance](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy).
+
+Use the [Apple embedding guide](./ios-embedding.md) for the Swift polling example,
+identity persistence, relay configuration, buffer sizes, and the threading
+contract. Give each context one serial host queue and each receive queue one
+consumer. Copy borrowed callback buffers before dispatching; never leave,
+destroy, or switch relays from an event-loop callback. Sleep, network changes,
+and app lifecycle transitions can invalidate reachability, so verify traffic
+after resuming instead of treating `meshguard_is_running` as connectivity proof.
+
 ## Notes
 
 - Kernel WireGuard mode is Linux-only; macOS uses the portable userspace data plane.
