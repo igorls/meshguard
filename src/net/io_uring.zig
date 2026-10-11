@@ -434,11 +434,26 @@ pub const UdpRing = struct {
 /// Check whether the UDP io_uring path should be attempted. This is intentionally
 /// independent from the TUN-reader gate: UDP sockets can use recvmsg/sendmsg rings
 /// even while TUN character-device reads remain disabled pending validation.
+///
+/// The ring path waits with IORING_OP_TIMEOUT (Linux 5.4). On older kernels
+/// that still create rings, the timeout would complete at once with -EINVAL
+/// and the loop would spin re-arming it (and before 5.3 recvmsg fails the same
+/// way), so the gate submits a 1 ns timeout and requires it to expire. Kernels
+/// that pass also have recvmsg, sendmsg and poll, which are older.
 pub fn isUdpRingAvailable() bool {
     if (builtin.os.tag != .linux) return false;
     var ring = initRing(8) catch return false;
-    ring.deinit();
-    return true;
+    defer ring.deinit();
+    return timeoutExpires(&ring);
+}
+
+fn timeoutExpires(ring: *IoUring) bool {
+    const ts: linux.kernel_timespec = .{ .sec = 0, .nsec = 1 };
+    _ = ring.timeout(0, &ts, 0, 0) catch return false;
+    _ = ring.submit_and_wait(1) catch return false;
+    var cqes: [1]linux.io_uring_cqe = undefined;
+    const n = ring.copy_cqes(&cqes, 0) catch return false;
+    return n == 1 and cqes[0].err() == .TIME;
 }
 
 /// Check if io_uring is available AND compatible with TUN devices.
@@ -531,6 +546,15 @@ test "UdpRing receives loopback datagram when runtime available" {
     }
 
     return error.UdpRingProbeTimedOut;
+}
+
+test "the ring gate requires timeouts that expire" {
+    if (builtin.os.tag != .linux) return;
+    var ring = initRing(8) catch return;
+    defer ring.deinit();
+    // Every kernel this runs on in CI has IORING_OP_TIMEOUT; the gate must agree.
+    try std.testing.expect(timeoutExpires(&ring));
+    try std.testing.expect(isUdpRingAvailable());
 }
 
 test "UdpRing waits in the kernel until a datagram or its timeout" {
