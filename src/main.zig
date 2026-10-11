@@ -43,8 +43,8 @@ const usage =
     \\  appsend     Send MGAPP1 channel message (meshguard appsend <peer> <channel> <msg>)
     \\  apprecv     Receive next message on a channel (meshguard apprecv <channel>)
     \\  appinfo     Print application-channel protocol and maxPayload
-    \\  invite      Create agent room meet link (meshguard invite [--name <label>])
-    \\  join        Join an agent room via meet link (meshguard join <token>)
+    \\  invite      Create an agent invite link (meshguard invite --seed <host:port> [--name <label>])
+    \\  join        Join via an agent invite link (meshguard join <token>)
     \\  agent       Run autonomous agent worker loop (meshguard agent)
     \\  upgrade     Upgrade to the latest release from GitHub
     \\  version     Print version
@@ -5828,8 +5828,8 @@ fn cmdInvite(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     const stdout = getStdOut();
     const stderr = getStdErr();
 
-    var label: []const u8 = "grok-worker";
-    var seed: []const u8 = "187.16.79.234:51821";
+    var label: []const u8 = "agent";
+    var seed: []const u8 = "";
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -5840,6 +5840,13 @@ fn cmdInvite(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             i += 1;
             seed = args[i];
         }
+    }
+
+    if (seed.len == 0) {
+        try stderr.writeStreamingAll(zio(), "error: invite requires --seed <host:port>\n");
+        try stderr.writeStreamingAll(zio(), "  usage: meshguard invite --seed <host:port> [--name <label>]\n");
+        try stderr.writeStreamingAll(zio(), "  the seed is the public address of a reachable MeshGuard node or relay\n");
+        std.process.exit(1);
     }
 
     const config_dir = try lib.config.Config.ensureConfigDir(allocator);
@@ -5887,13 +5894,13 @@ fn cmdInvite(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     const token_b64 = std.base64.url_safe_no_pad.Encoder.encode(&token_buf, json_str);
 
     try stdout.writeStreamingAll(zio(), "\n================================================================\n");
-    try stdout.writeStreamingAll(zio(), "  MeshGuard Agent Invite Link (\"Google Meet for Agents\")\n");
+    try stdout.writeStreamingAll(zio(), "  MeshGuard Agent Invite Link\n");
     try stdout.writeStreamingAll(zio(), "================================================================\n\n");
     try writeFormatted(stdout, "Target Agent Label: {s}\n", .{label});
     try writeFormatted(stdout, "Public Seed:        {s}\n", .{seed});
     try writeFormatted(stdout, "Host Identity:      {s}\n\n", .{&host_ed_hex});
     try writeFormatted(stdout, "Invite Token:\n  mgjoin://{s}\n\n", .{token_b64});
-    try stdout.writeStreamingAll(zio(), "Share this one-liner with Grok Bot or any remote cloud agent:\n\n");
+    try stdout.writeStreamingAll(zio(), "Share this one-liner with any remote agent:\n\n");
     try writeFormatted(stdout, "  curl -fsSL https://raw.githubusercontent.com/igorls/meshguard/main/dist/agent-join.sh | bash -s -- {s}\n\n", .{token_b64});
     try stdout.writeStreamingAll(zio(), "Or if meshguard is already installed locally/remotely:\n");
     try writeFormatted(stdout, "  meshguard join {s}\n", .{token_b64});
@@ -5955,7 +5962,12 @@ fn cmdJoin(allocator: std.mem.Allocator, exe_path: []const u8, token_arg: []cons
         try stderr.writeStreamingAll(zio(), "error: invite token missing 'host'\n");
         std.process.exit(1);
     };
-    const seed = findJsonStringField(json, "seed") orelse "187.16.79.234:51821";
+    const seed = findJsonStringField(json, "seed") orelse "";
+    if (seed.len == 0) {
+        try stderr.writeStreamingAll(zio(), "error: invite token has no seed address\n");
+        try stderr.writeStreamingAll(zio(), "  hint: ask the host for a new token made with 'meshguard invite --seed <host:port>'\n");
+        std.process.exit(1);
+    }
     const name = findJsonStringField(json, "name") orelse "agent";
 
     try stdout.writeStreamingAll(zio(), "\n[join] Decoded invite token:\n");

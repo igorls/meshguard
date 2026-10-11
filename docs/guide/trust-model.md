@@ -67,7 +67,7 @@ For fleet deployments, managing N individual keys becomes impractical. **Org tru
 ├── authorized_keys/               # Individual peer trust
 │   └── validator-1.pub
 ├── trusted_orgs/                  # Org trust (auto-accept members)
-│   └── eosrio.org
+│   └── acme.org
 └── org/                           # Org admin only
     ├── org.key                    # Org private key
     └── org.pub                    # Org public key
@@ -130,7 +130,7 @@ Blake3(org_pubkey)[0..3].hex() → 6 hex chars → *.a1b2c3.mesh
 
 Node names from certificates resolve as `node-name.org-domain.mesh`. For example, a node named `db-1` in org `a1b2c3` resolves to `db-1.a1b2c3.mesh`.
 
-Organizations can also claim **human-readable aliases** (e.g. `*.eosrio.mesh`) via gossip. Alias conflicts are resolved by Lamport timestamp — earliest claim wins.
+Organizations can also claim **human-readable aliases** (e.g. `*.acme.mesh`) via gossip. Alias conflicts are resolved by Lamport timestamp — earliest claim wins.
 
 ### CLI Commands
 
@@ -145,7 +145,7 @@ meshguard org-sign /path/to/node.pub --name db-1
 meshguard org-sign /path/to/node.pub --name db-1 --wg-pubkey /path/to/node.wg.pub
 
 # Trust an org (auto-accept all signed nodes)
-meshguard trust <org-pubkey> --org --name eosrio
+meshguard trust <org-pubkey> --org --name acme
 
 # Vouch for an external standalone node
 meshguard org-vouch <solo-node-pubkey>

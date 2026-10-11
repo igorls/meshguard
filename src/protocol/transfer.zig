@@ -251,7 +251,7 @@ test "a full DATA frame fits the shared 0x50 plaintext budget" {
 
 test "offer round-trips and validates its channel and sizes" {
     var buf: [MAX_FRAME]u8 = undefined;
-    const offer: Offer = .{ .created_unix = 1_790_000_000, .size = 10 * 1024 * 1024, .chunk_size = CHUNK_SIZE, .sha256 = @splat(3), .channel = "meshrooms-files", .meta = "{\"name\":\"bug.png\"}" };
+    const offer: Offer = .{ .created_unix = 1_790_000_000, .size = 10 * 1024 * 1024, .chunk_size = CHUNK_SIZE, .sha256 = @splat(3), .channel = "example-files", .meta = "{\"name\":\"bug.png\"}" };
     const parsed = try parse(try encodeOffer(&buf, @splat(1), offer));
     try std.testing.expectEqual(offer.size, parsed.body.offer.size);
     try std.testing.expectEqualStrings(offer.channel, parsed.body.offer.channel);
@@ -278,7 +278,7 @@ test "ack bitmap marks selective receipt past the cumulative point" {
 test "malformed, truncated, and trailing frames are rejected" {
     var buf: [MAX_FRAME]u8 = undefined;
     try std.testing.expectError(error.Malformed, parse("MGXF1"));
-    try std.testing.expectError(error.Malformed, parse("MGAPP1 meshrooms-v1 hi"));
+    try std.testing.expectError(error.Malformed, parse("MGAPP1 example-v1 hi"));
     const done = try encodeDone(&buf, @splat(9), .verified);
     try std.testing.expectError(error.Malformed, parse(done[0 .. done.len - 1]));
     var longer: [HEADER_LEN + 2]u8 = undefined;

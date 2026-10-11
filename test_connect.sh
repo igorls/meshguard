@@ -1,10 +1,10 @@
 #!/bin/bash
 # Automated Coordinated Punch E2E test
-# Prerequisites: ssh-copy-id igorls@blade14  (one-time setup)
-# Usage: ./test_connect.sh
+# Prerequisites: SSH key access to a second Linux host (ssh-copy-id user@host, one-time)
+# Usage: MESHGUARD_REMOTE=user@host ./test_connect.sh
 set -euo pipefail
 
-REMOTE="igorls@blade14"
+REMOTE="${MESHGUARD_REMOTE:?set MESHGUARD_REMOTE=user@host for the remote test machine}"
 BIN="./zig-out/bin/meshguard"
 FIFO="/tmp/mg_stdin_fifo"
 LOCAL_OUT="/tmp/mg_local_out"
@@ -24,7 +24,7 @@ echo ""
 
 if [ "$(id -u)" -eq 0 ]; then
     echo "ERROR: Do not run with sudo. The script uses sudo internally."
-    echo "Usage: ./test_connect.sh"
+    echo "Usage: MESHGUARD_REMOTE=user@host ./test_connect.sh"
     exit 1
 fi
 

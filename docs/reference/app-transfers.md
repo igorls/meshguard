@@ -8,8 +8,8 @@ without TUN or administrator rights.
 
 MeshGuard guarantees that a transfer reported `delivered` was fully received and
 its SHA-256 verified by the peer daemon. Durable storage and any application
-receipt remain the application's responsibility (Meshrooms stores the file,
-then sends its own `file-ack` on `meshrooms-v1`).
+receipt remain the application's responsibility (for example, an application
+stores the file, then sends its own `file-ack` on its `example-v1` channel).
 
 ## IPC commands
 

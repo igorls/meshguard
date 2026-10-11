@@ -37,7 +37,10 @@ node tests/wasm/serve.mjs
 ```
 
 The server binds to loopback and exposes the proof assets and optional public
-relay-test configuration. The core page at `/` uses public test seeds and does
+relay-test configuration. Its content security policy allows WebSocket
+connections to loopback only; set `MESHGUARD_WEB_PROOF_CONNECT_SRC` to a
+space-separated list of gateway origins (for example
+`wss://gateway.example.org`) to let `/relay.html` reach a remote gateway. The core page at `/` uses public test seeds and does
 not connect to a relay; `/relay.html` runs the separately configured adapter test.
 
 To test native interoperability, build a native FFI library first:
@@ -130,7 +133,7 @@ Qualification on 2026-10-09:
 These original checks qualify the portable packet core. Subsequent real
 Android-to-browser delivery and authenticated reconnect evidence is recorded in
 the [browser relay qualification](browser-relay.md). Background delivery and
-Peer Circle's browser product flows remain separate acceptance work.
+application-level browser flows remain separate acceptance work.
 
 ## ABI and memory lifecycle
 
@@ -176,5 +179,5 @@ identities in memory and does not persist them.
 
 The WSS-to-UDP adapter now carries existing sealed packets to native relays, with
 browser identity authentication and native Noise-based return-route updates.
-The next product step is browser-local Peer Circle storage, real profile/contact
-pairing, the shared chat/receipt protocol, and browser lifecycle handling.
+The next step for an application is browser-local storage, profile/contact
+pairing, its own message/receipt protocol, and browser lifecycle handling.

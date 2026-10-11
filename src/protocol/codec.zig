@@ -861,7 +861,7 @@ test "ping_req roundtrip" {
 
 test "org alias announce roundtrip" {
     const org_pk = [_]u8{0xAA} ** 32;
-    const alias_name = "eosrio\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+    const alias_name = "acme\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
     const sig = [_]u8{0x55} ** 64;
 
     const msg = messages.OrgAliasAnnounce{
@@ -879,7 +879,7 @@ test "org alias announce roundtrip" {
         .org_alias_announce => |a| {
             try std.testing.expectEqualSlices(u8, &org_pk, &a.org_pubkey);
             try std.testing.expectEqual(a.lamport, 100);
-            try std.testing.expectEqualSlices(u8, a.alias[0..6], "eosrio");
+            try std.testing.expectEqualSlices(u8, a.alias[0..4], "acme");
         },
         else => return error.InvalidMessageType,
     }

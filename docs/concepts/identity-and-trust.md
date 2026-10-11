@@ -98,4 +98,4 @@ In addition to mesh IPs (`10.99.X.Y`), each organization gets a **deterministic 
 Blake3(org_pubkey)[0..3].hex() → *.a1b2c3.mesh
 ```
 
-Nodes with org certificates resolve as `node-name.org-domain.mesh` (e.g. `db-1.a1b2c3.mesh`). Orgs can also claim aliases (e.g. `*.eosrio.mesh`) via SWIM gossip, with Lamport-based conflict resolution.
+Nodes with org certificates resolve as `node-name.org-domain.mesh` (e.g. `db-1.a1b2c3.mesh`). Orgs can also claim aliases (e.g. `*.acme.mesh`) via SWIM gossip, with Lamport-based conflict resolution.

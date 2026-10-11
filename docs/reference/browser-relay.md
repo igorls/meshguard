@@ -117,8 +117,8 @@ pairing/configuration flow. Native application contact trust remains distinct
 from shared relay membership.
 
 Put the gateway behind verified TLS. `gateway/nginx-location.conf` provides
-exact `/meshguard-web/ws` and `/meshguard-web/health` routes; it leaves existing
-Meshrooms routes intact. `gateway/meshguard-web.service` illustrates a separate
+exact `/meshguard-web/ws` and `/meshguard-web/health` routes; it leaves other
+routes on the same server intact. `gateway/meshguard-web.service` illustrates a separate
 service with a dynamic user, loopback listening, read-only filesystem access,
 and resource limits. Adjust its Bun path to the local runtime.
 
@@ -192,18 +192,17 @@ The host application owns message IDs, receipts, history, and retry persistence.
 
 ## Live qualification — 2026-10-09
 
-Run `pc-web-1a1229b5f86` used the real Pixel 7 Pro, the Codex in-app browser, and
-the shared public relay at `meshrooms.wormdb.dev:51821/UDP`. Browser traffic used
-`wss://meshrooms.wormdb.dev/meshguard-web/ws`. The Pixel's active default network was **Wi-Fi** for this
-run. This is public-relay delivery with direct app sends disabled, not a cellular
-qualification.
+An Android device and a desktop browser exchanged encrypted messages through a
+public relay over UDP, with the browser reaching it through the example gateway
+over verified TLS (`wss://…/meshguard-web/ws`). The Android device was on
+Wi-Fi and direct app sends were disabled, so every message went through the
+relay. This qualifies public-relay delivery, not cellular networks.
 
-The Android app was a separate `io.rioblocks.peer_circle.webrelayprobe` debug
-build of Peer Circle's existing `lib/main_relay_probe.dart`, using the already
-pinned native FFI at `1bd5c25`. Its fresh test seed stayed in ignored mode-0600
-build configuration. The browser generated its own identity and held its seed
-in browser-local storage. Only public keys were added to restricted admission.
-Profiles, contacts, and chat databases were not used by the probe.
+The Android side was a small debug probe app built on the native FFI library.
+Its fresh test seed stayed in ignored, owner-only build configuration. The
+browser generated its own identity and kept its seed in browser-local storage.
+Only public keys were added to restricted admission, and the probe used no
+application profiles, contacts, or message databases.
 
 | Check | Result |
 | --- | --- |
@@ -212,31 +211,26 @@ Profiles, contacts, and chat databases were not used by the probe.
 | Both clients acknowledged their own fresh challenge | Passed |
 | Browser authenticated the existing relay via Noise | Passed |
 | Browser identity survived page reload | Passed |
-| New connection authenticated port 41407, then 44346 | Passed |
+| A new connection authenticated from a new return port | Passed |
 | Fresh acknowledgement after the return port changed | Passed |
-| Pixel direct app sends | **0** |
-| Pixel relay app sends in final capture | **6** |
-| Pixel route failures | **0** |
+| Android direct app sends | **0** |
+| Android relay app sends in final capture | **6** |
+| Android route failures | **0** |
 | Final browser generation sent / received | **2 / 2** |
 | Browser console warnings / errors | **0** |
 
-Earlier connections also qualified ports 56977, 56568, and 33994. Each browser
-reconnect used a new random challenge and the same persistent identity. The
-relay refreshed its route after a direct native-compatible Noise handshake;
-unsigned gossip was not given authority to move a known return endpoint.
+Earlier connections qualified three more return ports. Each browser reconnect
+used a new random challenge and the same persistent identity. The relay
+refreshed its route after a direct native-compatible Noise handshake; unsigned
+gossip was not given authority to move a known return endpoint. The local proof
+page at `/relay.html` keeps the completed test view until it is reloaded.
 
-Evidence: [Pixel screenshot](../evidence/android-web-relay-pixel.png) and
-[browser DOM readout](../evidence/android-web-relay-browser.json). The local
-proof page at `/relay.html` retains the completed test view until it is reloaded.
-
-After qualification, both test public-key entries were removed. The original
-four-peer relay admission policy was verified against its backup. Gateway
-identity/destination lists were emptied, its sessions closed, and the Pixel was
-returned to Peer Circle Preview. The loopback gateway and TLS health route remain
+After qualification, both test public-key entries were removed and the relay's
+original admission policy was verified against its backup. The gateway's
+identity and destination lists were emptied and its sessions closed; it stays
 available with no admitted test identities. Repeating the test requires fresh
-or explicitly re-admitted development keys.
-
-The native relay binary and its admission policy were left unchanged.
+or explicitly re-admitted development keys. The native relay binary and its
+admission policy were left unchanged.
 
 Checks: WASM smoke and forged-Noise-response rejection passed with zero imports
 and a 63,369-byte artifact. Real native FFI Noise response and six sealed-packet
@@ -244,11 +238,12 @@ exchanges passed against both the pre-extraction and refactored native library.
 Eight gateway/client tests passed. The native suite passed 391 tests with two
 existing skips; all eight native CLI/library/FFI build steps succeeded.
 
-## Product work still required
+## Application work still required
 
 This proves foreground encrypted Android-to-browser transport and authenticated
-browser reconnect. Peer Circle still needs its browser platform adapter,
-browser-local database/outbox, real profile/contact pairing and key-binding
-verification, shared chat/receipt integration, and browser lifecycle UX.
-Automatic user admission, background delivery, files, and calls need their own
-acceptance runs. WASM initiator state does not expose tunnel transport keys.
+browser reconnect. An application that builds on it still needs its own
+browser platform adapter, browser-local database and outbox, profile/contact
+pairing with key-binding verification, message and receipt integration, and
+browser lifecycle UX. Automatic user admission, background delivery, files, and
+calls need their own acceptance runs. WASM initiator state does not expose
+tunnel transport keys.

@@ -144,7 +144,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `docs/reference/app-transfers.md`.
 - Isolated application messaging channels over the existing encrypted `0x50`
   payload: `APPSEND` / `APPRECV` / `APPINFO`, `MGAPP1` framing, and per-channel
-  queues so Meshrooms (`meshrooms-v1`) cannot be starved by legacy `RECV`.
+  queues so an application channel cannot be starved by legacy `RECV`.
 - `MESHGUARD_CONTROL_PATH` honored on both daemon bind and CLI connect, plus
   `meshguard up --control-path`. Isolated candidate daemons no longer steal
   `/run/meshguard/meshguard.sock` or `\\.\pipe\meshguard`.
@@ -152,6 +152,12 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   Explicit invalid values fail closed (no silent fallback to 51821).
 
 ### Changed
+- `meshguard invite` requires `--seed <host:port>`; it no longer falls back to a
+  built-in seed address, and its default agent label is `agent`. `meshguard
+  join` rejects a token that carries no seed instead of using a built-in one.
+- The LAN discovery app ID constant is now `APP_ID_DEFAULT` (same value,
+  `0x5043`, so beacons stay compatible), and the example application channel
+  constant is `app_channel.EXAMPLE_CHANNEL` (`example-v1`).
 - Relays (`--relay`) ask for 8 MiB socket buffers so bursts from many clients
   queue instead of being dropped, and the browser gateway's unit file allows
   65,536 descriptors, 1 GiB and two cores (it held about 120 sessions before).
