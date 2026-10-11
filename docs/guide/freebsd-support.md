@@ -39,3 +39,7 @@ sudo meshguard up --seed 1.2.3.4:51821
 - `meshguard status` and `meshguard down` use the Unix control socket while the userspace daemon is running.
 - GSO/GRO and io_uring paths are Linux-specific and are not used on FreeBSD.
 - The default config directory follows the POSIX rules: `/etc/meshguard` as root, otherwise `$XDG_CONFIG_HOME/meshguard` or `~/.config/meshguard`.
+
+## Embedding
+
+Applications embed MeshGuard through `libmeshguard-ffi.so`, which needs no TUN device or root. Releases ship it as `meshguard-ffi-freebsd-amd64.tar.gz` (shared and static library plus `meshguard.h`). See [Linux / FreeBSD Embedding](/guide/linux-embedding).

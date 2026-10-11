@@ -31,7 +31,8 @@ pub fn build(b: *std.Build) void {
     // resolved target's os.tag.
     const resolved_os = if (target.query.os_tag) |os| os else target.result.os.tag;
     const resolved_abi = if (target.query.abi) |abi| abi else target.result.abi;
-    const is_android = resolved_os == .linux and resolved_abi == .android;
+    // 32-bit ARM Android is .androideabi; the other Android targets are .android.
+    const is_android = resolved_os == .linux and resolved_abi.isAndroid();
     const is_ios = resolved_os == .ios;
     const is_windows = resolved_os == .windows;
     const is_macos = resolved_os == .macos;
@@ -59,7 +60,7 @@ pub fn build(b: *std.Build) void {
 
     // libsodium is only auto-selected on Linux desktop (non-Android), where the
     // vendored/system .so provides the AVX2 assembly. Everywhere else → std.crypto.
-    const auto_libsodium = (resolved_os == .linux and resolved_abi != .android);
+    const auto_libsodium = (resolved_os == .linux and !is_android);
     const use_libsodium = if (no_sodium) false else switch (crypto_backend) {
         .std => false,
         .sodium => true,
@@ -93,6 +94,10 @@ pub fn build(b: *std.Build) void {
         // Ad-hoc signing adds a load command to Intel dylibs. Reserve space so
         // codesign cannot grow the Mach-O header over the first code section.
         if (is_macos) ffi_lib.headerpad_size = 0x1000;
+        // Android 15+ devices may use 16 KB pages: align 64-bit LOAD segments
+        // to 16 KB, as the NDK does (Google Play requires it for arm64-v8a
+        // and x86_64 libraries).
+        if (is_android and target.result.ptrBitWidth() == 64) ffi_lib.link_z_max_page_size = 16 * 1024;
 
         // Link libsodium only when the resolved backend uses it (Linux desktop).
         // Otherwise the Zig std.crypto software path is used (no link needed).
@@ -109,9 +114,10 @@ pub fn build(b: *std.Build) void {
         const ffi_step = b.step("ffi", "Build the C ABI embedding library");
         ffi_step.dependOn(&install_ffi.step);
 
-        // macOS embedders may either load the dylib or link the C ABI statically.
-        // libmeshguard.a below exposes the Zig module, not these C entry points.
-        if (is_macos) {
+        // macOS, Linux and FreeBSD embedders may either load the shared library
+        // or link the C ABI statically. libmeshguard.a below exposes the Zig
+        // module, not these C entry points.
+        if (is_macos or is_freebsd or (resolved_os == .linux and !is_android)) {
             const ffi_static = b.addLibrary(.{
                 .name = "meshguard-ffi",
                 .root_module = ffi_mod,

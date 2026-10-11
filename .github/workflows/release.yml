@@ -151,8 +151,38 @@ jobs:
             zig-out/apple/meshguard-ffi-macos-universal.tar.gz
             zig-out/apple/meshguard-ffi-ios-xcframework.zip
 
+  libraries:
+    name: Linux, FreeBSD and Android FFI release artifacts
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # The runner image provides the Android NDK (ANDROID_NDK_HOME).
+      - name: Build library packages
+        run: ./scripts/build-libraries.sh
+
+      - name: Check library packages
+        run: ./scripts/test-libraries.sh
+
+      - name: Upload library packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: meshguard-ffi-libraries
+          if-no-files-found: error
+          path: |
+            zig-out/libraries/meshguard-ffi-linux-amd64.tar.gz
+            zig-out/libraries/meshguard-ffi-linux-arm64.tar.gz
+            zig-out/libraries/meshguard-ffi-freebsd-amd64.tar.gz
+            zig-out/libraries/meshguard-ffi-android.zip
+
   release:
-    needs: [build, apple]
+    needs: [build, apple, libraries]
     runs-on: [self-hosted, zig]
     steps:
       - uses: actions/checkout@v4

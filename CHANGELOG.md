@@ -8,6 +8,21 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## Unreleased
 
 ### Added
+- Linux, FreeBSD and Android embedding libraries in releases:
+  `meshguard-ffi-linux-amd64.tar.gz`, `meshguard-ffi-linux-arm64.tar.gz` and
+  `meshguard-ffi-freebsd-amd64.tar.gz` each hold `libmeshguard-ffi.so`, the
+  static `libmeshguard-ffi.a` and `meshguard.h` (glibc 2.28 or newer, FreeBSD
+  14.0 or newer); `meshguard-ffi-android.zip` holds
+  `jniLibs/{arm64-v8a,x86_64}/libmeshguard-ffi.so` (API 24 or newer, 16 KB
+  page aligned) and the header. All use `std.crypto` and depend only on the C
+  library. `scripts/build-libraries.sh` builds them and
+  `scripts/test-libraries.sh` checks exports against the source and header,
+  dependencies, Android alignment, and C hosts linked against every desktop
+  package; CI runs both and the relay test against the packaged Linux
+  library. `zig build` now also installs the static FFI library on Linux and
+  FreeBSD, and Android 64-bit libraries are linked with 16 KB maximum page
+  size. A new Linux / FreeBSD embedding guide covers linking, threading and
+  polling; the Android guide documents the release package and NDK builds.
 - Windows embedding library: `zig build` for Windows now produces
   `meshguard-ffi.dll` and its import library `meshguard-ffi.lib`, with the same
   `meshguard_*` exports and behaviour as the Linux, macOS, Android and iOS
