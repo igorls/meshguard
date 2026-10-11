@@ -2,7 +2,7 @@
 
 meshguard provides a **C-ABI shared library** (`libmeshguard-ffi.so`) for embedding mesh networking in mobile apps. The library exposes SWIM gossip discovery, LAN multicast, end-to-end encrypted messaging, and WireGuard-encrypted data tunnels (suitable for VoIP audio or real-time data).
 
-The same library builds for desktop hosts with the same exports: `libmeshguard-ffi.so` on Linux, `libmeshguard-ffi.dylib` on macOS and `meshguard-ffi.dll` on Windows (see [Embedding MeshGuard on Windows](/guide/windows-support#embedding-meshguard-meshguard-ffi-dll)).
+The same library builds for desktop hosts with the same exports: `libmeshguard-ffi.so` on Linux and FreeBSD (see [Linux / FreeBSD Embedding](/guide/linux-embedding)), `libmeshguard-ffi.dylib` on macOS and `meshguard-ffi.dll` on Windows (see [Embedding MeshGuard on Windows](/guide/windows-support#embedding-meshguard-meshguard-ffi-dll)). The C header is `include/meshguard.h`.
 
 ## What's Included
 
@@ -17,30 +17,69 @@ The same library builds for desktop hosts with the same exports: `libmeshguard-f
 | Trust enforcement        | ✅                | Open by default             |
 | libsodium dependency     | ✅ (AVX2 accel)   | ❌ (`std.crypto` only)      |
 
-## Building
+## Getting the library
 
-```bash
-# Android aarch64 (ARM64 devices)
-zig build -Dtarget=aarch64-linux-android -Doptimize=ReleaseFast
+Every [release](https://github.com/igorls/meshguard/releases/latest) ships
+`meshguard-ffi-android.zip`, listed in `checksums.txt`:
 
-# Android x86_64 (emulators)
-zig build -Dtarget=x86_64-linux-android -Doptimize=ReleaseFast
+```
+android/jniLibs/arm64-v8a/libmeshguard-ffi.so   ARM64 devices
+android/jniLibs/x86_64/libmeshguard-ffi.so      x86_64 emulators and devices
+android/include/meshguard.h                     C header (for C/C++ JNI glue)
+android/LICENSE
 ```
 
-Output: `zig-out/lib/libmeshguard-ffi.so`
+The libraries support Android 7.0 (API 24) and newer, depend only on Bionic
+`libc.so`, and are stripped. Their load segments are aligned to 16 KB, so they
+load on devices with 16 KB memory pages (Android 15 and newer), as Google Play
+requires. 32-bit ABIs (`armeabi-v7a`, `x86`) are not provided: the library keeps
+64-bit counters in atomics that do not compile for 32-bit ARM.
 
-No Android NDK required — Zig cross-compiles with its bundled Bionic libc headers.
+### Building from source
+
+Zig needs the NDK's sysroot (Bionic headers and libc stubs); any recent NDK
+works. With Zig 0.16.0 on Linux:
+
+```bash
+export ANDROID_NDK_HOME=$HOME/Android/Sdk/ndk/28.2.13676358
+MESHGUARD_LIBRARY_PLATFORMS=android ./scripts/build-libraries.sh
+./scripts/test-libraries.sh
+```
+
+This writes `zig-out/libraries/meshguard-ffi-android.zip` and the unpacked
+`zig-out/libraries/android/`. The test script checks each library's
+architecture, exports, dependencies and 16 KB alignment. The script passes Zig
+a libc file for each ABI; a manual build does the same:
+
+```bash
+# libc-arm64.conf, with SYSROOT = $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/<host>/sysroot:
+#   include_dir=SYSROOT/usr/include
+#   sys_include_dir=SYSROOT/usr/include/aarch64-linux-android
+#   crt_dir=SYSROOT/usr/lib/aarch64-linux-android/24
+#   msvc_lib_dir=
+#   kernel32_lib_dir=
+#   gcc_dir=
+zig build ffi -Dtarget=aarch64-linux-android.24 -Doptimize=ReleaseFast --libc libc-arm64.conf
+```
+
+Output: `zig-out/lib/libmeshguard-ffi.so`. For x86_64 use
+`x86_64-linux-android.24` and the `x86_64-linux-android` directories.
 
 ## JNI Integration (Kotlin)
 
 ### 1. Place the shared library
 
-Copy `libmeshguard-ffi.so` to your Android project:
+Copy the `jniLibs` directory from `meshguard-ffi-android.zip` into your
+Android project:
 
 ```
 app/src/main/jniLibs/arm64-v8a/libmeshguard-ffi.so
 app/src/main/jniLibs/x86_64/libmeshguard-ffi.so
 ```
+
+If the app also ships 32-bit ABIs, restrict it to these two (for example
+`ndk { abiFilters += listOf("arm64-v8a", "x86_64") }`), or load the library only
+on 64-bit devices.
 
 ### 2. Declare native functions
 

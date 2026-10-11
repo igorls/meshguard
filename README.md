@@ -180,9 +180,12 @@ zig build -Dtarget=aarch64-linux-gnu -Doptimize=ReleaseFast -Dno-sodium=true
 zig build -Dtarget=aarch64-macos -Doptimize=ReleaseFast
 zig build -Dtarget=x86_64-freebsd -Doptimize=ReleaseFast
 zig build -Dtarget=x86_64-windows -Doptimize=ReleaseFast
-zig build -Dtarget=aarch64-linux-android -Doptimize=ReleaseFast
 zig build -Dtarget=aarch64-ios -Doptimize=ReleaseFast
 ```
+
+Embedding (C ABI) library packages for Linux, FreeBSD and Android, the same
+ones releases ship, come from `./scripts/build-libraries.sh` (Android needs the
+NDK sysroot; see the [Android guide](docs/guide/android-embedding.md)).
 
 Crypto primitives are available through Zig `std.crypto`. libsodium is an
 optional Linux acceleration backend and can be disabled with `-Dno-sodium=true`
@@ -214,6 +217,7 @@ history, and remaining performance work.
 - [Configuration](docs/guide/configuration.md)
 - [Trust model](docs/guide/trust-model.md)
 - [Service access control](docs/guide/services.md)
+- [Linux / FreeBSD embedding](docs/guide/linux-embedding.md)
 - [Android embedding](docs/guide/android-embedding.md)
 - [Browser WASM core](docs/reference/wasm-core.md)
 - [Browser relay and Android qualification](docs/reference/browser-relay.md)
