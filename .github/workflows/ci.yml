@@ -87,3 +87,28 @@ jobs:
 
       - name: Test (std.crypto, no libsodium)
         run: zig build test -Dno-sodium=true
+
+  apple:
+    name: Apple FFI build and test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Unit and FFI tests (std.crypto)
+        run: zig build test -Dcrypto-backend=std
+
+      - name: Build Apple libraries and XCFramework
+        run: ./scripts/build-apple.sh
+
+      - name: Test Apple consumer linking
+        run: ./scripts/test-apple-link.sh
+
+      - name: Relay forwarding with Apple FFI
+        run: |
+          zig build -Doptimize=ReleaseFast -Dcrypto-backend=std
+          python3 scripts/test-relay.py zig-out/bin/meshguard zig-out/apple/macos-universal/lib/libmeshguard-ffi.dylib -v

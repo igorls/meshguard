@@ -1,0 +1,4 @@
+module MeshGuardFFI {
+    header "meshguard.h"
+    export *
+}
