@@ -178,6 +178,7 @@ jobs:
           path: |
             zig-out/libraries/meshguard-ffi-linux-amd64.tar.gz
             zig-out/libraries/meshguard-ffi-linux-arm64.tar.gz
+            zig-out/libraries/meshguard-ffi-linux-armhf.tar.gz
             zig-out/libraries/meshguard-ffi-freebsd-amd64.tar.gz
             zig-out/libraries/meshguard-ffi-android.zip
 

@@ -10,6 +10,7 @@
 ///! Reference: drivers/net/wireguard/send.c, receive.c
 const std = @import("std");
 const noise = @import("noise.zig");
+const atomic64 = @import("../atomic64.zig");
 
 // Compile-time AEAD backend selection, resolved in build.zig and passed in via
 // build_options so the source and the linker always agree (meshguard#102).
@@ -85,8 +86,10 @@ pub const Tunnel = struct {
     /// Transport keys from completed handshake
     keys: noise.TransportKeys,
 
-    /// Sending nonce counter (monotonically increasing, atomic for multi-thread)
-    send_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Sending nonce counter (monotonically increasing, safe for multi-thread):
+    /// one atomic fetch-add on 64-bit targets, a short locked section on 32-bit
+    /// targets without 64-bit atomics. See atomic64.NonceCounter.
+    send_counter: atomic64.NonceCounter = .init(0),
 
     /// Anti-replay window for receiving (mutex-protected for multi-thread)
     replay_window: ReplayWindow = .{},
@@ -109,8 +112,8 @@ pub const Tunnel = struct {
     /// Encrypt an outgoing IP packet into a WG transport message.
     /// Returns: [header(16) || encrypted_padded_data || tag(16)]
     pub fn encrypt(self: *Tunnel, plaintext: []const u8, out: []u8) !usize {
-        // Atomically fetch-add the counter for thread safety
-        const counter = self.send_counter.fetchAdd(1, .monotonic);
+        // Reserve a nonce no other caller receives (atomic fetch-add on 64-bit)
+        const counter = self.send_counter.reserve(1);
 
         if (counter >= REJECT_AFTER_MESSAGES) return error.KeyExpired;
 
@@ -159,7 +162,7 @@ pub const Tunnel = struct {
     /// Encrypt in-place with a pre-assigned nonce (for parallel pipeline).
     ///
     /// The caller (TUN reader) places the IP payload at buf[16..16+plaintext_len]
-    /// and assigns nonces via fetchAdd(batch_count). The crypto worker then calls
+    /// and assigns nonces via send_counter.reserve(batch_count). The crypto worker then calls
     /// this to encrypt in-place and write the WG transport header at buf[0..16].
     ///
     /// Returns total length: header(16) + padded_ciphertext + tag(16).
@@ -287,7 +290,7 @@ pub const Tunnel = struct {
     pub fn isValid(self: *const Tunnel) bool {
         const elapsed = nowNs() - self.keys.birthdate_ns;
         return elapsed < REJECT_AFTER_TIME_NS and
-            self.send_counter.load(.monotonic) < REJECT_AFTER_MESSAGES;
+            self.send_counter.load() < REJECT_AFTER_MESSAGES;
     }
 
     /// Check if a keepalive should be sent.
@@ -311,8 +314,8 @@ pub const ReplayWindow = struct {
         if (counter > self.counter) return true; // New highest — always OK
         if (self.counter - counter >= COUNTER_WINDOW_SIZE) return false; // Too old
 
-        // Check bitmap
-        const bit_index = counter % COUNTER_WINDOW_SIZE;
+        // Check bitmap (index with usize: 32-bit targets cannot index by u64)
+        const bit_index: usize = @intCast(counter % COUNTER_WINDOW_SIZE);
         const word_index = bit_index / 64;
         const bit_offset: u6 = @intCast(bit_index % 64);
         return (self.bitmap[word_index] & (@as(u64, 1) << bit_offset)) == 0;
@@ -333,7 +336,7 @@ pub const ReplayWindow = struct {
             self.counter = counter;
         }
         // Set the bit for this counter
-        const bit_index = counter % COUNTER_WINDOW_SIZE;
+        const bit_index: usize = @intCast(counter % COUNTER_WINDOW_SIZE);
         const word_index = bit_index / 64;
         const bit_offset: u6 = @intCast(bit_index % 64);
         self.bitmap[word_index] |= @as(u64, 1) << bit_offset;
@@ -352,7 +355,7 @@ pub const ReplayWindow = struct {
         if (shift <= 64) {
             var i: u64 = 0;
             while (i < shift) : (i += 1) {
-                const pos = (self.counter + 1 + i) % COUNTER_WINDOW_SIZE;
+                const pos: usize = @intCast((self.counter + 1 + i) % COUNTER_WINDOW_SIZE);
                 const word = pos / 64;
                 const bit: u6 = @intCast(pos % 64);
                 self.bitmap[word] &= ~(@as(u64, 1) << bit);
@@ -361,14 +364,14 @@ pub const ReplayWindow = struct {
         }
 
         // Large shift: clear words efficiently
-        var current = (self.counter + 1) % COUNTER_WINDOW_SIZE;
+        var current: usize = @intCast((self.counter + 1) % COUNTER_WINDOW_SIZE);
         var remaining = shift;
 
         while (remaining > 0) {
             const word_idx = current / 64;
             const bit_idx = current % 64;
             const bits_in_word = 64 - bit_idx;
-            const to_clear = @min(remaining, bits_in_word);
+            const to_clear: usize = @intCast(@min(remaining, bits_in_word));
 
             if (to_clear == 64) {
                 // Clear entire word
@@ -380,7 +383,7 @@ pub const ReplayWindow = struct {
             }
 
             remaining -= to_clear;
-            current = (current + to_clear) % COUNTER_WINDOW_SIZE;
+            current = @intCast((current + to_clear) % COUNTER_WINDOW_SIZE);
         }
     }
 };
@@ -473,9 +476,46 @@ test "transport nonce counter increments" {
     var buf: [256]u8 = undefined;
 
     _ = try tunnel.encrypt("test", &buf);
-    try std.testing.expectEqual(tunnel.send_counter.load(.monotonic), 1);
+    try std.testing.expectEqual(tunnel.send_counter.load(), 1);
     _ = try tunnel.encrypt("test", &buf);
-    try std.testing.expectEqual(tunnel.send_counter.load(.monotonic), 2);
+    try std.testing.expectEqual(tunnel.send_counter.load(), 2);
+}
+
+test "transport refuses to send past REJECT_AFTER_MESSAGES" {
+    const keys = noise.TransportKeys{
+        .sending_key = .{0x42} ** 32,
+        .receiving_key = .{0x99} ** 32,
+        .sending_index = 1,
+        .receiving_index = 2,
+        .is_initiator = true,
+        .birthdate_ns = nowNs(),
+    };
+    var tunnel = Tunnel{ .keys = keys, .send_counter = .init(REJECT_AFTER_MESSAGES - 1) };
+    var buf: [256]u8 = undefined;
+
+    const len = try tunnel.encrypt("last", &buf);
+    try std.testing.expectEqual(REJECT_AFTER_MESSAGES - 1, std.mem.readInt(u64, buf[8..16], .little));
+    try std.testing.expect(len > TRANSPORT_HEADER_LEN);
+    try std.testing.expect(!tunnel.isValid());
+    try std.testing.expectError(error.KeyExpired, tunnel.encrypt("over", &buf));
+    try std.testing.expectError(error.KeyExpired, tunnel.encrypt("over", &buf));
+}
+
+test "anti-replay window indexes every bit position" {
+    // Walk the window across a word boundary and the bitmap wraparound with
+    // both shift paths (<= 64 and > 64); the indices are usize on 32-bit targets.
+    var w = ReplayWindow{};
+    var c: u64 = 0;
+    while (c < 3 * COUNTER_WINDOW_SIZE) : (c += 61) {
+        try std.testing.expect(w.check(c));
+        w.update(c);
+        try std.testing.expect(!w.check(c));
+    }
+    const top = w.counter;
+    w.update(top + 1000);
+    try std.testing.expect(!w.check(top));
+    try std.testing.expect(w.check(top + 1));
+    try std.testing.expect(!w.check(top + 1000));
 }
 
 test "anti-replay window large shift" {

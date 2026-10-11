@@ -23,6 +23,20 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   FreeBSD, and Android 64-bit libraries are linked with 16 KB maximum page
   size. A new Linux / FreeBSD embedding guide covers linking, threading and
   polling; the Android guide documents the release package and NDK builds.
+- 32-bit ARM embedding libraries: `meshguard-ffi-android.zip` now also holds
+  `jniLibs/armeabi-v7a/libmeshguard-ffi.so`, and releases ship
+  `meshguard-ffi-linux-armhf.tar.gz` (ARMv7-A with NEON, hard-float, glibc
+  2.28 or newer). Zig has no 64-bit atomics on 32-bit ARM, so on targets with
+  32-bit pointers the WireGuard send counter, route statistics and last
+  receive time are guarded by a short mutex (`src/atomic64.zig`); the send
+  counter is reserved under the lock and saturates instead of wrapping, so a
+  nonce is never reused. 64-bit targets keep the same lock-free atomics, with
+  unchanged machine code. The anti-replay window indexes its bitmap with
+  `usize`. `scripts/test-libraries.sh` checks the new libraries (exports,
+  dependencies, API 24 symbols, stripping) and runs the armhf C hosts under
+  qemu-user when available; CI runs them and the unit tests on
+  `arm-linux-musleabihf` under qemu. The FFI now treats every Android ABI
+  (including `androideabi`) as Android.
 - Windows embedding library: `zig build` for Windows now produces
   `meshguard-ffi.dll` and its import library `meshguard-ffi.lib`, with the same
   `meshguard_*` exports and behaviour as the Linux, macOS, Android and iOS

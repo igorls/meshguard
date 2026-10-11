@@ -23,17 +23,24 @@ Every [release](https://github.com/igorls/meshguard/releases/latest) ships
 `meshguard-ffi-android.zip`, listed in `checksums.txt`:
 
 ```
-android/jniLibs/arm64-v8a/libmeshguard-ffi.so   ARM64 devices
-android/jniLibs/x86_64/libmeshguard-ffi.so      x86_64 emulators and devices
-android/include/meshguard.h                     C header (for C/C++ JNI glue)
+android/jniLibs/arm64-v8a/libmeshguard-ffi.so     ARM64 devices
+android/jniLibs/armeabi-v7a/libmeshguard-ffi.so   32-bit ARM devices
+android/jniLibs/x86_64/libmeshguard-ffi.so        x86_64 emulators and devices
+android/include/meshguard.h                       C header (for C/C++ JNI glue)
 android/LICENSE
 ```
 
 The libraries support Android 7.0 (API 24) and newer, depend only on Bionic
-`libc.so`, and are stripped. Their load segments are aligned to 16 KB, so they
-load on devices with 16 KB memory pages (Android 15 and newer), as Google Play
-requires. 32-bit ABIs (`armeabi-v7a`, `x86`) are not provided: the library keeps
-64-bit counters in atomics that do not compile for 32-bit ARM.
+`libc.so`, and are stripped. The 64-bit libraries' load segments are aligned to
+16 KB, so they load on devices with 16 KB memory pages (Android 15 and newer),
+as Google Play requires. The `armeabi-v7a` library targets ARMv7-A with NEON,
+the NDK default for that ABI. 32-bit x86 (`x86`) is not provided.
+
+On 32-bit ARM, Zig has no 64-bit atomic operations, so the library guards its
+64-bit values (the WireGuard send counter, route statistics and the last
+receive time) with a short mutex there. The send counter is read and advanced
+as one step under the lock and never wraps, so no nonce is ever used twice.
+64-bit builds use the same lock-free atomics as before.
 
 ### Building from source
 
@@ -48,7 +55,8 @@ MESHGUARD_LIBRARY_PLATFORMS=android ./scripts/build-libraries.sh
 
 This writes `zig-out/libraries/meshguard-ffi-android.zip` and the unpacked
 `zig-out/libraries/android/`. The test script checks each library's
-architecture, exports, dependencies and 16 KB alignment. The script passes Zig
+architecture, exports, dependencies, minimum API symbol versions, stripping
+and load alignment (16 KB for the 64-bit ABIs). The script passes Zig
 a libc file for each ABI; a manual build does the same:
 
 ```bash
@@ -63,7 +71,9 @@ zig build ffi -Dtarget=aarch64-linux-android.24 -Doptimize=ReleaseFast --libc li
 ```
 
 Output: `zig-out/lib/libmeshguard-ffi.so`. For x86_64 use
-`x86_64-linux-android.24` and the `x86_64-linux-android` directories.
+`x86_64-linux-android.24` and the `x86_64-linux-android` directories; for
+armeabi-v7a use `arm-linux-androideabi.24` and the `arm-linux-androideabi`
+directories.
 
 ## JNI Integration (Kotlin)
 
@@ -74,12 +84,13 @@ Android project:
 
 ```
 app/src/main/jniLibs/arm64-v8a/libmeshguard-ffi.so
+app/src/main/jniLibs/armeabi-v7a/libmeshguard-ffi.so
 app/src/main/jniLibs/x86_64/libmeshguard-ffi.so
 ```
 
-If the app also ships 32-bit ABIs, restrict it to these two (for example
-`ndk { abiFilters += listOf("arm64-v8a", "x86_64") }`), or load the library only
-on 64-bit devices.
+If the app also ships the `x86` ABI, restrict it to these three (for example
+`ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64") }`), or load
+the library only where it is present.
 
 ### 2. Declare native functions
 

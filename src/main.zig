@@ -2744,8 +2744,8 @@ fn dispatchBatch(
     // 1. Lock per-peer push_lock briefly for nonce assignment + ring insertion
     peer.tx_ring.push_lock.lockUncancelable(zio());
 
-    // Bulk nonce assignment: fetchAdd(count) claims a contiguous block
-    const start_nonce = tun.send_counter.fetchAdd(batch.count, .monotonic);
+    // Bulk nonce assignment: reserve(count) claims a contiguous block
+    const start_nonce = tun.send_counter.reserve(batch.count);
     for (0..batch.count) |i| {
         batch.nonces[i] = start_nonce + i;
     }

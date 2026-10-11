@@ -20,6 +20,7 @@ const AppStatus = @import("../protocol/app_status.zig");
 const Udp = @import("../net/udp.zig");
 const Holepuncher = @import("../nat/holepunch.zig").Holepuncher;
 const Relay = @import("../nat/relay.zig");
+const atomic64 = @import("../atomic64.zig");
 const log = std.log.scoped(.swim);
 
 // Max amount a single (possibly forged, unauthenticated) gossip entry may advance
@@ -326,7 +327,7 @@ pub const SwimProtocol = struct {
     sends_dropped_ratelimit: u32 = 0,
 
     // Liveness tracking: timestamp of last received packet (epoch nanoseconds, i64)
-    last_recv_ns: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+    last_recv_ns: atomic64.Value(i64) = atomic64.Value(i64).init(0),
 
     pub fn init(
         membership: *Membership.MembershipTable,
