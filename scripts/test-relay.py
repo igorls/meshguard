@@ -2,18 +2,26 @@
 sealed app frames between mobile FFI contexts that proved their endpoints, and
 refuses frames from anywhere else.
 
-Usage: python3 scripts/test-relay.py <meshguard binary> <libmeshguard-ffi.so>
+Usage: python3 scripts/test-relay.py <meshguard binary> <FFI library>
+
+The FFI library is libmeshguard-ffi.so on Linux, libmeshguard-ffi.dylib on
+macOS and meshguard-ffi.dll on Windows, where the daemon's control endpoint is
+a named pipe instead of a Unix socket.
 """
 import ctypes as c
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+import uuid
+
+WINDOWS = sys.platform == "win32"
 
 BINARY = Path(sys.argv.pop(1)).resolve()
 LIBRARY = Path(sys.argv.pop(1)).resolve()
@@ -44,6 +52,9 @@ set_on_delivery_status = bind("meshguard_set_on_delivery_status", [c.c_void_p, S
 recv_delivery_status = bind("meshguard_recv_delivery_status", [c.c_void_p, c.c_void_p, c.c_void_p, c.c_void_p], c.c_int)
 switch_relay = bind("meshguard_switch_relay", [c.c_void_p, c.c_void_p, c.c_bool, c.c_void_p, c.c_uint16], c.c_int)
 peer_count = bind("meshguard_peer_count", [c.c_void_p], c.c_uint32)
+tunnel_open = bind("meshguard_tunnel_open", [c.c_void_p, c.c_void_p], c.c_int)
+tunnel_send = bind("meshguard_tunnel_send", [c.c_void_p, c.c_void_p, c.c_void_p, c.c_uint32], c.c_int)
+tunnel_recv = bind("meshguard_tunnel_recv", [c.c_void_p] * 4, c.c_int)
 route_stats = bind("meshguard_app_route_stats", [c.c_void_p, c.c_void_p])
 destroy = bind("meshguard_destroy", [c.c_void_p])
 
@@ -64,11 +75,43 @@ def wait_for(predicate, seconds, what):
     raise AssertionError(f"timed out waiting for {what}")
 
 
+def pipe_exists(path):
+    # Listing the pipe namespace does not connect to the pipe; opening or
+    # stat-ing it would take the daemon's only pipe instance.
+    return path.rsplit("\\", 1)[1] in os.listdir(r"\\.\pipe\\")
+
+
+def pipe_request(path, line):
+    """One request on the daemon's named pipe: write a line, read a line."""
+    end = time.monotonic() + 5
+    while True:
+        try:
+            pipe = open(path, "r+b", buffering=0)
+            break
+        except OSError as err:
+            # 231 ERROR_PIPE_BUSY: the daemon is still serving another client.
+            if getattr(err, "winerror", None) not in (2, 231) or time.monotonic() > end:
+                raise
+            time.sleep(0.05)
+    with pipe:
+        pipe.write(line)
+        data = b""
+        while not data.endswith(b"\n"):
+            chunk = pipe.read(65536)
+            if not chunk:
+                break
+            data += chunk
+    return data
+
+
 class Relay:
     def __init__(self, root, *flags, open_trust=True):
         self.root = Path(root)
         self.port = free_udp_port()
-        self.control = self.root / "control.sock"
+        if WINDOWS:
+            self.control = rf"\\.\pipe\meshguard-test-{uuid.uuid4().hex}"
+        else:
+            self.control = self.root / "control.sock"
         self.env = {k: v for k, v in os.environ.items() if not k.startswith("MESHGUARD_")}
         self.env["MESHGUARD_CONFIG_DIR"] = str(self.root / "config")
         subprocess.run([BINARY, "keygen"], env=self.env, check=True, capture_output=True, timeout=30)
@@ -79,12 +122,17 @@ class Relay:
             [BINARY, "up", "--gossip-only", *(["--open"] if open_trust else []), "--announce", "127.0.0.1",
              "--gossip-port", str(self.port), "--control-path", str(self.control), *flags],
             env=self.env, stdout=self.log, stderr=subprocess.STDOUT)
-        wait_for(lambda: self.control.exists(), 20, "relay control socket")
+        if WINDOWS:
+            wait_for(lambda: pipe_exists(self.control), 20, "relay control pipe")
+        else:
+            wait_for(lambda: self.control.exists(), 20, "relay control socket")
 
     def status(self):
         return self.command(b"STATUS\n")
 
     def command(self, line):
+        if WINDOWS:
+            return json.loads(pipe_request(self.control, line))
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.settimeout(5)
             s.connect(str(self.control))
@@ -151,6 +199,18 @@ class Client:
                 return got
         return None
 
+    def tunnel_until_received(self, other, payload, seconds=20):
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            tunnel_send(self.ctx, other.pubkey, c.create_string_buffer(payload), len(payload))
+            until = time.monotonic() + 0.3
+            while time.monotonic() < until:
+                out, length, sender = c.create_string_buffer(1500), c.c_uint32(), c.create_string_buffer(32)
+                if tunnel_recv(other.ctx, out, c.byref(length), sender) == 0:
+                    return sender.raw, out.raw[:length.value]
+                time.sleep(0.01)
+        return None
+
     def direct_sends(self):
         out = c.create_string_buffer(32)
         route_stats(self.ctx, out)
@@ -202,6 +262,13 @@ class RelayForwarding(unittest.TestCase):
         self.assertEqual(relay.status()["relay"]["forwarding"], "endpoint_match")
         got = alice.send_until_received(bob, b"hello through a default relay")
         self.assertEqual(got, (alice.pubkey, b"hello through a default relay"))
+
+    def test_clients_that_met_through_a_relay_open_a_tunnel(self):
+        relay, alice, bob = self.start()
+        # -4 until Alice has learned Bob's WireGuard key, which can follow his first ack.
+        wait_for(lambda: tunnel_open(alice.ctx, bob.pubkey) == 0, 20, "a tunnel to open")
+        self.assertEqual(alice.tunnel_until_received(bob, b"through the tunnel"), (alice.pubkey, b"through the tunnel"))
+        self.assertEqual(bob.tunnel_until_received(alice, b"and back"), (bob.pubkey, b"and back"))
 
 
 class RelayPasses(unittest.TestCase):
@@ -290,7 +357,10 @@ class OpaqueRelay(unittest.TestCase):
         set_contacts_only(bob.ctx, True)
         got = alice.send_until_received(bob, b"hello as a contact")
         self.assertEqual(got, (alice.pubkey, b"hello as a contact"))
+        got = bob.send_until_received(alice, b"and back as a contact")
+        self.assertEqual(got, (bob.pubkey, b"and back as a contact"))
         self.assertEqual(alice.direct_sends(), 0)
+        self.assertEqual(bob.direct_sends(), 0)
 
         nonce = c.create_string_buffer(12)
         payload = c.create_string_buffer(b"are you there")
@@ -351,6 +421,16 @@ class SeveralRelays(unittest.TestCase):
         self.assertEqual(switch_relay(dave.ctx, second.pubkey, True, bytes([127, 0, 0, 1]), second.port), 0)
         wait_for(lambda: second.status()["relay"]["proven"] >= 3, 40, "the moved client to prove its endpoint on the second relay")
         self.assertEqual(dave.send_until_received(bob, b"after switching"), (dave.pubkey, b"after switching"))
+
+
+class ExportedSymbols(unittest.TestCase):
+    """The library exports every C function the FFI source declares."""
+
+    def test_every_export_resolves(self):
+        source = Path(__file__).resolve().parent.parent / "src" / "meshguard_ffi.zig"
+        names = re.findall(r"^export fn (meshguard_\w+)", source.read_text(encoding="utf-8"), re.MULTILINE)
+        self.assertGreater(len(names), 40)
+        self.assertEqual([name for name in names if not hasattr(lib, name)], [])
 
 
 if __name__ == "__main__":
