@@ -37,6 +37,16 @@ A frame is forwarded when:
 Frames addressed to the relay itself are delivered locally as before; the
 application authenticates their sender end to end.
 
+## Admission
+
+A relay forwards only for identities it admits: authorized keys, holders of a
+valid certificate from a trusted organization (`trusted_orgs/`), or everyone
+with `--open`. With `--relay` and no keys or orgs, it admits nobody rather than
+everybody. Trust lists reload on `SIGHUP` or the owner's control `RELOAD`
+without a restart, and every client is re-checked on its next frame; a client
+whose certificate expired is refused until it presents a renewed one. See
+`docs/guide/trust-model.md`.
+
 ## Modes
 
 | Node | Forwarding |

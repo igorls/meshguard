@@ -95,6 +95,10 @@ meshguard up [options]
 | `--legacy-wg-binding` | `false` | Accept gossip-learned WireGuard keys for admitted clients (migration only) |
 
 Relay forwarding is described in `docs/reference/relay-forwarding.md`.
+With `--relay`, empty trust lists refuse every peer instead of accepting all;
+`--open` is the only way to accept everyone. Send `SIGHUP` (or the owner's
+control command `RELOAD`) to re-read `authorized_keys/`, `trusted_orgs/` and
+`node.cert` without restarting.
 `meshguard status` includes a `relay` object with client counts, frames
 forwarded, and frames dropped by reason.
 

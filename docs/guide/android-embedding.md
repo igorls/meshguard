@@ -75,6 +75,11 @@ object MeshGuardFFI {
     external fun meshguard_last_recv_time(ctx: Long): Long
     external fun meshguard_get_bound_port(ctx: Long): Int
     external fun meshguard_get_pubkey_b64(ctx: Long, out: ByteArray)
+    external fun meshguard_get_wg_pubkey(ctx: Long, out: ByteArray)
+
+    // Organization certificate (for example a relay pass), before or after join
+    external fun meshguard_set_org_cert(ctx: Long, cert: ByteArray, len: Int): Int
+    external fun meshguard_clear_org_cert(ctx: Long): Int
 }
 ```
 

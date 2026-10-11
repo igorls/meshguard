@@ -9,6 +9,7 @@
 //!
 //! Commands:
 //!   PEERS\n                       → JSON array of alive peers with mesh IPs
+//!   RELOAD\n                      → re-read trust lists (daemon owner only)
 //!   STATUS\n                      → JSON object with daemon status summary
 //!                                      (with relay counters when forwarding)
 //!   STOP\n                        → request graceful daemon shutdown
@@ -499,6 +500,8 @@ pub const ControlSocket = struct {
     /// cooperation on Windows, so values may be momentarily stale.
     relay_core: ?*const RelayCore.RelayCore = null,
     relay_forwarding: []const u8 = "none",
+    /// Set by RELOAD; the event loop re-reads trust lists.
+    reload_flag: ?*std.atomic.Value(bool) = null,
 
     // In-memory incoming legacy message queue (unframed / non-MGAPP1 plaintext)
     queue: [MAX_QUEUED_MESSAGES]QueuedMessage = undefined,
@@ -862,7 +865,7 @@ pub const ControlSocket = struct {
         const resp_buf = self.response_buf.?;
         const trimmed = std.mem.trim(u8, cmd, " \t");
         // STOP and transfers (file contents) need the daemon owner; the socket itself is world-writable.
-        const owner = (std.mem.eql(u8, trimmed, "STOP") or std.mem.startsWith(u8, trimmed, "XFER")) and stopAuthorizedUnix(client);
+        const owner = (std.mem.eql(u8, trimmed, "STOP") or std.mem.eql(u8, trimmed, "RELOAD") or std.mem.startsWith(u8, trimmed, "XFER")) and stopAuthorizedUnix(client);
         const resp_len = self.formatCommandResponse(cmd, resp_buf, owner);
         if (resp_len > 0) {
             writeAllSocket(client, resp_buf[0..resp_len]);
@@ -878,6 +881,13 @@ pub const ControlSocket = struct {
             return self.formatPeers(buf);
         } else if (std.mem.eql(u8, cmd, "STATUS")) {
             return self.formatStatus(buf);
+        } else if (std.mem.eql(u8, cmd, "RELOAD")) {
+            if (!owner_authorized) return formatError(buf, "unauthorized: reload requires the daemon owner");
+            const flag = self.reload_flag orelse return formatError(buf, "reload not supported");
+            flag.store(true, .release);
+            const msg = "{\"ok\":true,\"reloading\":true}\n";
+            @memcpy(buf[0..msg.len], msg);
+            return msg.len;
         } else if (std.mem.eql(u8, cmd, "STOP")) {
             if (!owner_authorized) {
                 const msg = "{\"ok\":false,\"error\":\"unauthorized\"}\n";
@@ -1744,6 +1754,26 @@ test "control STATUS response includes peer counts" {
     try std.testing.expect(std.mem.indexOf(u8, buf[0..m], "\"relay\":{\"forwarding\":\"authenticated\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, buf[0..m], "\"spoofed_sender\":3") != null);
     try std.testing.expect(std.mem.endsWith(u8, buf[0..m], "}}\n"));
+}
+
+test "control RELOAD requires the owner and sets the reload flag" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 10);
+    defer membership.deinit();
+    var control = try ControlSocket.init(allocator, &membership, [_]u8{0x24} ** 32, .{ 10, 99, 3, 4 }, [_]u8{0} ** 32, "test.sock");
+    var buf: [512]u8 = undefined;
+
+    var n = control.formatCommandResponse("RELOAD", &buf, true);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "not supported") != null);
+
+    var flag = std.atomic.Value(bool).init(false);
+    control.reload_flag = &flag;
+    n = control.formatCommandResponse("RELOAD", &buf, false);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "unauthorized") != null);
+    try std.testing.expect(!flag.load(.acquire));
+    n = control.formatCommandResponse("RELOAD\n", &buf, true);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "\"reloading\":true") != null);
+    try std.testing.expect(flag.load(.acquire));
 }
 
 test "ControlSocket message queue push and pop" {

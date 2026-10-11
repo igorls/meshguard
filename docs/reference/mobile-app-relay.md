@@ -64,6 +64,19 @@ relay or derived from its identity.
 
 Mobile contexts never forward frames addressed to others.
 
+## Relay passes
+
+A relay that trusts an organization admits any holder of that organization's
+valid v2 certificate for the client's own Ed25519 and WireGuard keys. The host
+obtains one from its issuer (`meshguard_get_wg_pubkey` gives the WireGuard key
+to bind) and installs it with `meshguard_set_org_cert(ctx, cert, len)`, before
+or after joining. The context checks the certificate is its own, correctly
+signed and valid now; it returns `-3` for a wrong length and `-4` otherwise.
+A running context applies it on its event loop, pings its peers at once so the
+relay sees it, and proves its relay endpoint again. Renew before expiry by
+installing the next certificate the same way; `meshguard_clear_org_cert`
+stops presenting one.
+
 Tests cover admitted endpoint confirmation, refusal to move a known endpoint
 from unsigned observation, invalid initiation/response packets, and successful
 authenticated updates in both handshake directions.
