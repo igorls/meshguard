@@ -84,3 +84,47 @@ test.skipIf(!binary)('browsers with passes exchange messages through the gateway
     rmSync(root, { recursive: true, force: true });
   }
 }, 60000);
+
+// A relay daemon trusting the test org, with a gateway in front of it.
+async function relayWithGateway() {
+  const root = mkdtempSync(join(tmpdir(), 'meshguard-relay-e2e-'));
+  const env = { ...Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('MESHGUARD_'))), MESHGUARD_CONFIG_DIR: join(root, 'config') };
+  const run = (...args) => spawnSync(binary, args, { env, encoding: 'utf8', timeout: 30000 });
+  run('keygen');
+  const shown = run('config', 'show').stdout;
+  mkdirSync(join(root, 'config', 'trusted_orgs'), { recursive: true });
+  writeFileSync(join(root, 'config', 'trusted_orgs', 'test.org'), b64(orgPublic) + '\n');
+  const port = await freePort();
+  const process_ = spawn(binary, ['up', '--gossip-only', '--relay', '--opaque', '--announce', '127.0.0.1', '--gossip-port', String(port),
+    '--control-path', join(root, 'control.sock'), '--trusted-handshake-source', '127.0.0.1'], { env, stdio: 'ignore' });
+  const gateway = startGateway({ listenPort: 0, relayHost: '127.0.0.1', relayPort: port, allowedOrigins: [origin], trustedOrgs: [b64(orgPublic)] });
+  return {
+    peer: { publicKey: fromB64(/public key \(Ed25519\):\s+(\S+)/.exec(shown)[1]), wgPublicKey: fromB64(/public key \(WG X25519\):\s+(\S+)/.exec(shown)[1]) },
+    url: `ws://127.0.0.1:${gateway.server.port}/meshguard-web/ws`,
+    stop() { gateway.stop(); process_.kill('SIGTERM'); setTimeout(() => rmSync(root, { recursive: true, force: true }), 200); },
+  };
+}
+
+test.skipIf(!binary)('one browser identity holds a session on each of two relays, with a handle per relay', async () => {
+  const relays = [await relayWithGateway(), await relayWithGateway()];
+  const NativeWebSocket = globalThis.WebSocket;
+  globalThis.WebSocket = class extends NativeWebSocket { constructor(url) { super(url, { headers: { Origin: origin } }); } };
+  const clients = [];
+  try {
+    const core = new MeshguardWasm((await WebAssembly.instantiate(readFileSync('zig-out/bin/meshguard.wasm'), {})).instance);
+    const seed = new Uint8Array(32).fill(0x71);
+    // Each relay client needs its own identity handle: a handle holds one handshake at a time.
+    for (const relay of relays) {
+      const identity = core.createIdentity(seed);
+      const client = new MeshguardRelayClient({ identity, url: relay.url, relay: relay.peer, pass: issuePass(identity) });
+      client.connect(); clients.push(client);
+    }
+    expect(b64(clients[0].identity.publicKey())).toBe(b64(clients[1].identity.publicKey()));
+    await until(() => clients.every(c => c.ready), 20000, 'both relay sessions to complete their handshakes');
+  } finally {
+    for (const c of clients) c.disconnect();
+    globalThis.WebSocket = NativeWebSocket;
+    for (const r of relays) r.stop();
+    await new Promise(r => setTimeout(r, 300));
+  }
+}, 60000);

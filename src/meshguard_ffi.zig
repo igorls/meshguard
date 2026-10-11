@@ -113,6 +113,10 @@ pub const MeshguardContext = struct {
     sent_lock: std.Io.Mutex,
     on_delivery_status_cb: ?*const fn ([*]const u8, [*]const u8, u8) callconv(.c) void,
 
+    // Last packet time (ns), mirrored from SWIM by the event loop so host
+    // threads never read SWIM while leave() replaces it.
+    last_recv_ns: std.atomic.Value(i64),
+
     // Host-tunable timers (0 = default), read by the event loop.
     keepalive_ms: std.atomic.Value(u32),
     relay_proof_ms: std.atomic.Value(u32),
@@ -186,6 +190,7 @@ fn initContextStorage(ctx: *MeshguardContext, allocator: std.mem.Allocator) void
     ctx.sent_lock = .init;
     ctx.on_delivery_status_cb = null;
     ctx.keepalive_ms = std.atomic.Value(u32).init(0);
+    ctx.last_recv_ns = std.atomic.Value(i64).init(0);
     ctx.relay_proof_ms = std.atomic.Value(u32).init(0);
     ctx.membership = Membership.MembershipTable.init(allocator, 15000);
     ctx.swim = null;
@@ -755,6 +760,58 @@ export fn meshguard_leave(ctx: ?*MeshguardContext) void {
     }
     c.event_loop_thread = null;
     c.swim = null;
+    forgetNetwork(c);
+}
+
+/// After leaving: the next join may go through another relay, so drop every
+/// peer, the WireGuard sessions with them, and the relay proof state. The
+/// identity, contacts, certificate and settings stay.
+fn forgetNetwork(c: *MeshguardContext) void {
+    if (c.wg_device) |*dev| {
+        var keys: [256][32]u8 = undefined;
+        var n: usize = 0;
+        {
+            c.membership.lock.lockSharedUncancelable(zio());
+            defer c.membership.lock.unlockShared(zio());
+            var iter = c.membership.peers.iterator();
+            while (iter.next()) |entry| {
+                const wg = entry.value_ptr.wg_pubkey orelse continue;
+                if (n == keys.len) break;
+                keys[n] = wg;
+                n += 1;
+            }
+        }
+        c.wg_lock.lockUncancelable(zio());
+        defer c.wg_lock.unlock(zio());
+        for (keys[0..n]) |wg| dev.removePeer(wg);
+    }
+    c.membership.clear();
+    c.last_relay_auth_ns = 0;
+    c.last_recv_ns.store(0, .release);
+    c.sent_lock.lockUncancelable(zio());
+    c.sent_frames = std.mem.zeroes([256]SentFrame);
+    c.sent_lock.unlock(zio());
+}
+
+/// Moves this context to another relay: leaves the current network (if
+/// joined), pins `relay_pubkey` and joins through `seed_ip:seed_port`. The
+/// identity, contacts and certificate carry over. Returns what
+/// `meshguard_set_app_relay` or `meshguard_join` returns.
+///
+/// To use several relays at once, create one context per relay with the same
+/// identity seed instead; each binds its own socket.
+export fn meshguard_switch_relay(
+    ctx: ?*MeshguardContext,
+    relay_pubkey: [*]const u8,
+    force: bool,
+    seed_ip: [*]const u8,
+    seed_port: u16,
+) i32 {
+    const c = ctx orelse return -1;
+    meshguard_leave(c);
+    const rc = meshguard_set_app_relay(c, relay_pubkey, force);
+    if (rc != 0) return rc;
+    return meshguard_join(c, seed_ip, seed_port);
 }
 
 // ─── Messaging ───
@@ -1143,12 +1200,9 @@ export fn meshguard_is_suspended(ctx: ?*MeshguardContext) bool {
 /// Used by the host app for heartbeat/liveness detection.
 export fn meshguard_last_recv_time(ctx: ?*MeshguardContext) u64 {
     const c = ctx orelse return 0;
-    if (c.swim) |*swim| {
-        const ns = swim.last_recv_ns.load(.acquire);
-        if (ns <= 0) return 0;
-        return @intCast(@divTrunc(ns, 1_000_000));
-    }
-    return 0;
+    const ns = c.last_recv_ns.load(.acquire);
+    if (ns <= 0) return 0;
+    return @intCast(@divTrunc(ns, 1_000_000));
 }
 
 /// Get our actual bound UDP port.
@@ -1434,6 +1488,7 @@ fn eventLoop(ctx: *MeshguardContext) void {
             } else {
                 // ACTIVE: full gossip + discovery
                 applyPendingOrgCert(ctx, swim);
+                ctx.last_recv_ns.store(swim.last_recv_ns.load(.acquire), .release);
                 const keepalive = ctx.keepalive_ms.load(.acquire);
                 if (keepalive != 0) swim.config.gossip_interval_ms = keepalive;
                 swim.tick() catch {};
@@ -2411,6 +2466,57 @@ test "delivery statuses count only from the pinned relay and for frames we sent"
     onAppStatusCallback(ctx, &bytes, relay_ep);
     try std.testing.expectEqual(@as(u32, 1), StatusProbe.calls);
     relay.state = .alive;
+}
+
+test "leaving forgets the network but keeps identity and contacts" {
+    var seed = [_]u8{0x28} ** 32;
+    const ctx = meshguard_init(&seed, 0) orelse return error.InitFailed;
+    defer meshguard_destroy(ctx);
+    const friend = try AppPacket.Identity.fromSeed([_]u8{0x29} ** 32);
+    try std.testing.expectEqual(@as(i32, 0), meshguard_add_contact(ctx, &friend.public_key, &friend.wg_public));
+    const loopback = [_]u8{ 127, 0, 0, 1 };
+
+    try std.testing.expectEqual(@as(i32, 0), meshguard_join(ctx, &loopback, 9));
+    try ctx.membership.upsert(routeTestPeer(0x41));
+    ctx.last_relay_auth_ns = 77;
+    meshguard_leave(ctx);
+    try std.testing.expectEqual(@as(usize, 0), ctx.membership.count());
+    try std.testing.expectEqual(@as(i128, 0), ctx.last_relay_auth_ns);
+    try std.testing.expectEqual(@as(u32, 1), meshguard_contact_count(ctx));
+
+    // Switching to another relay joins again (and twice in a row is fine).
+    var relay = [_]u8{0x42} ** 32;
+    try std.testing.expectEqual(@as(i32, 0), meshguard_switch_relay(ctx, &relay, true, &loopback, 10));
+    try std.testing.expect(ctx.running.load(.acquire));
+    try std.testing.expectEqualSlices(u8, &relay, &ctx.app_relay_key.?);
+    try std.testing.expectEqual(@as(i32, 0), meshguard_switch_relay(ctx, &relay, true, &loopback, 11));
+    meshguard_leave(ctx);
+}
+
+test "repeated join and leave cycles stay consistent under concurrent sends" {
+    var seed = [_]u8{0x2a} ** 32;
+    const ctx = meshguard_init(&seed, 0) orelse return error.InitFailed;
+    defer meshguard_destroy(ctx);
+    const loopback = [_]u8{ 127, 0, 0, 1 };
+    var stop = std.atomic.Value(bool).init(false);
+    const Sender = struct {
+        fn run(c: *MeshguardContext, done: *std.atomic.Value(bool)) void {
+            const target = [_]u8{0x55} ** 32;
+            const payload = "x";
+            while (!done.load(.acquire)) {
+                _ = meshguard_send(c, &target, payload, 1);
+                _ = meshguard_last_recv_time(c);
+                _ = meshguard_peer_count(c);
+            }
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Sender.run, .{ ctx, &stop });
+    for (0..50) |i| {
+        try std.testing.expectEqual(@as(i32, 0), meshguard_join(ctx, &loopback, @intCast(9 + i % 3)));
+        meshguard_leave(ctx);
+    }
+    stop.store(true, .release);
+    thread.join();
 }
 
 test "keepalive and relay proof intervals are bounded" {
