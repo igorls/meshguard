@@ -19,6 +19,11 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   and releases ship `meshguard-ffi-windows-amd64.dll` and
   `meshguard-ffi-windows-amd64.lib`. The Windows guide documents embedding for
   any host language.
+- Apple C ABI embedding packages: macOS arm64, x86_64 and universal static and
+  dynamic libraries, plus an iOS device/simulator XCFramework. A public
+  `meshguard.h` and `MeshGuardFFI` Clang module support C, Objective-C, C++ and
+  Swift hosts. Apple build and link-smoke scripts and integration guides cover
+  identity persistence, polling, relay configuration and lifecycle limits.
 - Relay switching: `meshguard_switch_relay` moves a mobile context to another
   relay, and leaving now forgets the old network (peers, WireGuard sessions,
   relay proof) while keeping the identity, contacts and certificate. Several

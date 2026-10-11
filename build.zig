@@ -90,6 +90,9 @@ pub fn build(b: *std.Build) void {
             // iOS requires static linking — apps cannot dlopen user dylibs.
             .linkage = if (is_ios) .static else .dynamic,
         });
+        // Ad-hoc signing adds a load command to Intel dylibs. Reserve space so
+        // codesign cannot grow the Mach-O header over the first code section.
+        if (is_macos) ffi_lib.headerpad_size = 0x1000;
 
         // Link libsodium only when the resolved backend uses it (Linux desktop).
         // Otherwise the Zig std.crypto software path is used (no link needed).
@@ -101,7 +104,23 @@ pub fn build(b: *std.Build) void {
             ffi_mod.linkSystemLibrary("ws2_32", .{});
         }
 
-        b.installArtifact(ffi_lib);
+        const install_ffi = b.addInstallArtifact(ffi_lib, .{});
+        b.getInstallStep().dependOn(&install_ffi.step);
+        const ffi_step = b.step("ffi", "Build the C ABI embedding library");
+        ffi_step.dependOn(&install_ffi.step);
+
+        // macOS embedders may either load the dylib or link the C ABI statically.
+        // libmeshguard.a below exposes the Zig module, not these C entry points.
+        if (is_macos) {
+            const ffi_static = b.addLibrary(.{
+                .name = "meshguard-ffi",
+                .root_module = ffi_mod,
+                .linkage = .static,
+            });
+            const install_ffi_static = b.addInstallArtifact(ffi_static, .{});
+            b.getInstallStep().dependOn(&install_ffi_static.step);
+            ffi_step.dependOn(&install_ffi_static.step);
+        }
 
         if (!is_android and !is_ios) {
             const ffi_test_mod = b.createModule(.{
