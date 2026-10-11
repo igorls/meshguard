@@ -73,8 +73,8 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "use_libsodium", use_libsodium);
     const build_options_mod = build_options.createModule();
 
-    // ─── FFI module (for mobile embedding — not built on Windows) ───
-    if (!is_windows) {
+    // ─── FFI module (for embedding in mobile and desktop apps) ───
+    {
         const ffi_mod = b.createModule(.{
             .root_source_file = b.path("src/meshguard_ffi.zig"),
             .target = target,
@@ -96,6 +96,10 @@ pub fn build(b: *std.Build) void {
         if (use_libsodium) {
             ffi_mod.linkSystemLibrary("sodium", .{});
         }
+        // Windows: Winsock2 for the UDP socket (meshguard-ffi.dll).
+        if (is_windows) {
+            ffi_mod.linkSystemLibrary("ws2_32", .{});
+        }
 
         b.installArtifact(ffi_lib);
 
@@ -113,6 +117,9 @@ pub fn build(b: *std.Build) void {
             });
             if (use_libsodium) {
                 ffi_test_mod.linkSystemLibrary("sodium", .{});
+            }
+            if (is_windows) {
+                ffi_test_mod.linkSystemLibrary("ws2_32", .{});
             }
 
             const run_ffi_tests = b.addRunArtifact(ffi_tests);

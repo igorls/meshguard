@@ -1,13 +1,17 @@
-//! meshguard FFI — C-ABI surface for embedding in mobile apps.
+//! meshguard FFI — C-ABI surface for embedding in mobile and desktop apps.
 //!
 //! This module exposes a minimal C-compatible API for:
 //!   - Lifecycle: init, join mesh via seed, leave, destroy
 //!   - Messaging: send/receive encrypted app-level messages
 //!   - Events: peer join/leave callbacks
 //!
-//! Designed for JNI consumption from Android (Kotlin/Java).
+//! Built as libmeshguard-ffi.so (Linux, Android), libmeshguard-ffi.dylib /
+//! a static library (macOS, iOS) and meshguard-ffi.dll (Windows), with the
+//! same exports everywhere. Hosts call it from their own threads (JNI, Swift,
+//! P/Invoke, ctypes, dart:ffi...) while each joined context runs its own
+//! event-loop thread.
 //! Does NOT include the WireGuard TUN dataplane — application-level
-//! encrypted messaging only.
+//! encrypted messaging and userspace tunnels over the context's UDP socket.
 
 const std = @import("std");
 const builtin = @import("builtin");
