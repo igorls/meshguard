@@ -80,9 +80,12 @@ pub fn NonceCounterImpl(comptime use_atomics: bool) type {
     return if (use_atomics) AtomicNonceCounter else LockedNonceCounter;
 }
 
-/// Lock-free: a single `fetchAdd`, exactly what the send path always used.
-/// Values repeat only after 2^64 reservations, far beyond the point where
-/// WireGuard rejects a key (REJECT_AFTER_MESSAGES) or its 180 s lifetime.
+/// Lock-free: a single `fetchAdd`, exactly what the send path always used, and
+/// the same fetch-add-then-check scheme as the kernel WireGuard send path. It
+/// wraps, but only after 2^64 reservations: a key's counter starts at 0, so it
+/// would take about 1.8e19 sends to reach REJECT_AFTER_MESSAGES (and 2050 more
+/// to wrap), while a key is rejected after 180 s (REJECT_AFTER_TIME), which
+/// allows under 2e11 sends even at 10^9 packets per second.
 pub const AtomicNonceCounter = struct {
     value: std.atomic.Value(u64),
 
