@@ -8,6 +8,17 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## Unreleased
 
 ### Added
+- Windows embedding library: `zig build` for Windows now produces
+  `meshguard-ffi.dll` and its import library `meshguard-ffi.lib`, with the same
+  `meshguard_*` exports and behaviour as the Linux, macOS, Android and iOS
+  libraries. No function is unsupported, and the tunnel functions need no
+  Wintun adapter or Administrator rights. The FFI unit tests run in
+  `zig build test` on Windows. `scripts/test-relay.py` runs against the DLL,
+  reaching the relay daemon over its named pipe, and also covers tunnels and
+  checks that every exported function resolves. CI gains a Windows test job,
+  and releases ship `meshguard-ffi-windows-amd64.dll` and
+  `meshguard-ffi-windows-amd64.lib`. The Windows guide documents embedding for
+  any host language.
 - Relay switching: `meshguard_switch_relay` moves a mobile context to another
   relay, and leaving now forgets the old network (peers, WireGuard sessions,
   relay proof) while keeping the identity, contacts and certificate. Several
@@ -102,6 +113,12 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   peers instead of once per peer.
 
 ### Fixed
+- LAN discovery on Windows: the multicast socket stayed blocking because the
+  `FIONBIO` request used the wrong ioctl code and its failure was ignored, so
+  `recvBeacons` could stall an event loop. `SO_BROADCAST` went through
+  `std.posix.setsockopt`, which does not compile for Windows. Socket creation
+  failures are now detected, and Winsock is initialized before the socket is
+  created.
 - Idle daemons in full mode no longer keep a core busy. The io_uring UDP loop
   slept 100 µs whenever the ring was empty (about 5,000 wakeups a second) and
   its rings used SQPOLL, whose kernel thread polls for a second after every
