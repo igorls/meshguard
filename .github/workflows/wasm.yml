@@ -36,6 +36,12 @@ jobs:
         env:
           MESHGUARD_NATIVE_LIBRARY: ${{ github.workspace }}/zig-out/lib/libmeshguard-ffi.so
         run: node tests/wasm/native-interop.mjs
+      # The same tests, against the packed release packages instead of the source tree.
+      - name: Build, pack and test the browser packages
+        env:
+          MESHGUARD_BINARY: ${{ github.workspace }}/zig-out/bin/meshguard
+          MESHGUARD_NATIVE_LIBRARY: ${{ github.workspace }}/zig-out/lib/libmeshguard-ffi.so
+        run: ./scripts/build-web.sh
       - uses: actions/upload-artifact@v4
         with:
           name: meshguard-wasm
@@ -43,4 +49,11 @@ jobs:
             zig-out/bin/meshguard.wasm
             web/meshguard.mjs
             web/relay-protocol.mjs
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: meshguard-web-packages
+          path: |
+            zig-out/web/meshguard-web-*.tgz
+            zig-out/web/meshguard-gateway-*.tgz
           if-no-files-found: error

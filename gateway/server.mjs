@@ -1,3 +1,4 @@
+#!/usr/bin/env bun
 // Ciphertext-only WSS -> UDP adapter for browser clients of a MeshGuard relay. Requires Bun 1.4.2.
 //
 // A browser authenticates its Ed25519/WireGuard key pair by signing a fresh challenge, and is

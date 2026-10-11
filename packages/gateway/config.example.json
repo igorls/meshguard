@@ -1,0 +1,14 @@
+{
+  "listenHost": "127.0.0.1",
+  "listenPort": 4321,
+  "pathPrefix": "/meshguard-web",
+  "udpBindHost": "127.0.0.1",
+  "relayHost": "127.0.0.1",
+  "relayPort": 51821,
+  "allowedOrigins": ["https://app.example.com"],
+  "trustedOrgs": ["<pass issuer organization Ed25519 public key, Base64>"],
+  "allowedIdentities": [],
+  "maxSessions": 4096,
+  "maxSessionsPerIp": 16,
+  "passSkewSeconds": 300
+}

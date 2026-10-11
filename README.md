@@ -56,7 +56,8 @@ without a required server.
 - **Portable Zig build** with optional libsodium acceleration on Linux.
 - **Browser WASM core** for native-compatible identities, signatures, encrypted
   application packets, and authenticated relay routing, with a JavaScript
-  wrapper and ciphertext-only WSS gateway.
+  wrapper and ciphertext-only WSS gateway, shipped as release packages
+  (`meshguard-web-<version>.tgz`, `meshguard-gateway-<version>.tgz`).
 
 ## Install
 
@@ -171,6 +172,9 @@ zig build test
 
 # Build and test the browser packet core (Node.js 24 required for tests)
 zig build wasm wasm-test -Doptimize=ReleaseSmall
+
+# Pack the browser runtime and gateway and test the packages (also needs Bun and npm)
+./scripts/build-web.sh
 ```
 
 Cross-compile examples:
@@ -219,6 +223,7 @@ history, and remaining performance work.
 - [Service access control](docs/guide/services.md)
 - [Linux / FreeBSD embedding](docs/guide/linux-embedding.md)
 - [Android embedding](docs/guide/android-embedding.md)
+- [Using MeshGuard in the browser](docs/guide/browser.md)
 - [Browser WASM core](docs/reference/wasm-core.md)
 - [Browser relay and Android qualification](docs/reference/browser-relay.md)
 - [Architecture](docs/concepts/architecture.md)

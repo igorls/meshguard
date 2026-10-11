@@ -1,0 +1,9 @@
+# Files that ship in the browser packages are listed with SHA-256 sums, and embedders pin them:
+# keep them byte-identical (LF) on every checkout, Windows included.
+web/*.mjs text eol=lf
+web/*.mts text eol=lf
+gateway/*.mjs text eol=lf
+gateway/*.service text eol=lf
+gateway/*.conf text eol=lf
+packages/** text eol=lf
+scripts/*.sh text eol=lf

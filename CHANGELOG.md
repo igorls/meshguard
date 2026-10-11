@@ -8,6 +8,25 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## Unreleased
 
 ### Added
+- Browser packages in releases: `meshguard-web-<version>.tgz` (npm package
+  `@meshguard/web`) holds `meshguard.wasm` (ReleaseSmall), `meshguard.mjs`,
+  `relay-protocol.mjs`, TypeScript declarations for `MeshguardWasm`, identities
+  and `MeshguardRelayClient` (methods and event payloads) and a `SHA256SUMS` of
+  the runtime files; `meshguard-gateway-<version>.tgz` (npm package
+  `@meshguard/gateway`) holds the browser gateway (`gateway/server.mjs`,
+  `gateway/pass.mjs` and the shared `web/relay-protocol.mjs`, with a
+  `meshguard-gateway` command), an example configuration, and the systemd and
+  nginx templates. Both are `npm pack` tarballs listed in `checksums.txt`; they
+  are not published to the npm registry. File names and relative imports are
+  unchanged, so copied runtime files remain drop-in. `meshguard.mjs` now exports
+  `ABI_VERSION`, and `MeshguardWasm.load()` without a URL loads the
+  `meshguard.wasm` next to it. `scripts/build-web.sh` builds and packs both,
+  checks that the wrapper and the module share an ABI version and that every
+  export is declared, then runs the WASM and gateway tests and a strict
+  TypeScript check against the unpacked packages; CI runs it on every pull
+  request. The shipped files are checked out with LF line endings on every
+  platform, so their checksums match. A new guide, *Using MeshGuard in the
+  browser*, covers installation, identity storage and gateway deployment.
 - Linux, FreeBSD and Android embedding libraries in releases:
   `meshguard-ffi-linux-amd64.tar.gz`, `meshguard-ffi-linux-arm64.tar.gz` and
   `meshguard-ffi-freebsd-amd64.tar.gz` each hold `libmeshguard-ffi.so`, the

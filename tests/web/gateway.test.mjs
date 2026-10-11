@@ -1,12 +1,11 @@
 import { test, expect } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { createPrivateKey, createPublicKey, sign } from 'node:crypto';
-import { startGateway, validateOutbound, clientAddress } from '../../gateway/server.mjs';
-import { verifyPass } from '../../gateway/pass.mjs';
-import { MeshguardWasm } from '../../web/meshguard.mjs';
-import { authPayload, bindingPayload, b64, fromB64, selfAdvertisement, parseStatus, MeshguardRelayClient } from '../../web/relay-protocol.mjs';
+import { loadGateway, loadWeb, wasmBytes } from '../runtime.mjs';
 
-const core = new MeshguardWasm((await WebAssembly.instantiate(readFileSync('zig-out/bin/meshguard.wasm'), {})).instance);
+const { startGateway, validateOutbound, clientAddress, verifyPass } = await loadGateway();
+const { MeshguardWasm, authPayload, bindingPayload, b64, fromB64, selfAdvertisement, parseStatus, MeshguardRelayClient } = await loadWeb();
+const core = new MeshguardWasm((await WebAssembly.instantiate(wasmBytes(), {})).instance);
 const a = core.createIdentity(new Uint8Array(32).fill(1));
 const b = core.createIdentity(new Uint8Array(32).fill(2));
 const peer = identity => ({ publicKey: identity.publicKey(), wgPublicKey: identity.wgPublicKey() });

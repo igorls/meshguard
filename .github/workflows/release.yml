@@ -182,8 +182,47 @@ jobs:
             zig-out/libraries/meshguard-ffi-freebsd-amd64.tar.gz
             zig-out/libraries/meshguard-ffi-android.zip
 
+  web:
+    name: Browser runtime and gateway packages
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+
+      # A native relay and FFI library, for the end-to-end and interoperability tests.
+      - name: Build native binary and FFI library
+        run: zig build -Dcrypto-backend=std -Doptimize=ReleaseSafe
+
+      - name: Build, pack and test the browser packages
+        env:
+          MESHGUARD_BINARY: ${{ github.workspace }}/zig-out/bin/meshguard
+          MESHGUARD_NATIVE_LIBRARY: ${{ github.workspace }}/zig-out/lib/libmeshguard-ffi.so
+        run: ./scripts/build-web.sh
+
+      - name: Upload browser packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: meshguard-web
+          if-no-files-found: error
+          path: |
+            zig-out/web/meshguard-web-*.tgz
+            zig-out/web/meshguard-gateway-*.tgz
+
   release:
-    needs: [build, apple, libraries]
+    needs: [build, apple, libraries, web]
     runs-on: [self-hosted, zig]
     steps:
       - uses: actions/checkout@v4

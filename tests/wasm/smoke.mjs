@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
-import {MeshguardWasm} from '../../web/meshguard.mjs';
-const binary=readFileSync(process.argv[2]||'zig-out/bin/meshguard.wasm');
+import {loadWeb,wasmPath} from '../runtime.mjs';
+const {MeshguardWasm,ABI_VERSION}=await loadWeb();
+const binary=readFileSync(process.argv[2]||wasmPath);
 const module=await WebAssembly.compile(binary);
 assert.deepEqual(WebAssembly.Module.imports(module),[],'Browser core must not require WASI, libc or native sockets');
 const instance=await WebAssembly.instantiate(module,{});
+assert.equal(instance.exports.mg_abi_version(),ABI_VERSION,'The wrapper and the module must share an ABI version');
 const core=new MeshguardWasm(instance);
 const callerSeed=Buffer.alloc(32,7),temporary=core.createIdentity(callerSeed);
 assert.deepEqual(callerSeed,Buffer.alloc(32,7),'The wrapper must not erase caller-owned seed buffers');

@@ -3,7 +3,9 @@
 MeshGuard's identity and encrypted application-packet engine can run inside a
 browser as WebAssembly. The native FFI and desktop daemon use the same
 `src/app_packet.zig` implementation, preserving the existing `0x50` wire format.
-The JavaScript wrapper lives in `web/meshguard.mjs`.
+The JavaScript wrapper lives in `web/meshguard.mjs`. Releases ship both, with
+the relay client and TypeScript declarations, as the `meshguard-web-<version>.tgz`
+package; see [Using MeshGuard in the browser](../guide/browser.md).
 
 This target includes Ed25519 identity generation and signatures, X25519 key
 agreement, ChaCha20-Poly1305 application packets, and a WireGuard Noise IK
@@ -135,7 +137,9 @@ Peer Circle's browser product flows remain separate acceptance work.
 ABI version 1 exports `mg_abi_version`, `mg_scratch_ptr`, `mg_scratch_size`,
 `mg_max_payload`, `mg_identity_create`, `mg_identity_destroy`, `mg_public_key`,
 `mg_wg_public_key`, `mg_seal`, `mg_open`, `mg_sign`, `mg_verify`,
-`mg_noise_initiate`, and `mg_noise_complete`.
+`mg_noise_initiate`, and `mg_noise_complete`. `web/meshguard.mjs` exports the
+version it speaks as `ABI_VERSION` and refuses a module that reports another
+one; `scripts/build-web.sh` checks the pair before packaging.
 
 Pointers and lengths are unsigned 32-bit values confined to an 8 KiB scratch
 arena. Invalid ranges and overlapping packet input/output buffers are rejected.

@@ -7,7 +7,9 @@ Wants=network-online.target
 Type=simple
 DynamicUser=yes
 WorkingDirectory=/opt/meshguard-web/current
-ExecStart=/opt/meshrooms/bin/bun gateway/server.mjs /etc/meshguard-web/config.json
+# The release package unpacked here (meshguard-gateway-<version>.tgz holds it under package/).
+# Adjust the Bun path to the local runtime.
+ExecStart=/usr/local/bin/bun gateway/server.mjs /etc/meshguard-web/config.json
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=3
