@@ -92,6 +92,13 @@ overloaded. Statuses are accepted only from the pinned relay's endpoint and
 only for one of the last 256 frames sent through it, each at most once. Code
 `4` also re-proves the relay endpoint at once.
 
+The callback's pointers are valid only during the call. Hosts that handle
+statuses later on another thread (Dart's `NativeCallable.listener`, for
+example) poll instead:
+`meshguard_recv_delivery_status(ctx, out_destination[32], out_nonce[12], &code)`
+returns `0` with the next status, `1` when none is waiting. Up to 64 wait;
+newer ones are dropped while the queue is full.
+
 ## Timers
 
 `meshguard_set_keepalive_interval(ctx, ms)` sets the interval between pings

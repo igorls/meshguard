@@ -112,6 +112,10 @@ pub const MeshguardContext = struct {
     sent_next: usize,
     sent_lock: std.Io.Mutex,
     on_delivery_status_cb: ?*const fn ([*]const u8, [*]const u8, u8) callconv(.c) void,
+    // The same statuses for hosts that poll (`meshguard_recv_delivery_status`).
+    status_inbox: [64]StatusEntry,
+    status_write: std.atomic.Value(u32),
+    status_read: std.atomic.Value(u32),
 
     // Last packet time (ns), mirrored from SWIM by the event loop so host
     // threads never read SWIM while leave() replaces it.
@@ -189,6 +193,9 @@ fn initContextStorage(ctx: *MeshguardContext, allocator: std.mem.Allocator) void
     ctx.sent_next = 0;
     ctx.sent_lock = .init;
     ctx.on_delivery_status_cb = null;
+    ctx.status_inbox = std.mem.zeroes([64]StatusEntry);
+    ctx.status_write = std.atomic.Value(u32).init(0);
+    ctx.status_read = std.atomic.Value(u32).init(0);
     ctx.keepalive_ms = std.atomic.Value(u32).init(0);
     ctx.last_recv_ns = std.atomic.Value(i64).init(0);
     ctx.relay_proof_ms = std.atomic.Value(u32).init(0);
@@ -258,6 +265,14 @@ const AppMessage = struct {
     sender_pubkey: [32]u8,
     data: [1024]u8,
     len: u16,
+    valid: bool,
+};
+
+/// A delivery status waiting for the host to poll it.
+const StatusEntry = struct {
+    destination: [32]u8,
+    nonce: [12]u8,
+    code: u8,
     valid: bool,
 };
 
@@ -1026,19 +1041,59 @@ fn onAppStatusCallback(raw_ctx: *anyopaque, data: []const u8, src: messages.Endp
     if (!relay_ep.eql(src)) return;
     if (!takeSentFrame(ctx, status.destination, status.nonce)) return;
     if (status.code == .handshake_again) ctx.last_relay_auth_ns = 0;
+    enqueueStatus(ctx, status);
     if (ctx.on_delivery_status_cb) |cb| cb(&status.destination, &status.nonce, @intFromEnum(status.code));
+}
+
+/// Single producer (the event loop); drops new statuses while the queue is full.
+fn enqueueStatus(ctx: *MeshguardContext, status: AppStatus.Status) void {
+    const read_idx = ctx.status_read.load(.acquire);
+    const write_idx = ctx.status_write.load(.acquire);
+    if (write_idx -% read_idx >= ctx.status_inbox.len) return;
+    const slot = &ctx.status_inbox[write_idx % ctx.status_inbox.len];
+    slot.destination = status.destination;
+    slot.nonce = status.nonce;
+    slot.code = @intFromEnum(status.code);
+    @atomicStore(bool, &slot.valid, true, .release);
+    _ = ctx.status_write.fetchAdd(1, .release);
 }
 
 /// Called on the event loop with (destination, nonce, code) when the pinned
 /// relay reports a frame it did not forward: 1 offline, 2 destination not
 /// admitted, 3 rate limited, 4 handshake again (re-proved automatically),
-/// 5 not admitted, 6 relay overloaded.
+/// 5 not admitted, 6 relay overloaded. The pointers are valid only during the
+/// call: hosts that handle statuses later, on another thread, poll
+/// `meshguard_recv_delivery_status` instead.
 export fn meshguard_set_on_delivery_status(
     ctx: ?*MeshguardContext,
     cb: ?*const fn ([*]const u8, [*]const u8, u8) callconv(.c) void,
 ) void {
     const c = ctx orelse return;
     c.on_delivery_status_cb = cb;
+}
+
+/// Take the next delivery status, for hosts that poll rather than handle the
+/// callback on the event loop. Writes the destination identity (32 bytes), the
+/// frame's nonce (12 bytes) and the code. Up to 64 statuses wait; newer ones
+/// are dropped while the queue is full. Returns 0 when one was taken, 1 when
+/// none is waiting, -1 without a context.
+export fn meshguard_recv_delivery_status(
+    ctx: ?*MeshguardContext,
+    out_destination: [*]u8,
+    out_nonce: [*]u8,
+    out_code: *u8,
+) i32 {
+    const c = ctx orelse return -1;
+    const read_idx = c.status_read.load(.acquire);
+    if (read_idx == c.status_write.load(.acquire)) return 1;
+    const slot = &c.status_inbox[read_idx % c.status_inbox.len];
+    if (!@atomicLoad(bool, &slot.valid, .acquire)) return 1;
+    @memcpy(out_destination[0..32], &slot.destination);
+    @memcpy(out_nonce[0..12], &slot.nonce);
+    out_code.* = slot.code;
+    @atomicStore(bool, &slot.valid, false, .release);
+    _ = c.status_read.fetchAdd(1, .release);
+    return 0;
 }
 
 // ─── Timers ───
@@ -2456,6 +2511,12 @@ test "delivery statuses count only from the pinned relay and for frames we sent"
     onAppStatusCallback(ctx, &bytes, messages.Endpoint.initV4(.{ 203, 0, 113, 9 }, 51821));
     try std.testing.expectEqual(@as(u32, 0), StatusProbe.calls);
 
+    var got_dest: [32]u8 = undefined;
+    var got_nonce: [12]u8 = undefined;
+    var got_code: u8 = 0;
+    // Refused statuses are not queued either.
+    try std.testing.expectEqual(@as(i32, 1), meshguard_recv_delivery_status(ctx, &got_dest, &got_nonce, &got_code));
+
     ctx.last_relay_auth_ns = 12345;
     onAppStatusCallback(ctx, &bytes, relay_ep);
     try std.testing.expectEqual(@as(u32, 1), StatusProbe.calls);
@@ -2465,7 +2526,44 @@ test "delivery statuses count only from the pinned relay and for frames we sent"
     // Each frame is matched once.
     onAppStatusCallback(ctx, &bytes, relay_ep);
     try std.testing.expectEqual(@as(u32, 1), StatusProbe.calls);
+
+    // Polling hosts get the same status once.
+    try std.testing.expectEqual(@as(i32, 0), meshguard_recv_delivery_status(ctx, &got_dest, &got_nonce, &got_code));
+    try std.testing.expectEqualSlices(u8, &dest, &got_dest);
+    try std.testing.expectEqualSlices(u8, &nonce, &got_nonce);
+    try std.testing.expectEqual(@as(u8, 4), got_code);
+    try std.testing.expectEqual(@as(i32, 1), meshguard_recv_delivery_status(ctx, &got_dest, &got_nonce, &got_code));
+    try std.testing.expectEqual(@as(i32, -1), meshguard_recv_delivery_status(null, &got_dest, &got_nonce, &got_code));
     relay.state = .alive;
+}
+
+test "the delivery status queue holds 64 and drops newer statuses while full" {
+    var seed = [_]u8{0x27} ** 32;
+    const ctx = meshguard_init(&seed, 0) orelse return error.InitFailed;
+    defer meshguard_destroy(ctx);
+    const relay = routeTestPeer(0x32);
+    try ctx.membership.upsert(relay);
+    ctx.app_relay_key = relay.pubkey;
+    const relay_ep = relay.gossip_endpoint.?;
+
+    const dest = [_]u8{0x46} ** 32;
+    var bytes: [AppStatus.SIZE]u8 = undefined;
+    for (0..70) |i| {
+        var nonce = [_]u8{0} ** 12;
+        nonce[0] = @intCast(i);
+        rememberSentFrame(ctx, dest, nonce);
+        AppStatus.encode(&bytes, .{ .destination = dest, .nonce = nonce, .code = .offline });
+        onAppStatusCallback(ctx, &bytes, relay_ep);
+    }
+    var got_dest: [32]u8 = undefined;
+    var got_nonce: [12]u8 = undefined;
+    var got_code: u8 = 0;
+    for (0..64) |i| {
+        try std.testing.expectEqual(@as(i32, 0), meshguard_recv_delivery_status(ctx, &got_dest, &got_nonce, &got_code));
+        try std.testing.expectEqual(@as(u8, @intCast(i)), got_nonce[0]);
+        try std.testing.expectEqual(@as(u8, 1), got_code);
+    }
+    try std.testing.expectEqual(@as(i32, 1), meshguard_recv_delivery_status(ctx, &got_dest, &got_nonce, &got_code));
 }
 
 test "leaving forgets the network but keeps identity and contacts" {
