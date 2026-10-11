@@ -56,6 +56,9 @@ export declare class MeshguardWasm {
    * holds up to 16 identities at once.
    */
   createIdentity(seed?: ByteInput): MeshguardIdentity;
-  /** Checks an Ed25519 signature; returns false for any invalid input. */
+  /**
+   * Checks an Ed25519 signature. Returns false when it does not verify, when `message` exceeds
+   * `maxPayload` bytes, or when `signature` is not 64 bytes. Throws when `publicKey` is not 32 bytes.
+   */
   verify(publicKey: ByteInput, message: MessageInput, signature: ByteInput): boolean;
 }

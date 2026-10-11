@@ -205,8 +205,8 @@ export declare function selfAdvertisement(
   binding?: Uint8Array | null,
   pass?: Uint8Array | null,
 ): Uint8Array;
-/** Delivery status codes and their reasons. */
-export declare const STATUS_CODES: Readonly<Record<number, DeliveryStatusReason>>;
+/** Delivery status codes (1 to 6) and their reasons; other codes are not listed. */
+export declare const STATUS_CODES: Readonly<{ [code: number]: Exclude<DeliveryStatusReason, 'unknown'> | undefined }>;
 /** Parses a relay delivery status frame, or returns null for any other frame. */
 export declare function parseStatus(frame: Uint8Array): DeliveryStatus | null;
 /** The peers (with WireGuard keys) a SWIM ping or ACK describes. */

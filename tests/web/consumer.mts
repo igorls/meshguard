@@ -52,7 +52,9 @@ const sent: Uint8Array | false = client.send(contact, 'hi');
 client.renewPass(new Uint8Array(186));
 const removed: boolean = client.removeContact(contact.publicKey);
 const status = parseStatus(new Uint8Array(47));
-const reason: string | undefined = status?.reason ?? STATUS_CODES[1];
+const reason: string = status?.reason ?? STATUS_CODES[1] ?? 'unknown';
+// @ts-expect-error codes outside 1 to 6 have no entry
+const listed: string = STATUS_CODES[99];
 client.disconnect();
 identity.destroy();
 
@@ -61,4 +63,4 @@ identity.seal({ publicKey: 'x', wgPublicKey: 'y' }, 'hello');
 // @ts-expect-error send returns a nonce or false, never a number
 const wrong: number = client.send(contact, 'hi');
 
-void abi; void valid; void limit; void sent; void removed; void reason; void wrong;
+void abi; void valid; void limit; void sent; void removed; void reason; void listed; void wrong;

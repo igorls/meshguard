@@ -7,3 +7,4 @@ gateway/*.service text eol=lf
 gateway/*.conf text eol=lf
 packages/** text eol=lf
 scripts/*.sh text eol=lf
+LICENSE text eol=lf
