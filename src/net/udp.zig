@@ -281,6 +281,29 @@ pub const UdpSocket = struct {
         return .{ .fd = fd, .port = 0 };
     }
 
+    /// Ask for kernel socket buffers of `bytes` each way, so bursts are queued
+    /// instead of dropped while the event loop is busy. The kernel may cap the
+    /// size (net.core.rmem_max / wmem_max on Linux). Returns the receive
+    /// buffer size obtained, or null where it cannot be read.
+    pub fn setBufferSizes(self: UdpSocket, bytes: u32) ?u32 {
+        if (comptime is_windows) {
+            _ = std.c.setsockopt(self.fd, posix.SOL.SOCKET, posix.SO.RCVBUF, @ptrCast(&bytes), @sizeOf(u32));
+            _ = std.c.setsockopt(self.fd, posix.SOL.SOCKET, posix.SO.SNDBUF, @ptrCast(&bytes), @sizeOf(u32));
+            return null;
+        }
+        if (comptime is_linux) {
+            _ = linux.setsockopt(self.fd, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&bytes), @sizeOf(u32));
+            _ = linux.setsockopt(self.fd, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&bytes), @sizeOf(u32));
+            var got: u32 = 0;
+            var len: u32 = @sizeOf(u32);
+            if (@as(isize, @bitCast(linux.getsockopt(self.fd, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&got), &len))) < 0) return null;
+            return got;
+        }
+        posix.setsockopt(self.fd, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&bytes)) catch {};
+        posix.setsockopt(self.fd, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&bytes)) catch {};
+        return null;
+    }
+
     /// Enable UDP GRO (Generic Receive Offload) on this socket. Linux-only.
     pub fn enableGRO(self: UdpSocket) void {
         if (comptime !is_linux) return;

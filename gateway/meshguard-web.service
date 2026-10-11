@@ -22,9 +22,12 @@ ProtectControlGroups=yes
 RestrictSUIDSGID=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 CapabilityBoundingSet=
-MemoryMax=128M
-CPUQuota=50%
-LimitNOFILE=256
+# Each browser session holds a WebSocket and a UDP socket. These limits fit a
+# few thousand sessions (see bench/relay-load/browser.mjs and PERFORMANCE.md);
+# raise them together with maxSessions.
+MemoryMax=1G
+CPUQuota=200%
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target

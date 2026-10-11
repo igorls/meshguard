@@ -43,3 +43,19 @@ CI uses it for a small smoke run.
 Loss counts frames sent during the measurement window to contacts that had
 proven their endpoint; frames still in flight get one second to arrive.
 Latency is send to receive on the same host.
+
+## Browser sessions
+
+`browser.mjs` (Bun) measures the browser path: WASM identities holding passes,
+each with its own WebSocket session through a separately spawned gateway
+process (`gateway/server.mjs`), to a closed `--relay` daemon that trusts the
+pass issuer. Every session registers mutual contacts, proves its endpoint
+through the gateway, and sends sealed frames at a Poisson `--rate`.
+
+```bash
+bun bench/relay-load/browser.mjs --binary zig-out/bin/meshguard --sessions 2000 --rate 0.2 --duration 30 --opaque
+```
+
+The report adds sessions ready and ramp time, and the gateway's CPU time and
+peak memory. All sessions run in one process, so with thousands of sessions
+the generator's own WASM crypto dominates the latency tail.

@@ -81,6 +81,11 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   Explicit invalid values fail closed (no silent fallback to 51821).
 
 ### Changed
+- Relays (`--relay`) ask for 8 MiB socket buffers so bursts from many clients
+  queue instead of being dropped, and the browser gateway's unit file allows
+  65,536 descriptors, 1 GiB and two cores (it held about 120 sessions before).
+  `bench/relay-load/browser.mjs` measures browser sessions: 2,000 through one
+  gateway with no loss (`PERFORMANCE.md`).
 - Answers to pings use their own budget (`--reply-pps`, default 5,000/s) instead
   of the 500/s discovery budget. At 10,000 mobile clients pinging every 3 s only
   15% of pings were answered before; now all are.
