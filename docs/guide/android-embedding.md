@@ -59,7 +59,7 @@ object MeshGuardFFI {
     // Mesh join/leave
     external fun meshguard_join(ctx: Long, seedIp: ByteArray, seedPort: Int): Int
     external fun meshguard_join_ipv6(ctx: Long, seedIp: ByteArray, seedPort: Int): Int
-    external fun meshguard_join_host(ctx: Long, host: String, seedPort: Int): Int
+    external fun meshguard_join_host(ctx: Long, hostAndPort: String): Int // "host:port"
     external fun meshguard_join_lan(ctx: Long): Int
     external fun meshguard_leave(ctx: Long)
 

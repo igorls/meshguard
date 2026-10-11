@@ -134,8 +134,10 @@ the same behaviour: SWIM discovery, pinned and opaque relays, contacts,
 organization certificates (relay passes), delivery statuses, LAN discovery and
 userspace WireGuard tunnels.
 
-The library needs neither Administrator rights nor Wintun. Each context uses
-one UDP socket and creates no network adapter.
+The library needs neither Administrator rights nor Wintun, and it creates no
+network adapter. Each context uses one UDP socket. While LAN discovery runs
+(`meshguard_join_lan`), the context also uses a multicast socket on UDP port
+51820.
 
 ### Getting the DLL
 
@@ -213,9 +215,15 @@ The model is the same as on Android, iOS and Linux:
 - `meshguard_init*` creates a context and binds its UDP socket. Joining
   (`meshguard_join*`) starts one background event-loop thread for that context.
   `meshguard_leave` and `meshguard_destroy` stop that thread and wait for it.
-- Call any function from any host thread: a UI thread, a worker or a timer.
-  Configure `meshguard_set_app_relay` before joining (it returns `-2` while the
-  context runs). Contacts, certificates and timers can change at any time.
+- Call the library from any host thread: a UI thread, a worker or a timer.
+  Some calls have ordering rules:
+  - Set callbacks and `meshguard_set_app_relay` before joining.
+    `meshguard_set_app_relay` returns `-2` while the context runs, and the
+    callback setters are not synchronized with the event loop.
+  - Contacts, certificates, timers, suspend and resume can change at any time.
+  - Each queue has a single consumer, so poll it from one thread at a time.
+  - Call `meshguard_destroy` only after every other thread has stopped using
+    the context.
 - Incoming data waits in per-context queues: 64 app messages, 64 delivery
   statuses and 256 tunnel frames. Poll them with `meshguard_recv`,
   `meshguard_recv_delivery_status` and `meshguard_tunnel_recv`, which return `0`
