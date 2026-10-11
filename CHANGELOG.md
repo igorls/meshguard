@@ -8,6 +8,15 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## Unreleased
 
 ### Added
+- Browser gateway passes: the gateway admits a browser presenting a valid
+  pass (organization certificate) from `trustedOrgs`, in addition to
+  `allowedIdentities`; `allowedDestinations` becomes optional. Sessions end with
+  `4004` when the pass expires and can renew it in place; self-advertisements
+  may carry the session's own pass to the relay. New `maxSessions` and
+  `maxSessionsPerIp` caps (`1013` when full) and `SIGHUP` reload.
+  `gateway/pass.mjs` verifies passes against fixtures shared with the native
+  code (`zig build pass-fixtures`). The browser client gains `pass`,
+  `renewPass()` and jittered reconnects.
 - Trust lifecycle for relays: `meshguard up --relay` fails closed when it has
   no authorized keys or trusted orgs; `SIGHUP` and the owner-only control
   command `RELOAD` re-read `authorized_keys/`, `trusted_orgs/` and `node.cert`

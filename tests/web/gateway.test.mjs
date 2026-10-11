@@ -1,6 +1,8 @@
 import { test, expect } from 'bun:test';
 import { readFileSync } from 'node:fs';
+import { createPrivateKey, createPublicKey, sign } from 'node:crypto';
 import { startGateway, validateOutbound, clientAddress } from '../../gateway/server.mjs';
+import { verifyPass } from '../../gateway/pass.mjs';
 import { MeshguardWasm } from '../../web/meshguard.mjs';
 import { authPayload, bindingPayload, b64, fromB64, selfAdvertisement, MeshguardRelayClient } from '../../web/relay-protocol.mjs';
 
@@ -301,4 +303,165 @@ test('binding signatures match the native core byte for byte', () => {
   const identity = core.createIdentity(new Uint8Array(32).fill(7));
   const signature = identity.sign(bindingPayload(identity.publicKey(), new Uint8Array(32).fill(9)));
   expect(Buffer.from(signature).toString('hex')).toBe('16718f492c54ffe80a79fa28e66054faf3f94527239b0305f2b1787d05a718492025daade823f5f0ad24455594702627525cd3c51e82dbc759162537e2a00701');
+});
+
+// ─── Passes ───
+
+const fixtures = JSON.parse(readFileSync('src/identity/testdata/passes.json', 'utf8'));
+
+test('pass verdicts match the Zig implementation on shared fixtures', () => {
+  const trustedOrgs = new Set(fixtures.trusted_orgs);
+  for (const c of fixtures.cases) {
+    const result = verifyPass(Buffer.from(c.pass, 'hex'), { publicKey: fromB64(c.public_key), wgPublicKey: fromB64(c.wg_public_key),
+      trustedOrgs, now: c.now, skew: fixtures.skew });
+    expect([c.name, typeof result === 'string' ? result : 'ok']).toEqual([c.name, c.expect]);
+  }
+});
+
+const orgSeed = new Uint8Array(32).fill(0x51);
+const orgPrivate = createPrivateKey({ key: Buffer.concat([Buffer.from('302e020100300506032b657004220420', 'hex'), orgSeed]), format: 'der', type: 'pkcs8' });
+const orgPublic = new Uint8Array(createPublicKey(orgPrivate).export({ format: 'der', type: 'spki' }).subarray(12));
+
+/** A v2 pass from the test org for `identity`, valid from `issuedAt` to `expiresAt`. */
+function issuePass(identity, { expiresAt = Math.floor(Date.now() / 1000) + 3600, issuedAt = Math.floor(Date.now() / 1000) - 10, wg = identity.wgPublicKey() } = {}) {
+  const wire = new Uint8Array(314), view = new DataView(wire.buffer);
+  wire[0] = 2; wire.set(orgPublic, 1); wire.set(identity.publicKey(), 33);
+  view.setBigInt64(97, BigInt(issuedAt), true); view.setBigInt64(105, BigInt(expiresAt), true);
+  wire.set(wg, 186);
+  const payload = new Uint8Array(178); payload.set(wire.subarray(0, 114)); payload.set(wire.subarray(186, 250), 114);
+  wire.set(sign(null, payload, orgPrivate), 114);
+  return wire;
+}
+
+const passConfig = { allowedIdentities: [], trustedOrgs: [b64(orgPublic)], allowedDestinations: undefined };
+
+async function admitWithPass(url, identity, pass, extra = {}) {
+  const c = channel(url); const challenge = JSON.parse(await c.next());
+  c.ws.send(JSON.stringify({ ...authentication(challenge.challenge, identity), pass: b64(pass), ...extra }));
+  return { c, reply: JSON.parse(await c.next()) };
+}
+
+test('a pass from a trusted org admits a browser that is on no allowlist', async () => {
+  const f = await fixture(passConfig);
+  try {
+    const { c, reply } = await admitWithPass(f.url, b, issuePass(b));
+    expect(reply.type).toBe('ready'); expect(reply.passExpiresAt).toBeGreaterThan(Date.now() / 1000);
+    // No destination allowlist: the relay decides who may be addressed.
+    c.ws.send(b.seal(aPeer, 'to anyone the relay allows')); await settle(100);
+    expect(f.gateway.counters.forwarded).toBe(1);
+    c.ws.close();
+  } finally { f.stop(); }
+});
+
+for (const [kind, makePass] of [
+  ['another identity\'s pass', () => issuePass(a)],
+  ['a pass for another WireGuard key', () => issuePass(b, { wg: a.wgPublicKey() })],
+  ['an expired pass', () => issuePass(b, { expiresAt: Math.floor(Date.now() / 1000) - 1000 })],
+  ['a tampered pass', () => { const p = issuePass(b); p[70] ^= 1; return p; }],
+]) {
+  test(`gateway refuses ${kind}`, async () => {
+    const f = await fixture(passConfig);
+    try {
+      const c = channel(f.url); const challenge = JSON.parse(await c.next());
+      const closed = closing(c);
+      c.ws.send(JSON.stringify({ ...authentication(challenge.challenge, b), pass: b64(makePass()) }));
+      expect((await closed).code).toBe(4003);
+      expect(f.gateway.counters.authenticated).toBe(0);
+    } finally { f.stop(); }
+  });
+}
+
+test('a gateway with no allowlist and no trusted org refuses to start', () => {
+  expect(() => startGateway({ relayHost: '127.0.0.1', relayPort: 9, allowedOrigins: [origin], allowedIdentities: [] })).toThrow('admits nobody');
+});
+
+test('self-advertisements carry only the session\'s own pass and binding', () => {
+  const pass = issuePass(b), binding = bindingOf(b);
+  const session = { ...bPeer, endpoint: { address: '127.0.0.1', port: 51000 }, binding, pass };
+  const both = selfAdvertisement(b, session.endpoint, 1, 1n, 1n, binding, pass);
+  expect(both.length).toBe(577);
+  expect(validateOutbound(both, session, null)).toBe(true);
+  expect(validateOutbound(selfAdvertisement(b, session.endpoint, 1, 1n, 1n, null, pass), session, null)).toBe(true);
+  expect(validateOutbound(selfAdvertisement(b, session.endpoint, 1, 1n, 1n, binding, null), session, null)).toBe(true);
+  // Laundering someone else's pass through this session is refused.
+  expect(validateOutbound(selfAdvertisement(b, session.endpoint, 1, 1n, 1n, binding, issuePass(a)), session, null)).toBe(false);
+  expect(validateOutbound(both, { ...session, pass: null }, null)).toBe(false);
+  expect(validateOutbound(both.slice(0, 500), session, null)).toBe(false);
+});
+
+test('a session ends when its pass expires and can renew before that', async () => {
+  const f = await fixture({ ...passConfig, passSkewSeconds: 0 });
+  try {
+    const now = Math.floor(Date.now() / 1000);
+    const { c, reply } = await admitWithPass(f.url, b, issuePass(b, { expiresAt: now + 60 }));
+    expect(reply.type).toBe('ready');
+
+    const renewed = issuePass(b, { expiresAt: now + 3600 });
+    c.ws.send(JSON.stringify({ type: 'renew', pass: b64(renewed) }));
+    const answer = JSON.parse(await c.next());
+    expect(answer).toEqual({ type: 'renewed', passExpiresAt: now + 3600 });
+    // The renewed pass is now the one self-advertisements must carry.
+    c.ws.send(selfAdvertisement(b, reply.endpoint, 1, 1n, 1n, null, renewed)); await settle(100);
+    expect(f.packets.at(-1).length).toBe(480);
+
+    c.ws.send(JSON.stringify({ type: 'renew', pass: b64(issuePass(a)) }));
+    expect(JSON.parse(await c.next())).toEqual({ type: 'renew-rejected', reason: 'wrong-identity' });
+    c.ws.close();
+
+    const short = await admitWithPass(f.url, b, issuePass(b, { expiresAt: Math.ceil(Date.now() / 1000) + 1 }));
+    expect(short.reply.type).toBe('ready');
+    const ended = await closing(short.c);
+    expect(ended.code).toBe(4004);
+    expect(f.gateway.counters.expired).toBe(1);
+  } finally { f.stop(); }
+});
+
+test('sessions are capped overall and per source address', async () => {
+  const f = await fixture({ ...passConfig, maxSessions: 2, maxSessionsPerIp: 1, maxPendingPerIp: 10, upgradeBurst: 100 });
+  try {
+    const first = await admitWithPass(f.url, a, issuePass(a));
+    expect(first.reply.type).toBe('ready');
+    const c = channel(f.url); const challenge = JSON.parse(await c.next());
+    const closed = closing(c);
+    c.ws.send(JSON.stringify({ ...authentication(challenge.challenge, b), pass: b64(issuePass(b)) }));
+    expect((await closed).code).toBe(1013);
+    // Reconnecting the same identity replaces its session instead of counting twice.
+    const again = await admitWithPass(f.url, a, issuePass(a));
+    expect(again.reply.type).toBe('ready');
+    again.c.ws.close();
+  } finally { f.stop(); }
+});
+
+test('a reload that no longer trusts the org closes its sessions', async () => {
+  const f = await fixture(passConfig);
+  try {
+    const { c, reply } = await admitWithPass(f.url, b, issuePass(b));
+    expect(reply.type).toBe('ready');
+    const closed = closing(c);
+    f.gateway.reload({ allowedIdentities: [{ publicKey: b64(aPeer.publicKey), wgPublicKey: b64(aPeer.wgPublicKey) }] });
+    expect((await closed).code).toBe(4003);
+    expect(f.gateway.sessions()).toBe(0);
+  } finally { f.stop(); }
+});
+
+test('the relay client presents its pass and renews it in the live session', () => {
+  const pass = issuePass(a);
+  const client = new MeshguardRelayClient({ identity: a, url: 'ws://fixture.invalid', relay: bPeer, pass });
+  const sent = [];
+  client.socket = { readyState: WebSocket.OPEN, bufferedAmount: 0, send: frame => sent.push(frame) };
+  client.control({ type: 'challenge', challenge: b64(new Uint8Array(32).fill(3)) });
+  expect(JSON.parse(sent[0]).pass).toBe(b64(pass));
+  client.endpoint = { address: '127.0.0.1', port: 51000 };
+  client.advertise();
+  expect(sent[1].length).toBe(577);
+
+  const next = issuePass(a, { expiresAt: Math.floor(Date.now() / 1000) + 7200 });
+  client.renewPass(next);
+  expect(JSON.parse(sent[2])).toEqual({ type: 'renew', pass: b64(next) });
+  client.advertise();
+  expect(Array.from(sent[3].slice(166, 166 + 314))).toEqual(Array.from(pass)); // old pass until accepted
+  client.control({ type: 'renewed', passExpiresAt: 0 });
+  client.advertise();
+  expect(Array.from(sent[4].slice(166, 166 + 314))).toEqual(Array.from(next));
+  clearInterval(client.timer);
 });

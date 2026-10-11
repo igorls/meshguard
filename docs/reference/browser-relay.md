@@ -21,7 +21,8 @@ private keys or application plaintext.
 
 Before creating a UDP socket, the gateway requires a signature over a fresh,
 connection-specific random challenge plus the browser's Ed25519/WG key binding.
-Both keys must match an explicit operator allowlist. Signatures use the domain
+The key pair must be on the operator's allowlist (`allowedIdentities`), or the
+browser must present a valid pass (see below) from a trusted organization. Signatures use the domain
 `meshguard-browser-gateway-v1\0`. The browser Origin must also be explicitly
 allowed. Origin filtering complements identity authentication; it is not a
 substitute for it.
@@ -83,12 +84,27 @@ Example gateway configuration, containing public keys only:
   "relayHost": "127.0.0.1",
   "relayPort": 51821,
   "allowedOrigins": ["https://your-app.example"],
+  "trustedOrgs": ["<pass issuer organization Ed25519 Base64 key>"],
   "allowedIdentities": [
     { "publicKey": "<browser Ed25519 Base64 key>", "wgPublicKey": "<browser X25519 Base64 key>" }
   ],
   "allowedDestinations": ["<native peer Ed25519 Base64 key>"]
 }
 ```
+
+| Field | Default | Meaning |
+|---|---|---|
+| `trustedOrgs` | none | organizations whose passes admit a browser |
+| `allowedIdentities` | none | key pairs admitted without a pass |
+| `allowedDestinations` | none (any) | app-frame destinations a session may address; leave unset to let the relay decide |
+| `maxSessions` | 4096 | admitted sessions at once |
+| `maxSessionsPerIp` | 16 | admitted sessions per source address |
+| `passSkewSeconds` | 300 | clock difference tolerated with the pass issuer |
+
+The gateway refuses to start when neither `trustedOrgs` nor
+`allowedIdentities` admits anyone. `SIGHUP` re-reads the configuration file and
+closes sessions it no longer admits (`4003`); `meshguard-web.service` maps
+`systemctl reload` to it.
 
 The native relay must separately admit the browser identity. The browser and
 native peer must also know each other's public WG keys, through an authenticated
@@ -103,6 +119,30 @@ and resource limits. Adjust its Bun path to the local runtime.
 
 The implementation follows the primary [Bun WebSocket API](https://bun.sh/docs/runtime/http/websockets)
 and [connected UDP API](https://bun.sh/docs/runtime/networking/udp).
+
+## Passes
+
+A pass is a MeshGuard v2 node certificate (314 bytes; v1, 186 bytes, also
+works) issued by an organization to the browser's own Ed25519 and WireGuard
+keys. `gateway/pass.mjs` verifies it the same way the native code does
+(`src/identity/org.zig`), including delegated issuers and clock skew; both are
+checked against the shared fixtures in `src/identity/testdata/passes.json`.
+
+- The browser sends `pass` (Base64) in its `authenticate` message. The `ready`
+  reply includes `passExpiresAt` (0 = never).
+- Self-advertisements may carry the pass, as the `0x01` extension before the
+  binding; the gateway forwards only the session's own pass and binding, so a
+  session cannot launder another identity's pass. A relay that trusts the same
+  organization admits the browser from that extension.
+- When the pass expires (plus the skew) the gateway closes the session with
+  `4004`. Before that, the browser sends `{"type":"renew","pass":"..."}` in
+  the open session and gets `renewed` (with the new `passExpiresAt`) or
+  `renew-rejected` (with a reason, the old pass staying in force).
+- `MeshguardRelayClient` takes `pass` in its constructor and `renewPass(pass)`
+  to replace it; it switches its self-advertisements to the new pass only after
+  `renewed`, emits `pass` events, and does not reconnect by itself after `4004`.
+- A full gateway closes new sessions with `1013`; the client retries with
+  jittered backoff.
 
 ## Browser/native client
 

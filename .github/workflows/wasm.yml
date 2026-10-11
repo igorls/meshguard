@@ -26,7 +26,9 @@ jobs:
         run: zig build wasm wasm-test -Doptimize=ReleaseSmall
       - name: Build native FFI without libsodium
         run: zig build -Dcrypto-backend=std -Doptimize=ReleaseSafe
-      - name: Verify authenticated browser gateway and replay filtering
+      - name: Verify authenticated browser gateway, passes and relay delivery
+        env:
+          MESHGUARD_BINARY: ${{ github.workspace }}/zig-out/bin/meshguard
         run: bun test tests/web
       - name: Exchange packets between WASM and native FFI over UDP
         env:
