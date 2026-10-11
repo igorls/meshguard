@@ -81,26 +81,43 @@ def pipe_exists(path):
     return path.rsplit("\\", 1)[1] in os.listdir(r"\\.\pipe\\")
 
 
-def pipe_request(path, line):
-    """One request on the daemon's named pipe: write a line, read a line."""
-    end = time.monotonic() + 5
+if WINDOWS:
+    import msvcrt
+
+    kernel32 = c.WinDLL("kernel32", use_last_error=True)
+    kernel32.PeekNamedPipe.argtypes = [c.c_void_p, c.c_void_p, c.c_uint32, c.c_void_p, c.POINTER(c.c_uint32), c.c_void_p]
+    kernel32.PeekNamedPipe.restype = c.c_int
+
+
+def pipe_request(path, line, seconds=5):
+    """One request on the daemon's named pipe: write a line, read a line.
+    Fails after `seconds`, like the Unix socket's timeout."""
+    end = time.monotonic() + seconds
     while True:
         try:
             pipe = open(path, "r+b", buffering=0)
             break
         except OSError as err:
-            # 231 ERROR_PIPE_BUSY: the daemon is still serving another client.
+            # 2: not created yet. 231 ERROR_PIPE_BUSY: serving another client.
             if getattr(err, "winerror", None) not in (2, 231) or time.monotonic() > end:
                 raise
             time.sleep(0.05)
     with pipe:
         pipe.write(line)
+        handle = msvcrt.get_osfhandle(pipe.fileno())
         data = b""
         while not data.endswith(b"\n"):
-            chunk = pipe.read(65536)
-            if not chunk:
-                break
-            data += chunk
+            # Read only what is waiting, so a daemon that never answers
+            # cannot block the test.
+            available = c.c_uint32()
+            if not kernel32.PeekNamedPipe(handle, None, 0, None, c.byref(available), None):
+                break  # the daemon closed the pipe
+            if available.value:
+                data += pipe.read(available.value)
+            elif time.monotonic() > end:
+                raise TimeoutError(f"no reply on {path}")
+            else:
+                time.sleep(0.01)
     return data
 
 
