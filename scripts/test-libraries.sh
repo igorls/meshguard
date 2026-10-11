@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Check the packages from scripts/build-libraries.sh: every library exports
 # exactly the `export fn` entry points of src/meshguard_ffi.zig, which the
-# header declares; libraries depend only on the platform C library; Android
+# header declares; libraries depend only on the documented C library files; Android
 # libraries suit 16 KB page devices; C hosts compile and link against each
 # desktop package, and run where the host can execute them.
 #
@@ -103,7 +103,7 @@ native_amd64=no
 [[ "$(uname -s)-$(uname -m)" == Linux-x86_64 ]] && native_amd64=yes
 
 if [[ -d "$output/linux-amd64" || -d "$output/linux-arm64" ]]; then
-  glibc='libc\.so\.6|libpthread\.so\.0|libdl\.so\.2|librt\.so\.1|libm\.so\.6|ld-linux-x86-64\.so\.2|ld-linux-aarch64\.so\.1'
+  glibc='libc\.so\.6|libpthread\.so\.0|ld-linux-x86-64\.so\.2|ld-linux-aarch64\.so\.1'
   check_shared "$output/linux-amd64/lib/libmeshguard-ffi.so" 'Advanced Micro Devices X86-64' "$glibc"
   check_static "$output/linux-amd64/lib/libmeshguard-ffi.a"
   check_shared "$output/linux-arm64/lib/libmeshguard-ffi.so" AArch64 "$glibc"
@@ -126,13 +126,13 @@ fi
 
 if [[ -d "$output/freebsd-amd64" ]]; then
   check_shared "$output/freebsd-amd64/lib/libmeshguard-ffi.so" 'Advanced Micro Devices X86-64' \
-    'libc\.so\.7|libthr\.so\.3|libm\.so\.5|libsys\.so\.7'
+    'libc\.so\.7|libthr\.so\.3'
   check_static "$output/freebsd-amd64/lib/libmeshguard-ffi.a"
   link_hosts freebsd-amd64 x86_64-freebsd.14.0 no
 fi
 
 if [[ -d "$output/android" ]]; then
-  bionic='libc\.so|libdl\.so|libm\.so|liblog\.so'
+  bionic='libc\.so'
   for abi in arm64-v8a:AArch64 'x86_64:Advanced Micro Devices X86-64'; do
     file="$output/android/jniLibs/${abi%%:*}/libmeshguard-ffi.so"
     check_shared "$file" "${abi#*:}" "$bionic" 16384

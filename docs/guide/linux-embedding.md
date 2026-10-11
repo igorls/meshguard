@@ -102,7 +102,8 @@ int main(void) {
     /* Pin the relay before joining; its identity comes from trusted config. */
     uint8_t relay[32] = {0};
     if (meshguard_set_app_relay(ctx, relay, true) != 0) return 1;
-    if (meshguard_join_host(ctx, "relay.example.net:51821") != 0) return 1;
+    const char *relay_host = "relay.example.net:51821";
+    if (meshguard_join_host(ctx, (const uint8_t *)relay_host) != 0) return 1;
 
     uint8_t data[1024], sender[32];
     uint32_t len;
