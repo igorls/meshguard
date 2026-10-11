@@ -144,6 +144,18 @@ checked against the shared fixtures in `src/identity/testdata/passes.json`.
 - A full gateway closes new sessions with `1013`; the client retries with
   jittered backoff.
 
+## Contacts and delivery status
+
+Behind an opaque relay a browser learns no peers from gossip. Register the ones
+the application knows with `client.addContact(publicKey, wgPublicKey)` (it
+returns the peer object `send` expects) and `client.removeContact(publicKey)`.
+`send` returns the frame's 12-byte nonce, or `false`. A relay's delivery status
+for a frame this client sent arrives as a `status` event with `destination`,
+`nonce`, `code`, `reason` (`offline`, `destination-not-admitted`,
+`rate-limited`, `handshake-again`, `not-admitted`, `overloaded`) and `peer`;
+statuses for frames it did not send are ignored, and `handshake-again` also
+starts a new handshake at once.
+
 ## Browser/native client
 
 ```javascript

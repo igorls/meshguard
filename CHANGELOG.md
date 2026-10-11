@@ -8,6 +8,14 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## Unreleased
 
 ### Added
+- Contacts and delivery status for mobile and browser clients, needed behind
+  opaque relays: `meshguard_add_contact` / `remove` / `clear` / `count`,
+  `meshguard_set_contacts_only`, `meshguard_send_ex` (returns the nonce),
+  `meshguard_set_on_delivery_status` (accepted only from the pinned relay for a
+  recently sent frame; `handshake again` re-proves the endpoint at once), and
+  `meshguard_set_keepalive_interval` / `meshguard_set_relay_proof_interval`.
+  The browser client gains `addContact`, `removeContact`, `status` events and
+  `send` returning the nonce.
 - Opaque relays (`meshguard up --opaque`): clients stay out of the relay's
   membership and gossip, and a client's ACK describes only the relay, so no
   client learns about another; no ping-req or rendezvous on clients' behalf.

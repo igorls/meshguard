@@ -64,6 +64,44 @@ relay or derived from its identity.
 
 Mobile contexts never forward frames addressed to others.
 
+## Contacts and opaque relays
+
+An opaque relay (`meshguard up --opaque`) describes only itself, so a client
+cannot learn other clients' keys from it. The host registers the peers it
+already knows (for example from signed contact cards):
+
+- `meshguard_add_contact(ctx, ed25519[32], wg[32])` registers or replaces a
+  contact (`-3` for an invalid or low-order key, `-5` past 4096 contacts);
+  `meshguard_remove_contact`, `meshguard_clear_contacts` and
+  `meshguard_contact_count` manage the set.
+- Frames to and from a contact use its registered WireGuard key, which wins over
+  any key learned from gossip. A contact the relay does not describe is sent to
+  through the pinned relay only.
+- `meshguard_set_contacts_only(ctx, true)` drops app frames from anyone else
+  before any decryption.
+
+## Delivery status
+
+`meshguard_send_ex(ctx, peer, data, len, out_nonce[12])` sends like
+`meshguard_send` and returns the frame's nonce. When the pinned relay does not
+forward a frame it answers with a delivery status, delivered to
+`meshguard_set_on_delivery_status(ctx, cb(destination, nonce, code))` on the
+event loop: `1` offline, `2` destination not admitted, `3` rate limited,
+`4` handshake again, `5` not admitted (for example an expired pass), `6` relay
+overloaded. Statuses are accepted only from the pinned relay's endpoint and
+only for one of the last 256 frames sent through it, each at most once. Code
+`4` also re-proves the relay endpoint at once.
+
+## Timers
+
+`meshguard_set_keepalive_interval(ctx, ms)` sets the interval between pings
+(3000 ms by default for mobile contexts; 1000 to 600000), and
+`meshguard_set_relay_proof_interval(ctx, ms)` the interval between endpoint
+proofs to the pinned relay (15000 ms by default; 5000 to 3600000). With
+delivery statuses a client learns when its endpoint must be proven again, so
+both can be longer to save battery and relay capacity. Changes apply on the
+event loop.
+
 ## Relay passes
 
 A relay that trusts an organization admits any holder of that organization's
