@@ -16,6 +16,7 @@ const keys = @import("../identity/keys.zig");
 const Org = @import("../identity/org.zig");
 const Binding = @import("../identity/binding.zig");
 const RelayCore = @import("../relay/core.zig");
+const AppStatus = @import("../protocol/app_status.zig");
 const Udp = @import("../net/udp.zig");
 const Holepuncher = @import("../nat/holepunch.zig").Holepuncher;
 const Relay = @import("../nat/relay.zig");
@@ -68,6 +69,21 @@ pub const SwimConfig = struct {
     // that missed the one-shot registration-time advertisement still learns our WG
     // key (issue #114). 0 disables. Default 5s.
     self_readvertise_interval_ms: u32 = 5000,
+    // How often retained org revocations are re-sent, once each, so peers that
+    // missed the original broadcast learn them. 0 disables.
+    org_revoke_readvertise_interval_ms: u32 = 300_000,
+    // Budget for answers (ACKs) to incoming pings, separate from the send
+    // budget for our own discovery traffic, so many clients pinging a relay
+    // cannot starve its discovery or each other's liveness.
+    reply_pps: u32 = 5000,
+    reply_burst: u32 = 1000,
+};
+
+/// Runs on the event loop after `reload_requested` is set (SIGHUP, control
+/// RELOAD): the daemon re-reads its trust files and calls `replaceTrust`.
+pub const ReloadHook = struct {
+    ctx: *anyopaque,
+    run: *const fn (ctx: *anyopaque, swim: *SwimProtocol) void,
 };
 
 /// Callback interface for SWIM events (e.g. WireGuard peer management).
@@ -79,6 +95,8 @@ pub const EventHandler = struct {
     onAppMessage: ?*const fn (ctx: *anyopaque, data: []const u8) void = null,
     onWgPacket: ?*const fn (ctx: *anyopaque, data: []const u8, addr: [4]u8, port: u16) void = null,
     onRelayWgPacket: ?*const fn (ctx: *anyopaque, data: []const u8, sender_pubkey: [32]u8, relay_endpoint: messages.Endpoint) void = null,
+    /// A relay's 0x51 delivery status for a frame we sent (see protocol/app_status.zig).
+    onAppStatus: ?*const fn (ctx: *anyopaque, data: []const u8, sender_endpoint: messages.Endpoint) void = null,
     /// Query whether a live WireGuard session currently exists for `wg_pubkey`.
     /// Used as an origin-authentication signal for restart detection (S2): SWIM
     /// ping/ack are not origin-authenticated, but holding a live tunnel proves the
@@ -273,6 +291,24 @@ pub const SwimProtocol = struct {
     forwarding: Forwarding = .none,
     relay_core: ?*RelayCore.RelayCore = null,
 
+    // Opaque relays keep clients (everyone but mesh peers at our seed
+    // endpoints) out of membership and gossip: a client learns about the
+    // relay and nothing about other clients.
+    opaque_relay: bool = false,
+    // Answer frames the relay does not forward with a 0x51 delivery status.
+    delivery_status: bool = true,
+    reply_tokens: f64 = 0,
+    last_reply_refill_ns: i128 = 0,
+    replies_dropped_ratelimit: u32 = 0,
+
+    // Certificates are accepted this many seconds before issue and after
+    // expiry, for clock differences with the issuer.
+    cert_skew_s: i64 = Org.DEFAULT_CERT_SKEW_S,
+
+    // Set from a signal handler or the control thread; consumed on the loop.
+    reload_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    reload_hook: ?ReloadHook = null,
+
     // Control-plane send rate limiting (token bucket). A hard ceiling on
     // SWIM/gossip packets/sec so a pathological inbound rate (e.g. a NAT
     // retransmit storm) can never be amplified into a network-melting flood.
@@ -349,16 +385,20 @@ pub const SwimProtocol = struct {
         return false;
     }
 
-    fn certExpiryValid(expires_at: i64) bool {
+    fn wallSeconds() i64 {
+        return @intCast(std.Io.Timestamp.now(zio(), .real).toSeconds());
+    }
+
+    fn certExpiryValid(self: *const SwimProtocol, expires_at: i64) bool {
         if (expires_at == 0) return true;
-        return @as(i64, @intCast(std.Io.Timestamp.now(zio(), .real).toSeconds())) < expires_at;
+        return wallSeconds() < expires_at +| self.cert_skew_s;
     }
 
     fn certAuthorizesPeer(self: *const SwimProtocol, pubkey: [32]u8, cert_wire: [messages.ORG_CERT_WIRE_SIZE]u8) bool {
         const cert = Org.NodeCertificate.deserialize(&cert_wire);
         if (!std.mem.eql(u8, &cert.node_pubkey, &pubkey)) return false;
+        if (!cert.isValidAt(wallSeconds(), self.cert_skew_s)) return false;
         if (!Org.verifyCertificate(&cert)) return false;
-        if (!cert.isValid()) return false;
         if (!self.isOrgAuthorizedPeer(cert.org_pubkey)) return false;
         if (self.orgRevokesNode(cert.org_pubkey, pubkey)) return false;
         if (cert.isDelegated() and self.orgRevokesNode(cert.org_pubkey, cert.issuer_pubkey)) return false;
@@ -370,7 +410,7 @@ pub const SwimProtocol = struct {
         const org_pubkey = peer.org_pubkey orelse return false;
         const expires_at = peer.cert_expires_at orelse return false;
         if (!self.isOrgAuthorizedPeer(org_pubkey)) return false;
-        if (!certExpiryValid(expires_at)) return false;
+        if (!self.certExpiryValid(expires_at)) return false;
         if (self.orgRevokesNode(org_pubkey, pubkey)) return false;
         if (peer.cert_issuer_pubkey) |issuer| {
             if (self.orgRevokesNode(org_pubkey, issuer)) return false;
@@ -527,6 +567,27 @@ pub const SwimProtocol = struct {
         self.our_wg_binding = binding;
     }
 
+    /// Replaces the authorized keys and trusted organizations, as on a trust
+    /// reload. Revocations, vouches and our own certificate are kept, and
+    /// enforcement stays as configured, so emptied lists never open a node
+    /// that enforced trust. Relay clients are re-checked on their next frame.
+    pub fn replaceTrust(self: *SwimProtocol, authorized: []const [32]u8, orgs: []const [32]u8) void {
+        self.authorized_count = 0;
+        for (authorized) |key| self.addAuthorizedKey(key);
+        self.trusted_org_count = 0;
+        for (orgs) |org| self.addTrustedOrg(org);
+        if (self.relay_core) |core| core.bumpTrustEpoch();
+    }
+
+    fn runPendingReload(self: *SwimProtocol) void {
+        if (!self.reload_requested.swap(false, .acq_rel)) return;
+        if (self.reload_hook) |hook| hook.run(hook.ctx, self);
+    }
+
+    pub fn clearOrgCert(self: *SwimProtocol) void {
+        self.our_org_cert = null;
+    }
+
     pub fn setOrgCert(self: *SwimProtocol, cert_wire: [messages.ORG_CERT_WIRE_SIZE]u8) void {
         self.our_org_cert = cert_wire;
     }
@@ -609,6 +670,7 @@ pub const SwimProtocol = struct {
 
         // 3. Expire suspected peers
         if (self.relay_core) |core| core.expire(nowNs(), 256);
+        self.runPendingReload();
         var expired_buf: [256][32]u8 = undefined;
         const expired_n = self.membership.expireSuspected(&expired_buf);
         for (expired_buf[0..expired_n]) |pubkey| {
@@ -695,7 +757,7 @@ pub const SwimProtocol = struct {
     /// Queue a signed org revocation for local application and peer broadcast.
     pub fn queueOrgCertRevoke(self: *SwimProtocol, rev: messages.OrgCertRevoke) void {
         self.rememberOrgRevoke(rev);
-        self.enqueueOrgRevokeBroadcast(rev);
+        self.enqueueOrgRevokeBroadcast(rev, self.config.max_gossip_broadcasts);
         if (self.isOrgAuthorizedPeer(rev.org_pubkey)) {
             self.applyOrgRevoke(rev, false);
         }
@@ -711,6 +773,7 @@ pub const SwimProtocol = struct {
 
         // 2. Expire suspected peers
         if (self.relay_core) |core| core.expire(nowNs(), 256);
+        self.runPendingReload();
         var expired_buf: [256][32]u8 = undefined;
         const expired_n = self.membership.expireSuspected(&expired_buf);
         for (expired_buf[0..expired_n]) |pubkey| {
@@ -823,6 +886,13 @@ pub const SwimProtocol = struct {
             return;
         }
 
+        if (data.len > 0 and data[0] == AppStatus.TYPE) {
+            if (self.handler) |h| {
+                if (h.onAppStatus) |cb| cb(h.ctx, data, sender_endpoint);
+            }
+            return;
+        }
+
         // Check for app messages (type 0x50) — relay or deliver locally
         // Wire: [0x50][32B dest][32B sender][12B nonce][N ciphertext][16B tag]
         if (data.len > 0 and data[0] == 0x50) {
@@ -871,6 +941,14 @@ pub const SwimProtocol = struct {
         };
         if (!org_control_message and !self.isAuthorizedPeer(sender_pubkey, presented_cert)) return;
 
+        if (self.opaque_relay and !self.isMeshEndpoint(sender_endpoint)) switch (decoded) {
+            .ping => |p| return self.answerClientPing(&p, sender_endpoint),
+            .ack => |a| return self.claimForRelay(a.sender_pubkey, a.wg_binding, if (a.has_org_cert) &a.org_cert else null),
+            // No probing or rendezvous on behalf of clients: that would reveal other clients.
+            .ping_req, .holepunch_request, .holepunch_response => return,
+            .org_alias_announce, .org_cert_revoke, .org_trust_vouch => {},
+        };
+
         switch (decoded) {
             .ping => |p| self.handlePing(&p, sender_endpoint),
             .ack => |a| self.handleAck(&a, sender_endpoint),
@@ -886,7 +964,7 @@ pub const SwimProtocol = struct {
     fn handleRelayData(self: *SwimProtocol, data: []const u8, sender_endpoint: messages.Endpoint) void {
         const frame = Relay.decodeRelayData(data) catch return;
         if (!std.mem.eql(u8, &frame.target_pubkey, &self.our_pubkey)) {
-            if (self.forwardingEndpoint(frame.sender_pubkey, frame.target_pubkey, data.len, sender_endpoint)) |ep| {
+            if (self.forwardingEndpoint(frame.sender_pubkey, frame.target_pubkey, data.len, sender_endpoint, null)) |ep| {
                 self.forwardSend(data, ep);
             }
             return;
@@ -906,12 +984,13 @@ pub const SwimProtocol = struct {
 
     /// Where a frame for someone else should go, or null to drop it. See
     /// `Forwarding`. Frames forwarded by the relay core are budgeted there.
-    fn forwardingEndpoint(self: *SwimProtocol, sender: [32]u8, destination: [32]u8, len: usize, src: messages.Endpoint) ?ForwardTarget {
+    fn forwardingEndpoint(self: *SwimProtocol, sender: [32]u8, destination: [32]u8, len: usize, src: messages.Endpoint, why: ?*?RelayCore.DropReason) ?ForwardTarget {
         if (self.forwarding == .none) return null;
         if (self.relay_core) |core| {
             switch (core.route(sender, destination, len, src, nowNs())) {
                 .forward => |ep| return .{ .endpoint = ep, .budgeted = true },
                 .drop => |reason| {
+                    if (why) |out| out.* = reason;
                     if (self.forwarding == .authenticated) return null;
                     // Only "not known to the core" may fall back to the legacy check.
                     if (reason != .unproven_sender and reason != .unknown_destination) return null;
@@ -965,7 +1044,11 @@ pub const SwimProtocol = struct {
 
         // Not for us: forward the sealed frame unchanged if its sender is
         // authentic (no per-message logging in this hot path).
-        const target = self.forwardingEndpoint(data[33..65].*, dest_pubkey.*, data.len, sender_endpoint) orelse return;
+        var why: ?RelayCore.DropReason = null;
+        const target = self.forwardingEndpoint(data[33..65].*, dest_pubkey.*, data.len, sender_endpoint, &why) orelse {
+            if (why) |reason| self.sendDeliveryStatus(reason, data, sender_endpoint);
+            return;
+        };
         self.forwardSend(data, target);
     }
 
@@ -1063,27 +1146,33 @@ pub const SwimProtocol = struct {
             // If the revoked node, or any leaf cert issued by that node, is
             // currently authorized only by this org's cert/vouch, mark it dead.
             // Other orgs or explicit key trust are independent authorization
-            // boundaries.
+            // boundaries. Affected peers are collected in batches, so the
+            // membership is walked once per batch, not once per peer.
+            var batch: [256][32]u8 = undefined;
             while (true) {
-                var dead_key: ?[32]u8 = null;
+                var n: usize = 0;
                 var iter = self.membership.peers.iterator();
                 while (iter.next()) |entry| {
                     const peer = entry.value_ptr.*;
                     if (peer.state != .alive and peer.state != .suspected) continue;
                     if (!revokedOrgGrantAffectsPeer(rev, entry.key_ptr.*, peer)) continue;
                     if (self.isAuthorizedPeer(entry.key_ptr.*, null)) continue;
-                    dead_key = entry.key_ptr.*;
-                    break;
+                    batch[n] = entry.key_ptr.*;
+                    n += 1;
+                    if (n == batch.len) break;
                 }
-                const key = dead_key orelse break;
-                self.membership.markDead(key);
-                if (self.handler) |h| {
-                    h.onPeerDead(h.ctx, key);
+                for (batch[0..n]) |key| {
+                    self.membership.markDead(key);
+                    if (self.handler) |h| {
+                        h.onPeerDead(h.ctx, key);
+                    }
                 }
+                if (n < batch.len) break;
             }
+            if (self.relay_core) |core| core.bumpTrustEpoch();
         }
         if (rebroadcast) {
-            self.enqueueOrgRevokeBroadcast(rev);
+            self.enqueueOrgRevokeBroadcast(rev, self.config.max_gossip_broadcasts);
         }
     }
 
@@ -1161,8 +1250,7 @@ pub const SwimProtocol = struct {
         // std.debug.print here (one stderr syscall per inbound PING) was the
         // CPU sink that, under a NAT retransmit storm, pegged a core and helped
         // melt the LAN. Count instead.
-        self.gossipSend(buf[0..written], sender_endpoint);
-        self.acks_sent +%= 1;
+        if (self.replySend(buf[0..written], sender_endpoint)) self.acks_sent +%= 1;
     }
 
     fn handleAck(self: *SwimProtocol, ack: *const codec.DecodedAck, sender_endpoint: messages.Endpoint) void {
@@ -1509,6 +1597,74 @@ pub const SwimProtocol = struct {
         _ = self.tryGossipSend(data, endpoint);
     }
 
+    /// Answers to other nodes' pings, under their own token bucket.
+    fn replySend(self: *SwimProtocol, data: []const u8, endpoint: messages.Endpoint) bool {
+        const now = nowNs();
+        if (self.last_reply_refill_ns == 0) {
+            self.last_reply_refill_ns = now;
+            self.reply_tokens = @floatFromInt(self.config.reply_burst);
+        }
+        const elapsed_s: f64 = @as(f64, @floatFromInt(now - self.last_reply_refill_ns)) / 1_000_000_000.0;
+        self.last_reply_refill_ns = now;
+        self.reply_tokens = @min(@as(f64, @floatFromInt(self.config.reply_burst)), self.reply_tokens + elapsed_s * @as(f64, @floatFromInt(self.config.reply_pps)));
+        if (self.reply_tokens < 1.0) {
+            self.replies_dropped_ratelimit +%= 1;
+            return false;
+        }
+        self.reply_tokens -= 1.0;
+        _ = self.socket.sendToEndpoint(data, endpoint) catch return false;
+        self.pkts_sent +%= 1;
+        return true;
+    }
+
+    /// Mesh peers of an opaque relay are the nodes at our seed endpoints
+    /// (other relays); everyone else is a client.
+    fn isMeshEndpoint(self: *const SwimProtocol, endpoint: messages.Endpoint) bool {
+        for (self.seeds[0..self.seed_count]) |seed| {
+            if (seed.eql(endpoint)) return true;
+        }
+        return false;
+    }
+
+    /// An opaque relay's answer to a client ping: refresh the client's claim
+    /// and describe only ourselves.
+    fn answerClientPing(self: *SwimProtocol, ping: *const codec.DecodedPing, sender_endpoint: messages.Endpoint) void {
+        if (std.mem.eql(u8, &ping.sender_pubkey, &([_]u8{0} ** 32))) return;
+        self.claimForRelay(ping.sender_pubkey, ping.wg_binding, if (ping.has_org_cert) &ping.org_cert else null);
+        const own = [1]messages.GossipEntry{.{
+            .subject_pubkey = self.our_pubkey,
+            .event = .alive,
+            .lamport = self.membership.lamport,
+            .endpoint = self.our_public_endpoint,
+            .wg_pubkey = self.our_wg_pubkey,
+            .public_endpoint = self.our_public_endpoint,
+            .nat_type = self.our_nat_type,
+        }};
+        var buf: [1500]u8 = undefined;
+        const written = codec.encodeAck(&buf, .{
+            .sender_pubkey = self.our_pubkey,
+            .seq = ping.seq,
+            .incarnation = self.our_incarnation,
+            .gossip = &own,
+            .org_cert = self.our_org_cert orelse std.mem.zeroes([messages.ORG_CERT_WIRE_SIZE]u8),
+            .has_org_cert = self.our_org_cert != null,
+            .wg_binding = self.our_wg_binding,
+        }) catch return;
+        if (self.replySend(buf[0..written], sender_endpoint)) self.acks_sent +%= 1;
+    }
+
+    /// Tells the sender of a 0x50 frame we dropped why, within the relay
+    /// core's status limits.
+    fn sendDeliveryStatus(self: *SwimProtocol, reason: RelayCore.DropReason, frame: []const u8, src: messages.Endpoint) void {
+        if (!self.delivery_status) return;
+        const core = self.relay_core orelse return;
+        const code = core.statusFor(reason, src, nowNs()) orelse return;
+        const status = AppStatus.forFrame(frame, code) orelse return;
+        var out: [AppStatus.SIZE]u8 = undefined;
+        AppStatus.encode(&out, status);
+        _ = self.socket.sendToEndpoint(&out, src) catch {};
+    }
+
     fn sendPing(self: *SwimProtocol, endpoint: messages.Endpoint, target_pubkey: [32]u8) void {
         self.sendPingWithGossip(endpoint, target_pubkey, true, false);
     }
@@ -1792,13 +1948,13 @@ pub const SwimProtocol = struct {
         self.org_revoke_count += 1;
     }
 
-    fn enqueueOrgRevokeBroadcast(self: *SwimProtocol, rev: messages.OrgCertRevoke) void {
+    fn enqueueOrgRevokeBroadcast(self: *SwimProtocol, rev: messages.OrgCertRevoke, broadcasts: u32) void {
         var buf: [Org.ORG_REVOKE_WIRE_SIZE]u8 = undefined;
         const written = codec.encodeOrgCertRevoke(&buf, rev) catch return;
-        self.enqueueOrgControl(buf[0..written]);
+        self.enqueueOrgControl(buf[0..written], broadcasts);
     }
 
-    fn enqueueOrgControl(self: *SwimProtocol, data: []const u8) void {
+    fn enqueueOrgControl(self: *SwimProtocol, data: []const u8, broadcasts: u32) void {
         if (data.len > Org.ORG_REVOKE_WIRE_SIZE) return;
         for (self.org_control_queue[0..self.org_control_count]) |slot| {
             if (slot.len == data.len and std.mem.eql(u8, slot.data[0..slot.len], data)) return;
@@ -1808,7 +1964,7 @@ pub const SwimProtocol = struct {
         var slot = OrgControlSlot{
             .data = std.mem.zeroes([Org.ORG_REVOKE_WIRE_SIZE]u8),
             .len = @intCast(data.len),
-            .remaining = self.config.max_gossip_broadcasts,
+            .remaining = broadcasts,
             .next_peer_index = 0,
         };
         @memcpy(slot.data[0..data.len], data);
@@ -1871,15 +2027,18 @@ pub const SwimProtocol = struct {
         self.org_control_count = write;
     }
 
+    /// Re-sends each retained revocation once per interval. The original
+    /// broadcast already went out `max_gossip_broadcasts` times; this only
+    /// reaches peers that joined or missed it since.
     fn readvertiseOrgRevokes(self: *SwimProtocol, now: i128) void {
         if (self.org_revoke_count == 0) return;
-        const interval_ns: i128 = @as(i128, self.config.self_readvertise_interval_ms) * 1_000_000;
+        const interval_ns: i128 = @as(i128, self.config.org_revoke_readvertise_interval_ms) * 1_000_000;
         if (interval_ns <= 0) return;
         if (now - self.last_org_revoke_readvertise_ns < interval_ns) return;
         self.last_org_revoke_readvertise_ns = now;
 
         for (self.org_revokes[0..self.org_revoke_count]) |rev| {
-            self.enqueueOrgRevokeBroadcast(rev);
+            self.enqueueOrgRevokeBroadcast(rev, 1);
         }
     }
 
@@ -3156,7 +3315,7 @@ test "retained org revoke can be re-advertised without duplicate queue entries" 
     var membership = Membership.MembershipTable.init(allocator, 5000);
     defer membership.deinit();
 
-    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{ .self_readvertise_interval_ms = 1 }, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{ .org_revoke_readvertise_interval_ms = 1 }, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
 
     const org_kp = Org.generateOrgKeyPair();
     const victim = [_]u8{0x7a} ** 32;
@@ -3192,7 +3351,7 @@ test "org revoke fan-out resumes after rate-limit drops" {
     }
 
     const data = [_]u8{0x42} ** Org.ORG_REVOKE_WIRE_SIZE;
-    swim.enqueueOrgControl(&data);
+    swim.enqueueOrgControl(&data, swim.config.max_gossip_broadcasts);
     try std.testing.expectEqual(@as(usize, 1), swim.org_control_count);
 
     swim.send_tokens = 1;
@@ -3749,4 +3908,181 @@ test "authenticated relays forward only for senders proven by handshake" {
     try std.testing.expect(testReceive(f.bob_socket, &buf, 0x50) == null);
     try std.testing.expectEqual(@as(u64, 1), core.stats.droppedFor(.spoofed_sender));
     try std.testing.expectEqual(@as(u64, 1), core.stats.droppedFor(.unproven_sender));
+}
+
+test "a trust reload replaces keys and never opens a node that enforced trust" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 100);
+    defer membership.deinit();
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    const alice = [_]u8{0xA1} ** 32;
+    const bob = [_]u8{0xB0} ** 32;
+    const org = [_]u8{0x0C} ** 32;
+    swim.addAuthorizedKey(alice);
+    swim.enableTrust();
+
+    swim.replaceTrust(&.{}, &.{});
+    try std.testing.expect(swim.enforce_trust);
+    try std.testing.expect(!swim.isAuthorizedPeer(alice, null));
+
+    swim.replaceTrust(&.{bob}, &.{org});
+    try std.testing.expect(swim.isAuthorizedPeer(bob, null));
+    try std.testing.expect(!swim.isAuthorizedPeer(alice, null));
+    try std.testing.expect(swim.isOrgAuthorizedPeer(org));
+}
+
+test "reload requests run once on the event loop and re-check relay clients" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 100);
+    defer membership.deinit();
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    var core = try RelayCore.RelayCore.init(allocator, .{ .max_clients = 16, .max_unproven = 4, .max_claims = 16, .max_handshake_sources = 16 }, [_]u8{0x40} ** 32, [_]u8{0x41} ** 32, swim.relayAdmission(), 0);
+    defer core.deinit();
+    swim.relay_core = &core;
+
+    const Counter = struct {
+        runs: usize = 0,
+        fn run(raw: *anyopaque, s: *SwimProtocol) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.runs += 1;
+            s.replaceTrust(&.{}, &.{});
+        }
+    };
+    var counter = Counter{};
+    swim.reload_hook = .{ .ctx = &counter, .run = Counter.run };
+
+    swim.tickTimersOnly();
+    try std.testing.expectEqual(@as(usize, 0), counter.runs);
+    const epoch = core.trust_epoch;
+    swim.reload_requested.store(true, .release);
+    swim.tickTimersOnly();
+    swim.tickTimersOnly();
+    try std.testing.expectEqual(@as(usize, 1), counter.runs);
+    try std.testing.expect(core.trust_epoch != epoch);
+}
+
+test "retained revocations are re-sent once per interval, not as fresh broadcasts" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 100);
+    defer membership.deinit();
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{ .org_revoke_readvertise_interval_ms = 1 }, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    const org_kp = Org.generateOrgKeyPair();
+    const rev = try Org.issueOrgRevoke(org_kp, [_]u8{0x7b} ** 32, 2, 12);
+    swim.queueOrgCertRevoke(rev);
+    try std.testing.expectEqual(swim.config.max_gossip_broadcasts, swim.org_control_queue[0].remaining);
+
+    swim.org_control_count = 0;
+    swim.readvertiseOrgRevokes(2_000_000);
+    try std.testing.expectEqual(@as(usize, 1), swim.org_control_count);
+    try std.testing.expectEqual(@as(u32, 1), swim.org_control_queue[0].remaining);
+    // The default interval is minutes, not the self re-advertise seconds.
+    try std.testing.expect((SwimConfig{}).org_revoke_readvertise_interval_ms >= 60_000);
+}
+
+const TestRelay = struct {
+    private: [32]u8,
+    public: [32]u8,
+
+    fn init() !TestRelay {
+        var private = [_]u8{0x77} ** 32;
+        private[0] &= 248;
+        private[31] &= 127;
+        private[31] |= 64;
+        return .{ .private = private, .public = try std.crypto.dh.X25519.recoverPublicKey(private) };
+    }
+};
+
+test "opaque relays keep clients out of membership and describe only themselves" {
+    var f = ForwardFixture.init() catch return;
+    defer f.deinit();
+    const relay = try TestRelay.init();
+    var swim = SwimProtocol.init(&f.membership, f.relay_socket, .{}, [_]u8{1} ** 32, relay.public, .{ 127, 0, 0, 1 }, 51821, null);
+    var core = try RelayCore.RelayCore.init(std.testing.allocator, .{ .max_clients = 64, .max_unproven = 16, .max_claims = 64, .max_handshake_sources = 64 }, relay.private, relay.public, swim.relayAdmission(), nowNs());
+    defer core.deinit();
+    swim.relay_core = &core;
+    swim.forwarding = .authenticated;
+    swim.opaque_relay = true;
+    swim.setPublicEndpoint(loopback(f.relay_socket), .public);
+
+    const alice = try TestRelayClient.init(0x11);
+    const bob = try TestRelayClient.init(0x22);
+    try bob.join(&swim, f.bob_socket, relay.public);
+
+    // Alice's ping is answered with the relay's own entry and nothing about Bob.
+    var buf: [1500]u8 = undefined;
+    const ping_len = try codec.encodePing(&buf, .{ .sender_pubkey = alice.identity, .seq = 9, .gossip = &.{}, .wg_binding = alice.binding });
+    swim.handleMessage(buf[0..ping_len], loopback(f.alice_socket));
+    var recv_buf: [1500]u8 = undefined;
+    const ack_bytes = testReceive(f.alice_socket, &recv_buf, 0x03) orelse return error.NoAck;
+    const ack = (try codec.decode(ack_bytes)).ack;
+    try std.testing.expectEqual(@as(u64, 9), ack.seq);
+    try std.testing.expectEqual(@as(u8, 1), ack.gossip_count);
+    try std.testing.expectEqualSlices(u8, &([_]u8{1} ** 32), &ack.gossip()[0].subject_pubkey);
+    try std.testing.expectEqual(messages.NatType.public, ack.gossip()[0].nat_type);
+    try std.testing.expect(ack.wg_binding == null); // our test relay set none
+    try std.testing.expect(std.mem.indexOf(u8, ack_bytes, &bob.identity) == null);
+
+    // Clients never enter membership, yet proven clients still reach each other.
+    try alice.join(&swim, f.alice_socket, relay.public);
+    try std.testing.expectEqual(@as(usize, 0), f.membership.peers.count());
+    var frame_buf: [256]u8 = undefined;
+    const frame = testAppFrame(&frame_buf, bob.identity, alice.identity);
+    swim.handleMessage(frame, loopback(f.alice_socket));
+    const got = testReceive(f.bob_socket, &recv_buf, 0x50) orelse return error.NotForwarded;
+    try std.testing.expectEqualSlices(u8, frame, got);
+
+    // Opaque relays do not probe or rendezvous on behalf of clients.
+    const req_len = try codec.encodePingReq(&buf, .{ .sender_pubkey = alice.identity, .target_pubkey = bob.identity, .seq = 3 });
+    swim.handleMessage(buf[0..req_len], loopback(f.alice_socket));
+    try std.testing.expectEqual(@as(usize, 0), swim.pending_req_count);
+}
+
+test "frames the relay drops are answered with a delivery status" {
+    var f = ForwardFixture.init() catch return;
+    defer f.deinit();
+    const relay = try TestRelay.init();
+    var swim = SwimProtocol.init(&f.membership, f.relay_socket, .{}, [_]u8{1} ** 32, relay.public, .{ 127, 0, 0, 1 }, 51821, null);
+    var core = try RelayCore.RelayCore.init(std.testing.allocator, .{ .max_clients = 64, .max_unproven = 16, .max_claims = 64, .max_handshake_sources = 64 }, relay.private, relay.public, swim.relayAdmission(), nowNs());
+    defer core.deinit();
+    swim.relay_core = &core;
+    swim.forwarding = .authenticated;
+
+    const alice = try TestRelayClient.init(0x11);
+    const bob = try TestRelayClient.init(0x22);
+    var frame_buf: [256]u8 = undefined;
+    var recv_buf: [1500]u8 = undefined;
+
+    // Alice has not proven her endpoint: she is asked to handshake.
+    const early = testAppFrame(&frame_buf, bob.identity, alice.identity);
+    swim.handleMessage(early, loopback(f.alice_socket));
+    const first = AppStatus.decode(testReceive(f.alice_socket, &recv_buf, AppStatus.TYPE) orelse return error.NoStatus).?;
+    try std.testing.expectEqual(AppStatus.Code.handshake_again, first.code);
+    try std.testing.expectEqualSlices(u8, &bob.identity, &first.destination);
+    try std.testing.expectEqualSlices(u8, early[65..77], &first.nonce);
+
+    // Proven, but Bob is not here: offline.
+    try alice.join(&swim, f.alice_socket, relay.public);
+    swim.handleMessage(testAppFrame(&frame_buf, bob.identity, alice.identity), loopback(f.alice_socket));
+    const second = AppStatus.decode(testReceive(f.alice_socket, &recv_buf, AppStatus.TYPE) orelse return error.NoStatus).?;
+    try std.testing.expectEqual(AppStatus.Code.offline, second.code);
+
+    // Operators can turn statuses off.
+    swim.delivery_status = false;
+    swim.handleMessage(testAppFrame(&frame_buf, bob.identity, alice.identity), loopback(f.alice_socket));
+    try std.testing.expect(testReceive(f.alice_socket, &recv_buf, AppStatus.TYPE) == null);
+}
+
+test "answers to pings have their own budget" {
+    var f = ForwardFixture.init() catch return;
+    defer f.deinit();
+    var swim = SwimProtocol.init(&f.membership, f.relay_socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    // Our own discovery budget is spent; answers still go out.
+    swim.send_tokens = 0;
+    swim.last_token_refill_ns = nowNs();
+    var buf: [512]u8 = undefined;
+    const len = try codec.encodePing(&buf, .{ .sender_pubkey = [_]u8{0xA1} ** 32, .seq = 4, .gossip = &.{} });
+    swim.handleMessage(buf[0..len], loopback(f.alice_socket));
+    var recv_buf: [1500]u8 = undefined;
+    const ack = testReceive(f.alice_socket, &recv_buf, 0x03) orelse return error.NoAck;
+    try std.testing.expectEqual(@as(u64, 4), (try codec.decode(ack)).ack.seq);
 }

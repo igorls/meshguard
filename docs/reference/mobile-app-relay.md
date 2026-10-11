@@ -64,6 +64,83 @@ relay or derived from its identity.
 
 Mobile contexts never forward frames addressed to others.
 
+## Contacts and opaque relays
+
+An opaque relay (`meshguard up --opaque`) describes only itself, so a client
+cannot learn other clients' keys from it. The host registers the peers it
+already knows (for example from signed contact cards):
+
+- `meshguard_add_contact(ctx, ed25519[32], wg[32])` registers or replaces a
+  contact (`-3` for an invalid or low-order key, `-5` past 4096 contacts);
+  `meshguard_remove_contact`, `meshguard_clear_contacts` and
+  `meshguard_contact_count` manage the set.
+- Frames to and from a contact use its registered WireGuard key, which wins over
+  any key learned from gossip. A contact the relay does not describe is sent to
+  through the pinned relay only.
+- `meshguard_set_contacts_only(ctx, true)` drops app frames from anyone else
+  before any decryption.
+
+## Delivery status
+
+`meshguard_send_ex(ctx, peer, data, len, out_nonce[12])` sends like
+`meshguard_send` and returns the frame's nonce. When the pinned relay does not
+forward a frame it answers with a delivery status, delivered to
+`meshguard_set_on_delivery_status(ctx, cb(destination, nonce, code))` on the
+event loop: `1` offline, `2` destination not admitted, `3` rate limited,
+`4` handshake again, `5` not admitted (for example an expired pass), `6` relay
+overloaded. Statuses are accepted only from the pinned relay's endpoint and
+only for one of the last 256 frames sent through it, each at most once. Code
+`4` also re-proves the relay endpoint at once.
+
+The callback's pointers are valid only during the call. Hosts that handle
+statuses later on another thread (Dart's `NativeCallable.listener`, for
+example) poll instead:
+`meshguard_recv_delivery_status(ctx, out_destination[32], out_nonce[12], &code)`
+returns `0` with the next status, `1` when none is waiting. Up to 64 wait;
+newer ones are dropped while the queue is full.
+
+## Timers
+
+`meshguard_set_keepalive_interval(ctx, ms)` sets the interval between pings
+(3000 ms by default for mobile contexts; 1000 to 600000), and
+`meshguard_set_relay_proof_interval(ctx, ms)` the interval between endpoint
+proofs to the pinned relay (15000 ms by default; 5000 to 3600000). With
+delivery statuses a client learns when its endpoint must be proven again, so
+both can be longer to save battery and relay capacity. Changes apply on the
+event loop.
+
+## Several relays
+
+A context talks through one pinned relay at a time.
+
+- **Switching.** `meshguard_switch_relay(ctx, relay_pubkey, force, seed_ip,
+  seed_port)` leaves the current network, pins the new relay and joins through
+  it. Leaving forgets the old network: its peers, the WireGuard sessions with
+  them and the relay proof state. The identity, contacts, certificate and
+  timers carry over, so a host can move a running context without rebuilding
+  it. `meshguard_leave` followed by `meshguard_set_app_relay` and
+  `meshguard_join` does the same in steps.
+- **At once.** To reach people on several relays simultaneously, create one
+  context per relay from the same identity seed. Each binds its own socket,
+  proves its own endpoint and has its own contacts; a relay pass is per
+  organization, so each context installs the pass for its relay.
+
+`meshguard_last_recv_time` and the other host-thread queries do not read SWIM
+state, so they are safe to call while another thread leaves or joins.
+
+## Relay passes
+
+A relay that trusts an organization admits any holder of that organization's
+valid v2 certificate for the client's own Ed25519 and WireGuard keys. The host
+obtains one from its issuer (`meshguard_get_wg_pubkey` gives the WireGuard key
+to bind) and installs it with `meshguard_set_org_cert(ctx, cert, len)`, before
+or after joining. The context checks the certificate is its own, correctly
+signed and valid now; it returns `-3` for a wrong length and `-4` otherwise.
+A running context applies it on its event loop, pings its peers at once so the
+relay sees it, and proves its relay endpoint again. Renew before expiry by
+installing the next certificate the same way; `meshguard_clear_org_cert`
+stops presenting one.
+
 Tests cover admitted endpoint confirmation, refusal to move a known endpoint
 from unsigned observation, invalid initiation/response packets, and successful
 authenticated updates in both handshake directions.

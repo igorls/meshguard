@@ -34,6 +34,15 @@ join = bind("meshguard_join", [c.c_void_p, c.c_void_p, c.c_uint16], c.c_int)
 send = bind("meshguard_send", [c.c_void_p, c.c_void_p, c.c_void_p, c.c_uint32], c.c_int)
 recv = bind("meshguard_recv", [c.c_void_p] * 4, c.c_int)
 pubkey = bind("meshguard_get_pubkey", [c.c_void_p, c.c_void_p])
+wg_pubkey = bind("meshguard_get_wg_pubkey", [c.c_void_p, c.c_void_p])
+set_org_cert = bind("meshguard_set_org_cert", [c.c_void_p, c.c_void_p, c.c_uint32], c.c_int)
+add_contact = bind("meshguard_add_contact", [c.c_void_p, c.c_void_p, c.c_void_p], c.c_int)
+set_contacts_only = bind("meshguard_set_contacts_only", [c.c_void_p, c.c_bool])
+send_ex = bind("meshguard_send_ex", [c.c_void_p, c.c_void_p, c.c_void_p, c.c_uint32, c.c_void_p], c.c_int)
+STATUS_CALLBACK = c.CFUNCTYPE(None, c.c_void_p, c.c_void_p, c.c_uint8)
+set_on_delivery_status = bind("meshguard_set_on_delivery_status", [c.c_void_p, STATUS_CALLBACK])
+recv_delivery_status = bind("meshguard_recv_delivery_status", [c.c_void_p, c.c_void_p, c.c_void_p, c.c_void_p], c.c_int)
+switch_relay = bind("meshguard_switch_relay", [c.c_void_p, c.c_void_p, c.c_bool, c.c_void_p, c.c_uint16], c.c_int)
 peer_count = bind("meshguard_peer_count", [c.c_void_p], c.c_uint32)
 route_stats = bind("meshguard_app_route_stats", [c.c_void_p, c.c_void_p])
 destroy = bind("meshguard_destroy", [c.c_void_p])
@@ -56,7 +65,7 @@ def wait_for(predicate, seconds, what):
 
 
 class Relay:
-    def __init__(self, root, *flags):
+    def __init__(self, root, *flags, open_trust=True):
         self.root = Path(root)
         self.port = free_udp_port()
         self.control = self.root / "control.sock"
@@ -67,16 +76,19 @@ class Relay:
         self.pubkey = base64.b64decode((self.root / "config" / "identity.pub").read_text().strip())
         self.log = open(self.root / "relay.log", "w")
         self.process = subprocess.Popen(
-            [BINARY, "up", "--gossip-only", "--open", "--announce", "127.0.0.1",
+            [BINARY, "up", "--gossip-only", *(["--open"] if open_trust else []), "--announce", "127.0.0.1",
              "--gossip-port", str(self.port), "--control-path", str(self.control), *flags],
             env=self.env, stdout=self.log, stderr=subprocess.STDOUT)
         wait_for(lambda: self.control.exists(), 20, "relay control socket")
 
     def status(self):
+        return self.command(b"STATUS\n")
+
+    def command(self, line):
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.settimeout(5)
             s.connect(str(self.control))
-            s.sendall(b"STATUS\n")
+            s.sendall(line)
             data = b""
             while not data.endswith(b"\n"):
                 chunk = s.recv(65536)
@@ -102,10 +114,21 @@ class Client:
         key = c.create_string_buffer(32)
         pubkey(self.ctx, key)
         self.pubkey = key.raw
+        wg = c.create_string_buffer(32)
+        wg_pubkey(self.ctx, wg)
+        self.wg_pubkey = wg.raw
         if set_app_relay(self.ctx, relay.pubkey, True) != 0:
             raise RuntimeError("meshguard_set_app_relay failed")
+
+    def join(self, relay):
         if join(self.ctx, bytes([127, 0, 0, 1]), relay.port) != 0:
             raise RuntimeError("meshguard_join failed")
+
+    def install(self, cert):
+        buf = c.create_string_buffer(cert)
+        rc = set_org_cert(self.ctx, buf, len(cert))
+        if rc != 0:
+            raise RuntimeError(f"meshguard_set_org_cert failed: {rc}")
 
     def receive(self, seconds):
         end = time.monotonic() + seconds
@@ -149,6 +172,8 @@ class RelayForwarding(unittest.TestCase):
         self.addCleanup(alice.close)
         bob = Client(0x32, relay)
         self.addCleanup(bob.close)
+        alice.join(relay)
+        bob.join(relay)
         wait_for(lambda: peer_count(alice.ctx) >= 2 and peer_count(bob.ctx) >= 2, 30, "clients to see each other")
         return relay, alice, bob
 
@@ -177,6 +202,155 @@ class RelayForwarding(unittest.TestCase):
         self.assertEqual(relay.status()["relay"]["forwarding"], "endpoint_match")
         got = alice.send_until_received(bob, b"hello through a default relay")
         self.assertEqual(got, (alice.pubkey, b"hello through a default relay"))
+
+
+class RelayPasses(unittest.TestCase):
+    """A closed relay admits holders of passes from an organization it trusts."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="meshguard-passes-")
+        self.addCleanup(self.temp.cleanup)
+        self.issuer = {k: v for k, v in os.environ.items() if not k.startswith("MESHGUARD_")}
+        self.issuer["MESHGUARD_CONFIG_DIR"] = str(Path(self.temp.name) / "issuer")
+        subprocess.run([BINARY, "org-keygen"], env=self.issuer, check=True, capture_output=True, timeout=30)
+
+    def issue(self, client, name):
+        import base64
+        expires = int(time.time()) + 3600
+        subprocess.run([BINARY, "org-sign", base64.b64encode(client.pubkey).decode(), "--name", name,
+                        "--wg-pubkey", base64.b64encode(client.wg_pubkey).decode(), "--expires", str(expires)],
+                       env=self.issuer, check=True, capture_output=True, timeout=30)
+        return (Path(self.issuer["MESHGUARD_CONFIG_DIR"]) / f"{name}.cert").read_bytes()
+
+    def test_closed_relay_admits_pass_holders_after_reload(self):
+        relay = Relay(Path(self.temp.name) / "relay", "--relay", open_trust=False)
+        self.addCleanup(relay.stop)
+        alice = Client(0x41, relay)
+        self.addCleanup(alice.close)
+        bob = Client(0x42, relay)
+        self.addCleanup(bob.close)
+        alice.install(self.issue(alice, "alice"))
+        bob.install(self.issue(bob, "bob"))
+        alice.join(relay)
+        bob.join(relay)
+
+        # Trusting nobody yet, the relay refuses everyone: fail closed.
+        time.sleep(3)
+        self.assertEqual(relay.status()["relay"]["proven"], 0)
+
+        org_pub = (Path(self.issuer["MESHGUARD_CONFIG_DIR"]) / "org" / "org.pub").read_text()
+        trusted = Path(relay.env["MESHGUARD_CONFIG_DIR"]) / "trusted_orgs"
+        trusted.mkdir(parents=True, exist_ok=True)
+        (trusted / "issuer.org").write_text(org_pub)
+        self.assertTrue(relay.command(b"RELOAD\n")["reloading"])
+
+        wait_for(lambda: relay.status()["relay"]["proven"] >= 2, 40, "pass holders to prove their endpoints")
+        got = alice.send_until_received(bob, b"admitted by pass")
+        self.assertEqual(got, (alice.pubkey, b"admitted by pass"))
+
+        # A client without a pass is still refused.
+        carol = Client(0x43, relay)
+        self.addCleanup(carol.close)
+        carol.join(relay)
+        time.sleep(3)
+        self.assertEqual(relay.status()["relay"]["proven"], 2)
+
+
+class OpaqueRelay(unittest.TestCase):
+    """Clients of an opaque relay learn nothing about each other from it and talk as contacts."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="meshguard-opaque-")
+        self.addCleanup(self.temp.cleanup)
+
+    def test_contacts_reach_each_other_and_absent_contacts_report_offline(self):
+        relay = Relay(self.temp.name, "--opaque")
+        self.addCleanup(relay.stop)
+        alice = Client(0x51, relay)
+        self.addCleanup(alice.close)
+        bob = Client(0x52, relay)
+        self.addCleanup(bob.close)
+        carol = Client(0x53, relay)  # registered as a contact but never joins
+        self.addCleanup(carol.close)
+        statuses = []
+        callback = STATUS_CALLBACK(lambda dest, nonce, code: statuses.append((c.string_at(dest, 32), c.string_at(nonce, 12), code)))
+        set_on_delivery_status(alice.ctx, callback)
+        alice.join(relay)
+        bob.join(relay)
+        wait_for(lambda: relay.status()["relay"]["proven"] >= 2, 40, "both clients to prove their endpoints")
+
+        # The relay describes only itself: nobody sees the other client.
+        time.sleep(1)
+        self.assertEqual(peer_count(alice.ctx), 1)
+        self.assertEqual(peer_count(bob.ctx), 1)
+        self.assertEqual(relay.status()["peers"]["alive"], 0)
+
+        for me, other in ((alice, bob), (bob, alice), (alice, carol)):
+            self.assertEqual(add_contact(me.ctx, other.pubkey, other.wg_pubkey), 0)
+        set_contacts_only(bob.ctx, True)
+        got = alice.send_until_received(bob, b"hello as a contact")
+        self.assertEqual(got, (alice.pubkey, b"hello as a contact"))
+        self.assertEqual(alice.direct_sends(), 0)
+
+        nonce = c.create_string_buffer(12)
+        payload = c.create_string_buffer(b"are you there")
+        self.assertEqual(send_ex(alice.ctx, carol.pubkey, payload, 13, nonce), 0)
+        wait_for(lambda: any(s[1] == nonce.raw for s in statuses), 10, "an offline status for the absent contact")
+        status = next(s for s in statuses if s[1] == nonce.raw)
+        self.assertEqual(status[0], carol.pubkey)
+        self.assertEqual(status[2], 1)  # offline
+
+        # Polling hosts see the same statuses.
+        dest, polled_nonce, code = c.create_string_buffer(32), c.create_string_buffer(12), c.c_uint8()
+        polled = []
+        while recv_delivery_status(alice.ctx, dest, polled_nonce, c.byref(code)) == 0:
+            polled.append((dest.raw, polled_nonce.raw, code.value))
+        self.assertIn((carol.pubkey, nonce.raw, 1), polled)
+
+
+class SeveralRelays(unittest.TestCase):
+    """One identity can hold a context per relay, or move between relays."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="meshguard-relays-")
+        self.addCleanup(self.temp.cleanup)
+
+    def relay(self, name):
+        relay = Relay(Path(self.temp.name) / name, "--opaque")
+        self.addCleanup(relay.stop)
+        return relay
+
+    def client(self, seed, relay, *contacts):
+        client = Client(seed, relay)
+        self.addCleanup(client.close)
+        return client
+
+    def test_contexts_per_relay_and_switching(self):
+        first, second = self.relay("first"), self.relay("second")
+        alice = self.client(0x61, first)
+        bob = self.client(0x62, second)
+        carol_first = self.client(0x63, first)
+        carol_second = self.client(0x63, second)  # same identity, other relay
+        dave = self.client(0x64, first)
+        self.assertEqual(carol_first.pubkey, carol_second.pubkey)
+        for client, relay in ((alice, first), (bob, second), (carol_first, first), (carol_second, second), (dave, first)):
+            client.join(relay)
+        wait_for(lambda: first.status()["relay"]["proven"] >= 3 and second.status()["relay"]["proven"] >= 2, 40, "clients on both relays to prove their endpoints")
+
+        def befriend(a, b):
+            self.assertEqual(add_contact(a.ctx, b.pubkey, b.wg_pubkey), 0)
+            self.assertEqual(add_contact(b.ctx, a.pubkey, a.wg_pubkey), 0)
+
+        befriend(alice, carol_first)
+        befriend(bob, carol_second)
+        befriend(bob, dave)
+        self.assertEqual(alice.send_until_received(carol_first, b"via the first relay"), (alice.pubkey, b"via the first relay"))
+        self.assertEqual(bob.send_until_received(carol_second, b"via the second relay"), (bob.pubkey, b"via the second relay"))
+
+        # Dave moves to the second relay, keeping his contacts, and reaches Bob there.
+        self.assertEqual(switch_relay(dave.ctx, second.pubkey, True, bytes([127, 0, 0, 1]), second.port), 0)
+        wait_for(lambda: second.status()["relay"]["proven"] >= 3, 40, "the moved client to prove its endpoint on the second relay")
+        self.assertEqual(dave.send_until_received(bob, b"after switching"), (dave.pubkey, b"after switching"))
 
 
 if __name__ == "__main__":

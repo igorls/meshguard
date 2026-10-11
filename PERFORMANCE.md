@@ -11,6 +11,61 @@ This document captures the current performance profile, what has been tried, wha
 | **Latency (avg)** | 0.194 ms                                          |
 | **Test setup**    | LXC containers, localhost veth, 8 encrypt workers |
 
+## Relay Forwarding
+
+Authenticated relay forwarding (`meshguard up --gossip-only --relay`) measured
+with `bench/relay-load` on loopback: an x86_64 Linux host (32 threads, WSL2),
+ReleaseSafe builds, 200-byte frames, each client sending to random contacts
+among 4, re-proving its endpoint every 15 s and pinging every 25 s. The
+generator and the relay share the host.
+
+| Scenario | Clients | Offered | Loss | Latency p50 / p99 | Relay CPU | Relay peak RSS |
+|---|---|---|---|---|---|---|
+| Steady | 200 | 200 msg/s | 0 | 134 µs / 427 µs | 0.03 core | 6 MiB |
+| Steady | 2,000 | 1,000 msg/s | 0 | 80 µs / 593 µs | 0.10 core | 9 MiB |
+| Steady | 10,000 | 1,000 msg/s | 0 | 88 µs / 2.5 ms | 0.32 core | 17 MiB |
+| 10 flooders at 5,000 pps + 20 spoofers at 500 pps | 2,000 | 1,000 msg/s | 0.1% | 53 µs / 402 µs | 0.25 core | 9 MiB |
+| Reconnect storm (all clients change port) | 5,000 | 1,000 msg/s | 8.4% over 40 s | 92 µs / 2.4 ms | 0.23 core | 13 MiB |
+| Pings every 3 s, as mobile contexts do | 10,000 | 1,000 msg/s | 0 | — / 684 µs | 0.44 core | 17 MiB |
+| `--opaque`, pings every 3 s, 5 spoofers | 10,000 | 1,000 msg/s | 0 | 68 µs / 680 µs | 0.32 core | 13 MiB |
+
+Findings:
+
+- **Abuse is contained.** The flooders sent 1.31 M frames; the relay forwarded
+  16 k of them (their 50 frames/s budgets) and dropped the rest. Of 296 k
+  spoofed frames, none was delivered. Honest loss rose to 0.1%, consistent
+  with kernel receive-buffer drops at ~44 k packets/s on one socket.
+- **Handshakes bound recovery.** All 10,000 clients proved within 15 s of a
+  simultaneous start; 5,000 clients that changed port at once were re-proven
+  within 4.9 s. Frames sent in that gap from unproven ports, or to old ports,
+  are lost: the storm row's loss. The global handshake budget (1,000/s) is
+  the limit, and the 15 s mobile re-proof interval alone uses two thirds of
+  it at 10,000 clients.
+### Browser sessions
+
+`bench/relay-load/browser.mjs`: WASM browser identities with passes, each with
+its own WebSocket session through a gateway process, to an opaque `--relay`
+daemon. Same host, 200 sessions at 0.5 msg/s and 2,000 at 0.2 msg/s.
+
+| Sessions | Ready | Loss | Latency p50 / p99 | Gateway CPU | Gateway peak RSS | Relay peak RSS |
+|---|---|---|---|---|---|---|
+| 200 | all, in 1.1 s | 0 | 0.9 ms / 3.8 ms | 0.16 core | 65 MiB | 6 MiB |
+| 2,000 | all, in 11 s (ramped at 200/s) | 0 | 1.2 ms / 76 ms | 0.31 core | 81 MiB | 7 MiB |
+
+Each session holds a WebSocket and a UDP socket, so the gateway's file
+descriptor limit bounds it first: the previous unit file (`LimitNOFILE=256`,
+`MemoryMax=128M`, `CPUQuota=50%`) allowed about 120 browsers. The unit file now
+allows 65,536 descriptors, 1 GiB and two cores.
+
+- **Answers need their own budget.** Mobile contexts ping their relay every
+  3 s: 3,300 pings/s at 10,000 clients. While answers shared the 500 packets/s
+  discovery budget, only 15% were answered, enough for clients to mark the
+  relay dead. With a separate reply budget (`--reply-pps`, 5,000) all were.
+- **Opaque relays are cheaper.** Keeping clients out of membership and gossip
+  saved a quarter of the CPU and memory at 10,000 clients.
+- Next: clients re-prove on a `handshake again` status instead of every 15 s,
+  and the relay batches receives on its socket.
+
 ## Architecture Overview
 
 ```

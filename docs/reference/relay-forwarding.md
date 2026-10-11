@@ -37,6 +37,16 @@ A frame is forwarded when:
 Frames addressed to the relay itself are delivered locally as before; the
 application authenticates their sender end to end.
 
+## Admission
+
+A relay forwards only for identities it admits: authorized keys, holders of a
+valid certificate from a trusted organization (`trusted_orgs/`), or everyone
+with `--open`. With `--relay` and no keys or orgs, it admits nobody rather than
+everybody. Trust lists reload on `SIGHUP` or the owner's control `RELOAD`
+without a restart, and every client is re-checked on its next frame; a client
+whose certificate expired is refused until it presents a renewed one. See
+`docs/guide/trust-model.md`.
+
 ## Modes
 
 | Node | Forwarding |
@@ -48,6 +58,40 @@ application authenticates their sender end to end.
 `--legacy-wg-binding` lets a closed-trust relay accept a WireGuard key learned
 from gossip for an admitted identity while older clients that send no binding
 remain in use. Do not combine it with `--open`.
+
+## Opaque relays
+
+`meshguard up --opaque` (which implies `--relay`) tells clients nothing about
+other clients. Every node that is not at one of the relay's seed endpoints is a
+client:
+
+- A client's ping refreshes its claim and is answered with an ACK whose only
+  gossip entry describes the relay itself. Clients never enter the relay's
+  membership, so nothing about them is gossiped, and `meshguard status` and
+  `PEERS` count only mesh peers.
+- The relay does not probe (ping-req) or rendezvous (hole punching) on behalf
+  of clients.
+- Clients learn each other's keys from their own applications (contacts), not
+  from the relay, and send sealed frames addressed by key as before.
+
+Other relays at the seed endpoints remain ordinary mesh peers.
+
+## Delivery status
+
+When a relay does not forward a sealed frame it answers the sender with a
+47-byte `0x51` status (see `docs/concepts/wire-protocol.md`): `offline`,
+`rate_limited`, `handshake_again` (the sender's endpoint is not proven for its
+key; send a Noise initiation), `not_admitted` (for example an expired pass) or
+`overloaded`. Statuses echo the frame's nonce, go only to its source address,
+are smaller than any frame, and are limited per source address (2/s, burst 4)
+and overall (2,000/s). They tell a sender whether a destination is reachable;
+`--no-delivery-status` turns them off.
+
+## Answers to pings
+
+ACKs have their own budget (`--reply-pps`, 5,000/s, burst a fifth of that),
+separate from the relay's own discovery traffic (500/s), so thousands of clients
+pinging every few seconds all get answers.
 
 ## Limits
 

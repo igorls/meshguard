@@ -66,6 +66,9 @@ const usage =
     \\  --trusted-handshake-source <ip>
     \\                            Limit handshakes from this address per port (a local gateway)
     \\  --legacy-wg-binding       Accept gossip-learned WireGuard keys for admitted clients
+    \\  --opaque                  Relay that tells clients nothing about other clients (implies --relay)
+    \\  --no-delivery-status      Do not tell senders why a frame was not forwarded
+    \\  --reply-pps <n>           Answers to pings per second (default 5000)
     \\  --gossip-port <port>      Override gossip/listen UDP port (default 51821)
     \\  --control-path <path>     Override control socket path for this daemon
     \\  -h, --help               Show this help
@@ -912,6 +915,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     var open_mode: bool = false; // --open: skip trust, accept any peer
     var gossip_only: bool = false; // --gossip-only/--no-tun: seed/rendezvous mode
     var relay_flags = RelayFlags{};
+    var trust_reload: TrustReload = undefined;
     var control_path_flag: ?[]const u8 = null;
     // Collect raw seed strings for hostname resolution
     var seed_strs: [16][]const u8 = undefined;
@@ -1252,6 +1256,20 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
             if (!swim.enforce_trust) swim.enableTrust();
             try writeFormatted(stdout, "  org trust: {d} trusted org(s)\n", .{trusted_orgs.len});
         }
+
+        if (!swim.enforce_trust) {
+            if (relay_flags.relay) {
+                // A relay never opens because its trust lists are empty.
+                swim.enableTrust();
+                try stdout.writeStreamingAll(zio(), "  trust: closed, no authorized keys or trusted orgs yet (add them, then reload)\n");
+            } else {
+                try stdout.writeStreamingAll(zio(), "  trust: open, no authorized keys or trusted orgs (--relay refuses everyone instead)\n");
+            }
+        }
+
+        trust_reload = .{ .allocator = allocator, .config_dir = config_dir, .stdout = stdout };
+        swim.reload_hook = .{ .ctx = &trust_reload, .run = TrustReload.run };
+        control.reload_flag = &swim.reload_requested;
     } else {
         try stdout.writeStreamingAll(zio(), "  trust: OPEN (accepting all peers)\n");
     }
@@ -1289,10 +1307,23 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     defer relay_core.deinit();
     swim.relay_core = &relay_core;
     swim.forwarding = if (relay_flags.relay) .authenticated else .endpoint_match;
+    if (relay_flags.relay) {
+        // A relay absorbs bursts from many clients on one socket: queue them.
+        if (gossip_socket.setBufferSizes(8 * 1024 * 1024)) |bytes| {
+            try writeFormatted(stdout, "  relay socket buffers: {d} KiB\n", .{bytes / 1024});
+        }
+    }
+    swim.opaque_relay = relay_flags.opaque_relay;
+    swim.delivery_status = relay_flags.delivery_status;
+    if (relay_flags.reply_pps) |n| {
+        swim.config.reply_pps = n;
+        swim.config.reply_burst = @max(10, n / 5);
+    }
     control.relay_core = &relay_core;
     control.relay_forwarding = @tagName(swim.forwarding);
-    try writeFormatted(stdout, "  relay: {s}, up to {d} clients\n", .{
+    try writeFormatted(stdout, "  relay: {s}{s}, up to {d} clients\n", .{
         if (relay_flags.relay) @as([]const u8, "authenticated forwarding") else @as([]const u8, "forwarding for known endpoints"),
+        if (relay_flags.opaque_relay) @as([]const u8, ", opaque") else @as([]const u8, ""),
         relay_core.config.max_clients,
     });
 
@@ -2006,6 +2037,14 @@ fn signalHandler(sig: posix.SIG) callconv(.c) void {
     }
 }
 
+/// SIGHUP: re-read trust lists on the event loop (see TrustReload).
+fn reloadSignalHandler(sig: posix.SIG) callconv(.c) void {
+    _ = sig;
+    if (g_swim_stop) |swim_ref| {
+        swim_ref.reload_requested.store(true, .release);
+    }
+}
+
 fn installSignalHandler(swim_ref: *lib.discovery.Swim.SwimProtocol) void {
     g_swim_stop = swim_ref;
 
@@ -2017,6 +2056,12 @@ fn installSignalHandler(swim_ref: *lib.discovery.Swim.SwimProtocol) void {
         };
         posix.sigaction(posix.SIG.INT, &sa, null);
         posix.sigaction(posix.SIG.TERM, &sa, null);
+        const reload_sa: posix.Sigaction = .{
+            .handler = .{ .handler = &reloadSignalHandler },
+            .mask = std.mem.zeroes(@TypeOf(@as(posix.Sigaction, undefined).mask)),
+            .flags = 0,
+        };
+        posix.sigaction(posix.SIG.HUP, &reload_sa, null);
     } else if (comptime @import("builtin").os.tag == .windows) {
         // SetConsoleCtrlHandler for Ctrl+C / console close
         const k32 = struct {
@@ -3304,9 +3349,63 @@ fn decryptRxWorker(
 
 /// Process a single incoming UDP packet: classify and dispatch to the appropriate handler.
 /// Shared by both GRO (single coalesced buffer) and legacy batch (recvmmsg) receive paths.
+/// Re-reads authorized_keys/, trusted_orgs/ and node.cert on SIGHUP or the
+/// owner's control RELOAD, on the event loop. A read failure keeps the current
+/// lists. Enforcement only ever tightens: a node that enforced trust keeps
+/// enforcing even if its lists become empty.
+const TrustReload = struct {
+    allocator: std.mem.Allocator,
+    config_dir: []const u8,
+    stdout: std.Io.File,
+
+    fn run(raw: *anyopaque, swim: *lib.discovery.Swim.SwimProtocol) void {
+        const self: *TrustReload = @ptrCast(@alignCast(raw));
+        self.reload(swim) catch |err| {
+            writeFormatted(self.stdout, "  trust reload failed ({s}); keeping the current lists\n", .{@errorName(err)}) catch {};
+        };
+    }
+
+    fn reload(self: *TrustReload, swim: *lib.discovery.Swim.SwimProtocol) !void {
+        const Trust = lib.identity.Trust;
+        const peers = try Trust.loadAuthorizedKeys(self.allocator, self.config_dir);
+        defer {
+            for (peers) |peer| self.allocator.free(peer.name);
+            self.allocator.free(peers);
+        }
+        const orgs = try Trust.loadTrustedOrgs(self.allocator, self.config_dir);
+        defer {
+            for (orgs) |org| self.allocator.free(org.name);
+            self.allocator.free(orgs);
+        }
+        const keys = try self.allocator.alloc([32]u8, peers.len);
+        defer self.allocator.free(keys);
+        for (peers, keys) |peer, *key| key.* = peer.public_key.toBytes();
+        const org_keys = try self.allocator.alloc([32]u8, orgs.len);
+        defer self.allocator.free(org_keys);
+        for (orgs, org_keys) |org, *key| key.* = org.public_key;
+
+        swim.replaceTrust(keys, org_keys);
+        if (!swim.enforce_trust and (keys.len > 0 or org_keys.len > 0)) swim.enableTrust();
+
+        // Our own certificate may have been renewed.
+        const cert_path = try std.fs.path.join(self.allocator, &.{ self.config_dir, "node.cert" });
+        defer self.allocator.free(cert_path);
+        if (lib.identity.Org.loadCertificate(self.allocator, cert_path)) |cert| {
+            var wire: [lib.protocol.Messages.ORG_CERT_WIRE_SIZE]u8 = undefined;
+            cert.serialize(&wire);
+            swim.setOrgCert(wire);
+        } else |_| {}
+
+        try writeFormatted(self.stdout, "  trust reloaded: {d} authorized peer(s), {d} trusted org(s)\n", .{ keys.len, org_keys.len });
+    }
+};
+
 /// `meshguard up` relay options.
 const RelayFlags = struct {
     relay: bool = false,
+    opaque_relay: bool = false,
+    delivery_status: bool = true,
+    reply_pps: ?u32 = null,
     max_clients: ?u32 = null,
     client_pps: ?f64 = null,
     client_kbps: ?f64 = null,
@@ -3326,9 +3425,18 @@ const RelayFlags = struct {
             self.legacy_wg_binding = true;
             return true;
         }
+        if (std.mem.eql(u8, arg, "--opaque")) {
+            self.opaque_relay = true;
+            self.relay = true;
+            return true;
+        }
+        if (std.mem.eql(u8, arg, "--no-delivery-status")) {
+            self.delivery_status = false;
+            return true;
+        }
         const takes_value = std.mem.eql(u8, arg, "--max-clients") or std.mem.eql(u8, arg, "--client-pps") or
             std.mem.eql(u8, arg, "--client-kbps") or std.mem.eql(u8, arg, "--forward-pps") or
-            std.mem.eql(u8, arg, "--trusted-handshake-source");
+            std.mem.eql(u8, arg, "--trusted-handshake-source") or std.mem.eql(u8, arg, "--reply-pps");
         if (!takes_value) return false;
         if (i.* + 1 >= args.len) return error.MissingValue;
         const value = args[i.* + 1];
@@ -3336,6 +3444,10 @@ const RelayFlags = struct {
             const n = try std.fmt.parseInt(u32, value, 10);
             if (n < 16 or n > 1 << 20) return error.OutOfRange;
             self.max_clients = n;
+        } else if (std.mem.eql(u8, arg, "--reply-pps")) {
+            const n = try std.fmt.parseInt(u32, value, 10);
+            if (n < 10 or n > 1_000_000) return error.OutOfRange;
+            self.reply_pps = n;
         } else if (std.mem.eql(u8, arg, "--trusted-handshake-source")) {
             var addr = std.mem.zeroes([16]u8);
             if (parseIpv4(value)) |v4| {

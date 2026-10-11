@@ -53,6 +53,7 @@ pub const wireguard = struct {
 pub const protocol = struct {
     pub const Messages = @import("protocol/messages.zig");
     pub const Codec = @import("protocol/codec.zig");
+    pub const AppStatus = @import("protocol/app_status.zig");
     pub const AppChannel = @import("protocol/app_channel.zig");
     pub const Transfer = @import("protocol/transfer.zig");
 };
@@ -91,6 +92,7 @@ test {
     _ = wireguard.Ip;
     _ = discovery.Swim;
     _ = relay.Core;
+    _ = protocol.AppStatus;
     _ = identity.Binding;
     @import("std").testing.refAllDecls(net.Dns);
     @import("std").testing.refAllDecls(nat.Stun);

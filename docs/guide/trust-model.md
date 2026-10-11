@@ -168,6 +168,12 @@ invalidate that org's certificate or vouch for the node without cancelling a
 different trusted org's authority. Individual trust files can still be removed
 locally with `meshguard revoke` when a peer was admitted outside org trust.
 
+A new revocation is broadcast `max_gossip_broadcasts` times. Retained
+revocations are then re-sent once every five minutes, so peers that joined
+later learn them without a steady broadcast load. For short-lived
+certificates, such as relay passes renewed daily, expiry is usually the
+simpler revocation: stop renewing.
+
 ### Org Vouch (External Peers)
 
 Org admins can **vouch for external standalone nodes** without issuing them a full certificate. The vouch is gossip-propagated:
@@ -197,6 +203,30 @@ When a new peer connects, trust is evaluated in order:
    - For delegated v2, verify the org-signed issuer grant and issuer signature
 3. **Org vouch check** — has a trusted org vouched for this peer?
 4. **Revocation check** — has the cert/vouch been revoked via gossip?
+
+Certificates are accepted from five minutes before `issued_at` until five
+minutes after `expires_at`, tolerating clock differences with the issuer.
+
+### Open and Closed Trust
+
+A daemon enforces trust when it has any authorized key or trusted org, and
+accepts everyone when it has none and runs without `--relay`. `meshguard up
+--relay` never accepts everyone: with empty lists it refuses every peer until
+keys or orgs are added. `--open` turns enforcement off explicitly.
+
+### Reloading Trust
+
+`authorized_keys/`, `trusted_orgs/` and `node.cert` are re-read without a
+restart on `SIGHUP` or the control command `RELOAD` (the daemon owner only;
+Unix). A read failure keeps the current lists. Reloading never turns
+enforcement off: a node that enforced trust keeps enforcing even if its lists
+become empty. Relay clients are re-checked on their next frame, so removing a
+key or an org stops their forwarding at once.
+
+```bash
+cp issuer.pub /etc/meshguard/trusted_orgs/issuer.org
+kill -HUP "$(pidof meshguard)"
+```
 
 ## Key Validation
 

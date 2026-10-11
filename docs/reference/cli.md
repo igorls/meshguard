@@ -93,8 +93,15 @@ meshguard up [options]
 | `--forward-pps`     | `20000`  | Frames per second forwarded for all clients |
 | `--trusted-handshake-source` | _(none)_ | Address whose handshakes are limited per port, such as a co-located browser gateway |
 | `--legacy-wg-binding` | `false` | Accept gossip-learned WireGuard keys for admitted clients (migration only) |
+| `--opaque`          | `false`  | Tell clients nothing about other clients (implies `--relay`) |
+| `--no-delivery-status` | `false` | Do not answer dropped frames with a `0x51` status |
+| `--reply-pps`       | `5000`   | Answers to pings per second |
 
 Relay forwarding is described in `docs/reference/relay-forwarding.md`.
+With `--relay`, empty trust lists refuse every peer instead of accepting all;
+`--open` is the only way to accept everyone. Send `SIGHUP` (or the owner's
+control command `RELOAD`) to re-read `authorized_keys/`, `trusted_orgs/` and
+`node.cert` without restarting.
 `meshguard status` includes a `relay` object with client counts, frames
 forwarded, and frames dropped by reason.
 

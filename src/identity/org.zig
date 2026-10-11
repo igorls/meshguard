@@ -47,6 +47,8 @@ pub const MAX_ORG_REVOKES: usize = 64;
 pub const CERT_VERSION_V1: u8 = 1;
 pub const CERT_VERSION_V2: u8 = 2;
 pub const CERT_FLAG_DELEGATED: u8 = 1 << 0;
+/// Clock difference tolerated between an issuer and a verifier, in seconds.
+pub const DEFAULT_CERT_SKEW_S: i64 = 300;
 pub const V1_CERT_WIRE_SIZE: usize = 186;
 
 /// Fixed-size node certificate signed by an org key.
@@ -202,6 +204,17 @@ pub const NodeCertificate = struct {
         if (self.version == CERT_VERSION_V2 and std.mem.allEqual(u8, &self.wg_pubkey, 0)) return false;
         if (self.expires_at == 0) return true; // never expires
         return nowUnixSecs() < self.expires_at;
+    }
+
+    /// Valid at `now` (unix seconds), tolerating `skew` seconds of clock
+    /// difference with the issuer: not before `issued_at - skew` and until
+    /// `expires_at + skew`.
+    pub fn isValidAt(self: *const NodeCertificate, now: i64, skew: i64) bool {
+        if (self.version != CERT_VERSION_V1 and self.version != CERT_VERSION_V2) return false;
+        if (self.version == CERT_VERSION_V2 and std.mem.allEqual(u8, &self.wg_pubkey, 0)) return false;
+        if (self.issued_at > now +| skew) return false;
+        if (self.expires_at == 0) return true;
+        return now < self.expires_at +| skew;
     }
 
     pub fn isDelegated(self: *const NodeCertificate) bool {
@@ -406,6 +419,19 @@ pub fn issueDelegatedCertificateV2(
 
     try signCertificate(&cert, issuer_kp.secret_key);
     return cert;
+}
+
+test "certificate validity tolerates clock skew both ways" {
+    const org_kp = generateOrgKeyPair();
+    var cert = try issueCertificateV2(org_kp, [_]u8{1} ** 32, [_]u8{2} ** 32, "n", 2_000);
+    cert.issued_at = 1_000;
+    try std.testing.expect(cert.isValidAt(1_500, 300));
+    try std.testing.expect(cert.isValidAt(2_299, 300)); // just expired, within skew
+    try std.testing.expect(!cert.isValidAt(2_300, 300));
+    try std.testing.expect(cert.isValidAt(700, 300)); // issuer clock ahead
+    try std.testing.expect(!cert.isValidAt(699, 300));
+    cert.expires_at = 0;
+    try std.testing.expect(cert.isValidAt(std.math.maxInt(i64) - 1, 300));
 }
 
 pub fn parseRevokeReason(reason: []const u8) ?u8 {
@@ -807,4 +833,53 @@ test "org revoke reason parser" {
     try std.testing.expectEqual(@as(?u8, 1), parseRevokeReason("1"));
     try std.testing.expectEqual(@as(?u8, 2), parseRevokeReason("admin_removed"));
     try std.testing.expectEqual(@as(?u8, null), parseRevokeReason("mystery"));
+}
+
+test "certificate verdicts match the shared fixtures" {
+    // The browser gateway checks the same file (tests/web/gateway.test.mjs).
+    const Fixture = struct {
+        trusted_orgs: []const []const u8,
+        skew: i64,
+        cases: []const struct {
+            name: []const u8,
+            pass: []const u8,
+            public_key: []const u8,
+            wg_public_key: []const u8,
+            now: i64,
+            expect: []const u8,
+        },
+    };
+    const parsed = try std.json.parseFromSlice(Fixture, std.testing.allocator, @embedFile("testdata/passes.json"), .{});
+    defer parsed.deinit();
+    var trusted: [32]u8 = undefined;
+    try std.base64.standard.Decoder.decode(&trusted, parsed.value.trusted_orgs[0]);
+
+    for (parsed.value.cases) |case| {
+        var raw: [NodeCertificate.WIRE_SIZE]u8 = std.mem.zeroes([NodeCertificate.WIRE_SIZE]u8);
+        const bytes = try std.fmt.hexToBytes(&raw, case.pass);
+        try std.testing.expect(bytes.len == V1_CERT_WIRE_SIZE or bytes.len == NodeCertificate.WIRE_SIZE);
+        var node: [32]u8 = undefined;
+        var wg: [32]u8 = undefined;
+        try std.base64.standard.Decoder.decode(&node, case.public_key);
+        try std.base64.standard.Decoder.decode(&wg, case.wg_public_key);
+
+        const cert = NodeCertificate.deserialize(&raw);
+        // Same order of checks as gateway/pass.mjs verifyPass.
+        const verdict: []const u8 = if (!std.mem.eql(u8, &cert.org_pubkey, &trusted))
+            "untrusted-org"
+        else if (!std.mem.eql(u8, &cert.node_pubkey, &node))
+            "wrong-identity"
+        else if (cert.version == CERT_VERSION_V2 and !std.mem.eql(u8, &cert.wg_pubkey, &wg))
+            "wrong-wireguard-key"
+        else if (!cert.isValidAt(case.now, parsed.value.skew))
+            "expired"
+        else if (!verifyCertificate(&cert))
+            "bad-signature"
+        else
+            "ok";
+        std.testing.expectEqualStrings(case.expect, verdict) catch |err| {
+            std.debug.print("fixture \"{s}\"\n", .{case.name});
+            return err;
+        };
+    }
 }

@@ -179,6 +179,38 @@ pub fn build(b: *std.Build) void {
             b.installArtifact(interop_exe);
         }
 
+        // ─── Relay load generator (Linux only — epoll) ───
+        if (resolved_os == .linux and !is_android) {
+            const loadgen_mod = b.createModule(.{
+                .root_source_file = b.path("bench/relay-load/loadgen.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            });
+            loadgen_mod.addImport("meshguard", lib_mod);
+            const loadgen = b.addExecutable(.{ .name = "relay-loadgen", .root_module = loadgen_mod });
+            if (use_libsodium) loadgen_mod.linkSystemLibrary("sodium", .{});
+            const install_loadgen = b.addInstallArtifact(loadgen, .{});
+            b.step("relay-loadgen", "Build the relay load generator (bench/relay-load)").dependOn(&install_loadgen.step);
+        }
+
+        // ─── Certificate fixtures for cross-implementation tests ───
+        {
+            const fixtures_mod = b.createModule(.{
+                .root_source_file = b.path("scripts/pass-fixtures.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            });
+            fixtures_mod.addImport("meshguard", lib_mod);
+            if (use_libsodium) fixtures_mod.linkSystemLibrary("sodium", .{});
+            if (is_windows) fixtures_mod.linkSystemLibrary("ws2_32", .{});
+            const fixtures = b.addExecutable(.{ .name = "pass-fixtures", .root_module = fixtures_mod });
+            const run_fixtures = b.addRunArtifact(fixtures);
+            run_fixtures.stdio = .inherit;
+            b.step("pass-fixtures", "Print certificate fixtures (src/identity/testdata/passes.json)").dependOn(&run_fixtures.step);
+        }
+
         // ─── Run step ───
         const run_cmd = b.addRunArtifact(exe);
         run_cmd.step.dependOn(b.getInstallStep());

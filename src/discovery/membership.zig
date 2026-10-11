@@ -129,6 +129,17 @@ pub const MembershipTable = struct {
         self.peers.deinit();
     }
 
+    /// Forgets every peer (for example before joining another network).
+    pub fn clear(self: *MembershipTable) void {
+        self.lock.lockUncancelable(zio());
+        defer self.lock.unlock(zio());
+        var iter = self.peers.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.name.len > 0) self.allocator.free(entry.value_ptr.name);
+        }
+        self.peers.clearRetainingCapacity();
+    }
+
     /// Add or update a peer in the membership table.
     pub fn upsert(self: *MembershipTable, peer: Peer) !void {
         self.lock.lockUncancelable(zio());

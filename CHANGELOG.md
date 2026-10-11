@@ -8,6 +8,50 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## Unreleased
 
 ### Added
+- Relay switching: `meshguard_switch_relay` moves a mobile context to another
+  relay, and leaving now forgets the old network (peers, WireGuard sessions,
+  relay proof) while keeping the identity, contacts and certificate. Several
+  relays at once take one context per relay (mobile) or one identity handle per
+  relay client (browser); both are covered by end-to-end tests.
+- Contacts and delivery status for mobile and browser clients, needed behind
+  opaque relays: `meshguard_add_contact` / `remove` / `clear` / `count`,
+  `meshguard_set_contacts_only`, `meshguard_send_ex` (returns the nonce),
+  `meshguard_set_on_delivery_status` (accepted only from the pinned relay for a
+  recently sent frame; `handshake again` re-proves the endpoint at once),
+  `meshguard_recv_delivery_status` (the same statuses for hosts that poll from
+  another thread, since the callback's pointers last only for the call), and
+  `meshguard_set_keepalive_interval` / `meshguard_set_relay_proof_interval`.
+  The browser client gains `addContact`, `removeContact`, `status` events and
+  `send` returning the nonce.
+- Opaque relays (`meshguard up --opaque`): clients stay out of the relay's
+  membership and gossip, and a client's ACK describes only the relay, so no
+  client learns about another; no ping-req or rendezvous on clients' behalf.
+- Delivery status (`0x51`, 47 bytes): a relay answers a sealed frame it does not
+  forward with why (offline, rate limited, handshake again, not admitted,
+  overloaded), echoing the frame's nonce, limited per source address;
+  `--no-delivery-status` turns it off.
+- Browser gateway passes: the gateway admits a browser presenting a valid
+  pass (organization certificate) from `trustedOrgs`, in addition to
+  `allowedIdentities`; `allowedDestinations` becomes optional. Sessions end with
+  `4004` when the pass expires and can renew it in place; self-advertisements
+  may carry the session's own pass to the relay. New `maxSessions` and
+  `maxSessionsPerIp` caps (`1013` when full) and `SIGHUP` reload.
+  `gateway/pass.mjs` verifies passes against fixtures shared with the native
+  code (`zig build pass-fixtures`). The browser client gains `pass`,
+  `renewPass()` and jittered reconnects.
+- Trust lifecycle for relays: `meshguard up --relay` fails closed when it has
+  no authorized keys or trusted orgs; `SIGHUP` and the owner-only control
+  command `RELOAD` re-read `authorized_keys/`, `trusted_orgs/` and `node.cert`
+  without a restart and re-check relay clients; certificates tolerate five
+  minutes of clock skew with their issuer. Mobile contexts install and replace
+  certificates such as relay passes at any time with `meshguard_set_org_cert`
+  (`meshguard_clear_org_cert`, `meshguard_get_wg_pubkey`).
+
+- Relay load harness (`bench/relay-load`, `zig build relay-loadgen`):
+  simulates thousands of mobile-style relay clients on loopback, with
+  flooders, spoofers and reconnect storms, and reports loss, latency and the
+  relay's CPU and memory. Baseline numbers are in `PERFORMANCE.md`; CI runs a
+  small smoke scenario.
 - Authenticated relay forwarding (`src/relay/core.zig`). A relay forwards
   sealed `0x50` and `0x31` frames only from an endpoint where the sender's
   signed WireGuard key is proven by a Noise handshake, only to a destination
@@ -43,7 +87,23 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Gossip/listen UDP port override via `--gossip-port` and `MESHGUARD_GOSSIP_PORT`.
   Explicit invalid values fail closed (no silent fallback to 51821).
 
+### Changed
+- Relays (`--relay`) ask for 8 MiB socket buffers so bursts from many clients
+  queue instead of being dropped, and the browser gateway's unit file allows
+  65,536 descriptors, 1 GiB and two cores (it held about 120 sessions before).
+  `bench/relay-load/browser.mjs` measures browser sessions: 2,000 through one
+  gateway with no loss (`PERFORMANCE.md`).
+- Answers to pings use their own budget (`--reply-pps`, default 5,000/s) instead
+  of the 500/s discovery budget. At 10,000 mobile clients pinging every 3 s only
+  15% of pings were answered before; now all are.
+- Retained org revocations are re-sent once every five minutes
+  (`org_revoke_readvertise_interval_ms`) instead of as fresh broadcasts every
+  five seconds, and revoking walks the membership once per batch of affected
+  peers instead of once per peer.
+
 ### Fixed
+- `meshguard_last_recv_time` no longer reads SWIM state from the host thread,
+  which could race with `meshguard_leave`.
 - Event loops no longer block forever in `recvfrom` once a peer is live: UDP
   sockets are non-blocking on macOS/BSD (`fcntl`) and Windows (`FIONBIO`) as on
   Linux, with IPv4/IPv6 empty-drain regression tests. Previously the control
