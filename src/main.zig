@@ -4046,9 +4046,8 @@ fn userspaceEventLoop(
     const udp_path = lib.net.IoUring.selectUdpPath(udp_ring_available, use_udp_ring);
     switch (udp_path) {
         .io_uring => {
-            const sqpoll_msg = if (udp_ring.sqpoll) "SQPOLL" else "submit";
             const buffer_msg = if (udp_ring.registered_buffers) "registered buffers" else "unregistered buffers";
-            writeFormatted(stdout, "  UDP path: io_uring recvmsg/sendmsg ring active ({s}, {s})\n", .{ sqpoll_msg, buffer_msg }) catch {};
+            writeFormatted(stdout, "  UDP path: io_uring recvmsg/sendmsg ring active ({s})\n", .{buffer_msg}) catch {};
         },
         .poll_recvmsg => |reason| switch (reason) {
             .runtime_unavailable => writeFormatted(stdout, "  UDP path: poll+recvmsg (io_uring runtime unavailable)\n", .{}) catch {},
@@ -4066,15 +4065,19 @@ fn userspaceEventLoop(
     var decrypt_storage: [MAX_DECRYPTED][1500]u8 = undefined;
     var decrypt_lens: [MAX_DECRYPTED]usize = undefined;
     var decrypt_slots: [MAX_DECRYPTED]usize = undefined;
-    var cqe_buffer: [lib.net.IoUring.UdpRing.RECV_DEPTH + lib.net.IoUring.UdpRing.SEND_DEPTH]std.os.linux.io_uring_cqe = undefined;
-    const UDP_RING_IDLE_BACKOFF_NS = 100 * std.time.ns_per_us;
+    // Room for every recv and send slot plus the wait's own timeout and wake-up.
+    var cqe_buffer: [lib.net.IoUring.UdpRing.RECV_DEPTH + lib.net.IoUring.UdpRing.SEND_DEPTH + 2]std.os.linux.io_uring_cqe = undefined;
 
     while (swim.running.load(.acquire)) {
         if (use_udp_ring) {
-            const n_cqes = udp_ring.copyCompletions(&cqe_buffer, 0) catch 0;
+            // Sleeps in the kernel until a datagram, a control connection or the
+            // same timeouts the poll() path uses (5 ms while transfers need ticks).
+            const wait_ns: u64 = if (control_socket.transfersActive()) 5 * std.time.ns_per_ms else 50 * std.time.ns_per_ms;
+            const n_cqes = udp_ring.waitCompletions(&cqe_buffer, wait_ns, control_socket.listenerFd()) catch 0;
             var n_decrypted: usize = 0;
 
             for (cqe_buffer[0..n_cqes]) |cqe| {
+                if (udp_ring.noteWaitCompletion(cqe)) continue;
                 udp_ring.noteSendCompletion(cqe);
                 const recv = udp_ring.recvCompletion(cqe) orelse {
                     if (lib.net.IoUring.UdpRing.recvSlotFromUserData(cqe.user_data)) |slot| {
@@ -4126,11 +4129,6 @@ fn userspaceEventLoop(
                     }
                 }
             }
-
-            // Short backoff avoids spinning while keeping control-plane latency below the
-            // 50ms poll fallback timeout when the SQPOLL thread has no completions ready.
-            // The fallback branch blocks in poll(), so it does not need this extra backoff.
-            if (n_cqes == 0) sleepNs(UDP_RING_IDLE_BACKOFF_NS);
 
             // Final flush of remaining decrypted packets
             if (n_decrypted > 0) {
