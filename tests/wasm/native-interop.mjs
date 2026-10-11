@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
-import {readFileSync} from 'node:fs';
 import {spawnSync} from 'node:child_process';
-import {MeshguardWasm} from '../../web/meshguard.mjs';
+import {loadWeb,wasmBytes} from '../runtime.mjs';
+const {MeshguardWasm}=await loadWeb();
 if(!process.env.MESHGUARD_NATIVE_LIBRARY)throw new Error('Set MESHGUARD_NATIVE_LIBRARY to an independently built native FFI library');
-const core=new MeshguardWasm((await WebAssembly.instantiate(readFileSync('zig-out/bin/meshguard.wasm'),{})).instance);
+const core=new MeshguardWasm((await WebAssembly.instantiate(wasmBytes(),{})).instance);
 const a=core.createIdentity(new Uint8Array(32).fill(1)),b=core.createIdentity(new Uint8Array(32).fill(2));
 const peer=i=>({publicKey:i.publicKey(),wgPublicKey:i.wgPublicKey()});
 const hex=b=>Buffer.from(b).toString('hex');

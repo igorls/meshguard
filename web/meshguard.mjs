@@ -28,6 +28,9 @@ function key(value) {
   return result;
 }
 
+/** The WASM ABI this wrapper speaks; `mg_abi_version()` of the module must match. */
+export const ABI_VERSION = 1;
+
 // Scratch layout is private to this wrapper. Inputs and output never overlap.
 const offset = {
   publicKey: 32, wgKey: 64, nonce: 96, data: 256, signature: 2048, output: 4096,
@@ -39,13 +42,15 @@ export class MeshguardWasm {
 
   constructor(instance) {
     this.#exports = instance.exports;
-    if (this.#exports.mg_abi_version() !== 1) {
-      throw new Error('Unsupported MeshGuard WASM ABI');
+    const abi = this.#exports.mg_abi_version();
+    if (abi !== ABI_VERSION) {
+      throw new Error(`Unsupported MeshGuard WASM ABI ${abi} (this wrapper needs ${ABI_VERSION})`);
     }
     this.#base = this.#exports.mg_scratch_ptr();
   }
 
-  static async load(url) {
+  // Without a URL, loads the meshguard.wasm that sits next to this file.
+  static async load(url = new URL('./meshguard.wasm', import.meta.url)) {
     const response = await fetch(url);
     if (!response.ok) {
       throw new Error(`Could not load MeshGuard WASM (${response.status})`);

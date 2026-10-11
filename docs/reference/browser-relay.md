@@ -68,6 +68,11 @@ timestamps. These APIs qualify routing, not a browser WireGuard tunnel.
 
 ## Run the adapter
 
+Releases ship the gateway as `meshguard-gateway-<version>.tgz` (npm package
+`@meshguard/gateway`, files under `package/`) and the browser side as
+`meshguard-web-<version>.tgz`; [Using MeshGuard in the browser](../guide/browser.md)
+covers installing both. From a source checkout:
+
 ```bash
 zig build wasm wasm-test -Doptimize=ReleaseSmall
 bun test tests/web

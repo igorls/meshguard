@@ -1,0 +1,30 @@
+{
+  "name": "@meshguard/gateway",
+  "version": "0.0.0-dev",
+  "description": "Authenticated WSS-to-UDP gateway that connects MeshGuard browser clients to a native MeshGuard relay",
+  "keywords": ["meshguard", "wireguard", "websocket", "gateway", "relay"],
+  "license": "MIT",
+  "homepage": "https://igorls.github.io/meshguard/reference/browser-relay",
+  "repository": { "type": "git", "url": "git+https://github.com/igorls/meshguard.git" },
+  "bugs": { "url": "https://github.com/igorls/meshguard/issues" },
+  "type": "module",
+  "engines": { "bun": ">=1.4.2" },
+  "bin": { "meshguard-gateway": "gateway/server.mjs" },
+  "exports": {
+    ".": "./gateway/server.mjs",
+    "./pass": "./gateway/pass.mjs",
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "start": "bun gateway/server.mjs config.json"
+  },
+  "files": [
+    "gateway/server.mjs",
+    "gateway/pass.mjs",
+    "gateway/meshguard-web.service",
+    "gateway/nginx-location.conf",
+    "web/relay-protocol.mjs",
+    "config.example.json",
+    "SHA256SUMS"
+  ]
+}

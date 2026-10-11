@@ -1,0 +1,30 @@
+{
+  "name": "@meshguard/web",
+  "version": "0.0.0-dev",
+  "description": "MeshGuard in the browser: WebAssembly identity and encrypted packet core, and a client for the MeshGuard browser gateway",
+  "keywords": ["meshguard", "wireguard", "webassembly", "wasm", "encryption", "relay"],
+  "license": "MIT",
+  "homepage": "https://igorls.github.io/meshguard/guide/browser",
+  "repository": { "type": "git", "url": "git+https://github.com/igorls/meshguard.git" },
+  "bugs": { "url": "https://github.com/igorls/meshguard/issues" },
+  "type": "module",
+  "sideEffects": false,
+  "main": "./meshguard.mjs",
+  "types": "./meshguard.d.mts",
+  "exports": {
+    ".": { "types": "./meshguard.d.mts", "default": "./meshguard.mjs" },
+    "./meshguard.mjs": { "types": "./meshguard.d.mts", "default": "./meshguard.mjs" },
+    "./relay-protocol": { "types": "./relay-protocol.d.mts", "default": "./relay-protocol.mjs" },
+    "./relay-protocol.mjs": { "types": "./relay-protocol.d.mts", "default": "./relay-protocol.mjs" },
+    "./meshguard.wasm": "./meshguard.wasm",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "meshguard.wasm",
+    "meshguard.mjs",
+    "meshguard.d.mts",
+    "relay-protocol.mjs",
+    "relay-protocol.d.mts",
+    "SHA256SUMS"
+  ]
+}

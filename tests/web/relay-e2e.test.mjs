@@ -1,15 +1,16 @@
 // Browser clients holding passes reach each other through the gateway and a real, closed relay.
 // Needs a native daemon: MESHGUARD_BINARY=zig-out/bin/meshguard bun test tests/web (Linux).
 import { test, expect } from 'bun:test';
-import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createPrivateKey, createPublicKey, sign } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
 import { createSocket } from 'node:dgram';
-import { startGateway } from '../../gateway/server.mjs';
-import { MeshguardWasm } from '../../web/meshguard.mjs';
-import { MeshguardRelayClient, b64, fromB64 } from '../../web/relay-protocol.mjs';
+import { loadGateway, loadWeb, wasmBytes } from '../runtime.mjs';
+
+const { startGateway } = await loadGateway();
+const { MeshguardWasm, MeshguardRelayClient, b64, fromB64 } = await loadWeb();
 
 const binary = process.env.MESHGUARD_BINARY;
 const origin = 'http://relay-e2e.invalid';
@@ -56,7 +57,7 @@ test.skipIf(!binary)('browsers with passes exchange messages through the gateway
   globalThis.WebSocket = class extends NativeWebSocket { constructor(url) { super(url, { headers: { Origin: origin } }); } };
   const clients = [];
   try {
-    const core = new MeshguardWasm((await WebAssembly.instantiate(readFileSync('zig-out/bin/meshguard.wasm'), {})).instance);
+    const core = new MeshguardWasm((await WebAssembly.instantiate(wasmBytes(), {})).instance);
     const a = core.createIdentity(new Uint8Array(32).fill(0x61)), b = core.createIdentity(new Uint8Array(32).fill(0x62));
     const peer = identity => ({ publicKey: identity.publicKey(), wgPublicKey: identity.wgPublicKey() });
     const url = `ws://127.0.0.1:${gateway.server.port}/meshguard-web/ws`;
@@ -111,7 +112,7 @@ test.skipIf(!binary)('one browser identity holds a session on each of two relays
   globalThis.WebSocket = class extends NativeWebSocket { constructor(url) { super(url, { headers: { Origin: origin } }); } };
   const clients = [];
   try {
-    const core = new MeshguardWasm((await WebAssembly.instantiate(readFileSync('zig-out/bin/meshguard.wasm'), {})).instance);
+    const core = new MeshguardWasm((await WebAssembly.instantiate(wasmBytes(), {})).instance);
     const seed = new Uint8Array(32).fill(0x71);
     // Each relay client needs its own identity handle: a handle holds one handshake at a time.
     for (const relay of relays) {
