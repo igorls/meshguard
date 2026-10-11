@@ -7,7 +7,12 @@ const routes={'/':['web/proof.html','text/html; charset=utf-8'],'/meshguard.mjs'
 // Extra origins the proof page may connect to (the browser gateway), space-separated,
 // for example MESHGUARD_WEB_PROOF_CONNECT_SRC='wss://gateway.example.org'. Loopback only by default.
 const extraConnect=(process.env.MESHGUARD_WEB_PROOF_CONNECT_SRC||'').split(/\s+/).filter(Boolean);
-for(const origin of extraConnect)if(!/^wss?:\/\/[A-Za-z0-9.\-\[\]:*]+$/.test(origin))throw new Error(`MESHGUARD_WEB_PROOF_CONNECT_SRC: not a ws(s):// origin: ${origin}`);
+// Each entry must be a plain ws(s) origin: no wildcard, credentials, path, query or fragment.
+for(const origin of extraConnect){
+ let url;try{url=new URL(origin);}catch{url=null;}
+ const plain=url&&(url.protocol==='ws:'||url.protocol==='wss:')&&url.hostname&&!url.hostname.includes('*')&&!url.username&&!url.password&&url.pathname==='/'&&!url.search&&!url.hash&&!origin.includes('*')&&url.origin===origin.replace(/\/$/,'');
+ if(!plain)throw new Error(`MESHGUARD_WEB_PROOF_CONNECT_SRC: not a plain ws(s):// origin: ${origin}`);
+}
 const connectSrc=["'self'",'ws://127.0.0.1:*','ws://localhost:*',...extraConnect].join(' ');
 const server=createServer(async(req,res)=>{
  const entry=routes[new URL(req.url,'http://localhost').pathname];if(!entry){res.writeHead(404);res.end();return;}

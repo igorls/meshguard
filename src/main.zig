@@ -1001,15 +1001,16 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
             }
         }
     } else {
-        // No DNS/mDNS — parse static seeds directly (fast path, no allocator)
+        // No DNS/mDNS — parse static seeds directly (no allocator); hostnames
+        // are resolved through DNS A records.
         for (seed_strs[0..seed_str_count]) |seed_str| {
-            if (lib.discovery.Seed.parseEndpoint(seed_str)) |ep| {
+            if (lib.discovery.Seed.parseOrResolve(seed_str)) |ep| {
                 if (seed_count < seed_buf.len) {
                     seed_buf[seed_count] = ep;
                     seed_count += 1;
                 }
             } else {
-                try writeFormatted(stderr, "warning: ignoring invalid seed '{s}'\n", .{seed_str});
+                try writeFormatted(stderr, "warning: ignoring invalid or unresolvable seed '{s}'\n", .{seed_str});
             }
         }
     }

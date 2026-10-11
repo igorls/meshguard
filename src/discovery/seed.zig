@@ -20,9 +20,7 @@ pub fn resolveSeeds(
 
     // 1. Parse static seed addresses (ip:port or hostname:port)
     for (static_seeds) |seed| {
-        if (parseEndpoint(seed)) |ep| {
-            try endpoints.append(allocator, ep);
-        } else if (resolveHostSeed(seed)) |ep| {
+        if (parseOrResolve(seed)) |ep| {
             try endpoints.append(allocator, ep);
         }
     }
@@ -62,6 +60,12 @@ pub fn resolveSeeds(
     }
 
     return endpoints.toOwnedSlice(allocator);
+}
+
+/// Parse a static seed: a numeric "ip:port" / "[ipv6]:port", or a
+/// "hostname:port" resolved through DNS A records.
+pub fn parseOrResolve(s: []const u8) ?messages.Endpoint {
+    return parseEndpoint(s) orelse resolveHostSeed(s);
 }
 
 /// Parse an "ip:port" string into an Endpoint.
@@ -198,6 +202,14 @@ test "parse invalid endpoint" {
     try std.testing.expect(parseEndpoint("not-an-ip") == null);
     try std.testing.expect(parseEndpoint("1.2.3.4") == null);
     try std.testing.expect(parseEndpoint("") == null);
+}
+
+test "parseOrResolve takes numeric seeds without DNS" {
+    const ep = parseOrResolve("1.2.3.4:51821").?;
+    try std.testing.expectEqual(ep.addr, [4]u8{ 1, 2, 3, 4 });
+    try std.testing.expectEqual(ep.port, 51821);
+    try std.testing.expect(parseOrResolve("1.2.3.4") == null);
+    try std.testing.expect(parseOrResolve("") == null);
 }
 
 test "resolve host seed with numeric IP falls through" {

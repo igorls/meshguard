@@ -92,6 +92,7 @@ test {
     _ = wireguard.Crypto;
     _ = wireguard.Ip;
     _ = discovery.Swim;
+    _ = discovery.Seed;
     _ = relay.Core;
     _ = protocol.AppStatus;
     _ = identity.Binding;
