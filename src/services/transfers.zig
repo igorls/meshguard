@@ -879,19 +879,19 @@ test "a multi-megabyte transfer arrives verified over a clean link" {
     var pair: Pair = undefined;
     pair.init(allocator, .{});
     defer pair.deinit();
-    try pair.b.listen("meshrooms-files", 16 * 1024 * 1024);
+    try pair.b.listen("example-files", 16 * 1024 * 1024);
     const bytes = try pattern(allocator, 3 * 1024 * 1024 + 17);
     defer allocator.free(bytes);
-    const id = try pair.send(bytes, "meshrooms-files");
+    const id = try pair.send(bytes, "example-files");
     pair.run(20 * std.time.ns_per_s);
     try std.testing.expectEqual(OutState.delivered, pair.a.status(id).?.state);
-    const got = (try pair.received(allocator, "meshrooms-files")).?;
+    const got = (try pair.received(allocator, "example-files")).?;
     defer allocator.free(got);
     try std.testing.expectEqualSlices(u8, bytes, got);
-    const info = pair.b.nextComplete("meshrooms-files").?;
+    const info = pair.b.nextComplete("example-files").?;
     try std.testing.expectEqualStrings("{\"name\":\"shot.png\"}", info.meta[0..info.meta_len]);
     try std.testing.expect(pair.b.release(info.id));
-    try std.testing.expect(pair.b.nextComplete("meshrooms-files") == null);
+    try std.testing.expect(pair.b.nextComplete("example-files") == null);
 }
 
 test "loss, duplication, and reordering are repaired by selective retransmission" {
@@ -902,15 +902,15 @@ test "loss, duplication, and reordering are repaired by selective retransmission
     pair.net.loss_percent = 15;
     pair.net.duplicate_percent = 5;
     pair.net.jitter_ns = 40 * ms;
-    try pair.b.listen("meshrooms-files", 16 * 1024 * 1024);
+    try pair.b.listen("example-files", 16 * 1024 * 1024);
     const bytes = try pattern(allocator, 1024 * 1024);
     defer allocator.free(bytes);
-    const id = try pair.send(bytes, "meshrooms-files");
+    const id = try pair.send(bytes, "example-files");
     pair.run(60 * std.time.ns_per_s);
     const s = pair.a.status(id).?;
     try std.testing.expectEqual(OutState.delivered, s.state);
     try std.testing.expect(s.retransmits > 0);
-    const got = (try pair.received(allocator, "meshrooms-files")).?;
+    const got = (try pair.received(allocator, "example-files")).?;
     defer allocator.free(got);
     try std.testing.expectEqualSlices(u8, bytes, got);
 }

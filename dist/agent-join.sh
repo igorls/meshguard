@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-# MeshGuard Agent Onboarding ("Google Meet Link" for Agents)
+# MeshGuard Agent Onboarding (join a host via an invite token)
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/igorls/meshguard/main/dist/agent-join.sh | bash -s -- <INVITE_TOKEN>
 

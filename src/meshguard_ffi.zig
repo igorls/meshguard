@@ -728,11 +728,11 @@ export fn meshguard_join_lan(
     // Trust is open by default (enforce_trust = false)
     // For production, add authorized keys before join
 
-    // Initialize LAN discovery (multicast beacon with Peer Circle app ID)
+    // Initialize LAN discovery (multicast beacon with the default app ID)
     c.lan_discovery = LanDiscovery.init(
         c.ed25519_public,
         our_port,
-        lib.discovery.Lan.APP_ID_PEER_CIRCLE,
+        lib.discovery.Lan.APP_ID_DEFAULT,
         &onLanPeerDiscovered,
         @ptrCast(c),
     ) catch |err| blk: {
@@ -1473,7 +1473,7 @@ export fn meshguard_get_peer_info(
 
 /// Join the mesh by connecting to a seed peer specified by hostname:port string.
 ///
-/// `host_str`:  Null-terminated hostname:port string (e.g., "s1.peercircle.live:51821").
+/// `host_str`:  Null-terminated hostname:port string (e.g., "relay.example.org:51821").
 ///
 /// Resolves the hostname via DNS A record, then delegates to meshguard_join().
 /// Returns 0 on success, -1 on failure, -11 on DNS resolution failure.

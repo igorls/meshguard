@@ -1,8 +1,9 @@
 # Application messaging channels
 
 Isolated MeshGuard application channels sit on top of the existing encrypted
-`0x50` payload. Meshrooms uses channel `meshrooms-v1`. Room admission and
-durable retry remain Meshrooms' responsibility.
+`0x50` payload. An application picks its own channel name, for example
+`example-v1`. Admission to the application's own groups and durable retry
+remain the application's responsibility.
 
 Files larger than one message use [application transfers](app-transfers.md).
 
@@ -118,5 +119,5 @@ export MESHGUARD_CONTROL_PATH=/tmp/meshguard-candidate.sock
 export MESHGUARD_GOSSIP_PORT=51921
 meshguard up --gossip-only --open --gossip-port 51921 --control-path /tmp/meshguard-candidate.sock
 meshguard appinfo
-meshguard apprecv meshrooms-v1
+meshguard apprecv example-v1
 ```

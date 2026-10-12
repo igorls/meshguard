@@ -214,8 +214,8 @@ meshguard service default deny
 # Peer-specific: allow Postgres for node-1
 meshguard service allow --peer node-1 tcp 5432
 
-# Org-specific: allow HTTP for all eosrio members
-meshguard service allow --org eosrio tcp 80
+# Org-specific: allow HTTP for all acme members
+meshguard service allow --org acme tcp 80
 
 # List all policies
 meshguard service list
@@ -364,7 +364,7 @@ as `MGAPP1 <channel> <payload>` and encrypts it on the existing `0x50` path.
 meshguard appsend <peer-pubkey-hex-or-b64> <channel> <message>
 ```
 
-Channel names must match `[a-z0-9._-]{1,64}`. Meshrooms uses `meshrooms-v1`.
+Channel names must match `[a-z0-9._-]{1,64}`, for example `example-v1`.
 
 ---
 
@@ -386,6 +386,40 @@ conservative framed maximum (1024-byte `0x50` plaintext minus `MGAPP1 `, a
 64-byte channel, and the payload separator).
 
 See [Application messaging channels](app-channels.md).
+
+---
+
+## `meshguard invite`
+
+Create an invite token that lets a remote agent join this node. The seed is
+required: it is the public `host:port` of a MeshGuard node or relay that both
+sides can reach. There is no built-in default.
+
+```bash
+meshguard invite --seed <host:port> [--name <label>]
+```
+
+| Option               | Description                                    |
+| -------------------- | ---------------------------------------------- |
+| `--seed <host:port>` | Seed the joining agent will use (required)     |
+| `--name <label>`     | Label for the joining agent (default: `agent`) |
+
+The token (`mgjoin://...`) carries this node's public keys, the seed, and the
+label. Without `--seed` the command exits with an error.
+
+---
+
+## `meshguard join`
+
+Join a host from an invite token. Starts a `--gossip-only --open` daemon with
+the token's seed if none is running, then greets the host.
+
+```bash
+meshguard join <invite-token>
+```
+
+A token without a seed address is rejected; ask the host for a new token made
+with `meshguard invite --seed <host:port>`.
 
 ---
 

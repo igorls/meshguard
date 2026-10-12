@@ -186,7 +186,7 @@ class ControlStartup(unittest.TestCase):
             send = conn.write if os.name == "nt" else conn.sendall
             send(b"APPSEND " + b"a" * 64 + b" ")
             time.sleep(0.03)
-            send(b"meshrooms-v1 complete payload\n")
+            send(b"example-v1 complete payload\n")
             if os.name == "nt":
                 response = conn.readline()
             else:
@@ -253,14 +253,14 @@ class ControlStartup(unittest.TestCase):
         worker = threading.Thread(target=serve, daemon=True)
         worker.start()
         try:
-            result = subprocess.run([str(BINARY), "apprecv", "meshrooms-v1"], env=self.env,
+            result = subprocess.run([str(BINARY), "apprecv", "example-v1"], env=self.env,
                                     capture_output=True, text=True, encoding="utf-8", timeout=10)
         finally:
             worker.join(4)
         self.assertFalse(worker.is_alive())
-        self.assertEqual(commands, [b"APPRECV meshrooms-v1\n"])
+        self.assertEqual(commands, [b"APPRECV example-v1\n"])
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "From: " + "a" * 64 + "\nChannel: meshrooms-v1\nPayload:\n" + payload + "\n")
+        self.assertEqual(result.stdout, "From: " + "a" * 64 + "\nChannel: example-v1\nPayload:\n" + payload + "\n")
 
     def test_worst_case_escaped_apprecv(self):
         self.receive_fixture(False)

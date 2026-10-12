@@ -2026,8 +2026,8 @@ test "drained app channels release capacity without evicting other queued messag
     var control = try ControlSocket.init(allocator, &membership, [_]u8{1} ** 32, .{ 10, 99, 0, 1 }, [_]u8{2} ** 32, "dummy.sock");
     defer control.deinit(allocator);
     const sender = [_]u8{3} ** 32;
-    try std.testing.expect(!control.pushMessage(sender, "MGAPP1 meshrooms-v1 "));
-    try std.testing.expect(!control.pushAppMessage(sender, "meshrooms-v1", ""));
+    try std.testing.expect(!control.pushMessage(sender, "MGAPP1 example-v1 "));
+    try std.testing.expect(!control.pushAppMessage(sender, "example-v1", ""));
     try std.testing.expectEqual(@as(usize, 0), control.getMessageCount());
     for (0..MAX_APP_CHANNELS) |i| {
         var name_buf: [32]u8 = undefined;
@@ -2089,10 +2089,10 @@ test "legacy RECV never sees MGAPP1 frames and APPRECV never sees legacy" {
 
     const sender = [_]u8{0x11} ** 32;
     try std.testing.expect(control.pushMessage(sender, "legacy-hello"));
-    try std.testing.expect(control.pushMessage(sender, "MGAPP1 meshrooms-v1 room-hello"));
+    try std.testing.expect(control.pushMessage(sender, "MGAPP1 example-v1 room-hello"));
 
     try std.testing.expectEqual(@as(usize, 1), control.getMessageCount());
-    try std.testing.expectEqual(@as(usize, 1), control.getAppMessageCount("meshrooms-v1"));
+    try std.testing.expectEqual(@as(usize, 1), control.getAppMessageCount("example-v1"));
 
     var resp_buf: [1024]u8 = undefined;
     const recv_len = control.handleCommand("RECV", &resp_buf);
@@ -2103,12 +2103,12 @@ test "legacy RECV never sees MGAPP1 frames and APPRECV never sees legacy" {
     const recv_empty = control.handleCommand("RECV", &resp_buf);
     try std.testing.expectEqualStrings("{\"empty\":true}\n", resp_buf[0..recv_empty]);
 
-    const app_len = control.handleCommand("APPRECV meshrooms-v1", &resp_buf);
+    const app_len = control.handleCommand("APPRECV example-v1", &resp_buf);
     try std.testing.expect(std.mem.indexOf(u8, resp_buf[0..app_len], "room-hello") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp_buf[0..app_len], "legacy-hello") == null);
     try std.testing.expect(std.mem.indexOf(u8, resp_buf[0..app_len], "MGAPP1") == null);
 
-    const app_empty = control.handleCommand("APPRECV meshrooms-v1", &resp_buf);
+    const app_empty = control.handleCommand("APPRECV example-v1", &resp_buf);
     try std.testing.expectEqualStrings("{\"empty\":true}\n", resp_buf[0..app_empty]);
 
     const msgs_len = control.handleCommand("MSGS", &resp_buf);
@@ -2235,19 +2235,19 @@ test "oversize and malformed MGAPP1 frames are rejected without truncate" {
 
     const sender = [_]u8{0x66} ** 32;
     try std.testing.expect(!control.pushMessage(sender, "MGAPP1 "));
-    try std.testing.expect(!control.pushMessage(sender, "MGAPP1 meshrooms-v1"));
+    try std.testing.expect(!control.pushMessage(sender, "MGAPP1 example-v1"));
     try std.testing.expect(!control.pushMessage(sender, "MGAPP1  payload"));
-    try std.testing.expect(!control.pushMessage(sender, "MGAPP1 meshrooms-v1 \xff"));
-    try std.testing.expect(!control.pushMessage(sender, "MGAPP1 meshrooms-v1 " ++ "x" ** (app_channel.MAX_APP_PAYLOAD + 1)));
-    try std.testing.expect(!control.pushAppMessage(sender, "meshrooms-v1", "\xff"));
-    try std.testing.expect(!control.pushAppMessage(sender, "meshrooms-v1", "x" ** (app_channel.MAX_APP_PAYLOAD + 1)));
+    try std.testing.expect(!control.pushMessage(sender, "MGAPP1 example-v1 \xff"));
+    try std.testing.expect(!control.pushMessage(sender, "MGAPP1 example-v1 " ++ "x" ** (app_channel.MAX_APP_PAYLOAD + 1)));
+    try std.testing.expect(!control.pushAppMessage(sender, "example-v1", "\xff"));
+    try std.testing.expect(!control.pushAppMessage(sender, "example-v1", "x" ** (app_channel.MAX_APP_PAYLOAD + 1)));
 
     var oversize: [MAX_MESSAGE_PAYLOAD + 32]u8 = undefined;
-    const prefix = "MGAPP1 meshrooms-v1 ";
+    const prefix = "MGAPP1 example-v1 ";
     @memcpy(oversize[0..prefix.len], prefix);
     @memset(oversize[prefix.len..], 'x');
     try std.testing.expect(!control.pushMessage(sender, &oversize));
-    try std.testing.expectEqual(@as(usize, 0), control.getAppMessageCount("meshrooms-v1"));
+    try std.testing.expectEqual(@as(usize, 0), control.getAppMessageCount("example-v1"));
     try std.testing.expectEqual(@as(usize, 0), control.getMessageCount());
 
     // Unframed oversize still truncates onto the legacy queue (preserved behavior).
@@ -2318,7 +2318,7 @@ test "APPSEND frames plaintext before the 0x50 encrypt path" {
     var resp_buf: [512]u8 = undefined;
     const pk_hex = std.fmt.bytesToHex(peer_pk, .lower);
     var cmd_buf: [256]u8 = undefined;
-    const cmd = std.fmt.bufPrint(&cmd_buf, "APPSEND {s} meshrooms-v1   hello rooms \t \n", .{&pk_hex}) catch unreachable;
+    const cmd = std.fmt.bufPrint(&cmd_buf, "APPSEND {s} example-v1   hello rooms \t \n", .{&pk_hex}) catch unreachable;
     const len = control.handleCommand(cmd, &resp_buf);
     try std.testing.expectEqualStrings("{\"ok\":true}\n", resp_buf[0..len]);
     try std.testing.expect(dummy.sent);
@@ -2343,11 +2343,11 @@ test "APPSEND frames plaintext before the 0x50 encrypt path" {
         nonce,
         key_result.key,
     ) catch unreachable;
-    try std.testing.expectEqualStrings("MGAPP1 meshrooms-v1   hello rooms \t ", plaintext[0..payload_len]);
+    try std.testing.expectEqualStrings("MGAPP1 example-v1   hello rooms \t ", plaintext[0..payload_len]);
 
     try std.testing.expect(control.pushMessage(peer_pk, plaintext[0..payload_len]));
     try std.testing.expectEqual(@as(usize, 0), control.getMessageCount());
-    const app_len = control.handleCommand("APPRECV meshrooms-v1", &resp_buf);
+    const app_len = control.handleCommand("APPRECV example-v1", &resp_buf);
     try std.testing.expect(std.mem.indexOf(u8, resp_buf[0..app_len], "hello rooms") != null);
     const legacy_empty = control.handleCommand("RECV", &resp_buf);
     try std.testing.expectEqualStrings("{\"empty\":true}\n", resp_buf[0..legacy_empty]);

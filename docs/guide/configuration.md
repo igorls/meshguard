@@ -33,7 +33,7 @@ $MESHGUARD_CONFIG_DIR/
 │   ├── peer-a.pub
 │   └── peer-b.pub
 ├── trusted_orgs/          # Org trust (auto-accept org members)
-│   └── eosrio.org
+│   └── acme.org
 ├── org/                   # Org admin keypair, if this node signs certs
 │   ├── org.key
 │   └── org.pub
@@ -45,7 +45,7 @@ $MESHGUARD_CONFIG_DIR/
     ├── peer/              # Per-peer policies (by alias)
     │   └── node-1.policy
     └── org/               # Per-org policies
-        └── eosrio.policy
+        └── acme.policy
 ```
 
 ## CLI Flags

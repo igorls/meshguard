@@ -38,7 +38,7 @@ services/
 │   ├── node-1.policy
 │   └── validator-3.policy
 └── org/                 # Per-org policies
-    └── eosrio.policy
+    └── acme.policy
 ```
 
 ### Rule Syntax
@@ -86,7 +86,7 @@ meshguard service allow --peer node-1 tcp 5432  # Allow Postgres for node-1
 meshguard service deny --peer untrusted tcp 22  # Block SSH from untrusted
 
 # Per-org rules
-meshguard service allow --org eosrio tcp 80     # Allow HTTP for org
+meshguard service allow --org acme tcp 80     # Allow HTTP for org
 
 # Set default action
 meshguard service default deny              # Switch to allowlist mode

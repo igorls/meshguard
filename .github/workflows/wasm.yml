@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main, codex/mobile-app-relay]
+    branches: [main]
   workflow_dispatch:
 
 jobs:

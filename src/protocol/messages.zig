@@ -243,7 +243,7 @@ pub const HolepunchResponse = struct {
 /// Allows orgs to claim human-readable *.name.mesh domains.
 pub const OrgAliasAnnounce = struct {
     org_pubkey: [32]u8,
-    alias: [32]u8, // e.g. "eosrio", null-padded
+    alias: [32]u8, // e.g. "acme", null-padded
     lamport: u64, // conflict resolution (earliest wins)
     signature: [64]u8, // sign(alias ‖ lamport, org_privkey)
 };

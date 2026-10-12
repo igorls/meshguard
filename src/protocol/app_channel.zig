@@ -28,7 +28,7 @@ pub const MAX_CHANNEL_LEN: usize = 64;
 pub const MAX_PLAINTEXT: usize = 1024;
 pub const FRAME_OVERHEAD_WITHOUT_CHANNEL: usize = PREFIX.len + 1; // prefix + payload separator
 pub const MAX_APP_PAYLOAD: usize = MAX_PLAINTEXT - FRAME_OVERHEAD_WITHOUT_CHANNEL - MAX_CHANNEL_LEN;
-pub const MESHROOMS_CHANNEL = "meshrooms-v1";
+pub const EXAMPLE_CHANNEL = "example-v1";
 pub const PROTOCOL_VERSION: u8 = 1;
 
 pub const Frame = struct {
@@ -116,11 +116,11 @@ test "MAX_APP_PAYLOAD accounts for worst-case framing" {
     try std.testing.expectEqual(@as(usize, 7), PREFIX.len);
     try std.testing.expectEqual(@as(usize, 952), MAX_APP_PAYLOAD);
     try std.testing.expectEqual(@as(usize, 1024 - 7 - 64 - 1), MAX_APP_PAYLOAD);
-    try std.testing.expectEqual(MAX_APP_PAYLOAD, maxPayloadForChannelLen(MESHROOMS_CHANNEL.len));
+    try std.testing.expectEqual(MAX_APP_PAYLOAD, maxPayloadForChannelLen(EXAMPLE_CHANNEL.len));
 }
 
-test "channel validation accepts meshrooms-v1 and rejects illegal names" {
-    try std.testing.expect(isValidChannel(MESHROOMS_CHANNEL));
+test "channel validation accepts example-v1 and rejects illegal names" {
+    try std.testing.expect(isValidChannel(EXAMPLE_CHANNEL));
     try std.testing.expect(isValidChannel("a"));
     try std.testing.expect(isValidChannel("chan_1.foo-bar"));
     try std.testing.expect(!isValidChannel(""));
@@ -134,11 +134,11 @@ test "channel validation accepts meshrooms-v1 and rejects illegal names" {
 
 test "encode/decode round-trip" {
     var buf: [MAX_PLAINTEXT]u8 = undefined;
-    const framed = try encode(MESHROOMS_CHANNEL, "hello rooms", &buf);
-    try std.testing.expectEqualStrings("MGAPP1 meshrooms-v1 hello rooms", framed);
+    const framed = try encode(EXAMPLE_CHANNEL, "hello rooms", &buf);
+    try std.testing.expectEqualStrings("MGAPP1 example-v1 hello rooms", framed);
 
     const parsed = try parse(framed);
-    try std.testing.expectEqualStrings(MESHROOMS_CHANNEL, parsed.channel);
+    try std.testing.expectEqualStrings(EXAMPLE_CHANNEL, parsed.channel);
     try std.testing.expectEqualStrings("hello rooms", parsed.payload);
 }
 
@@ -146,12 +146,12 @@ test "parse rejects malformed and oversize frames without truncating" {
     try std.testing.expectError(error.Malformed, parse("hello"));
     try std.testing.expectError(error.Malformed, parse("MGAPP1"));
     try std.testing.expectError(error.Malformed, parse("MGAPP1 "));
-    try std.testing.expectError(error.Malformed, parse("MGAPP1 meshrooms-v1"));
+    try std.testing.expectError(error.Malformed, parse("MGAPP1 example-v1"));
     try std.testing.expectError(error.InvalidChannel, parse("MGAPP1 BAD payload"));
     try std.testing.expectError(error.InvalidChannel, parse("MGAPP1  payload"));
 
     var oversize: [MAX_PLAINTEXT + 8]u8 = undefined;
-    const prefix = "MGAPP1 meshrooms-v1 ";
+    const prefix = "MGAPP1 example-v1 ";
     @memcpy(oversize[0..prefix.len], prefix);
     @memset(oversize[prefix.len..], 'x');
     try std.testing.expectError(error.Oversize, parse(&oversize));
@@ -159,19 +159,19 @@ test "parse rejects malformed and oversize frames without truncating" {
 
 test "encode rejects oversize payloads instead of truncating" {
     var buf: [MAX_PLAINTEXT]u8 = undefined;
-    const max_for_room = maxPayloadForChannelLen(MESHROOMS_CHANNEL.len);
+    const max_for_room = maxPayloadForChannelLen(EXAMPLE_CHANNEL.len);
     const ok_payload = [_]u8{'x'} ** MAX_APP_PAYLOAD;
     try std.testing.expectEqual(max_for_room, ok_payload.len);
-    _ = try encode(MESHROOMS_CHANNEL, &ok_payload, &buf);
+    _ = try encode(EXAMPLE_CHANNEL, &ok_payload, &buf);
 
     const too_big = [_]u8{'x'} ** (MAX_APP_PAYLOAD + 1);
-    try std.testing.expectError(error.Oversize, encode(MESHROOMS_CHANNEL, &too_big, &buf));
+    try std.testing.expectError(error.Oversize, encode(EXAMPLE_CHANNEL, &too_big, &buf));
 }
 
 test "all channel lengths enforce the advertised payload ceiling" {
     var buf: [MAX_PLAINTEXT]u8 = undefined;
     const payload = [_]u8{'x'} ** MAX_APP_PAYLOAD;
-    for ([_][]const u8{ "a", MESHROOMS_CHANNEL, &([_]u8{'a'} ** MAX_CHANNEL_LEN) }) |channel| {
+    for ([_][]const u8{ "a", EXAMPLE_CHANNEL, &([_]u8{'a'} ** MAX_CHANNEL_LEN) }) |channel| {
         const frame = try encode(channel, &payload, &buf);
         try std.testing.expectEqualStrings(&payload, (try parse(frame)).payload);
         try std.testing.expectError(error.Oversize, encode(channel, &([_]u8{'x'} ** (MAX_APP_PAYLOAD + 1)), &buf));
@@ -194,12 +194,12 @@ test "application payloads must be valid UTF-8" {
 test "unframed plaintext is not an app frame" {
     try std.testing.expect(!looksLikeAppFrame("hello meshguard"));
     try std.testing.expect(!looksLikeAppFrame("MGAPP1"));
-    try std.testing.expect(!looksLikeAppFrame("MGAPP2 meshrooms-v1 x"));
-    try std.testing.expect(looksLikeAppFrame("MGAPP1 meshrooms-v1 x"));
+    try std.testing.expect(!looksLikeAppFrame("MGAPP2 example-v1 x"));
+    try std.testing.expect(looksLikeAppFrame("MGAPP1 example-v1 x"));
 }
 
 test "empty application payloads are rejected on receive" {
-    try std.testing.expectError(error.Malformed, parse("MGAPP1 meshrooms-v1 "));
+    try std.testing.expectError(error.Malformed, parse("MGAPP1 example-v1 "));
     var buf: [MAX_PLAINTEXT]u8 = undefined;
-    try std.testing.expectError(error.EmptyPayload, encode(MESHROOMS_CHANNEL, "", &buf));
+    try std.testing.expectError(error.EmptyPayload, encode(EXAMPLE_CHANNEL, "", &buf));
 }

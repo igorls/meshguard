@@ -6,7 +6,7 @@
 //!
 //! Beacon wire format (41 bytes):
 //!   [5B magic "MGLAN"]
-//!   [2B app_id (e.g. 0x5043 = "PC" for Peer Circle)]
+//!   [2B app_id (e.g. 0x5043 = ASCII "PC", the default application ID)]
 //!   [32B ed25519_pubkey]
 //!   [2B gossip_port (little-endian)]
 //!
@@ -67,7 +67,9 @@ fn closeSocket(fd: posix.socket_t) void {
 }
 
 /// Well-known app IDs.
-pub const APP_ID_PEER_CIRCLE: u16 = 0x5043; // "PC" (Peer Circle)
+/// Default application ID, ASCII "PC". The value is part of the beacon wire
+/// format: keep it unchanged so existing nodes keep discovering each other.
+pub const APP_ID_DEFAULT: u16 = 0x5043;
 
 /// Callback when a LAN peer is discovered.
 pub const OnLanPeerFn = *const fn (ctx: *anyopaque, pubkey: [32]u8, addr: [4]u8, gossip_port: u16) void;
