@@ -14,7 +14,7 @@ Objective-C, C, C++, and Swift through the `MeshGuardFFI` Clang module.
 > The iOS integration instructions below describe the expected package layout
 > once iOS builds are restored; they cannot be completed with this toolchain.
 
-Run these commands on macOS with Zig 0.16.0 and Xcode's command-line tools selected:
+Run these commands on macOS with Zig 0.17.0 and Xcode's command-line tools selected:
 
 ```bash
 ./scripts/build-apple.sh

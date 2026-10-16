@@ -158,7 +158,7 @@ Details live in the [trust model guide](docs/guide/trust-model.md).
 
 ## Build from source
 
-meshguard requires Zig `0.16.0` or newer.
+meshguard requires Zig `0.17.0` or newer.
 
 ```bash
 # Debug build

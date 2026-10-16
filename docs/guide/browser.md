@@ -231,7 +231,7 @@ codes.
 
 ## Building from source
 
-With Zig 0.16.0, Node.js 22 or newer, npm and Bun:
+With Zig 0.17.0, Node.js 22 or newer, npm and Bun:
 
 ```bash
 ./scripts/build-web.sh

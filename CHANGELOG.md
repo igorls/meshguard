@@ -8,6 +8,8 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## Unreleased
 
 ### Changed
+- Building from source now requires Zig 0.17.0. The source, build definitions,
+  packaging scripts and CI use the 0.17 APIs; Zig 0.16 is no longer supported.
 - Apple packaging temporarily ships only macOS arm64, x86_64 and universal
   libraries. Zig 0.17.0 fails to compile its `std.Io.Threaded` I/O table for
   iOS device and simulator targets: `processReplace` reaches `NullFile.fd`,

@@ -16,7 +16,7 @@ SWIM liveness, and explicitly pinned peer keys.
 
 ## Build and verify
 
-Use Zig 0.16.0 and Node.js 24:
+Use Zig 0.17.0 and Node.js 24:
 
 ```bash
 zig build wasm wasm-test -Doptimize=ReleaseSmall

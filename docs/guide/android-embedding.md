@@ -45,7 +45,7 @@ as one step under the lock and never wraps, so no nonce is ever used twice.
 ### Building from source
 
 Zig needs the NDK's sysroot (Bionic headers and libc stubs); any recent NDK
-works. With Zig 0.16.0 on Linux:
+works. With Zig 0.17.0 on Linux:
 
 ```bash
 export ANDROID_NDK_HOME=$HOME/Android/Sdk/ndk/28.2.13676358

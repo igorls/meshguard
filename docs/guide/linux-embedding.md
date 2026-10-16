@@ -40,7 +40,7 @@ builds use lock-free atomics.
 
 ## Building from source
 
-With Zig 0.16.0 on Linux:
+With Zig 0.17.0 on Linux:
 
 ```bash
 MESHGUARD_LIBRARY_PLATFORMS="linux freebsd" ./scripts/build-libraries.sh
