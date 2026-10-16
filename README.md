@@ -158,7 +158,8 @@ Details live in the [trust model guide](docs/guide/trust-model.md).
 
 ## Build from source
 
-meshguard requires Zig `0.17.0` or newer.
+meshguard requires Zig `0.17.0` or newer. Apple library packaging pins
+Zig `0.18.0-dev.253+16d31ceed` to include the upstream iOS build fix.
 
 ```bash
 # Debug build

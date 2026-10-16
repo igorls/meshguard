@@ -54,7 +54,7 @@ later. It embeds UDP discovery, encrypted application messages, relay routing,
 contacts and userspace WireGuard data tunnels. It does not create a `utun`
 interface and does not need the daemon's interface-configuration privileges.
 
-Build and verify the Apple packages on macOS with Zig 0.17 and Xcode tools:
+Build and verify the Apple packages on macOS with Zig `0.18.0-dev.253+16d31ceed` and Xcode tools:
 
 ```bash
 ./scripts/build-apple.sh

@@ -9,8 +9,8 @@ if [[ "$(uname -s)" != Darwin ]]; then
   echo 'Apple packaging requires macOS and Xcode.' >&2
   exit 1
 fi
-if [[ "$(zig version)" != 0.17.0 ]]; then
-  echo 'Apple packaging requires Zig 0.17.0.' >&2
+if [[ "$(zig version)" != 0.18.0-dev.253+16d31ceed ]]; then
+  echo 'Apple packaging requires Zig 0.18.0-dev.253+16d31ceed.' >&2
   exit 1
 fi
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -57,16 +57,20 @@ codesign --verify --strict --all-architectures "$universal/lib/libmeshguard-ffi.
 cp include/meshguard.h include/module.modulemap "$universal/include/"
 cp LICENSE "$universal/"
 
-# Zig 0.17.0's Threaded I/O table instantiates processReplace on iOS,
-# where spawnDarwin accesses the fd absent from NullFile. Keep macOS packages
-# available without patching the toolchain. Remove stale generated iOS outputs
-# so a reused output directory cannot accidentally ship an older XCFramework.
-rm -rf "$output/build/ios-device" "$output/build/ios-simulator" "$output/MeshGuardFFI.xcframework"
-rm -f "$output/meshguard-ffi-ios-xcframework.zip"
-echo 'Skipping iOS device/simulator and XCFramework: Zig 0.17.0 Threaded NullFile.fd regression.'
+build_slice ios-device aarch64-ios.15.0
+build_slice ios-simulator aarch64-ios.15.0-simulator
+# xcodebuild refuses to replace an existing bundle. Remove only this generated
+# bundle, leaving the other build/install outputs alone.
+rm -rf "$output/MeshGuardFFI.xcframework"
+xcodebuild -create-xcframework \
+  -library "$output/build/ios-device/lib/libmeshguard-ffi.a" -headers "$root/include" \
+  -library "$output/build/ios-simulator/lib/libmeshguard-ffi.a" -headers "$root/include" \
+  -output "$output/MeshGuardFFI.xcframework"
 
 for arch in arm64 x86_64 universal; do
   COPYFILE_DISABLE=1 tar -czf "$output/meshguard-ffi-macos-$arch.tar.gz" -C "$output" "macos-$arch"
 done
 cp LICENSE "$output/LICENSE"
+rm -f "$output/meshguard-ffi-ios-xcframework.zip"
+(cd "$output" && zip -qrX meshguard-ffi-ios-xcframework.zip MeshGuardFFI.xcframework LICENSE)
 echo "Apple embedding artifacts built in $output"

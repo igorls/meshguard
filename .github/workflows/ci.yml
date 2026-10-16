@@ -157,12 +157,12 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0
+          version: 0.18.0-dev.253+16d31ceed
 
       - name: Unit and FFI tests (std.crypto)
         run: zig build test -Dcrypto-backend=std
 
-      - name: Build macOS libraries (iOS blocked by Zig 0.17.0)
+      - name: Build Apple libraries and XCFramework
         run: ./scripts/build-apple.sh
 
       - name: Test Apple consumer linking

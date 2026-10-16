@@ -57,8 +57,19 @@ SWIFT
 xcrun swiftc -I "$package/include" "$scratch/host.swift" \
   "$package/lib/libmeshguard-ffi.a" -o "$scratch/swift-host"
 "$scratch/swift-host"
-# The Zig 0.17.0 build intentionally omits iOS; never validate stale slices.
-test ! -e "$output/MeshGuardFFI.xcframework"
-test ! -e "$output/meshguard-ffi-ios-xcframework.zip"
-echo 'Apple link checks passed: C static/dynamic and Swift hosts; both macOS architectures linked.'
-echo 'iOS device/simulator links skipped: Zig 0.17.0 Threaded NullFile.fd regression.'
+for variant in device simulator; do
+  sdk=iphoneos
+  target=arm64-apple-ios15.0
+  slice=ios-arm64
+  if [[ "$variant" == simulator ]]; then
+    sdk=iphonesimulator
+    target=arm64-apple-ios15.0-simulator
+    slice=ios-arm64-simulator
+  fi
+  sdk_path="$(xcrun --sdk "$sdk" --show-sdk-path)"
+  framework="$output/MeshGuardFFI.xcframework/$slice"
+  xcrun --sdk "$sdk" swiftc -target "$target" -sdk "$sdk_path" \
+    -I "$framework/Headers" "$scratch/host.swift" "$framework/libmeshguard-ffi.a" \
+    -o "$scratch/ios-$variant-host"
+done
+echo 'Apple link checks passed: C static/dynamic and Swift hosts; iOS device/simulator links.'
