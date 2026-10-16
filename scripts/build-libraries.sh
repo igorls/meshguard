@@ -90,9 +90,10 @@ if wants android; then
 include_dir=$sysroot/usr/include
 sys_include_dir=$sysroot/usr/include/$triple
 crt_dir=$sysroot/usr/lib/$triple/$android_api
+cc_dir=$sysroot/usr/lib/$triple/$android_api
 msvc_lib_dir=
 kernel32_lib_dir=
-gcc_dir=
+darwin_sdk_dir=
 EOF
     build_target "android-$abi" "$target.$android_api" --libc "$libc"
     mkdir -p "$package/jniLibs/$abi"

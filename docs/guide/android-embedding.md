@@ -64,9 +64,10 @@ a libc file for each ABI; a manual build does the same:
 #   include_dir=SYSROOT/usr/include
 #   sys_include_dir=SYSROOT/usr/include/aarch64-linux-android
 #   crt_dir=SYSROOT/usr/lib/aarch64-linux-android/24
+#   cc_dir=SYSROOT/usr/lib/aarch64-linux-android/24
 #   msvc_lib_dir=
 #   kernel32_lib_dir=
-#   gcc_dir=
+#   darwin_sdk_dir=
 zig build ffi -Dtarget=aarch64-linux-android.24 -Doptimize=ReleaseFast --libc libc-arm64.conf
 ```
 
