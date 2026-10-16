@@ -106,7 +106,7 @@ fn splitHostPort(s: []const u8) ?struct { host: []const u8, port: []const u8 } {
 
 fn parseIpv6(s: []const u8) ?[16]u8 {
     if (std.mem.indexOfScalar(u8, s, ':') == null) return null;
-    var groups: [8]u16 = .{0} ** 8;
+    var groups: [8]u16 = @splat(0);
     var group_count: usize = 0;
 
     const compress_idx = std.mem.indexOf(u8, s, "::");
@@ -124,7 +124,7 @@ fn parseIpv6(s: []const u8) ?[16]u8 {
 
     var src: usize = 0;
     var dst: usize = 0;
-    var out: [16]u8 = .{0} ** 16;
+    var out: [16]u8 = @splat(0);
     while (dst < 8) : (dst += 1) {
         const value: u16 = if (compress_idx != null and dst >= group_count and dst < group_count + zeros)
             0

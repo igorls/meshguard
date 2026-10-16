@@ -28,8 +28,8 @@ pub const TunDevice = struct {
     const AF_INET: u32 = 2;
 
     const Ifreq = extern struct {
-        ifr_name: [16]u8 = .{0} ** 16,
-        _pad: [24]u8 = .{0} ** 24,
+        ifr_name: [16]u8 = @splat(0),
+        _pad: [24]u8 = @splat(0),
     };
 
     pub fn open(name: []const u8) !TunDevice {
@@ -122,9 +122,9 @@ pub const TunDevice = struct {
 
     pub fn setMtu(self: *const TunDevice, mtu: u32) !void {
         const MtuIfreq = extern struct {
-            ifr_name: [16]u8 = .{0} ** 16,
+            ifr_name: [16]u8 = @splat(0),
             ifr_mtu: i32 = 0,
-            _pad: [20]u8 = .{0} ** 20,
+            _pad: [20]u8 = @splat(0),
         };
 
         var ifr = MtuIfreq{};

@@ -23,7 +23,7 @@ pub const Identity = struct {
         private[0] &= 248;
         private[31] &= 127;
         private[31] |= 64;
-        return .{ .seed = seed, .public_key = pair.public_key.toBytes(), .wg_private = private, .wg_public = try X25519.recoverPublicKey(private) };
+        return .{ .seed = seed, .public_key = pair.public_key.toBytes(), .wg_private = private, .wg_public = X25519.recoverPublicKey(private) };
     }
 
     pub fn clear(self: *Identity) void {
@@ -82,12 +82,12 @@ pub fn open(recipient: [32]u8, private: [32]u8, sender_wg: [32]u8, packet: []con
 }
 
 test "portable packets authenticate recipient, sender and ciphertext" {
-    var a = try Identity.fromSeed(.{1} ** 32);
+    var a = try Identity.fromSeed(@splat(1));
     defer a.clear();
-    var b = try Identity.fromSeed(.{2} ** 32);
+    var b = try Identity.fromSeed(@splat(2));
     defer b.clear();
     var packet: [max_packet]u8 = undefined;
-    const length = try seal(a.public_key, a.wg_private, b.public_key, b.wg_public, .{7} ** 12, "portable", &packet);
+    const length = try seal(a.public_key, a.wg_private, b.public_key, b.wg_public, @splat(7), "portable", &packet);
     var plain: [max_payload]u8 = undefined;
     const opened = try open(b.public_key, b.wg_private, a.wg_public, packet[0..length], &plain);
     try std.testing.expectEqualStrings("portable", plain[0..opened.len]);

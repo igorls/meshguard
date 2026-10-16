@@ -25,7 +25,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       - name: Build
         run: zig build
@@ -49,7 +49,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       - name: Test
         run: zig build test
@@ -74,7 +74,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       - name: Test (core + FFI)
         run: zig build test
@@ -98,7 +98,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       # qemu-user runs 32-bit ARM code: the unit tests (static musl) and the
       # linux-armhf C hosts (with the armhf glibc from libc6-armhf-cross).
@@ -137,7 +137,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       - name: Build (std.crypto, no libsodium)
         run: zig build -Dno-sodium=true
@@ -157,7 +157,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       - name: Unit and FFI tests (std.crypto)
         run: zig build test -Dcrypto-backend=std

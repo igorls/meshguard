@@ -69,7 +69,7 @@ pub const DecodedRelayData = struct {
 pub const RendezvousRecord = struct {
     pubkey: [32]u8,
     endpoint: ?messages.Endpoint = null,
-    challenge: [REGISTRATION_NONCE_SIZE]u8 = .{0} ** REGISTRATION_NONCE_SIZE,
+    challenge: [REGISTRATION_NONCE_SIZE]u8 = @splat(0),
     challenge_issued_ns: i128 = 0,
     registered_at_ns: i128 = 0,
 };
@@ -85,7 +85,7 @@ pub const IdentityRateLimiter = struct {
     const RATE_PER_SEC: f64 = 50.0;
     const BURST: f64 = @floatFromInt(BURST_TOKENS);
 
-    entries: [MAX_RENDEZVOUS_RECORDS]?RateEntry = .{null} ** MAX_RENDEZVOUS_RECORDS,
+    entries: [MAX_RENDEZVOUS_RECORDS]?RateEntry = @splat(null),
 
     pub fn allow(self: *IdentityRateLimiter, pubkey: [32]u8, now_ns: i128) bool {
         const slot = self.findOrInsert(pubkey, now_ns) orelse return false;
@@ -125,7 +125,7 @@ pub const IdentityRateLimiter = struct {
 };
 
 pub const RendezvousRegistry = struct {
-    records: [MAX_RENDEZVOUS_RECORDS]?RendezvousRecord = .{null} ** MAX_RENDEZVOUS_RECORDS,
+    records: [MAX_RENDEZVOUS_RECORDS]?RendezvousRecord = @splat(null),
 
     pub fn issueChallenge(self: *RendezvousRegistry, pubkey: [32]u8, now_ns: i128) RelayError![REGISTRATION_NONCE_SIZE]u8 {
         const slot = self.findOrInsert(pubkey) orelse return error.RegistryFull;
@@ -237,7 +237,7 @@ pub fn encodeRelayData(
     if (buf.len < required) return error.BufferTooShort;
 
     var pos: usize = 0;
-    buf[pos] = @intFromEnum(messages.MessageType.relay_data);
+    buf[pos] = @backingInt(messages.MessageType.relay_data);
     pos += 1;
     @memcpy(buf[pos..][0..32], &sender_pubkey);
     pos += 32;
@@ -251,7 +251,7 @@ pub fn encodeRelayData(
 
 pub fn decodeRelayData(data: []const u8) RelayError!DecodedRelayData {
     if (data.len < RELAY_FRAME_HEADER_SIZE) return error.BufferTooShort;
-    if (data[0] != @intFromEnum(messages.MessageType.relay_data)) return error.InvalidFrame;
+    if (data[0] != @backingInt(messages.MessageType.relay_data)) return error.InvalidFrame;
     var pos: usize = 1;
     var sender_pubkey: [32]u8 = undefined;
     @memcpy(&sender_pubkey, data[pos..][0..32]);
@@ -373,9 +373,9 @@ test "choosePath prefers direct then punch then relay" {
 }
 
 test "relay frame carries only opaque WireGuard packet types" {
-    const sender = [_]u8{0xAA} ** 32;
-    const target = [_]u8{0xBB} ** 32;
-    var wg_payload = [_]u8{0} ** 32;
+    const sender = @as([32]u8, @splat(0xAA));
+    const target = @as([32]u8, @splat(0xBB));
+    var wg_payload = @as([32]u8, @splat(0));
     std.mem.writeInt(u32, wg_payload[0..4], 4, .little);
 
     var buf: [RELAY_FRAME_HEADER_SIZE + wg_payload.len]u8 = undefined;
@@ -414,8 +414,8 @@ test "rendezvous registration requires signed challenge" {
 
 test "identity rate limiter is per identity" {
     var limiter = IdentityRateLimiter{};
-    const a = [_]u8{0xAA} ** 32;
-    const b = [_]u8{0xBB} ** 32;
+    const a = @as([32]u8, @splat(0xAA));
+    const b = @as([32]u8, @splat(0xBB));
 
     for (0..IdentityRateLimiter.BURST_TOKENS) |_| {
         try std.testing.expect(limiter.allow(a, 0));
@@ -428,11 +428,11 @@ test "identity rate limiter is per identity" {
 test "identity rate limiter evicts oldest identity when full" {
     var limiter = IdentityRateLimiter{};
     for (0..MAX_RENDEZVOUS_RECORDS) |i| {
-        var pubkey = [_]u8{0} ** 32;
+        var pubkey = @as([32]u8, @splat(0));
         pubkey[31] = @intCast(i);
         try std.testing.expect(limiter.allow(pubkey, @intCast(i)));
     }
 
-    const newcomer = [_]u8{0xFF} ** 32;
+    const newcomer = @as([32]u8, @splat(0xFF));
     try std.testing.expect(limiter.allow(newcomer, 10_000));
 }

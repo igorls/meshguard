@@ -350,7 +350,7 @@ pub fn ntpQuery() ?u64 {
 
     for (NTP_SERVERS) |server| {
         // Build SNTP request (48 bytes)
-        var req: [48]u8 = .{0} ** 48;
+        var req: [48]u8 = @splat(0);
         req[0] = 0x23; // LI=0, VN=4, Mode=3 (client)
 
         _ = socket.sendTo(&req, server, NTP_PORT) catch continue;
@@ -604,14 +604,14 @@ pub fn savePunchedSeed(
 
 test "token encode/decode round-trip" {
     var token = Token{
-        .pubkey = [_]u8{0xAA} ** 32,
-        .wg_pubkey = [_]u8{0xBB} ** 32,
+        .pubkey = @as([32]u8, @splat(0xAA)),
+        .wg_pubkey = @as([32]u8, @splat(0xBB)),
         .stun_addr = .{ 179, 218, 15, 153 },
         .stun_port = 8475,
         .mesh_ip = .{ 10, 99, 38, 137 },
         .punch_time = 1740000000,
         .punch_window = 60,
-        .nonce = [_]u8{0xCC} ** 8,
+        .nonce = @as([8]u8, @splat(0xCC)),
         .stun_server = .{ 74, 125, 250, 129 },
         .stun_server_port = 19302,
         .nat_type = 1,
@@ -636,14 +636,14 @@ test "token encode/decode round-trip" {
 
 test "token URI encode/decode round-trip" {
     var token = Token{
-        .pubkey = [_]u8{0x11} ** 32,
-        .wg_pubkey = [_]u8{0x22} ** 32,
+        .pubkey = @as([32]u8, @splat(0x11)),
+        .wg_pubkey = @as([32]u8, @splat(0x22)),
         .stun_addr = .{ 1, 2, 3, 4 },
         .stun_port = 12345,
         .mesh_ip = .{ 10, 99, 1, 2 },
         .punch_time = 1740000060,
         .punch_window = 60,
-        .nonce = [_]u8{0x33} ** 8,
+        .nonce = @as([8]u8, @splat(0x33)),
         .stun_server = .{ 74, 125, 250, 129 },
         .stun_server_port = 19302,
         .nat_type = 1,
@@ -672,14 +672,14 @@ test "token URI encode/decode round-trip" {
 
 test "token signature verification" {
     var token = Token{
-        .pubkey = [_]u8{0x44} ** 32,
-        .wg_pubkey = [_]u8{0x55} ** 32,
+        .pubkey = @as([32]u8, @splat(0x44)),
+        .wg_pubkey = @as([32]u8, @splat(0x55)),
         .stun_addr = .{ 10, 0, 0, 1 },
         .stun_port = 5000,
         .mesh_ip = .{ 10, 99, 10, 20 },
         .punch_time = 1740000000,
         .punch_window = 60,
-        .nonce = [_]u8{0x66} ** 8,
+        .nonce = @as([8]u8, @splat(0x66)),
         .stun_server = .{ 8, 8, 8, 8 },
         .stun_server_port = 3478,
         .nat_type = 0,
@@ -711,24 +711,24 @@ test "decodeTokenUri rejects over-long token without OOB write (C1 regression)" 
 }
 
 test "probe building and detection" {
-    const nonce = [_]u8{0xAB} ** 8;
-    const pubkey = [_]u8{0xCD} ** 32;
+    const nonce = @as([8]u8, @splat(0xAB));
+    const pubkey = @as([32]u8, @splat(0xCD));
     const probe = buildProbe(nonce, pubkey);
 
     try std.testing.expect(isCoordinatedProbe(&probe));
     try std.testing.expect(probeMatchesNonce(&probe, nonce));
 
     // Wrong nonce
-    try std.testing.expect(!probeMatchesNonce(&probe, [_]u8{0x00} ** 8));
+    try std.testing.expect(!probeMatchesNonce(&probe, @as([8]u8, @splat(0x00))));
 
     // Not a probe
-    const not_probe = [_]u8{0x01} ** 16;
+    const not_probe = @as([16]u8, @splat(0x01));
     try std.testing.expect(!isCoordinatedProbe(&not_probe));
 }
 
 test "NTP packet format" {
     // Verify our NTP request packet structure
-    var req: [48]u8 = .{0} ** 48;
+    var req: [48]u8 = @splat(0);
     req[0] = 0x23; // LI=0, VN=4, Mode=3
 
     // Check LI (bits 7-6) = 0, VN (bits 5-3) = 4, Mode (bits 2-0) = 3

@@ -28,9 +28,6 @@ fn nowNs() i128 {
     return @intCast(std.Io.Timestamp.now(zio(), .awake).toNanoseconds());
 }
 
-
-
-
 const aead = struct {
     const StdAead = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
 
@@ -134,7 +131,7 @@ pub const Tunnel = struct {
         std.mem.writeInt(u64, out[8..16], counter, .little);
 
         // Build 12-byte nonce: 4 zero bytes || 8-byte LE counter
-        var nonce: [12]u8 = .{0} ** 12;
+        var nonce: [12]u8 = @splat(0);
         std.mem.writeInt(u64, nonce[4..12], counter, .little);
 
         // Copy plaintext + zero padding into output buffer temporarily
@@ -191,7 +188,7 @@ pub const Tunnel = struct {
         }
 
         // Build 12-byte nonce
-        var nonce: [12]u8 = .{0} ** 12;
+        var nonce: [12]u8 = @splat(0);
         std.mem.writeInt(u64, nonce[4..12], nonce_val, .little);
 
         // Encrypt in-place (plaintext at buf[16..], ciphertext overwrites same region)
@@ -236,7 +233,7 @@ pub const Tunnel = struct {
         if (elapsed >= REJECT_AFTER_TIME_NS) return error.KeyExpired;
 
         // Build nonce: 4 zero bytes || 8-byte LE counter
-        var nonce: [12]u8 = .{0} ** 12;
+        var nonce: [12]u8 = @splat(0);
         std.mem.writeInt(u64, nonce[4..12], counter, .little);
 
         const ciphertext = packet[TRANSPORT_HEADER_LEN..];
@@ -307,7 +304,7 @@ pub const ReplayWindow = struct {
     /// Highest counter value seen
     counter: u64 = 0,
     /// Bitmap of seen counters in [counter - WINDOW_SIZE + 1, counter]
-    bitmap: [COUNTER_WINDOW_SIZE / 64]u64 = .{0} ** (COUNTER_WINDOW_SIZE / 64),
+    bitmap: [COUNTER_WINDOW_SIZE / 64]u64 = @splat(0),
 
     /// Check if a counter value is acceptable (not replayed, not too old).
     pub fn check(self: *const ReplayWindow, counter: u64) bool {
@@ -392,8 +389,8 @@ pub const ReplayWindow = struct {
 
 test "transport encrypt/decrypt roundtrip" {
     const keys = noise.TransportKeys{
-        .sending_key = .{0x42} ** 32,
-        .receiving_key = .{0x99} ** 32,
+        .sending_key = @splat(0x42),
+        .receiving_key = @splat(0x99),
         .sending_index = 1,
         .receiving_index = 2,
         .is_initiator = true,
@@ -465,8 +462,8 @@ test "anti-replay window" {
 
 test "transport nonce counter increments" {
     const keys = noise.TransportKeys{
-        .sending_key = .{0x42} ** 32,
-        .receiving_key = .{0x99} ** 32,
+        .sending_key = @splat(0x42),
+        .receiving_key = @splat(0x99),
         .sending_index = 1,
         .receiving_index = 2,
         .is_initiator = true,
@@ -483,8 +480,8 @@ test "transport nonce counter increments" {
 
 test "transport refuses to send past REJECT_AFTER_MESSAGES" {
     const keys = noise.TransportKeys{
-        .sending_key = .{0x42} ** 32,
-        .receiving_key = .{0x99} ** 32,
+        .sending_key = @splat(0x42),
+        .receiving_key = @splat(0x99),
         .sending_index = 1,
         .receiving_index = 2,
         .is_initiator = true,
@@ -571,8 +568,8 @@ test "anti-replay window large shift" {
 
 test "transport tunnel deinit zeros keys" {
     const keys = noise.TransportKeys{
-        .sending_key = .{0x42} ** 32,
-        .receiving_key = .{0x99} ** 32,
+        .sending_key = @splat(0x42),
+        .receiving_key = @splat(0x99),
         .sending_index = 1,
         .receiving_index = 2,
         .is_initiator = true,
@@ -603,8 +600,8 @@ test "transport tunnel deinit zeros keys" {
 
 test "isValid honors session expiry (W3)" {
     const fresh = Tunnel{ .keys = .{
-        .sending_key = .{0x11} ** 32,
-        .receiving_key = .{0x22} ** 32,
+        .sending_key = @splat(0x11),
+        .receiving_key = @splat(0x22),
         .sending_index = 1,
         .receiving_index = 2,
         .is_initiator = true,
@@ -615,8 +612,8 @@ test "isValid honors session expiry (W3)" {
     // A session past REJECT_AFTER_TIME can no longer en/decrypt; isValid must say so
     // (this is what lets hasActiveTunnel report it inactive so it gets re-established).
     const expired = Tunnel{ .keys = .{
-        .sending_key = .{0x11} ** 32,
-        .receiving_key = .{0x22} ** 32,
+        .sending_key = @splat(0x11),
+        .receiving_key = @splat(0x22),
         .sending_index = 1,
         .receiving_index = 2,
         .is_initiator = true,
@@ -627,8 +624,8 @@ test "isValid honors session expiry (W3)" {
 
 test "replayed transport packet is rejected (W1 atomic check+update)" {
     const keys = noise.TransportKeys{
-        .sending_key = .{0x42} ** 32,
-        .receiving_key = .{0x99} ** 32,
+        .sending_key = @splat(0x42),
+        .receiving_key = @splat(0x99),
         .sending_index = 1,
         .receiving_index = 2,
         .is_initiator = true,

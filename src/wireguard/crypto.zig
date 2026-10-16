@@ -103,14 +103,14 @@ test "HMAC-Blake2s basic" {
 }
 
 test "KDF2 produces two distinct keys" {
-    const ck: [32]u8 = .{0x42} ** 32;
+    const ck: [32]u8 = @splat(0x42);
     const result = kdf2(ck, "input");
     // The two outputs should be different
     try std.testing.expect(!std.mem.eql(u8, &result.ck, &result.key));
 }
 
 test "KDF3 produces three distinct keys" {
-    const ck: [32]u8 = .{0x42} ** 32;
+    const ck: [32]u8 = @splat(0x42);
     const result = kdf3(ck, "input");
     try std.testing.expect(!std.mem.eql(u8, &result.ck, &result.key1));
     try std.testing.expect(!std.mem.eql(u8, &result.key1, &result.key2));
@@ -118,7 +118,7 @@ test "KDF3 produces three distinct keys" {
 }
 
 test "mixHash updates hash" {
-    var hash: [32]u8 = .{0} ** 32;
+    var hash: [32]u8 = @splat(0);
     const original = hash;
     mixHash(&hash, "data");
     try std.testing.expect(!std.mem.eql(u8, &hash, &original));

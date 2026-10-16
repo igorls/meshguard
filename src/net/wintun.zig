@@ -162,7 +162,7 @@ pub const WintunDevice = struct {
         const read_event = api.getReadWaitEvent(session);
 
         // Store name
-        var stored_name: [16]u8 = .{0} ** 16;
+        var stored_name: [16]u8 = @splat(0);
         const copy_len = @min(name.len, 15);
         @memcpy(stored_name[0..copy_len], name[0..copy_len]);
 

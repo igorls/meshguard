@@ -804,9 +804,9 @@ pub const ControlSocket = struct {
             }
 
             const connected = win.ConnectNamedPipe(pipe_handle, null);
-            if (connected == @as(win.BOOL, @enumFromInt(0))) {
+            if (connected == @as(win.BOOL, @fromBackingInt(@intCast(0)))) {
                 const err = win.GetLastError();
-                if (err != @as(win.windows.Win32Error, @enumFromInt(535))) { // ERROR_PIPE_CONNECTED
+                if (err != @as(win.windows.Win32Error, @fromBackingInt(@intCast(535)))) { // ERROR_PIPE_CONNECTED
                     _ = win.DisconnectNamedPipe(pipe_handle);
                     continue;
                 }
@@ -820,7 +820,7 @@ pub const ControlSocket = struct {
                 var written: usize = 0;
                 while (written < resp_len) {
                     var bytes_written: win.DWORD = 0;
-                    if (win.WriteFile(pipe_handle, @ptrCast(resp_buf[written..resp_len].ptr), @intCast(resp_len - written), &bytes_written, null) == @as(win.BOOL, @enumFromInt(0)) or bytes_written == 0) break;
+                    if (win.WriteFile(pipe_handle, @ptrCast(resp_buf[written..resp_len].ptr), @intCast(resp_len - written), &bytes_written, null) == @as(win.BOOL, @fromBackingInt(@intCast(0))) or bytes_written == 0) break;
                     written += bytes_written;
                 }
                 if (resp_len > 0) _ = win.FlushFileBuffers(pipe_handle);
@@ -1582,11 +1582,11 @@ fn requestWindows(path: []const u8, command: []const u8, out: []u8) !usize {
         if (handle != win.windows.INVALID_HANDLE_VALUE) break;
 
         const err = win.GetLastError();
-        if (err == @as(win.windows.Win32Error, @enumFromInt(231))) { // ERROR_PIPE_BUSY
+        if (err == @as(win.windows.Win32Error, @fromBackingInt(@intCast(231)))) { // ERROR_PIPE_BUSY
             _ = win.WaitNamedPipeW(pipe_name, 500);
         } else {
             const waited = win.WaitNamedPipeW(pipe_name, 500);
-            if (waited == @as(win.BOOL, @enumFromInt(0))) {
+            if (waited == @as(win.BOOL, @fromBackingInt(@intCast(0)))) {
                 std.Io.sleep(zio(), std.Io.Duration.fromNanoseconds(50 * std.time.ns_per_ms), .awake) catch {};
             }
         }
@@ -1597,10 +1597,10 @@ fn requestWindows(path: []const u8, command: []const u8, out: []u8) !usize {
     defer _ = win.CloseHandle(handle);
 
     var bytes_written: win.DWORD = 0;
-    if (win.WriteFile(handle, @ptrCast(command.ptr), @intCast(command.len), &bytes_written, null) == @as(win.BOOL, @enumFromInt(0))) {
+    if (win.WriteFile(handle, @ptrCast(command.ptr), @intCast(command.len), &bytes_written, null) == @as(win.BOOL, @fromBackingInt(@intCast(0)))) {
         return error.WriteFailed;
     }
-    if (win.WriteFile(handle, @ptrCast("\n".ptr), 1, &bytes_written, null) == @as(win.BOOL, @enumFromInt(0))) {
+    if (win.WriteFile(handle, @ptrCast("\n".ptr), 1, &bytes_written, null) == @as(win.BOOL, @fromBackingInt(@intCast(0)))) {
         return error.WriteFailed;
     }
 
@@ -1612,7 +1612,7 @@ fn readWindowsLine(handle: win.HANDLE, out: []u8) !usize {
     var used: usize = 0;
     while (used < out.len) {
         var available: win.DWORD = 0;
-        if (win.PeekNamedPipe(handle, null, 0, null, &available, null) == @as(win.BOOL, @enumFromInt(0))) return error.ReadFailed;
+        if (win.PeekNamedPipe(handle, null, 0, null, &available, null) == @as(win.BOOL, @fromBackingInt(@intCast(0)))) return error.ReadFailed;
         if (available == 0) {
             if (nowMilliSecs() >= deadline) return error.ControlSocketUnavailable;
             std.Io.sleep(zio(), std.Io.Duration.fromNanoseconds(5 * std.time.ns_per_ms), .awake) catch {};
@@ -1620,7 +1620,7 @@ fn readWindowsLine(handle: win.HANDLE, out: []u8) !usize {
         }
         var bytes_read: win.DWORD = 0;
         const capacity: win.DWORD = @intCast(@min(out.len - used, available));
-        if (win.ReadFile(handle, @ptrCast(out[used..].ptr), capacity, &bytes_read, null) == @as(win.BOOL, @enumFromInt(0))) return error.ReadFailed;
+        if (win.ReadFile(handle, @ptrCast(out[used..].ptr), capacity, &bytes_read, null) == @as(win.BOOL, @fromBackingInt(@intCast(0)))) return error.ReadFailed;
         if (bytes_read == 0) return error.ReadFailed;
         used += bytes_read;
         if (std.mem.indexOfScalar(u8, out[0..used], '\n')) |end| return end + 1;
@@ -1640,10 +1640,10 @@ test "Windows listener reserves its name and joins the worker during cleanup" {
     defer allocator.free(path);
     var membership = Membership.MembershipTable.init(allocator, 10);
     defer membership.deinit();
-    var control = try ControlSocket.init(allocator, &membership, [_]u8{1} ** 32, .{ 10, 99, 0, 1 }, [_]u8{2} ** 32, path);
+    var control = try ControlSocket.init(allocator, &membership, @as([32]u8, @splat(1)), .{ 10, 99, 0, 1 }, @as([32]u8, @splat(2)), path);
     defer control.deinit(allocator);
     try control.listen();
-    var duplicate = try ControlSocket.init(allocator, &membership, [_]u8{1} ** 32, .{ 10, 99, 0, 1 }, [_]u8{2} ** 32, path);
+    var duplicate = try ControlSocket.init(allocator, &membership, @as([32]u8, @splat(1)), .{ 10, 99, 0, 1 }, @as([32]u8, @splat(2)), path);
     defer duplicate.deinit(allocator);
     try std.testing.expectError(error.BindFailed, duplicate.listen());
     control.deinit(allocator);
@@ -1659,10 +1659,10 @@ test "Unix listener reclaims only stale sockets and cleans up only its own path"
     defer allocator.free(path);
     var membership = Membership.MembershipTable.init(allocator, 10);
     defer membership.deinit();
-    var control = try ControlSocket.init(allocator, &membership, [_]u8{1} ** 32, .{ 10, 99, 0, 1 }, [_]u8{2} ** 32, path);
+    var control = try ControlSocket.init(allocator, &membership, @as([32]u8, @splat(1)), .{ 10, 99, 0, 1 }, @as([32]u8, @splat(2)), path);
     defer control.deinit(allocator);
     try control.listen();
-    var duplicate = try ControlSocket.init(allocator, &membership, [_]u8{1} ** 32, .{ 10, 99, 0, 1 }, [_]u8{2} ** 32, path);
+    var duplicate = try ControlSocket.init(allocator, &membership, @as([32]u8, @splat(1)), .{ 10, 99, 0, 1 }, @as([32]u8, @splat(2)), path);
     try std.testing.expectError(error.ControlSocketInUse, duplicate.listen());
     duplicate.deinit(allocator);
     try std.testing.expect((try existingUnixSocket(path)) != null);
@@ -1692,7 +1692,7 @@ test "control STOP response toggles stop flag" {
     var membership = Membership.MembershipTable.init(allocator, 5000);
     defer membership.deinit();
 
-    var control = try ControlSocket.init(allocator, &membership, [_]u8{0x42} ** 32, .{ 10, 99, 1, 2 }, [_]u8{0} ** 32, "test.sock");
+    var control = try ControlSocket.init(allocator, &membership, @as([32]u8, @splat(0x42)), .{ 10, 99, 1, 2 }, @as([32]u8, @splat(0)), "test.sock");
 
     var running = std.atomic.Value(bool).init(true);
     control.setStopFlag(&running);
@@ -1708,7 +1708,7 @@ test "control STOP rejects unauthorized peers" {
     var membership = Membership.MembershipTable.init(allocator, 5000);
     defer membership.deinit();
 
-    var control = try ControlSocket.init(allocator, &membership, [_]u8{0x42} ** 32, .{ 10, 99, 1, 2 }, [_]u8{0} ** 32, "test.sock");
+    var control = try ControlSocket.init(allocator, &membership, @as([32]u8, @splat(0x42)), .{ 10, 99, 1, 2 }, @as([32]u8, @splat(0)), "test.sock");
 
     var running = std.atomic.Value(bool).init(true);
     control.setStopFlag(&running);
@@ -1730,7 +1730,7 @@ test "control STATUS response includes peer counts" {
     var membership = Membership.MembershipTable.init(allocator, 5000);
     defer membership.deinit();
 
-    var control = try ControlSocket.init(allocator, &membership, [_]u8{0x24} ** 32, .{ 10, 99, 3, 4 }, [_]u8{0} ** 32, "test.sock");
+    var control = try ControlSocket.init(allocator, &membership, @as([32]u8, @splat(0x24)), .{ 10, 99, 3, 4 }, @as([32]u8, @splat(0)), "test.sock");
 
     var buf: [8192]u8 = undefined;
     const n = control.formatCommandResponse("STATUS", &buf, false);
@@ -1745,9 +1745,9 @@ test "control STATUS response includes peer counts" {
         }
     };
     var dummy: u8 = 0;
-    var core = try RelayCore.RelayCore.init(allocator, .{ .max_clients = 16, .max_unproven = 4, .max_claims = 16, .max_handshake_sources = 16 }, [_]u8{0x40} ** 32, [_]u8{0x41} ** 32, .{ .ctx = &dummy, .admits = Admit.all }, 0);
+    var core = try RelayCore.RelayCore.init(allocator, .{ .max_clients = 16, .max_unproven = 4, .max_claims = 16, .max_handshake_sources = 16 }, @as([32]u8, @splat(0x40)), @as([32]u8, @splat(0x41)), .{ .ctx = &dummy, .admits = Admit.all }, 0);
     defer core.deinit();
-    core.stats.dropped[@intFromEnum(RelayCore.DropReason.spoofed_sender)] = 3;
+    core.stats.dropped[@backingInt(RelayCore.DropReason.spoofed_sender)] = 3;
     control.relay_core = &core;
     control.relay_forwarding = "authenticated";
     const m = control.formatCommandResponse("STATUS", &buf, false);
@@ -1760,7 +1760,7 @@ test "control RELOAD requires the owner and sets the reload flag" {
     const allocator = std.testing.allocator;
     var membership = Membership.MembershipTable.init(allocator, 10);
     defer membership.deinit();
-    var control = try ControlSocket.init(allocator, &membership, [_]u8{0x24} ** 32, .{ 10, 99, 3, 4 }, [_]u8{0} ** 32, "test.sock");
+    var control = try ControlSocket.init(allocator, &membership, @as([32]u8, @splat(0x24)), .{ 10, 99, 3, 4 }, @as([32]u8, @splat(0)), "test.sock");
     var buf: [512]u8 = undefined;
 
     var n = control.formatCommandResponse("RELOAD", &buf, true);
@@ -1784,16 +1784,16 @@ test "ControlSocket message queue push and pop" {
     var control = try ControlSocket.init(
         allocator,
         &membership,
-        [_]u8{1} ** 32,
+        @as([32]u8, @splat(1)),
         .{ 10, 99, 0, 1 },
-        [_]u8{2} ** 32,
+        @as([32]u8, @splat(2)),
         "dummy.sock",
     );
     defer control.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 0), control.getMessageCount());
 
-    const sender = [_]u8{0xaa} ** 32;
+    const sender = @as([32]u8, @splat(0xaa));
     try std.testing.expect(control.pushMessage(sender, "hello meshguard"));
     try std.testing.expectEqual(@as(usize, 1), control.getMessageCount());
 
@@ -1814,9 +1814,9 @@ test "ControlSocket message queue overflow drops oldest" {
     var control = try ControlSocket.init(
         allocator,
         &membership,
-        [_]u8{1} ** 32,
+        @as([32]u8, @splat(1)),
         .{ 10, 99, 0, 1 },
-        [_]u8{2} ** 32,
+        @as([32]u8, @splat(2)),
         "dummy.sock",
     );
     defer control.deinit(allocator);
@@ -1825,7 +1825,7 @@ test "ControlSocket message queue overflow drops oldest" {
     while (i < MAX_QUEUED_MESSAGES + 5) : (i += 1) {
         var buf: [16]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "msg-{d}", .{i}) catch unreachable;
-        _ = control.pushMessage([_]u8{@intCast(i % 255)} ** 32, msg);
+        _ = control.pushMessage(@as([32]u8, @splat(@intCast(i % 255))), msg);
     }
 
     try std.testing.expectEqual(MAX_QUEUED_MESSAGES, control.getMessageCount());
@@ -1864,9 +1864,9 @@ test "ControlSocket handleCommand MSGS and RECV empty" {
     var control = try ControlSocket.init(
         allocator,
         &membership,
-        [_]u8{1} ** 32,
+        @as([32]u8, @splat(1)),
         .{ 10, 99, 0, 1 },
-        [_]u8{2} ** 32,
+        @as([32]u8, @splat(2)),
         "dummy.sock",
     );
     defer control.deinit(allocator);
@@ -1888,14 +1888,14 @@ test "ControlSocket handleCommand RECV with queued message" {
     var control = try ControlSocket.init(
         allocator,
         &membership,
-        [_]u8{1} ** 32,
+        @as([32]u8, @splat(1)),
         .{ 10, 99, 0, 1 },
-        [_]u8{2} ** 32,
+        @as([32]u8, @splat(2)),
         "dummy.sock",
     );
     defer control.deinit(allocator);
 
-    const sender = [_]u8{0x42} ** 32;
+    const sender = @as([32]u8, @splat(0x42));
     _ = control.pushMessage(sender, "hello \"agent\"\nnew line");
 
     var resp_buf: [1024]u8 = undefined;
@@ -1939,8 +1939,8 @@ test "ControlSocket handleSend falls back to public_endpoint" {
     var membership = Membership.MembershipTable.init(allocator, 10);
     defer membership.deinit();
 
-    const peer_pk = [_]u8{0x77} ** 32;
-    const peer_wg = [_]u8{0x88} ** 32;
+    const peer_pk = @as([32]u8, @splat(0x77));
+    const peer_wg = @as([32]u8, @splat(0x88));
     const pub_ep = messages.Endpoint.initV4(.{ 192, 168, 1, 50 }, 51820);
 
     try membership.upsert(.{
@@ -1951,7 +1951,7 @@ test "ControlSocket handleSend falls back to public_endpoint" {
         .public_endpoint = pub_ep, // but public endpoint is known!
         .wg_pubkey = peer_wg,
         .mesh_ip = .{ 10, 99, 0, 77 },
-        .mesh_ip6 = .{0} ** 16,
+        .mesh_ip6 = @splat(0),
         .wg_port = 51830,
         .lamport = 1,
         .last_seen_ns = 1,
@@ -1963,9 +1963,9 @@ test "ControlSocket handleSend falls back to public_endpoint" {
     var control = try ControlSocket.init(
         allocator,
         &membership,
-        [_]u8{1} ** 32,
+        @as([32]u8, @splat(1)),
         .{ 10, 99, 0, 1 },
-        [_]u8{2} ** 32,
+        @as([32]u8, @splat(2)),
         "dummy.sock",
     );
     defer control.deinit(allocator);
@@ -2008,9 +2008,9 @@ test "explicit invalid listener paths fail before default resolution" {
         try std.testing.expectError(error.InvalidControlPath, ControlSocket.init(
             allocator,
             &membership,
-            [_]u8{1} ** 32,
+            @as([32]u8, @splat(1)),
             .{ 10, 99, 0, 1 },
-            [_]u8{2} ** 32,
+            @as([32]u8, @splat(2)),
             path,
         ));
     }
@@ -2023,9 +2023,9 @@ test "drained app channels release capacity without evicting other queued messag
     const allocator = std.testing.allocator;
     var membership = Membership.MembershipTable.init(allocator, 10);
     defer membership.deinit();
-    var control = try ControlSocket.init(allocator, &membership, [_]u8{1} ** 32, .{ 10, 99, 0, 1 }, [_]u8{2} ** 32, "dummy.sock");
+    var control = try ControlSocket.init(allocator, &membership, @as([32]u8, @splat(1)), .{ 10, 99, 0, 1 }, @as([32]u8, @splat(2)), "dummy.sock");
     defer control.deinit(allocator);
-    const sender = [_]u8{3} ** 32;
+    const sender = @as([32]u8, @splat(3));
     try std.testing.expect(!control.pushMessage(sender, "MGAPP1 example-v1 "));
     try std.testing.expect(!control.pushAppMessage(sender, "example-v1", ""));
     try std.testing.expectEqual(@as(usize, 0), control.getMessageCount());
@@ -2060,9 +2060,9 @@ test "APPINFO reports honest framed maxPayload" {
     var control = try ControlSocket.init(
         allocator,
         &membership,
-        [_]u8{1} ** 32,
+        @as([32]u8, @splat(1)),
         .{ 10, 99, 0, 1 },
-        [_]u8{2} ** 32,
+        @as([32]u8, @splat(2)),
         "dummy.sock",
     );
     defer control.deinit(allocator);
@@ -2080,14 +2080,14 @@ test "legacy RECV never sees MGAPP1 frames and APPRECV never sees legacy" {
     var control = try ControlSocket.init(
         allocator,
         &membership,
-        [_]u8{1} ** 32,
+        @as([32]u8, @splat(1)),
         .{ 10, 99, 0, 1 },
-        [_]u8{2} ** 32,
+        @as([32]u8, @splat(2)),
         "dummy.sock",
     );
     defer control.deinit(allocator);
 
-    const sender = [_]u8{0x11} ** 32;
+    const sender = @as([32]u8, @splat(0x11));
     try std.testing.expect(control.pushMessage(sender, "legacy-hello"));
     try std.testing.expect(control.pushMessage(sender, "MGAPP1 example-v1 room-hello"));
 
@@ -2123,14 +2123,14 @@ test "application channels A and B are isolated" {
     var control = try ControlSocket.init(
         allocator,
         &membership,
-        [_]u8{1} ** 32,
+        @as([32]u8, @splat(1)),
         .{ 10, 99, 0, 1 },
-        [_]u8{2} ** 32,
+        @as([32]u8, @splat(2)),
         "dummy.sock",
     );
     defer control.deinit(allocator);
 
-    const sender = [_]u8{0x22} ** 32;
+    const sender = @as([32]u8, @splat(0x22));
     try std.testing.expect(control.pushMessage(sender, "MGAPP1 chan-a alpha"));
     try std.testing.expect(control.pushMessage(sender, "MGAPP1 chan-b beta"));
 
@@ -2155,15 +2155,15 @@ test "application queue overflow drops oldest on that channel only" {
     var control = try ControlSocket.init(
         allocator,
         &membership,
-        [_]u8{1} ** 32,
+        @as([32]u8, @splat(1)),
         .{ 10, 99, 0, 1 },
-        [_]u8{2} ** 32,
+        @as([32]u8, @splat(2)),
         "dummy.sock",
     );
     defer control.deinit(allocator);
 
-    const sender_a = [_]u8{0x33} ** 32;
-    const sender_b = [_]u8{0x44} ** 32;
+    const sender_a = @as([32]u8, @splat(0x33));
+    const sender_b = @as([32]u8, @splat(0x44));
     try std.testing.expect(control.pushMessage(sender_b, "MGAPP1 chan-b keep-me"));
     try std.testing.expect(control.pushMessage(sender_a, "legacy-keep"));
 
@@ -2198,14 +2198,14 @@ test "invalid channel names are rejected by IPC and demux" {
     var control = try ControlSocket.init(
         allocator,
         &membership,
-        [_]u8{1} ** 32,
+        @as([32]u8, @splat(1)),
         .{ 10, 99, 0, 1 },
-        [_]u8{2} ** 32,
+        @as([32]u8, @splat(2)),
         "dummy.sock",
     );
     defer control.deinit(allocator);
 
-    const sender = [_]u8{0x55} ** 32;
+    const sender = @as([32]u8, @splat(0x55));
     try std.testing.expect(!control.pushMessage(sender, "MGAPP1 BAD payload"));
     try std.testing.expect(!control.pushMessage(sender, "MGAPP1 has/slash payload"));
     try std.testing.expectEqual(@as(usize, 0), control.getMessageCount());
@@ -2214,7 +2214,7 @@ test "invalid channel names are rejected by IPC and demux" {
     const recv_bad = control.handleCommand("APPRECV BAD", &resp_buf);
     try std.testing.expect(std.mem.indexOf(u8, resp_buf[0..recv_bad], "invalid channel name") != null);
 
-    const send_bad = control.handleCommand("APPSEND 11" ++ "11" ** 31 ++ " BAD hello", &resp_buf);
+    const send_bad = control.handleCommand("APPSEND " ++ @as([64]u8, @splat('1')) ++ " BAD hello", &resp_buf);
     try std.testing.expect(std.mem.indexOf(u8, resp_buf[0..send_bad], "invalid channel name") != null);
 }
 
@@ -2226,21 +2226,21 @@ test "oversize and malformed MGAPP1 frames are rejected without truncate" {
     var control = try ControlSocket.init(
         allocator,
         &membership,
-        [_]u8{1} ** 32,
+        @splat(1),
         .{ 10, 99, 0, 1 },
-        [_]u8{2} ** 32,
+        @splat(2),
         "dummy.sock",
     );
     defer control.deinit(allocator);
 
-    const sender = [_]u8{0x66} ** 32;
+    const sender: [32]u8 = @splat(0x66);
     try std.testing.expect(!control.pushMessage(sender, "MGAPP1 "));
     try std.testing.expect(!control.pushMessage(sender, "MGAPP1 example-v1"));
     try std.testing.expect(!control.pushMessage(sender, "MGAPP1  payload"));
     try std.testing.expect(!control.pushMessage(sender, "MGAPP1 example-v1 \xff"));
-    try std.testing.expect(!control.pushMessage(sender, "MGAPP1 example-v1 " ++ "x" ** (app_channel.MAX_APP_PAYLOAD + 1)));
+    try std.testing.expect(!control.pushMessage(sender, "MGAPP1 example-v1 " ++ @as([app_channel.MAX_APP_PAYLOAD + 1]u8, @splat('x'))));
     try std.testing.expect(!control.pushAppMessage(sender, "example-v1", "\xff"));
-    try std.testing.expect(!control.pushAppMessage(sender, "example-v1", "x" ** (app_channel.MAX_APP_PAYLOAD + 1)));
+    try std.testing.expect(!control.pushAppMessage(sender, "example-v1", &@as([app_channel.MAX_APP_PAYLOAD + 1]u8, @splat('x'))));
 
     var oversize: [MAX_MESSAGE_PAYLOAD + 32]u8 = undefined;
     const prefix = "MGAPP1 example-v1 ";
@@ -2264,9 +2264,9 @@ test "APPSEND frames plaintext before the 0x50 encrypt path" {
     var membership = Membership.MembershipTable.init(allocator, 10);
     defer membership.deinit();
 
-    const peer_pk = [_]u8{0x77} ** 32;
-    const peer_wg = [_]u8{0x88} ** 32;
-    const our_wg = [_]u8{2} ** 32;
+    const peer_pk = @as([32]u8, @splat(0x77));
+    const peer_wg = @as([32]u8, @splat(0x88));
+    const our_wg = @as([32]u8, @splat(2));
     const pub_ep = messages.Endpoint.initV4(.{ 192, 168, 1, 50 }, 51820);
 
     try membership.upsert(.{
@@ -2277,7 +2277,7 @@ test "APPSEND frames plaintext before the 0x50 encrypt path" {
         .public_endpoint = pub_ep,
         .wg_pubkey = peer_wg,
         .mesh_ip = .{ 10, 99, 0, 77 },
-        .mesh_ip6 = .{0} ** 16,
+        .mesh_ip6 = @splat(0),
         .wg_port = 51830,
         .lamport = 1,
         .last_seen_ns = 1,
@@ -2289,7 +2289,7 @@ test "APPSEND frames plaintext before the 0x50 encrypt path" {
     var control = try ControlSocket.init(
         allocator,
         &membership,
-        [_]u8{1} ** 32,
+        @as([32]u8, @splat(1)),
         .{ 10, 99, 0, 1 },
         our_wg,
         "dummy.sock",
@@ -2355,12 +2355,12 @@ test "APPSEND frames plaintext before the 0x50 encrypt path" {
 
 test "XFER commands move a verified file between two control sockets over sealed 0x50 datagrams" {
     const allocator = std.testing.allocator;
-    const a_wg_private = [_]u8{0x11} ** 32;
-    const b_wg_private = [_]u8{0x22} ** 32;
-    const a_key = [_]u8{0xa1} ** 32;
-    const b_key = [_]u8{0xb2} ** 32;
-    const a_wg = try X25519.recoverPublicKey(a_wg_private);
-    const b_wg = try X25519.recoverPublicKey(b_wg_private);
+    const a_wg_private = @as([32]u8, @splat(0x11));
+    const b_wg_private = @as([32]u8, @splat(0x22));
+    const a_key = @as([32]u8, @splat(0xa1));
+    const b_key = @as([32]u8, @splat(0xb2));
+    const a_wg = X25519.recoverPublicKey(a_wg_private);
+    const b_wg = X25519.recoverPublicKey(b_wg_private);
 
     var a_members = Membership.MembershipTable.init(allocator, 10);
     defer a_members.deinit();
@@ -2368,7 +2368,7 @@ test "XFER commands move a verified file between two control sockets over sealed
     defer b_members.deinit();
     const peer = struct {
         fn entry(pubkey: [32]u8, wg: [32]u8) Membership.Peer {
-            return .{ .pubkey = pubkey, .name = "", .state = .alive, .gossip_endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 1), .public_endpoint = null, .wg_pubkey = wg, .mesh_ip = .{ 10, 99, 0, 2 }, .mesh_ip6 = .{0} ** 16, .wg_port = 51830, .lamport = 1, .last_seen_ns = 1, .suspected_at_ns = null, .last_rtt_ns = null, .handshake_complete = false };
+            return .{ .pubkey = pubkey, .name = "", .state = .alive, .gossip_endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 1), .public_endpoint = null, .wg_pubkey = wg, .mesh_ip = .{ 10, 99, 0, 2 }, .mesh_ip6 = @splat(0), .wg_port = 51830, .lamport = 1, .last_seen_ns = 1, .suspected_at_ns = null, .last_rtt_ns = null, .handshake_complete = false };
         }
     };
     try a_members.upsert(peer.entry(b_key, b_wg));

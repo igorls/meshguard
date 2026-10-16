@@ -52,7 +52,7 @@ pub const Peer = struct {
     /// Deterministic mesh IP
     mesh_ip: [4]u8,
     /// Deterministic mesh IPv6 address
-    mesh_ip6: [16]u8 = .{0} ** 16,
+    mesh_ip6: [16]u8 = @splat(0),
     /// WireGuard listen port
     wg_port: u16,
     /// Lamport timestamp of last state change
@@ -363,7 +363,7 @@ test "basic membership lifecycle" {
     var table = MembershipTable.init(allocator, 5000);
     defer table.deinit();
 
-    const pubkey = [_]u8{0x42} ** 32;
+    const pubkey = @as([32]u8, @splat(0x42));
     try table.upsert(.{
         .pubkey = pubkey,
         .name = "",
@@ -400,7 +400,7 @@ test "lamport ordering" {
     var table = MembershipTable.init(allocator, 5000);
     defer table.deinit();
 
-    const pubkey = [_]u8{0xAA} ** 32;
+    const pubkey = @as([32]u8, @splat(0xAA));
 
     // Insert with lamport=5
     try table.upsert(.{
@@ -463,18 +463,18 @@ test "membership table caps growth and reclaims non-alive slots (H3 regression)"
 
     var i: usize = 0;
     while (i < MAX_MEMBERS) : (i += 1) {
-        var pk = [_]u8{0} ** 32;
+        var pk = @as([32]u8, @splat(0));
         std.mem.writeInt(u32, pk[0..4], @intCast(i), .little);
         try table.upsert(testPeer(pk, .alive, null));
     }
     try std.testing.expectEqual(MAX_MEMBERS, table.count());
 
     // A new peer past the cap with no reclaimable slot must be rejected.
-    const overflow_pk = [_]u8{0xFF} ** 32;
+    const overflow_pk = @as([32]u8, @splat(0xFF));
     try std.testing.expectError(error.MembershipFull, table.upsert(testPeer(overflow_pk, .alive, null)));
 
     // Kill an existing peer, then the new peer is admitted by reclaiming it.
-    const victim = [_]u8{0} ** 32; // i==0
+    const victim = @as([32]u8, @splat(0)); // i==0
     table.markDead(victim);
     try table.upsert(testPeer(overflow_pk, .alive, null));
     try std.testing.expectEqual(MAX_MEMBERS, table.count());
@@ -486,7 +486,7 @@ test "expireSuspected writes to caller-owned buffer (H8 regression)" {
     var table = MembershipTable.init(allocator, 1000); // 1s timeout
     defer table.deinit();
 
-    const keys = [_][32]u8{ [_]u8{1} ** 32, [_]u8{2} ** 32, [_]u8{3} ** 32 };
+    const keys = [_][32]u8{ @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), @as([32]u8, @splat(3)) };
     for (keys) |k| {
         try table.upsert(testPeer(k, .suspected, 1)); // suspected_at = 1ns → long expired
     }

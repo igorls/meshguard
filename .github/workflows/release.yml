@@ -135,7 +135,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       - name: Build Apple libraries and XCFramework
         run: ./scripts/build-apple.sh
@@ -161,7 +161,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       # The runner image provides the Android NDK (ANDROID_NDK_HOME).
       - name: Build library packages
@@ -192,7 +192,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       - uses: actions/setup-node@v4
         with:

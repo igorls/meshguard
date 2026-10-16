@@ -43,7 +43,7 @@ pub const TunDevice = struct {
     // ctl_info structure for CTLIOCGINFO ioctl
     const CtlInfo = extern struct {
         ctl_id: u32 = 0,
-        ctl_name: [96]u8 = .{0} ** 96,
+        ctl_name: [96]u8 = @splat(0),
     };
 
     // sockaddr_ctl for connect()
@@ -53,7 +53,7 @@ pub const TunDevice = struct {
         ss_sysaddr: u16 = AF_SYS_CONTROL,
         sc_id: u32 = 0,
         sc_unit: u32 = 0, // utun unit number + 1 (0 = auto-assign)
-        sc_reserved: [5]u32 = .{0} ** 5,
+        sc_reserved: [5]u32 = @splat(0),
     };
 
     /// Open a utun device. The name parameter is a hint — macOS auto-assigns
@@ -63,10 +63,7 @@ pub const TunDevice = struct {
     pub fn open(name: []const u8) !TunDevice {
         // Create PF_SYSTEM control socket
         const fd = blk: {
-            const c = @cImport({
-                @cInclude("sys/socket.h");
-            });
-            const result = c.socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL);
+            const result = std.c.socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL);
             if (result < 0) return error.TunSetupFailed;
             break :blk @as(posix.fd_t, @intCast(result));
         };
@@ -101,7 +98,7 @@ pub const TunDevice = struct {
 
         // Get the actual interface name via getsockopt(UTUN_OPT_IFNAME)
         const UTUN_OPT_IFNAME: u32 = 2;
-        var if_name: [16]u8 = .{0} ** 16;
+        var if_name: [16]u8 = @splat(0);
         var name_len: posix.socklen_t = @sizeOf(@TypeOf(if_name));
         const gso_rc = std.c.getsockopt(
             fd,
@@ -189,15 +186,11 @@ pub const TunDevice = struct {
 
     /// Set the MTU of the utun interface.
     pub fn setMtu(self: *const TunDevice, mtu: u32) !void {
-        // Use ifconfig via child process — more reliable on macOS than raw ioctls
-        // which require the interface to be fully configured first
-        const c = @cImport({
-            @cInclude("sys/ioctl.h");
-            @cInclude("net/if.h");
-        });
+        // macOS SIOCSIFMTU = _IOW('i', 52, struct ifreq) = 0x80206934
+        const SIOCSIFMTU: c_uint = 0x80206934;
 
         const MtuIfreq = extern struct {
-            ifr_name: [16]u8 = .{0} ** 16,
+            ifr_name: [16]u8 = @splat(0),
             ifr_mtu: i32 = 0,
         };
 
@@ -208,7 +201,7 @@ pub const TunDevice = struct {
         const sock = linuxSocket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0) catch return error.SocketFailed;
         defer _ = std.c.close(sock);
 
-        const rc = std.c.ioctl(sock, @as(c_int, @bitCast(@as(c_uint, c.SIOCSIFMTU))), &ifr);
+        const rc = std.c.ioctl(sock, @as(c_int, @bitCast(SIOCSIFMTU)), &ifr);
         if (rc < 0) return error.SetMtuFailed;
     }
 

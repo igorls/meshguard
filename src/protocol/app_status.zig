@@ -43,13 +43,13 @@ pub fn encode(out: *[SIZE]u8, status: Status) void {
     out[0] = TYPE;
     @memcpy(out[1..33], &status.destination);
     @memcpy(out[33..45], &status.nonce);
-    out[45] = @intFromEnum(status.code);
+    out[45] = @backingInt(status.code);
     out[46] = 0;
 }
 
 pub fn decode(data: []const u8) ?Status {
     if (data.len != SIZE or data[0] != TYPE) return null;
-    return .{ .destination = data[1..33].*, .nonce = data[33..45].*, .code = @enumFromInt(data[45]) };
+    return .{ .destination = data[1..33].*, .nonce = data[33..45].*, .code = @fromBackingInt(@intCast(data[45])) };
 }
 
 /// The status for a sealed frame `[0x50][dest][sender][nonce]...`.
@@ -59,7 +59,7 @@ pub fn forFrame(frame: []const u8, code: Code) ?Status {
 }
 
 test "a status round-trips and is smaller than any sealed frame" {
-    var frame = [_]u8{0} ** 93;
+    var frame = @as([93]u8, @splat(0));
     frame[0] = 0x50;
     @memset(frame[1..33], 0xDD);
     @memset(frame[65..77], 0x77);

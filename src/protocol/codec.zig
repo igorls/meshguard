@@ -74,7 +74,7 @@ pub fn encodePing(buf: []u8, ping: messages.Ping) !usize {
     var pos: usize = 0;
 
     // Type tag
-    buf[pos] = @intFromEnum(messages.MessageType.ping);
+    buf[pos] = @backingInt(messages.MessageType.ping);
     pos += 1;
 
     // Pubkey
@@ -110,7 +110,7 @@ pub fn encodeAck(buf: []u8, ack: messages.Ack) !usize {
 
     var pos: usize = 0;
 
-    buf[pos] = @intFromEnum(messages.MessageType.ack);
+    buf[pos] = @backingInt(messages.MessageType.ack);
     pos += 1;
 
     @memcpy(buf[pos..][0..32], &ack.sender_pubkey);
@@ -142,7 +142,7 @@ pub fn encodePingReq(buf: []u8, req: messages.PingReq) !usize {
 
     var pos: usize = 0;
 
-    buf[pos] = @intFromEnum(messages.MessageType.ping_req);
+    buf[pos] = @backingInt(messages.MessageType.ping_req);
     pos += 1;
 
     @memcpy(buf[pos..][0..32], &req.sender_pubkey);
@@ -162,7 +162,7 @@ pub fn encodeHolepunchRequest(buf: []u8, req: messages.HolepunchRequest) !usize 
     if (buf.len < 1 + 32 + 32 + ENDPOINT_SIZE + 16) return error.BufferTooShort;
     var pos: usize = 0;
 
-    buf[pos] = @intFromEnum(messages.MessageType.holepunch_request);
+    buf[pos] = @backingInt(messages.MessageType.holepunch_request);
     pos += 1;
 
     @memcpy(buf[pos..][0..32], &req.sender_pubkey);
@@ -184,7 +184,7 @@ pub fn encodeHolepunchResponse(buf: []u8, resp: messages.HolepunchResponse) !usi
     if (buf.len < 1 + 32 + ENDPOINT_SIZE + 16) return error.BufferTooShort;
     var pos: usize = 0;
 
-    buf[pos] = @intFromEnum(messages.MessageType.holepunch_response);
+    buf[pos] = @backingInt(messages.MessageType.holepunch_response);
     pos += 1;
 
     @memcpy(buf[pos..][0..32], &resp.sender_pubkey);
@@ -207,7 +207,7 @@ pub fn encodeOrgAliasAnnounce(buf: []u8, msg: messages.OrgAliasAnnounce) !usize 
     if (buf.len < required) return error.BufferTooShort;
     var pos: usize = 0;
 
-    buf[pos] = @intFromEnum(messages.MessageType.org_alias_announce);
+    buf[pos] = @backingInt(messages.MessageType.org_alias_announce);
     pos += 1;
 
     @memcpy(buf[pos..][0..32], &msg.org_pubkey);
@@ -232,7 +232,7 @@ pub fn encodeOrgCertRevoke(buf: []u8, msg: messages.OrgCertRevoke) !usize {
     if (buf.len < required) return error.BufferTooShort;
     var pos: usize = 0;
 
-    buf[pos] = @intFromEnum(messages.MessageType.org_cert_revoke);
+    buf[pos] = @backingInt(messages.MessageType.org_cert_revoke);
     pos += 1;
 
     @memcpy(buf[pos..][0..32], &msg.org_pubkey);
@@ -260,7 +260,7 @@ pub fn encodeOrgTrustVouch(buf: []u8, msg: messages.OrgTrustVouch) !usize {
     if (buf.len < required) return error.BufferTooShort;
     var pos: usize = 0;
 
-    buf[pos] = @intFromEnum(messages.MessageType.org_trust_vouch);
+    buf[pos] = @backingInt(messages.MessageType.org_trust_vouch);
     pos += 1;
 
     @memcpy(buf[pos..][0..32], &msg.org_pubkey);
@@ -316,7 +316,7 @@ fn encodeGossipEntry(buf: []u8, entry: messages.GossipEntry) !usize {
     @memcpy(buf[pos..][0..32], &entry.subject_pubkey);
     pos += 32;
 
-    buf[pos] = @intFromEnum(entry.event);
+    buf[pos] = @backingInt(entry.event);
     pos += 1;
 
     std.mem.writeInt(u64, buf[pos..][0..8], entry.lamport, .little);
@@ -341,7 +341,7 @@ fn encodeGossipEntry(buf: []u8, entry: messages.GossipEntry) !usize {
     pos += try encodeEndpoint(buf[pos..], entry.public_endpoint);
 
     // NAT type
-    buf[pos] = @intFromEnum(entry.nat_type);
+    buf[pos] = @backingInt(entry.nat_type);
     pos += 1;
 
     return pos;
@@ -646,7 +646,7 @@ fn decodeOrgTrustVouch(data: []const u8) DecodeError!messages.OrgTrustVouch {
 // ─── Tests ───
 
 test "ping roundtrip" {
-    const pubkey = [_]u8{0x42} ** 32;
+    const pubkey = @as([32]u8, @splat(0x42));
     const ping = messages.Ping{
         .sender_pubkey = pubkey,
         .seq = 12345,
@@ -668,7 +668,7 @@ test "ping roundtrip" {
 }
 
 test "ack roundtrip" {
-    const pubkey = [_]u8{0xAA} ** 32;
+    const pubkey = @as([32]u8, @splat(0xAA));
     const ack = messages.Ack{
         .sender_pubkey = pubkey,
         .seq = 99,
@@ -688,8 +688,8 @@ test "ack roundtrip" {
 }
 
 test "ping optional org cert extension roundtrip" {
-    const pubkey = [_]u8{0x42} ** 32;
-    const cert = [_]u8{0xC7} ** messages.ORG_CERT_WIRE_SIZE;
+    const pubkey = @as([32]u8, @splat(0x42));
+    const cert = @as([messages.ORG_CERT_WIRE_SIZE]u8, @splat(0xC7));
     const ping = messages.Ping{
         .sender_pubkey = pubkey,
         .seq = 12345,
@@ -712,8 +712,8 @@ test "ping optional org cert extension roundtrip" {
 }
 
 test "ack optional org cert extension roundtrip" {
-    const pubkey = [_]u8{0xAA} ** 32;
-    const cert = [_]u8{0xAC} ** messages.ORG_CERT_WIRE_SIZE;
+    const pubkey = @as([32]u8, @splat(0xAA));
+    const cert = @as([messages.ORG_CERT_WIRE_SIZE]u8, @splat(0xAC));
     const ack = messages.Ack{
         .sender_pubkey = pubkey,
         .seq = 99,
@@ -736,12 +736,12 @@ test "ack optional org cert extension roundtrip" {
 }
 
 test "ack accepts legacy v1 org cert extension" {
-    const pubkey = [_]u8{0xAA} ** 32;
-    const legacy_cert = [_]u8{0xA1} ** 186;
+    const pubkey = @as([32]u8, @splat(0xAA));
+    const legacy_cert = @as([186]u8, @splat(0xA1));
     var buf: [1 + 32 + 8 + 8 + 1 + 1 + 186]u8 = undefined;
     var pos: usize = 0;
 
-    buf[pos] = @intFromEnum(messages.MessageType.ack);
+    buf[pos] = @backingInt(messages.MessageType.ack);
     pos += 1;
     @memcpy(buf[pos..][0..32], &pubkey);
     pos += 32;
@@ -768,8 +768,8 @@ test "ack accepts legacy v1 org cert extension" {
 }
 
 test "ping with gossip roundtrip" {
-    const pubkey = [_]u8{0x01} ** 32;
-    const subject = [_]u8{0x02} ** 32;
+    const pubkey = @as([32]u8, @splat(0x01));
+    const subject = @as([32]u8, @splat(0x02));
 
     const gossip = [_]messages.GossipEntry{.{
         .subject_pubkey = subject,
@@ -802,8 +802,8 @@ test "ping with gossip roundtrip" {
 }
 
 test "ping with IPv6 gossip endpoint roundtrip" {
-    const pubkey = [_]u8{0x01} ** 32;
-    const subject = [_]u8{0x02} ** 32;
+    const pubkey = @as([32]u8, @splat(0x01));
+    const subject = @as([32]u8, @splat(0x02));
     const addr6 = [16]u8{ 0xfd, 0x99, 0x6d, 0x67, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
 
     const gossip = [_]messages.GossipEntry{.{
@@ -836,8 +836,8 @@ test "ping with IPv6 gossip endpoint roundtrip" {
 }
 
 test "ping_req roundtrip" {
-    const sender = [_]u8{0x01} ** 32;
-    const target = [_]u8{0x02} ** 32;
+    const sender = @as([32]u8, @splat(0x01));
+    const target = @as([32]u8, @splat(0x02));
 
     const req = messages.PingReq{
         .sender_pubkey = sender,
@@ -860,9 +860,9 @@ test "ping_req roundtrip" {
 }
 
 test "org alias announce roundtrip" {
-    const org_pk = [_]u8{0xAA} ** 32;
+    const org_pk = @as([32]u8, @splat(0xAA));
     const alias_name = "acme\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
-    const sig = [_]u8{0x55} ** 64;
+    const sig = @as([64]u8, @splat(0x55));
 
     const msg = messages.OrgAliasAnnounce{
         .org_pubkey = org_pk,
@@ -886,9 +886,9 @@ test "org alias announce roundtrip" {
 }
 
 test "org cert revoke roundtrip" {
-    const org_pk = [_]u8{0xBB} ** 32;
-    const node_pk = [_]u8{0xCC} ** 32;
-    const sig = [_]u8{0xDD} ** 64;
+    const org_pk = @as([32]u8, @splat(0xBB));
+    const node_pk = @as([32]u8, @splat(0xCC));
+    const sig = @as([64]u8, @splat(0xDD));
 
     const msg = messages.OrgCertRevoke{
         .org_pubkey = org_pk,
@@ -914,9 +914,9 @@ test "org cert revoke roundtrip" {
 }
 
 test "org trust vouch roundtrip" {
-    const org_pk = [_]u8{0xEE} ** 32;
-    const vouched_pk = [_]u8{0xFF} ** 32;
-    const sig = [_]u8{0x11} ** 64;
+    const org_pk = @as([32]u8, @splat(0xEE));
+    const vouched_pk = @as([32]u8, @splat(0xFF));
+    const sig = @as([64]u8, @splat(0x11));
 
     const msg = messages.OrgTrustVouch{
         .org_pubkey = org_pk,
@@ -944,7 +944,7 @@ test "org trust vouch roundtrip" {
 }
 
 test "truncated trailing org-cert flag does not drop the whole packet (C4)" {
-    const pubkey = [_]u8{0x01} ** 32;
+    const pubkey = @as([32]u8, @splat(0x01));
     const ping = messages.Ping{ .sender_pubkey = pubkey, .seq = 7, .gossip = &.{} };
 
     var buf: [600]u8 = undefined;
@@ -963,23 +963,23 @@ test "truncated trailing org-cert flag does not drop the whole packet (C4)" {
 
 fn testGossipEntry(i: u8) messages.GossipEntry {
     return .{
-        .subject_pubkey = [_]u8{i} ** 32,
+        .subject_pubkey = @as([32]u8, @splat(i)),
         .event = .alive,
         .lamport = i,
         .endpoint = messages.Endpoint.initV4(.{ 10, 0, 0, i }, 51821),
-        .wg_pubkey = [_]u8{i +% 1} ** 32,
+        .wg_pubkey = @as([32]u8, @splat(i +% 1)),
     };
 }
 
 test "ping and ack carry a WireGuard binding with or without a certificate" {
-    const binding = messages.WgBinding{ .wg_pubkey = [_]u8{0x5A} ** 32, .signature = [_]u8{0xB5} ** 64 };
-    const cert = [_]u8{0xC7} ** messages.ORG_CERT_WIRE_SIZE;
+    const binding = messages.WgBinding{ .wg_pubkey = @as([32]u8, @splat(0x5A)), .signature = @as([64]u8, @splat(0xB5)) };
+    const cert = @as([messages.ORG_CERT_WIRE_SIZE]u8, @splat(0xC7));
     const gossip = [_]messages.GossipEntry{testGossipEntry(3)};
 
     for ([_]bool{ false, true }) |with_cert| {
         var buf: [1500]u8 = undefined;
         const ping_len = try encodePing(&buf, .{
-            .sender_pubkey = [_]u8{0x42} ** 32,
+            .sender_pubkey = @as([32]u8, @splat(0x42)),
             .seq = 5,
             .gossip = &gossip,
             .org_cert = if (with_cert) cert else std.mem.zeroes([messages.ORG_CERT_WIRE_SIZE]u8),
@@ -994,7 +994,7 @@ test "ping and ack carry a WireGuard binding with or without a certificate" {
         try std.testing.expectEqualSlices(u8, &binding.signature, &ping.wg_binding.?.signature);
 
         const ack_len = try encodeAck(&buf, .{
-            .sender_pubkey = [_]u8{0x43} ** 32,
+            .sender_pubkey = @as([32]u8, @splat(0x43)),
             .seq = 6,
             .gossip = &gossip,
             .org_cert = cert,
@@ -1009,7 +1009,7 @@ test "ping and ack carry a WireGuard binding with or without a certificate" {
 
 test "packets without a binding decode as before" {
     var buf: [1500]u8 = undefined;
-    const len = try encodePing(&buf, .{ .sender_pubkey = [_]u8{1} ** 32, .seq = 1, .gossip = &.{} });
+    const len = try encodePing(&buf, .{ .sender_pubkey = @as([32]u8, @splat(1)), .seq = 1, .gossip = &.{} });
     const ping = (try decode(buf[0..len])).ping;
     try std.testing.expect(ping.wg_binding == null);
     try std.testing.expect(!ping.has_org_cert);
@@ -1018,15 +1018,15 @@ test "packets without a binding decode as before" {
 test "a legacy decoder reading the certificate ignores the binding behind it" {
     // Pre-binding decoders copy at most 314 bytes after a 0x01 flag; the
     // binding must start exactly there so they never mistake it for a cert.
-    const cert = [_]u8{0xC7} ** messages.ORG_CERT_WIRE_SIZE;
+    const cert = @as([messages.ORG_CERT_WIRE_SIZE]u8, @splat(0xC7));
     var buf: [1500]u8 = undefined;
     const len = try encodePing(&buf, .{
-        .sender_pubkey = [_]u8{1} ** 32,
+        .sender_pubkey = @as([32]u8, @splat(1)),
         .seq = 1,
         .gossip = &.{},
         .org_cert = cert,
         .has_org_cert = true,
-        .wg_binding = .{ .wg_pubkey = [_]u8{2} ** 32, .signature = [_]u8{3} ** 64 },
+        .wg_binding = .{ .wg_pubkey = @as([32]u8, @splat(2)), .signature = @as([64]u8, @splat(3)) },
     });
     try std.testing.expectEqual(@as(usize, PING_HEADER_SIZE + ORG_CERT_EXTENSION_SIZE + WG_BINDING_EXTENSION_SIZE), len);
     try std.testing.expectEqual(EXT_ORG_CERT, buf[PING_HEADER_SIZE]);
@@ -1036,10 +1036,10 @@ test "a legacy decoder reading the certificate ignores the binding behind it" {
 test "a truncated binding is ignored without dropping the packet" {
     var buf: [1500]u8 = undefined;
     const len = try encodePing(&buf, .{
-        .sender_pubkey = [_]u8{1} ** 32,
+        .sender_pubkey = @as([32]u8, @splat(1)),
         .seq = 1,
         .gossip = &.{},
-        .wg_binding = .{ .wg_pubkey = [_]u8{2} ** 32, .signature = [_]u8{3} ** 64 },
+        .wg_binding = .{ .wg_pubkey = @as([32]u8, @splat(2)), .signature = @as([64]u8, @splat(3)) },
     });
     const ping = (try decode(buf[0 .. len - 1])).ping;
     try std.testing.expect(ping.wg_binding == null);
@@ -1054,11 +1054,11 @@ test "maximum gossip with every extension stays within the datagram budget" {
             const count = maxGossipEntries(with_cert, with_binding);
             var buf: [1500]u8 = undefined;
             const len = try encodePing(&buf, .{
-                .sender_pubkey = [_]u8{1} ** 32,
+                .sender_pubkey = @as([32]u8, @splat(1)),
                 .seq = 1,
                 .gossip = entries[0..count],
                 .has_org_cert = with_cert,
-                .wg_binding = if (with_binding) messages.WgBinding{ .wg_pubkey = [_]u8{2} ** 32, .signature = [_]u8{3} ** 64 } else null,
+                .wg_binding = if (with_binding) messages.WgBinding{ .wg_pubkey = @as([32]u8, @splat(2)), .signature = @as([64]u8, @splat(3)) } else null,
             });
             try std.testing.expect(len <= MAX_SWIM_DATAGRAM);
             const ping = (try decode(buf[0..len])).ping;

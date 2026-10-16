@@ -42,9 +42,9 @@ pub const TunDevice = struct {
 
     // ifreq structure for ioctl
     const Ifreq = extern struct {
-        ifr_name: [16]u8 = .{0} ** 16,
+        ifr_name: [16]u8 = @splat(0),
         ifr_flags: u16 = 0,
-        _pad: [22]u8 = .{0} ** 22,
+        _pad: [22]u8 = @splat(0),
     };
 
     /// Open a TUN device with the given name.
@@ -223,9 +223,9 @@ pub const TunDevice = struct {
         const SIOCSIFMTU: u32 = 0x8922;
         // ifreq for MTU: name + u32 mtu at offset 16
         const MtuIfreq = extern struct {
-            ifr_name: [16]u8 = .{0} ** 16,
+            ifr_name: [16]u8 = @splat(0),
             ifr_mtu: u32 = 0,
-            _pad: [20]u8 = .{0} ** 20,
+            _pad: [20]u8 = @splat(0),
         };
         var ifr = MtuIfreq{};
         @memcpy(ifr.ifr_name[0..self.name_len], self.name[0..self.name_len]);

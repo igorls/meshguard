@@ -308,8 +308,8 @@ pub const Holepuncher = struct {
 test "initiate and respond" {
     var puncher = Holepuncher{};
 
-    const our_pubkey = [_]u8{0xAA} ** 32;
-    const target_pubkey = [_]u8{0xBB} ** 32;
+    const our_pubkey = @as([32]u8, @splat(0xAA));
+    const target_pubkey = @as([32]u8, @splat(0xBB));
     const our_ep = messages.Endpoint{ .addr = .{ 1, 2, 3, 4 }, .port = 51820 };
 
     // Initiate a punch
@@ -319,7 +319,7 @@ test "initiate and respond" {
 
     // Build and handle response
     const target_ep = messages.Endpoint{ .addr = .{ 5, 6, 7, 8 }, .port = 51820 };
-    const response = Holepuncher.buildResponse([_]u8{0xBB} ** 32, target_ep, request.?);
+    const response = Holepuncher.buildResponse(@as([32]u8, @splat(0xBB)), target_ep, request.?);
     const result_ep = puncher.handleResponse(response);
     try std.testing.expect(result_ep != null);
     try std.testing.expectEqual(result_ep.?.addr[0], 5);
@@ -327,10 +327,10 @@ test "initiate and respond" {
 
 test "probe magic detection" {
     var probe_buf: [PROBE_SIZE]u8 = undefined;
-    Holepuncher.encodeProbe([_]u8{0x42} ** 16, &probe_buf);
+    Holepuncher.encodeProbe(@as([16]u8, @splat(0x42)), &probe_buf);
 
     try std.testing.expect(Holepuncher.isProbe(&probe_buf));
-    try std.testing.expectEqualSlices(u8, &([_]u8{0x42} ** 16), &Holepuncher.decodeProbe(&probe_buf).?.token);
+    try std.testing.expectEqualSlices(u8, &@as([16]u8, @splat(0x42)), &Holepuncher.decodeProbe(&probe_buf).?.token);
     try std.testing.expect(!Holepuncher.isProbe(&PROBE_MAGIC));
     try std.testing.expect(!Holepuncher.isProbe(&.{ 0x01, 0x02, 0x03, 0x04 }));
     try std.testing.expect(!Holepuncher.isProbe(&.{0x01}));
@@ -342,21 +342,21 @@ test "max concurrent punches" {
 
     // Fill all slots
     for (0..MAX_CONCURRENT_PUNCHES) |i| {
-        var target = [_]u8{0} ** 32;
+        var target = @as([32]u8, @splat(0));
         target[0] = @intCast(i);
-        try std.testing.expect(puncher.initiate([_]u8{0xAA} ** 32, target, our_ep) != null);
+        try std.testing.expect(puncher.initiate(@as([32]u8, @splat(0xAA)), target, our_ep) != null);
     }
 
     // Next one should fail
-    try std.testing.expect(puncher.initiate([_]u8{0xAA} ** 32, [_]u8{0xFF} ** 32, our_ep) == null);
+    try std.testing.expect(puncher.initiate(@as([32]u8, @splat(0xAA)), @as([32]u8, @splat(0xFF)), our_ep) == null);
     try std.testing.expectEqual(puncher.activeCount(), MAX_CONCURRENT_PUNCHES);
 }
 
 test "holepunch response is bound to token and peer identity" {
     var puncher = Holepuncher{};
-    const our_pubkey = [_]u8{0xAA} ** 32;
-    const target_pubkey = [_]u8{0xBB} ** 32;
-    const wrong_pubkey = [_]u8{0xCC} ** 32;
+    const our_pubkey = @as([32]u8, @splat(0xAA));
+    const target_pubkey = @as([32]u8, @splat(0xBB));
+    const wrong_pubkey = @as([32]u8, @splat(0xCC));
     const our_ep = messages.Endpoint.initV4(.{ 1, 2, 3, 4 }, 51821);
     const target_ep = messages.Endpoint.initV4(.{ 5, 6, 7, 8 }, 51821);
 
@@ -369,7 +369,7 @@ test "holepunch response is bound to token and peer identity" {
     try std.testing.expect(puncher.handleResponse(.{
         .sender_pubkey = target_pubkey,
         .public_endpoint = target_ep,
-        .token_echo = [_]u8{0x11} ** 16,
+        .token_echo = @as([16]u8, @splat(0x11)),
     }) == null);
     try std.testing.expect(puncher.handleResponse(.{
         .sender_pubkey = target_pubkey,
@@ -380,11 +380,11 @@ test "holepunch response is bound to token and peer identity" {
 
 test "target accepts request with initiator session token" {
     var puncher = Holepuncher{};
-    const our_pubkey = [_]u8{0xBB} ** 32;
-    const initiator_pubkey = [_]u8{0xAA} ** 32;
+    const our_pubkey = @as([32]u8, @splat(0xBB));
+    const initiator_pubkey = @as([32]u8, @splat(0xAA));
     const our_ep = messages.Endpoint.initV4(.{ 5, 6, 7, 8 }, 51821);
     const initiator_ep = messages.Endpoint.initV4(.{ 1, 2, 3, 4 }, 51821);
-    const token = [_]u8{0x99} ** 16;
+    const token = @as([16]u8, @splat(0x99));
 
     try std.testing.expect(puncher.acceptRequest(our_pubkey, .{
         .sender_pubkey = initiator_pubkey,

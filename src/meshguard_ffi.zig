@@ -448,10 +448,7 @@ export fn meshguard_init(
     x_priv[31] &= 127;
     x_priv[31] |= 64;
     ctx.x25519_private = x_priv;
-    ctx.x25519_public = X25519.recoverPublicKey(x_priv) catch {
-        destroyContext(ctx);
-        return null;
-    };
+    ctx.x25519_public = X25519.recoverPublicKey(x_priv);
     ctx.wg_binding = lib.identity.Binding.signWithSeed(ctx.ed25519_seed, ctx.x25519_public) catch {
         destroyContext(ctx);
         return null;
@@ -477,7 +474,7 @@ export fn meshguard_init_ipv6(
 ) ?*MeshguardContext {
     const ctx = meshguard_init(identity_seed, listen_port) orelse return null;
     closeContextSocket(ctx);
-    ctx.socket = Udp.UdpSocket.bindAddr6(.{0} ** 16, listen_port) catch {
+    ctx.socket = Udp.UdpSocket.bindAddr6(@splat(0), listen_port) catch {
         destroyContext(ctx);
         return null;
     };
@@ -959,7 +956,7 @@ fn contactOnlyPeer(identity: [32]u8) Membership.Peer {
 fn validContactKeys(ed25519: [32]u8, wg: [32]u8) bool {
     _ = Ed25519.PublicKey.fromBytes(ed25519) catch return false;
     // Reject low-order WireGuard keys: they make every shared secret predictable.
-    const probe = [_]u8{0x48} ++ [_]u8{0x11} ** 30 ++ [_]u8{0x41};
+    const probe = [_]u8{0x48} ++ @as([30]u8, @splat(0x11)) ++ [_]u8{0x41};
     _ = X25519.scalarmult(probe, wg) catch return false;
     return true;
 }
@@ -1049,7 +1046,7 @@ fn onAppStatusCallback(raw_ctx: *anyopaque, data: []const u8, src: messages.Endp
     if (!takeSentFrame(ctx, status.destination, status.nonce)) return;
     if (status.code == .handshake_again) ctx.last_relay_auth_ns = 0;
     enqueueStatus(ctx, status);
-    if (ctx.on_delivery_status_cb) |cb| cb(&status.destination, &status.nonce, @intFromEnum(status.code));
+    if (ctx.on_delivery_status_cb) |cb| cb(&status.destination, &status.nonce, @backingInt(status.code));
 }
 
 /// Single producer (the event loop); drops new statuses while the queue is full.
@@ -1060,7 +1057,7 @@ fn enqueueStatus(ctx: *MeshguardContext, status: AppStatus.Status) void {
     const slot = &ctx.status_inbox[write_idx % ctx.status_inbox.len];
     slot.destination = status.destination;
     slot.nonce = status.nonce;
-    slot.code = @intFromEnum(status.code);
+    slot.code = @backingInt(status.code);
     @atomicStore(bool, &slot.valid, true, .release);
     _ = ctx.status_write.fetchAdd(1, .release);
 }
@@ -2238,7 +2235,7 @@ test "destroyContext releases FFI-owned membership allocations" {
 
     const peer_name = try allocator.dupe(u8, "ffi-peer");
     try ctx.membership.upsert(.{
-        .pubkey = [_]u8{0x42} ** 32,
+        .pubkey = @as([32]u8, @splat(0x42)),
         .name = peer_name,
         .state = .alive,
         .gossip_endpoint = null,
@@ -2263,7 +2260,7 @@ test "tunnel frame payload length guard widens before adding header" {
 }
 
 fn routeTestPeer(key: u8) Membership.Peer {
-    return .{ .pubkey = [_]u8{key} ** 32, .name = "", .state = .alive, .gossip_endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 51000 + @as(u16, key)), .wg_pubkey = [_]u8{key} ** 32, .mesh_ip = .{ 10, 99, 0, key }, .wg_port = 0, .lamport = 1, .last_seen_ns = 1, .suspected_at_ns = null, .last_rtt_ns = null, .handshake_complete = false };
+    return .{ .pubkey = @as([32]u8, @splat(key)), .name = "", .state = .alive, .gossip_endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 51000 + @as(u16, key)), .wg_pubkey = @as([32]u8, @splat(key)), .mesh_ip = .{ 10, 99, 0, key }, .wg_port = 0, .lamport = 1, .last_seen_ns = 1, .suspected_at_ns = null, .last_rtt_ns = null, .handshake_complete = false };
 }
 
 test "forced app relay route never falls back to direct" {
@@ -2283,15 +2280,15 @@ test "forced app relay requires an identity before join" {
     initContextStorage(&ctx, std.testing.allocator);
     defer ctx.membership.deinit();
     try std.testing.expectEqual(@as(i32, -3), meshguard_set_app_relay(&ctx, null, true));
-    var pin = [_]u8{2} ** 32;
+    var pin = @as([32]u8, @splat(2));
     try std.testing.expectEqual(@as(i32, 0), meshguard_set_app_relay(&ctx, &pin, true));
     ctx.running.store(true, .release);
     try std.testing.expectEqual(@as(i32, -2), meshguard_set_app_relay(&ctx, null, false));
 }
 
 test "authenticated direct and relay copies enqueue only once" {
-    var seed_a = [_]u8{1} ** 32;
-    var seed_b = [_]u8{2} ** 32;
+    var seed_a = @as([32]u8, @splat(1));
+    var seed_b = @as([32]u8, @splat(2));
     const sender = meshguard_init(&seed_a, 0) orelse return error.InitFailed;
     defer meshguard_destroy(sender);
     const receiver = meshguard_init(&seed_b, 0) orelse return error.InitFailed;
@@ -2305,7 +2302,7 @@ test "authenticated direct and relay copies enqueue only once" {
     packet[0] = 0x50;
     @memcpy(packet[1..33], &receiver.ed25519_public);
     @memcpy(packet[33..65], &sender.ed25519_public);
-    const nonce = [_]u8{7} ** 12;
+    const nonce = @as([12]u8, @splat(7));
     @memcpy(packet[65..77], &nonce);
     const shared = try X25519.scalarmult(sender.x25519_private, receiver.x25519_public);
     var tag: [16]u8 = undefined;
@@ -2323,7 +2320,7 @@ test "authenticated direct and relay copies enqueue only once" {
 }
 
 fn smallStackLifecycle() !void {
-    var seed = [_]u8{0x37} ** 32;
+    var seed = @as([32]u8, @splat(0x37));
     for (0..3) |_| {
         const ctx = meshguard_init(&seed, 0) orelse return error.InitFailed;
         defer meshguard_destroy(ctx);
@@ -2341,17 +2338,17 @@ fn smallStackLifecycle() !void {
 test "FFI lifecycle fits a small mobile host thread stack" {
     // Unoptimized std.crypto arithmetic needs more stack than the ReleaseFast
     // mobile artifacts. Both limits remain below the old initializer's frame.
-    const stack_size: usize = if (builtin.mode == .Debug) 1024 * 1024 else 256 * 1024;
+    const stack_size: usize = if (builtin.mode == .debug) 1024 * 1024 else 256 * 1024;
     const thread = try std.Thread.spawn(.{ .stack_size = stack_size }, smallStackLifecycle, .{});
     thread.join();
 }
 
 test "pinned relay WireGuard key is used only when signed or derived" {
-    const relay = try Ed25519.KeyPair.generateDeterministic([_]u8{5} ** 32);
+    const relay = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(5)));
     const pin = relay.public_key.toBytes();
     var peer = routeTestPeer(3);
 
-    peer.wg_pubkey = [_]u8{0x66} ** 32;
+    peer.wg_pubkey = @as([32]u8, @splat(0x66));
     peer.wg_key_source = .gossip;
     try std.testing.expect(trustedRelayWgKey(pin, peer) == null);
 
@@ -2365,7 +2362,7 @@ test "pinned relay WireGuard key is used only when signed or derived" {
 }
 
 test "certificates are checked against this context before they are installed" {
-    var seed = [_]u8{6} ** 32;
+    var seed = @as([32]u8, @splat(6));
     const ctx = meshguard_init(&seed, 0) orelse return error.InitFailed;
     defer meshguard_destroy(ctx);
     const Org = lib.identity.Org;
@@ -2378,11 +2375,11 @@ test "certificates are checked against this context before they are installed" {
     try std.testing.expectEqual(@as(i32, 0), meshguard_set_org_cert(ctx, &wire, wire.len));
     try std.testing.expect(ctx.org_cert != null and ctx.org_cert_dirty.load(.acquire));
 
-    const other_wg = try Org.issueCertificateV2(org, ctx.ed25519_public, [_]u8{9} ** 32, "", now + 3600);
+    const other_wg = try Org.issueCertificateV2(org, ctx.ed25519_public, @as([32]u8, @splat(9)), "", now + 3600);
     other_wg.serialize(&wire);
     try std.testing.expectEqual(@as(i32, -4), meshguard_set_org_cert(ctx, &wire, wire.len));
 
-    const other_node = try Org.issueCertificateV2(org, [_]u8{8} ** 32, ctx.x25519_public, "", now + 3600);
+    const other_node = try Org.issueCertificateV2(org, @as([32]u8, @splat(8)), ctx.x25519_public, "", now + 3600);
     other_node.serialize(&wire);
     try std.testing.expectEqual(@as(i32, -4), meshguard_set_org_cert(ctx, &wire, wire.len));
 
@@ -2400,7 +2397,7 @@ test "certificates are checked against this context before they are installed" {
 }
 
 test "a certificate set before join is advertised once the context runs" {
-    var seed = [_]u8{7} ** 32;
+    var seed = @as([32]u8, @splat(7));
     const ctx = meshguard_init(&seed, 0) orelse return error.InitFailed;
     defer meshguard_destroy(ctx);
     const Org = lib.identity.Org;
@@ -2419,7 +2416,7 @@ test "a certificate set before join is advertised once the context runs" {
 }
 
 test "contexts advertise a binding for their own WireGuard key" {
-    var seed = [_]u8{4} ** 32;
+    var seed = @as([32]u8, @splat(4));
     const ctx = meshguard_init(&seed, 0) orelse return error.InitFailed;
     defer meshguard_destroy(ctx);
     try std.testing.expectEqualSlices(u8, &ctx.x25519_public, &ctx.wg_binding.wg_pubkey);
@@ -2427,17 +2424,17 @@ test "contexts advertise a binding for their own WireGuard key" {
 }
 
 test "contacts are validated, counted and removed" {
-    var seed = [_]u8{0x21} ** 32;
+    var seed = @as([32]u8, @splat(0x21));
     const ctx = meshguard_init(&seed, 0) orelse return error.InitFailed;
     defer meshguard_destroy(ctx);
-    const other = try AppPacket.Identity.fromSeed([_]u8{0x22} ** 32);
+    const other = try AppPacket.Identity.fromSeed(@as([32]u8, @splat(0x22)));
 
     try std.testing.expectEqual(@as(i32, 0), meshguard_add_contact(ctx, &other.public_key, &other.wg_public));
     try std.testing.expectEqual(@as(i32, 0), meshguard_add_contact(ctx, &other.public_key, &other.wg_public));
     try std.testing.expectEqual(@as(u32, 1), meshguard_contact_count(ctx));
-    const zero = [_]u8{0} ** 32;
+    const zero = @as([32]u8, @splat(0));
     try std.testing.expectEqual(@as(i32, -3), meshguard_add_contact(ctx, &other.public_key, &zero));
-    var not_a_point = [_]u8{0xff} ** 32;
+    var not_a_point = @as([32]u8, @splat(0xff));
     not_a_point[31] = 0x7f;
     try std.testing.expectEqual(@as(i32, -3), meshguard_add_contact(ctx, &not_a_point, &other.wg_public));
 
@@ -2456,11 +2453,11 @@ fn sealedFrom(sender: AppPacket.Identity, ctx: *const MeshguardContext, text: []
 }
 
 test "frames from a contact open with its registered key, and contacts-only drops strangers" {
-    var seed = [_]u8{0x23} ** 32;
+    var seed = @as([32]u8, @splat(0x23));
     const ctx = meshguard_init(&seed, 0) orelse return error.InitFailed;
     defer meshguard_destroy(ctx);
-    const friend = try AppPacket.Identity.fromSeed([_]u8{0x24} ** 32);
-    const stranger = try AppPacket.Identity.fromSeed([_]u8{0x25} ** 32);
+    const friend = try AppPacket.Identity.fromSeed(@as([32]u8, @splat(0x24)));
+    const stranger = try AppPacket.Identity.fromSeed(@as([32]u8, @splat(0x25)));
     var buf: [AppPacket.max_packet]u8 = undefined;
 
     // Not in membership and not a contact: nothing to open it with.
@@ -2494,7 +2491,7 @@ const StatusProbe = struct {
 };
 
 test "delivery statuses count only from the pinned relay and for frames we sent" {
-    var seed = [_]u8{0x26} ** 32;
+    var seed = @as([32]u8, @splat(0x26));
     const ctx = meshguard_init(&seed, 0) orelse return error.InitFailed;
     defer meshguard_destroy(ctx);
     var relay = routeTestPeer(0x31);
@@ -2503,8 +2500,8 @@ test "delivery statuses count only from the pinned relay and for frames we sent"
     meshguard_set_on_delivery_status(ctx, StatusProbe.record);
     StatusProbe.calls = 0;
 
-    const dest = [_]u8{0x44} ** 32;
-    const nonce = [_]u8{0x55} ** 12;
+    const dest = @as([32]u8, @splat(0x44));
+    const nonce = @as([12]u8, @splat(0x55));
     var bytes: [AppStatus.SIZE]u8 = undefined;
     AppStatus.encode(&bytes, .{ .destination = dest, .nonce = nonce, .code = .handshake_again });
     const relay_ep = relay.gossip_endpoint.?;
@@ -2545,7 +2542,7 @@ test "delivery statuses count only from the pinned relay and for frames we sent"
 }
 
 test "the delivery status queue holds 64 and drops newer statuses while full" {
-    var seed = [_]u8{0x27} ** 32;
+    var seed = @as([32]u8, @splat(0x27));
     const ctx = meshguard_init(&seed, 0) orelse return error.InitFailed;
     defer meshguard_destroy(ctx);
     const relay = routeTestPeer(0x32);
@@ -2553,10 +2550,10 @@ test "the delivery status queue holds 64 and drops newer statuses while full" {
     ctx.app_relay_key = relay.pubkey;
     const relay_ep = relay.gossip_endpoint.?;
 
-    const dest = [_]u8{0x46} ** 32;
+    const dest = @as([32]u8, @splat(0x46));
     var bytes: [AppStatus.SIZE]u8 = undefined;
     for (0..70) |i| {
-        var nonce = [_]u8{0} ** 12;
+        var nonce = @as([12]u8, @splat(0));
         nonce[0] = @intCast(i);
         rememberSentFrame(ctx, dest, nonce);
         AppStatus.encode(&bytes, .{ .destination = dest, .nonce = nonce, .code = .offline });
@@ -2574,10 +2571,10 @@ test "the delivery status queue holds 64 and drops newer statuses while full" {
 }
 
 test "leaving forgets the network but keeps identity and contacts" {
-    var seed = [_]u8{0x28} ** 32;
+    var seed = @as([32]u8, @splat(0x28));
     const ctx = meshguard_init(&seed, 0) orelse return error.InitFailed;
     defer meshguard_destroy(ctx);
-    const friend = try AppPacket.Identity.fromSeed([_]u8{0x29} ** 32);
+    const friend = try AppPacket.Identity.fromSeed(@as([32]u8, @splat(0x29)));
     try std.testing.expectEqual(@as(i32, 0), meshguard_add_contact(ctx, &friend.public_key, &friend.wg_public));
     const loopback = [_]u8{ 127, 0, 0, 1 };
 
@@ -2590,7 +2587,7 @@ test "leaving forgets the network but keeps identity and contacts" {
     try std.testing.expectEqual(@as(u32, 1), meshguard_contact_count(ctx));
 
     // Switching to another relay joins again (and twice in a row is fine).
-    var relay = [_]u8{0x42} ** 32;
+    var relay = @as([32]u8, @splat(0x42));
     try std.testing.expectEqual(@as(i32, 0), meshguard_switch_relay(ctx, &relay, true, &loopback, 10));
     try std.testing.expect(ctx.running.load(.acquire));
     try std.testing.expectEqualSlices(u8, &relay, &ctx.app_relay_key.?);
@@ -2599,14 +2596,14 @@ test "leaving forgets the network but keeps identity and contacts" {
 }
 
 test "repeated join and leave cycles stay consistent under concurrent sends" {
-    var seed = [_]u8{0x2a} ** 32;
+    var seed = @as([32]u8, @splat(0x2a));
     const ctx = meshguard_init(&seed, 0) orelse return error.InitFailed;
     defer meshguard_destroy(ctx);
     const loopback = [_]u8{ 127, 0, 0, 1 };
     var stop = std.atomic.Value(bool).init(false);
     const Sender = struct {
         fn run(c: *MeshguardContext, done: *std.atomic.Value(bool)) void {
-            const target = [_]u8{0x55} ** 32;
+            const target = @as([32]u8, @splat(0x55));
             const payload = "x";
             while (!done.load(.acquire)) {
                 _ = meshguard_send(c, &target, payload, 1);
@@ -2625,7 +2622,7 @@ test "repeated join and leave cycles stay consistent under concurrent sends" {
 }
 
 test "keepalive and relay proof intervals are bounded" {
-    var seed = [_]u8{0x27} ** 32;
+    var seed = @as([32]u8, @splat(0x27));
     const ctx = meshguard_init(&seed, 0) orelse return error.InitFailed;
     defer meshguard_destroy(ctx);
     try std.testing.expectEqual(@as(i32, 0), meshguard_set_keepalive_interval(ctx, 25_000));

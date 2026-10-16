@@ -128,8 +128,8 @@ test "channel validation accepts example-v1 and rejects illegal names" {
     try std.testing.expect(!isValidChannel("has space"));
     try std.testing.expect(!isValidChannel("slash/no"));
     try std.testing.expect(!isValidChannel("A"));
-    try std.testing.expect(!isValidChannel(&[_]u8{'a'} ** 65));
-    try std.testing.expect(isValidChannel(&[_]u8{'a'} ** 64));
+    try std.testing.expect(!isValidChannel(&@as([65]u8, @splat('a'))));
+    try std.testing.expect(isValidChannel(&@as([64]u8, @splat('a'))));
 }
 
 test "encode/decode round-trip" {
@@ -160,23 +160,23 @@ test "parse rejects malformed and oversize frames without truncating" {
 test "encode rejects oversize payloads instead of truncating" {
     var buf: [MAX_PLAINTEXT]u8 = undefined;
     const max_for_room = maxPayloadForChannelLen(EXAMPLE_CHANNEL.len);
-    const ok_payload = [_]u8{'x'} ** MAX_APP_PAYLOAD;
+    const ok_payload: [MAX_APP_PAYLOAD]u8 = @splat('x');
     try std.testing.expectEqual(max_for_room, ok_payload.len);
     _ = try encode(EXAMPLE_CHANNEL, &ok_payload, &buf);
 
-    const too_big = [_]u8{'x'} ** (MAX_APP_PAYLOAD + 1);
+    const too_big: [MAX_APP_PAYLOAD + 1]u8 = @splat('x');
     try std.testing.expectError(error.Oversize, encode(EXAMPLE_CHANNEL, &too_big, &buf));
 }
 
 test "all channel lengths enforce the advertised payload ceiling" {
     var buf: [MAX_PLAINTEXT]u8 = undefined;
-    const payload = [_]u8{'x'} ** MAX_APP_PAYLOAD;
-    for ([_][]const u8{ "a", EXAMPLE_CHANNEL, &([_]u8{'a'} ** MAX_CHANNEL_LEN) }) |channel| {
+    const payload: [MAX_APP_PAYLOAD]u8 = @splat('x');
+    for ([_][]const u8{ "a", EXAMPLE_CHANNEL, &@as([MAX_CHANNEL_LEN]u8, @splat('a')) }) |channel| {
         const frame = try encode(channel, &payload, &buf);
         try std.testing.expectEqualStrings(&payload, (try parse(frame)).payload);
-        try std.testing.expectError(error.Oversize, encode(channel, &([_]u8{'x'} ** (MAX_APP_PAYLOAD + 1)), &buf));
+        try std.testing.expectError(error.Oversize, encode(channel, &@as([MAX_APP_PAYLOAD + 1]u8, @splat('x')), &buf));
     }
-    try std.testing.expectError(error.Oversize, parse("MGAPP1 a " ++ "x" ** (MAX_APP_PAYLOAD + 1)));
+    try std.testing.expectError(error.Oversize, parse("MGAPP1 a " ++ @as([MAX_APP_PAYLOAD + 1]u8, @splat('x'))));
 }
 
 test "application payloads must be valid UTF-8" {
@@ -186,9 +186,16 @@ test "application payloads must be valid UTF-8" {
         const raw = try std.fmt.bufPrint(&buf, "MGAPP1 a {s}", .{invalid});
         try std.testing.expectError(error.InvalidUtf8, parse(raw));
     }
-    const valid = "\xf0\x9f\x9a\x80" ** (MAX_APP_PAYLOAD / 4);
-    const frame = try encode("a", valid, &buf);
-    try std.testing.expectEqualStrings(valid, (try parse(frame)).payload);
+    const valid = comptime blk: {
+        var arr: [MAX_APP_PAYLOAD]u8 = undefined;
+        var i: usize = 0;
+        while (i + 4 <= arr.len) : (i += 4) {
+            @memcpy(arr[i .. i + 4], "\xf0\x9f\x9a\x80");
+        }
+        break :blk arr;
+    };
+    const frame = try encode("a", &valid, &buf);
+    try std.testing.expectEqualStrings(&valid, (try parse(frame)).payload);
 }
 
 test "unframed plaintext is not an app frame" {

@@ -168,7 +168,7 @@ pub fn parse(data: []const u8) Error!Frame {
             break :blk .{ .ack = .{ .cumulative = cumulative, .bitmap = try take(data, &pos, len) } };
         },
         .done => .{ .done = std.enums.fromInt(DoneStatus, try readInt(u8, data, &pos)) orelse return error.Malformed },
-        .cancel => .{ .cancel = @enumFromInt(try readInt(u8, data, &pos)) },
+        .cancel => .{ .cancel = @fromBackingInt(@intCast(try readInt(u8, data, &pos))) },
     };
     if (pos != data.len) return error.Malformed;
     return .{ .id = id, .body = body };
@@ -177,7 +177,7 @@ pub fn parse(data: []const u8) Error!Frame {
 fn header(out: []u8, kind: Kind, id: [16]u8) Error!usize {
     if (out.len < HEADER_LEN) return error.Oversize;
     @memcpy(out[0..MAGIC.len], MAGIC);
-    out[MAGIC.len] = @intFromEnum(kind);
+    out[MAGIC.len] = @backingInt(kind);
     @memcpy(out[MAGIC.len + 1 ..][0..16], &id);
     return HEADER_LEN;
 }
@@ -229,19 +229,19 @@ pub fn encodeAck(out: []u8, id: [16]u8, cumulative: u32, bitmap: []const u8) Err
 
 pub fn encodeDone(out: []u8, id: [16]u8, status: DoneStatus) Error![]u8 {
     var pos = try header(out, .done, id);
-    try put(u8, out, &pos, @intFromEnum(status));
+    try put(u8, out, &pos, @backingInt(status));
     return out[0..pos];
 }
 
 pub fn encodeCancel(out: []u8, id: [16]u8, reason: Reason) Error![]u8 {
     var pos = try header(out, .cancel, id);
-    try put(u8, out, &pos, @intFromEnum(reason));
+    try put(u8, out, &pos, @backingInt(reason));
     return out[0..pos];
 }
 
 test "a full DATA frame fits the shared 0x50 plaintext budget" {
     var buf: [MAX_FRAME]u8 = undefined;
-    const bytes = [_]u8{0xab} ** CHUNK_SIZE;
+    const bytes = @as([CHUNK_SIZE]u8, @splat(0xab));
     const frame = try encodeData(&buf, @splat(7), 42, &bytes);
     try std.testing.expect(frame.len <= MAX_FRAME);
     const parsed = try parse(frame);
@@ -300,8 +300,8 @@ test "chunk counts round up" {
 
 test "an offer with maximum metadata and channel still fits one frame" {
     var buf: [MAX_FRAME]u8 = undefined;
-    const meta = [_]u8{'m'} ** MAX_META;
-    const channel = [_]u8{'c'} ** app_channel.MAX_CHANNEL_LEN;
+    const meta = @as([MAX_META]u8, @splat('m'));
+    const channel = @as([app_channel.MAX_CHANNEL_LEN]u8, @splat('c'));
     const frame = try encodeOffer(&buf, @splat(1), .{ .created_unix = 1, .size = 1, .chunk_size = CHUNK_SIZE, .sha256 = @splat(0), .channel = &channel, .meta = &meta });
     try std.testing.expect(frame.len <= MAX_FRAME);
     try std.testing.expectEqual(MAX_META, (try parse(frame)).body.offer.meta.len);

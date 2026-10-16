@@ -673,8 +673,8 @@ test "ServiceFilter.check: evaluation chain" {
         \\deny all
     );
 
-    const peer_pubkey = [_]u8{0xAA} ** 32;
-    const other_pubkey = [_]u8{0xBB} ** 32;
+    const peer_pubkey = @as([32]u8, @splat(0xAA));
+    const other_pubkey = @as([32]u8, @splat(0xBB));
 
     // Peer-specific: allow SSH + Postgres
     filter.peer_policies[0] = .{
@@ -702,7 +702,7 @@ test "ServiceFilter.check: evaluation chain" {
 
 test "ServiceFilter.check: default allow-all when no policies" {
     const filter = ServiceFilter{};
-    const pk = [_]u8{0x42} ** 32;
+    const pk = @as([32]u8, @splat(0x42));
 
     try std.testing.expect(filter.check(pk, null, .tcp, 22));
     try std.testing.expect(filter.check(pk, null, .tcp, 5432));
@@ -769,9 +769,9 @@ test "classifyPacket handles IPv6 and allowPacket fails closed (M5 regression)" 
 
     // allowPacket: under default-deny, unclassified IPv6 is dropped, ICMPv6 passes.
     const deny = ServiceFilter{ .default_action = .deny, .peer_count = 0, .org_count = 0 };
-    try std.testing.expect(!deny.allowPacket(.{0} ** 32, null, &v6ext));
-    try std.testing.expect(deny.allowPacket(.{0} ** 32, null, &icmp6));
+    try std.testing.expect(!deny.allowPacket(@splat(0), null, &v6ext));
+    try std.testing.expect(deny.allowPacket(@splat(0), null, &icmp6));
     // Under default-allow (unconfigured), behavior is unchanged (passes).
     const allow = ServiceFilter{ .default_action = .allow, .peer_count = 0, .org_count = 0 };
-    try std.testing.expect(allow.allowPacket(.{0} ** 32, null, &v6ext));
+    try std.testing.expect(allow.allowPacket(@splat(0), null, &v6ext));
 }

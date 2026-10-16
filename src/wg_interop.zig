@@ -67,10 +67,7 @@ pub fn main(init: std.process.Init) !void {
     };
 
     // Derive our public key
-    const public_key = std.crypto.dh.X25519.recoverPublicKey(private_key) catch {
-        try stderr.writeStreamingAll(zio, "error: failed to derive public key\n");
-        std.process.exit(1);
-    };
+    const public_key = std.crypto.dh.X25519.recoverPublicKey(private_key);
 
     // Parse local IP/mask
     const ip_info = parseIpCidr(local_ip_cidr.?) catch {
@@ -131,7 +128,7 @@ pub fn main(init: std.process.Init) !void {
     try writeFormatted(stdout, zio, "  UDP listening on :{d}\n", .{listen_port});
 
     // Add peer
-    const slot = wg_dev.addPeer(.{0} ** 32, peer_pub, ep.addr, ep.port) catch |err| {
+    const slot = wg_dev.addPeer(@splat(0), peer_pub, ep.addr, ep.port) catch |err| {
         try writeFormatted(stderr, zio, "error: addPeer: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };

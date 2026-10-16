@@ -26,8 +26,8 @@ if [[ $# -gt 1 ]]; then
   echo 'Usage: scripts/build-web.sh [output-directory]' >&2
   exit 1
 fi
-if [[ "$(zig version)" != 0.16.0 ]]; then
-  echo 'Web packaging requires Zig 0.16.0.' >&2
+if [[ "$(zig version)" != 0.17.0 ]]; then
+  echo 'Web packaging requires Zig 0.17.0.' >&2
   exit 1
 fi
 for tool in node npm bun; do

@@ -14,7 +14,7 @@ pub fn createWgInterface(name: []const u8) !void {
     defer sock.close();
 
     var b = nl.MessageBuilder.init(
-        @intFromEnum(linux.NetlinkMessageType.RTM_NEWLINK),
+        @backingInt(linux.NetlinkMessageType.RTM_NEWLINK),
         linux.NLM_F_REQUEST | linux.NLM_F_ACK | linux.NLM_F_CREATE | linux.NLM_F_EXCL,
         sock.nextSeq(),
     );
@@ -30,13 +30,13 @@ pub fn createWgInterface(name: []const u8) !void {
     });
 
     // IFLA_IFNAME
-    b.addAttrStr(@intFromEnum(linux.IFLA.IFNAME), name);
+    b.addAttrStr(@backingInt(linux.IFLA.IFNAME), name);
 
     // IFLA_LINKINFO (nested)
-    const linkinfo_off = b.beginNested(@intFromEnum(linux.IFLA.LINKINFO));
+    const linkinfo_off = b.beginNested(@backingInt(linux.IFLA.LINKINFO));
     {
         // IFLA_INFO_KIND = "wireguard"
-        b.addAttrStr(@intFromEnum(nl.IFLA_INFO.KIND), "wireguard");
+        b.addAttrStr(@backingInt(nl.IFLA_INFO.KIND), "wireguard");
     }
     b.endNested(linkinfo_off);
 
@@ -52,7 +52,7 @@ pub fn deleteInterface(name: []const u8) !void {
     defer sock.close();
 
     var b = nl.MessageBuilder.init(
-        @intFromEnum(linux.NetlinkMessageType.RTM_DELLINK),
+        @backingInt(linux.NetlinkMessageType.RTM_DELLINK),
         linux.NLM_F_REQUEST | linux.NLM_F_ACK,
         sock.nextSeq(),
     );
@@ -76,7 +76,7 @@ pub fn getInterfaceIndex(name: []const u8) !u32 {
     defer sock.close();
 
     var b = nl.MessageBuilder.init(
-        @intFromEnum(linux.NetlinkMessageType.RTM_GETLINK),
+        @backingInt(linux.NetlinkMessageType.RTM_GETLINK),
         linux.NLM_F_REQUEST,
         sock.nextSeq(),
     );
@@ -91,7 +91,7 @@ pub fn getInterfaceIndex(name: []const u8) !u32 {
     });
 
     // Filter by name
-    b.addAttrStr(@intFromEnum(linux.IFLA.IFNAME), name);
+    b.addAttrStr(@backingInt(linux.IFLA.IFNAME), name);
 
     const msg = b.finish();
 
@@ -123,7 +123,7 @@ pub fn addAddress(ifindex: u32, ip: [4]u8, prefix_len: u8) !void {
     defer sock.close();
 
     var b = nl.MessageBuilder.init(
-        @intFromEnum(linux.NetlinkMessageType.RTM_NEWADDR),
+        @backingInt(linux.NetlinkMessageType.RTM_NEWADDR),
         linux.NLM_F_REQUEST | linux.NLM_F_ACK | linux.NLM_F_CREATE | linux.NLM_F_REPLACE,
         sock.nextSeq(),
     );
@@ -138,10 +138,10 @@ pub fn addAddress(ifindex: u32, ip: [4]u8, prefix_len: u8) !void {
     });
 
     // IFA_LOCAL
-    b.addAttr(@intFromEnum(linux.IFA.LOCAL), &ip);
+    b.addAttr(@backingInt(linux.IFA.LOCAL), &ip);
 
     // IFA_ADDRESS
-    b.addAttr(@intFromEnum(linux.IFA.ADDRESS), &ip);
+    b.addAttr(@backingInt(linux.IFA.ADDRESS), &ip);
 
     const msg = b.finish();
     try sock.sendAndAck(msg);
@@ -153,7 +153,7 @@ pub fn addAddress6(ifindex: u32, ip: [16]u8, prefix_len: u8) !void {
     defer sock.close();
 
     var b = nl.MessageBuilder.init(
-        @intFromEnum(linux.NetlinkMessageType.RTM_NEWADDR),
+        @backingInt(linux.NetlinkMessageType.RTM_NEWADDR),
         linux.NLM_F_REQUEST | linux.NLM_F_ACK | linux.NLM_F_CREATE | linux.NLM_F_REPLACE,
         sock.nextSeq(),
     );
@@ -166,8 +166,8 @@ pub fn addAddress6(ifindex: u32, ip: [16]u8, prefix_len: u8) !void {
         .index = ifindex,
     });
 
-    b.addAttr(@intFromEnum(linux.IFA.LOCAL), &ip);
-    b.addAttr(@intFromEnum(linux.IFA.ADDRESS), &ip);
+    b.addAttr(@backingInt(linux.IFA.LOCAL), &ip);
+    b.addAttr(@backingInt(linux.IFA.ADDRESS), &ip);
 
     const msg = b.finish();
     try sock.sendAndAck(msg);
@@ -179,7 +179,7 @@ pub fn setInterfaceUp(ifindex: u32, up: bool) !void {
     defer sock.close();
 
     var b = nl.MessageBuilder.init(
-        @intFromEnum(linux.NetlinkMessageType.RTM_SETLINK),
+        @backingInt(linux.NetlinkMessageType.RTM_SETLINK),
         linux.NLM_F_REQUEST | linux.NLM_F_ACK,
         sock.nextSeq(),
     );
@@ -203,7 +203,7 @@ pub fn addRoute(ifindex: u32, dst: [4]u8, prefix_len: u8) !void {
     defer sock.close();
 
     var b = nl.MessageBuilder.init(
-        @intFromEnum(linux.NetlinkMessageType.RTM_NEWROUTE),
+        @backingInt(linux.NetlinkMessageType.RTM_NEWROUTE),
         linux.NLM_F_REQUEST | linux.NLM_F_ACK | linux.NLM_F_CREATE | linux.NLM_F_REPLACE,
         sock.nextSeq(),
     );
@@ -249,7 +249,7 @@ pub fn addRoute6(ifindex: u32, dst: [16]u8, prefix_len: u8) !void {
     defer sock.close();
 
     var b = nl.MessageBuilder.init(
-        @intFromEnum(linux.NetlinkMessageType.RTM_NEWROUTE),
+        @backingInt(linux.NetlinkMessageType.RTM_NEWROUTE),
         linux.NLM_F_REQUEST | linux.NLM_F_ACK | linux.NLM_F_CREATE | linux.NLM_F_REPLACE,
         sock.nextSeq(),
     );
