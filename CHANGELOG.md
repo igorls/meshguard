@@ -7,6 +7,15 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## Unreleased
 
+### Changed
+- Building from source now requires Zig 0.17.0. The source, build definitions,
+  packaging scripts and CI use the 0.17 APIs; Zig 0.16 is no longer supported.
+- Apple packaging uses Zig `0.18.0-dev.253+16d31ceed`, which includes the
+  upstream fix for the iOS `std.Io.Threaded.NullFile.fd` compilation regression
+  in Zig 0.17.0. Device and simulator static libraries, their XCFramework archive,
+  and both iOS Swift consumer link checks are restored. The other CI jobs keep
+  Zig 0.17.0; no local standard-library patches are needed.
+
 ### Added
 - Browser packages in releases: `meshguard-web-<version>.tgz` (npm package
   `@meshguard/web`) holds `meshguard.wasm` (ReleaseSmall), `meshguard.mjs`,

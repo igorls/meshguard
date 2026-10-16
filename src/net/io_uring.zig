@@ -402,7 +402,7 @@ pub const UdpRing = struct {
                 .family = linux.AF.INET,
                 .port = std.mem.nativeToBig(u16, dest_port),
                 .addr = @bitCast(dest_addr),
-                .zero = .{0} ** 8,
+                .zero = @splat(0),
             };
             slot.iov = .{ .base = &slot.buf, .len = data.len };
             slot.msg.namelen = @sizeOf(posix.sockaddr.in);

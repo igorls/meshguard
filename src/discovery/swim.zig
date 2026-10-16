@@ -434,7 +434,7 @@ pub const SwimProtocol = struct {
         if (current.wg_pubkey) |existing| {
             if (std.mem.eql(u8, &existing, &signed_wg)) {
                 if (self.membership.peers.getPtr(pubkey)) |peer| {
-                    if (@intFromEnum(source) > @intFromEnum(peer.wg_key_source)) peer.wg_key_source = source;
+                    if (@backingInt(source) > @backingInt(peer.wg_key_source)) peer.wg_key_source = source;
                 }
                 return;
             }
@@ -486,7 +486,7 @@ pub const SwimProtocol = struct {
         // Always allow our own pubkey
         if (std.mem.eql(u8, &pubkey, &self.our_pubkey)) return true;
         // Allow zero pubkey (initial seed hello pings)
-        if (std.mem.eql(u8, &pubkey, &([_]u8{0} ** 32))) return true;
+        if (std.mem.eql(u8, &pubkey, &@as([32]u8, @splat(0)))) return true;
         // Check authorized set (individual keys)
         for (self.authorized_keys[0..self.authorized_count]) |key| {
             if (std.mem.eql(u8, &key, &pubkey)) return true;
@@ -734,7 +734,7 @@ pub const SwimProtocol = struct {
         if (now_ns - self.last_seed_ping_ns >= seed_interval_ns) {
             self.last_seed_ping_ns = now_ns;
             for (self.seeds[0..self.seed_count]) |seed| {
-                self.sendPing(seed, [_]u8{0} ** 32);
+                self.sendPing(seed, @as([32]u8, @splat(0)));
             }
         }
     }
@@ -751,7 +751,7 @@ pub const SwimProtocol = struct {
         for (self.seeds[0..self.seed_count]) |seed| {
             // Send a ping to each seed — we don't know their pubkey yet,
             // so we use a zero pubkey as "hello" ping
-            self.sendPing(seed, [_]u8{0} ** 32);
+            self.sendPing(seed, @as([32]u8, @splat(0)));
         }
     }
 
@@ -882,7 +882,7 @@ pub const SwimProtocol = struct {
             return;
         }
 
-        if (data.len > 0 and data[0] == @intFromEnum(messages.MessageType.relay_data)) {
+        if (data.len > 0 and data[0] == @backingInt(messages.MessageType.relay_data)) {
             self.handleRelayData(data, sender_endpoint);
             return;
         }
@@ -1214,7 +1214,7 @@ pub const SwimProtocol = struct {
 
     fn handlePing(self: *SwimProtocol, ping: *const codec.DecodedPing, sender_endpoint: messages.Endpoint) void {
         // Register sender FIRST so gossip callbacks see the real network address
-        if (!std.mem.eql(u8, &ping.sender_pubkey, &([_]u8{0} ** 32))) {
+        if (!std.mem.eql(u8, &ping.sender_pubkey, &@as([32]u8, @splat(0)))) {
             self.registerOrUpdatePeerEndpoint(ping.sender_pubkey, sender_endpoint);
             if (ping.has_org_cert) {
                 self.recordPeerCertificate(ping.sender_pubkey, ping.org_cert);
@@ -1256,7 +1256,7 @@ pub const SwimProtocol = struct {
 
     fn handleAck(self: *SwimProtocol, ack: *const codec.DecodedAck, sender_endpoint: messages.Endpoint) void {
         // Register sender FIRST so gossip callbacks see the real network address
-        if (!std.mem.eql(u8, &ack.sender_pubkey, &([_]u8{0} ** 32))) {
+        if (!std.mem.eql(u8, &ack.sender_pubkey, &@as([32]u8, @splat(0)))) {
             self.registerOrUpdatePeerEndpoint(ack.sender_pubkey, sender_endpoint);
             if (ack.has_org_cert) {
                 self.recordPeerCertificate(ack.sender_pubkey, ack.org_cert);
@@ -1455,7 +1455,7 @@ pub const SwimProtocol = struct {
         // Skip self
         if (std.mem.eql(u8, &pubkey, &self.our_pubkey)) return;
         // Skip zero pubkey (used for initial seed pings)
-        if (std.mem.eql(u8, &pubkey, &([_]u8{0} ** 32))) return;
+        if (std.mem.eql(u8, &pubkey, &@as([32]u8, @splat(0)))) return;
 
         const existing = self.membership.peers.get(pubkey);
 
@@ -1630,7 +1630,7 @@ pub const SwimProtocol = struct {
     /// An opaque relay's answer to a client ping: refresh the client's claim
     /// and describe only ourselves.
     fn answerClientPing(self: *SwimProtocol, ping: *const codec.DecodedPing, sender_endpoint: messages.Endpoint) void {
-        if (std.mem.eql(u8, &ping.sender_pubkey, &([_]u8{0} ** 32))) return;
+        if (std.mem.eql(u8, &ping.sender_pubkey, &@as([32]u8, @splat(0)))) return;
         self.claimForRelay(ping.sender_pubkey, ping.wg_binding, if (ping.has_org_cert) &ping.org_cert else null);
         const own = [1]messages.GossipEntry{.{
             .subject_pubkey = self.our_pubkey,
@@ -2244,7 +2244,7 @@ pub const SwimProtocol = struct {
             return;
         }
         // Skip zero-pubkey entries
-        if (std.mem.eql(u8, &entry.subject_pubkey, &([_]u8{0} ** 32))) return;
+        if (std.mem.eql(u8, &entry.subject_pubkey, &@as([32]u8, @splat(0)))) return;
 
         switch (entry.event) {
             .join, .alive => {
@@ -2337,14 +2337,14 @@ test "swim creates sequential pings" {
         &membership,
         socket,
         .{}, // SwimConfig
-        [_]u8{1} ** 32, // our_pubkey
-        [_]u8{2} ** 32, // our_wg_pubkey
+        @as([32]u8, @splat(1)), // our_pubkey
+        @as([32]u8, @splat(2)), // our_wg_pubkey
         .{ 127, 0, 0, 1 }, // our_mesh_ip
         51821, // our_wg_port
         null, // handler
     );
 
-    const target_pubkey = [_]u8{3} ** 32;
+    const target_pubkey = @as([32]u8, @splat(3));
     const target = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 12345);
 
     // Send first ping
@@ -2386,9 +2386,9 @@ const JoinCounter = struct {
 
 const RelayDeliveryCounter = struct {
     count: usize = 0,
-    payload: [64]u8 = .{0} ** 64,
+    payload: [64]u8 = @splat(0),
     payload_len: usize = 0,
-    addr: [4]u8 = .{0} ** 4,
+    addr: [4]u8 = @splat(0),
     port: u16 = 0,
 };
 
@@ -2451,8 +2451,8 @@ test "relay data addressed to us is delivered as opaque WG packet" {
     defer membership.deinit();
 
     var delivery = RelayDeliveryCounter{};
-    const our_pubkey = [_]u8{0x11} ** 32;
-    const sender_pubkey = [_]u8{0x22} ** 32;
+    const our_pubkey = @as([32]u8, @splat(0x11));
+    const sender_pubkey = @as([32]u8, @splat(0x22));
     try membership.upsert(.{
         .pubkey = sender_pubkey,
         .name = "",
@@ -2460,7 +2460,7 @@ test "relay data addressed to us is delivered as opaque WG packet" {
         .gossip_endpoint = messages.Endpoint.initV4(.{ 198, 51, 100, 9 }, 40000),
         .wg_pubkey = null,
         .mesh_ip = .{ 10, 99, 0x22, 0x22 },
-        .mesh_ip6 = .{0} ** 16,
+        .mesh_ip6 = @splat(0),
         .wg_port = 51830,
         .lamport = 1,
         .last_seen_ns = nowNs(),
@@ -2474,9 +2474,9 @@ test "relay data addressed to us is delivered as opaque WG packet" {
         .onPeerDead = ignorePeerDead,
         .onWgPacket = countRelayWgPacket,
     };
-    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, our_pubkey, [_]u8{0x33} ** 32, .{ 127, 0, 0, 1 }, 51821, handler);
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, our_pubkey, @as([32]u8, @splat(0x33)), .{ 127, 0, 0, 1 }, 51821, handler);
 
-    var wg_payload = [_]u8{0} ** 32;
+    var wg_payload = @as([32]u8, @splat(0));
     std.mem.writeInt(u32, wg_payload[0..4], 4, .little);
     var frame: [Relay.RELAY_FRAME_HEADER_SIZE + wg_payload.len]u8 = undefined;
     const frame_len = try Relay.encodeRelayData(&frame, sender_pubkey, our_pubkey, &wg_payload);
@@ -2495,17 +2495,17 @@ test "relay data from unknown sender is ignored" {
     defer membership.deinit();
 
     var delivery = RelayDeliveryCounter{};
-    const our_pubkey = [_]u8{0x11} ** 32;
-    const unknown_sender = [_]u8{0x44} ** 32;
+    const our_pubkey = @as([32]u8, @splat(0x11));
+    const unknown_sender = @as([32]u8, @splat(0x44));
     const handler = EventHandler{
         .ctx = &delivery,
         .onPeerJoin = ignorePeerJoin,
         .onPeerDead = ignorePeerDead,
         .onWgPacket = countRelayWgPacket,
     };
-    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, our_pubkey, [_]u8{0x33} ** 32, .{ 127, 0, 0, 1 }, 51821, handler);
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, our_pubkey, @as([32]u8, @splat(0x33)), .{ 127, 0, 0, 1 }, 51821, handler);
 
-    var wg_payload = [_]u8{0} ** 32;
+    var wg_payload = @as([32]u8, @splat(0));
     std.mem.writeInt(u32, wg_payload[0..4], 4, .little);
     var frame: [Relay.RELAY_FRAME_HEADER_SIZE + wg_payload.len]u8 = undefined;
     const frame_len = try Relay.encodeRelayData(&frame, unknown_sender, our_pubkey, &wg_payload);
@@ -2529,9 +2529,9 @@ fn issueVouch(org_kp: Org.OrgKeyPair, node_pubkey: [32]u8, lamport: u64) message
 test "only an admitted authenticated endpoint confirmation moves a known peer" {
     var membership = Membership.MembershipTable.init(std.testing.allocator, 5000);
     defer membership.deinit();
-    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, null);
     swim.enableTrust();
-    const key = [_]u8{3} ** 32;
+    const key = @as([32]u8, @splat(3));
     const old = messages.Endpoint.initV4(.{ 198, 51, 100, 1 }, 10001);
     const changed = messages.Endpoint.initV4(.{ 203, 0, 113, 1 }, 20001);
     var peer = aliveTestPeer(key);
@@ -2543,7 +2543,7 @@ test "only an admitted authenticated endpoint confirmation moves a known peer" {
     try std.testing.expectEqual(old, membership.peers.get(key).?.gossip_endpoint.?);
     try std.testing.expect(swim.confirmAuthenticatedEndpoint(key, changed));
     try std.testing.expectEqual(changed, membership.peers.get(key).?.gossip_endpoint.?);
-    try std.testing.expect(!swim.confirmAuthenticatedEndpoint([_]u8{4} ** 32, changed));
+    try std.testing.expect(!swim.confirmAuthenticatedEndpoint(@as([32]u8, @splat(4)), changed));
 }
 
 test "peer restart is detected by incarnation and steady state is not" {
@@ -2556,14 +2556,14 @@ test "peer restart is detected by incarnation and steady state is not" {
         &membership,
         inertTestSocket(),
         .{},
-        [_]u8{1} ** 32, // our_pubkey
-        [_]u8{2} ** 32, // our_wg_pubkey
+        @as([32]u8, @splat(1)), // our_pubkey
+        @as([32]u8, @splat(2)), // our_wg_pubkey
         .{ 127, 0, 0, 1 },
         51821,
         .{ .ctx = &counter, .onPeerJoin = countPeerJoin, .onPeerDead = ignorePeerDead },
     );
 
-    const peer_pk = [_]u8{3} ** 32;
+    const peer_pk = @as([32]u8, @splat(3));
     try membership.upsert(aliveTestPeer(peer_pk));
 
     // First incarnation observed: recorded, NOT treated as a restart.
@@ -2592,11 +2592,11 @@ test "peer restart is detected by incarnation and steady state is not" {
     try std.testing.expectEqual(@as(usize, 1), counter.count);
 
     // Our own pubkey is ignored.
-    swim.handleSenderIncarnation([_]u8{1} ** 32, 999);
+    swim.handleSenderIncarnation(@as([32]u8, @splat(1)), 999);
     try std.testing.expectEqual(@as(usize, 1), counter.count);
 
     // An unknown peer is ignored (no rejoin, no crash).
-    swim.handleSenderIncarnation([_]u8{9} ** 32, 999);
+    swim.handleSenderIncarnation(@as([32]u8, @splat(9)), 999);
     try std.testing.expectEqual(@as(usize, 1), counter.count);
 }
 
@@ -2612,9 +2612,9 @@ test "gossiped join cannot admit an unauthorized subject with wg key" {
         .onPeerJoin = countPeerJoin,
         .onPeerDead = ignorePeerDead,
     };
-    var swim = SwimProtocol.init(&membership, socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, handler);
+    var swim = SwimProtocol.init(&membership, socket, .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, handler);
     swim.enableTrust();
-    swim.addTrustedOrg([_]u8{0xA0} ** 32);
+    swim.addTrustedOrg(@as([32]u8, @splat(0xA0)));
 
     const fake_kp = keys.generate();
     const fake_peer = fake_kp.public_key.toBytes();
@@ -2623,7 +2623,7 @@ test "gossiped join cannot admit an unauthorized subject with wg key" {
         .event = .join,
         .lamport = 10,
         .endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 40000),
-        .wg_pubkey = [_]u8{0x66} ** 32,
+        .wg_pubkey = @as([32]u8, @splat(0x66)),
     });
 
     try std.testing.expect(membership.peers.get(fake_peer) == null);
@@ -2637,7 +2637,7 @@ test "gossiped join cannot admit an unauthorized subject with wg key" {
         .event = .alive,
         .lamport = 11,
         .endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 40001),
-        .wg_pubkey = [_]u8{0x77} ** 32,
+        .wg_pubkey = @as([32]u8, @splat(0x77)),
     });
 
     try std.testing.expect(membership.peers.get(fake_peer).?.wg_pubkey == null);
@@ -2650,13 +2650,13 @@ test "unauthorized gossip candidates are capped and probed one at a time" {
     defer membership.deinit();
     const socket = inertTestSocket();
 
-    var swim = SwimProtocol.init(&membership, socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    var swim = SwimProtocol.init(&membership, socket, .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, null);
     swim.enableTrust();
-    swim.addTrustedOrg([_]u8{0xA0} ** 32);
+    swim.addTrustedOrg(@as([32]u8, @splat(0xA0)));
 
     var i: usize = 0;
     while (i < MAX_CANDIDATE_PEERS + 8) : (i += 1) {
-        var subject = [_]u8{0x51} ** 32;
+        var subject = @as([32]u8, @splat(0x51));
         subject[0] = @intCast(i + 1);
         subject[31] = @intCast(0xA0 + i);
         swim.applyGossip(.{
@@ -2664,7 +2664,7 @@ test "unauthorized gossip candidates are capped and probed one at a time" {
             .event = .join,
             .lamport = @intCast(i + 1),
             .endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, @intCast(41000 + i)),
-            .wg_pubkey = [_]u8{0x66} ** 32,
+            .wg_pubkey = @as([32]u8, @splat(0x66)),
         });
     }
 
@@ -2687,11 +2687,11 @@ test "candidate probes do not drain queued gossip" {
     defer membership.deinit();
     const socket = inertTestSocket();
 
-    var swim = SwimProtocol.init(&membership, socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    var swim = SwimProtocol.init(&membership, socket, .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, null);
     swim.enableTrust();
-    swim.addTrustedOrg([_]u8{0xA0} ** 32);
+    swim.addTrustedOrg(@as([32]u8, @splat(0xA0)));
 
-    const candidate = [_]u8{0x32} ** 32;
+    const candidate = @as([32]u8, @splat(0x32));
     swim.applyGossip(.{
         .subject_pubkey = candidate,
         .event = .join,
@@ -2699,7 +2699,7 @@ test "candidate probes do not drain queued gossip" {
         .endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 41900),
     });
     swim.enqueueGossip(.{
-        .subject_pubkey = [_]u8{0x99} ** 32,
+        .subject_pubkey = @as([32]u8, @splat(0x99)),
         .event = .alive,
         .lamport = 2,
         .endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 41901),
@@ -2723,12 +2723,12 @@ test "candidate probe timeout does not escalate to ping-req" {
     defer membership.deinit();
     const socket = inertTestSocket();
 
-    var swim = SwimProtocol.init(&membership, socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    var swim = SwimProtocol.init(&membership, socket, .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, null);
     swim.enableTrust();
-    swim.addTrustedOrg([_]u8{0xA0} ** 32);
-    try membership.upsert(aliveTestPeer([_]u8{0x60} ** 32));
+    swim.addTrustedOrg(@as([32]u8, @splat(0xA0)));
+    try membership.upsert(aliveTestPeer(@as([32]u8, @splat(0x60))));
 
-    const candidate = [_]u8{0x36} ** 32;
+    const candidate = @as([32]u8, @splat(0x36));
     swim.applyGossip(.{
         .subject_pubkey = candidate,
         .event = .join,
@@ -2756,18 +2756,18 @@ test "candidate with invalid cert never graduates and is evicted" {
     defer membership.deinit();
     const socket = inertTestSocket();
 
-    var swim = SwimProtocol.init(&membership, socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    var swim = SwimProtocol.init(&membership, socket, .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, null);
     swim.enableTrust();
-    swim.addTrustedOrg([_]u8{0xA0} ** 32);
+    swim.addTrustedOrg(@as([32]u8, @splat(0xA0)));
 
-    const candidate = [_]u8{0x33} ** 32;
+    const candidate = @as([32]u8, @splat(0x33));
     const endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 42000);
     swim.applyGossip(.{
         .subject_pubkey = candidate,
         .event = .join,
         .lamport = 1,
         .endpoint = endpoint,
-        .wg_pubkey = [_]u8{0x44} ** 32,
+        .wg_pubkey = @as([32]u8, @splat(0x44)),
     });
     try std.testing.expectEqual(@as(usize, 1), swim.candidate_count);
 
@@ -2796,11 +2796,11 @@ test "candidate endpoint refresh resets probes but not lifetime" {
     defer membership.deinit();
     const socket = inertTestSocket();
 
-    var swim = SwimProtocol.init(&membership, socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    var swim = SwimProtocol.init(&membership, socket, .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, null);
     swim.enableTrust();
-    swim.addTrustedOrg([_]u8{0xA0} ** 32);
+    swim.addTrustedOrg(@as([32]u8, @splat(0xA0)));
 
-    const candidate = [_]u8{0x34} ** 32;
+    const candidate = @as([32]u8, @splat(0x34));
     const stale_endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 42100);
     const fresh_endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 42101);
     swim.applyGossip(.{
@@ -2825,7 +2825,7 @@ test "candidate endpoint refresh resets probes but not lifetime" {
     try std.testing.expectEqual(@as(u8, 0), swim.candidate_peers[0].probe_count);
     try std.testing.expectEqual(@as(i128, 0), swim.candidate_peers[0].last_probe_ns);
 
-    const expiring_candidate = [_]u8{0x35} ** 32;
+    const expiring_candidate = @as([32]u8, @splat(0x35));
     const endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 42102);
     swim.applyGossip(.{
         .subject_pubkey = expiring_candidate,
@@ -2863,7 +2863,7 @@ test "cert-only gossip candidate is probed then graduates on direct cert" {
         .onPeerJoin = countPeerJoin,
         .onPeerDead = ignorePeerDead,
     };
-    var swim = SwimProtocol.init(&membership, socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, handler);
+    var swim = SwimProtocol.init(&membership, socket, .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, handler);
     swim.enableTrust();
 
     const org_kp = Org.generateOrgKeyPair();
@@ -2874,7 +2874,7 @@ test "cert-only gossip candidate is probed then graduates on direct cert" {
     const node_pubkey = node_kp.public_key.toBytes();
     const cert_wire = try issueCertWire(org_kp, node_pubkey, "node-1");
     const endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 43000);
-    const wg_key = [_]u8{0x77} ** 32;
+    const wg_key = @as([32]u8, @splat(0x77));
 
     swim.applyGossip(.{
         .subject_pubkey = node_pubkey,
@@ -2934,7 +2934,7 @@ test "v2 org cert binds WireGuard key on direct cert admission" {
         .onPeerJoin = countPeerJoin,
         .onPeerDead = countPeerDead,
     };
-    var swim = SwimProtocol.init(&membership, socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, handler);
+    var swim = SwimProtocol.init(&membership, socket, .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, handler);
     swim.enableTrust();
 
     const org_kp = Org.generateOrgKeyPair();
@@ -2943,7 +2943,7 @@ test "v2 org cert binds WireGuard key on direct cert admission" {
 
     const node_kp = keys.generate();
     const node_pubkey = node_kp.public_key.toBytes();
-    const signed_wg = [_]u8{0x91} ** 32;
+    const signed_wg = @as([32]u8, @splat(0x91));
     const cert_wire = try issueCertV2Wire(org_kp, node_pubkey, signed_wg, "node-v2");
     const endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 43100);
 
@@ -2976,7 +2976,7 @@ test "v2 org cert overrides preseeded gossip WireGuard key" {
         .onPeerJoin = countPeerJoin,
         .onPeerDead = countPeerDead,
     };
-    var swim = SwimProtocol.init(&membership, socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, handler);
+    var swim = SwimProtocol.init(&membership, socket, .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, handler);
     swim.enableTrust();
 
     const org_kp = Org.generateOrgKeyPair();
@@ -2986,8 +2986,8 @@ test "v2 org cert overrides preseeded gossip WireGuard key" {
     const node_pubkey = node_kp.public_key.toBytes();
     swim.addAuthorizedKey(node_pubkey);
 
-    const fake_wg = [_]u8{0xF0} ** 32;
-    const signed_wg = [_]u8{0x92} ** 32;
+    const fake_wg = @as([32]u8, @splat(0xF0));
+    const signed_wg = @as([32]u8, @splat(0x92));
     const endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 43101);
 
     swim.applyGossip(.{
@@ -3029,7 +3029,7 @@ test "delegated v2 org cert admits and intermediate revocation evicts leaf" {
         .onPeerJoin = countPeerJoin,
         .onPeerDead = countPeerDead,
     };
-    var swim = SwimProtocol.init(&membership, socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, handler);
+    var swim = SwimProtocol.init(&membership, socket, .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, handler);
     swim.enableTrust();
 
     const org_kp = Org.generateOrgKeyPair();
@@ -3040,7 +3040,7 @@ test "delegated v2 org cert admits and intermediate revocation evicts leaf" {
 
     const node_kp = keys.generate();
     const node_pubkey = node_kp.public_key.toBytes();
-    const signed_wg = [_]u8{0x93} ** 32;
+    const signed_wg = @as([32]u8, @splat(0x93));
     const cert_wire = try issueDelegatedCertV2Wire(org_kp, issuer_kp, node_pubkey, signed_wg, "delegated");
     const endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 43102);
 
@@ -3081,12 +3081,12 @@ test "gossiped join still admits an individually authorized subject" {
         .onPeerJoin = countPeerJoin,
         .onPeerDead = ignorePeerDead,
     };
-    var swim = SwimProtocol.init(&membership, socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, handler);
+    var swim = SwimProtocol.init(&membership, socket, .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, handler);
     swim.enableTrust();
 
     const peer_kp = keys.generate();
     const peer = peer_kp.public_key.toBytes();
-    const wg_key = [_]u8{0x44} ** 32;
+    const wg_key = @as([32]u8, @splat(0x44));
     swim.addAuthorizedKey(peer);
     swim.applyGossip(.{
         .subject_pubkey = peer,
@@ -3109,11 +3109,11 @@ test "trusted org does not admit arbitrary peers without a cert" {
     var socket = Udp.UdpSocket.bind(0) catch return;
     defer socket.close();
 
-    var swim = SwimProtocol.init(&membership, socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    var swim = SwimProtocol.init(&membership, socket, .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, null);
     swim.enableTrust();
-    swim.addTrustedOrg([_]u8{0xA0} ** 32);
+    swim.addTrustedOrg(@as([32]u8, @splat(0xA0)));
 
-    try std.testing.expect(!swim.isAuthorizedPeer([_]u8{0x55} ** 32, null));
+    try std.testing.expect(!swim.isAuthorizedPeer(@as([32]u8, @splat(0x55)), null));
 }
 
 test "valid trusted org cert admits and records peer until revoked" {
@@ -3123,7 +3123,7 @@ test "valid trusted org cert admits and records peer until revoked" {
     var socket = Udp.UdpSocket.bind(0) catch return;
     defer socket.close();
 
-    var swim = SwimProtocol.init(&membership, socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    var swim = SwimProtocol.init(&membership, socket, .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, null);
     swim.enableTrust();
 
     const org_kp = Org.generateOrgKeyPair();
@@ -3137,7 +3137,7 @@ test "valid trusted org cert admits and records peer until revoked" {
     cert.serialize(&cert_wire);
 
     try std.testing.expect(swim.isAuthorizedPeer(node_pubkey, cert_wire));
-    try std.testing.expect(!swim.isAuthorizedPeer([_]u8{0x66} ** 32, cert_wire));
+    try std.testing.expect(!swim.isAuthorizedPeer(@as([32]u8, @splat(0x66)), cert_wire));
 
     try membership.upsert(aliveTestPeer(node_pubkey));
     swim.recordPeerCertificate(node_pubkey, cert_wire);
@@ -3165,14 +3165,14 @@ test "org revoke requires a valid trusted-org signature (C2 regression)" {
     var socket = Udp.UdpSocket.bind(0) catch return; // skip if no socket
     defer socket.close();
 
-    var swim = SwimProtocol.init(&membership, socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    var swim = SwimProtocol.init(&membership, socket, .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, null);
     swim.enableTrust();
 
     const org_kp = keys.generate();
     const org_pubkey = org_kp.public_key.toBytes();
     swim.addTrustedOrg(org_pubkey);
 
-    const victim = [_]u8{0x77} ** 32;
+    const victim = @as([32]u8, @splat(0x77));
     try membership.upsert(aliveTestPeer(victim));
     const victim_cert = try issueCertWire(.{
         .public_key = org_kp.public_key,
@@ -3181,7 +3181,7 @@ test "org revoke requires a valid trusted-org signature (C2 regression)" {
     swim.recordPeerCertificate(victim, victim_cert);
 
     // (1) Forged: trusted org pubkey but an all-zero signature → rejected.
-    const forged = messages.OrgCertRevoke{ .org_pubkey = org_pubkey, .node_pubkey = victim, .reason = 2, .lamport = 5, .signature = [_]u8{0} ** 64 };
+    const forged = messages.OrgCertRevoke{ .org_pubkey = org_pubkey, .node_pubkey = victim, .reason = 2, .lamport = 5, .signature = @as([64]u8, @splat(0)) };
     swim.handleOrgRevoke(forged);
     try std.testing.expect(membership.peers.get(victim).?.state == .alive);
     try std.testing.expectEqual(@as(usize, 0), swim.revoked_count);
@@ -3199,7 +3199,7 @@ test "org revoke requires a valid trusted-org signature (C2 regression)" {
     // (3) Untrusted org with a valid self-signature → rejected.
     const evil_kp = keys.generate();
     const evil_pub = evil_kp.public_key.toBytes();
-    const victim2 = [_]u8{0x88} ** 32;
+    const victim2 = @as([32]u8, @splat(0x88));
     try membership.upsert(aliveTestPeer(victim2));
     var evil = messages.OrgCertRevoke{ .org_pubkey = evil_pub, .node_pubkey = victim2, .reason = 2, .lamport = 7, .signature = undefined };
     const evil_signed = codec.orgRevokeSignedBytes(evil);
@@ -3213,7 +3213,7 @@ test "org revokes are scoped to certificate issuer" {
     var membership = Membership.MembershipTable.init(allocator, 5000);
     defer membership.deinit();
 
-    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, null);
     swim.enableTrust();
 
     const org_a = Org.generateOrgKeyPair();
@@ -3223,7 +3223,7 @@ test "org revokes are scoped to certificate issuer" {
     swim.addTrustedOrg(org_a_pub);
     swim.addTrustedOrg(org_b_pub);
 
-    const node = [_]u8{0x89} ** 32;
+    const node = @as([32]u8, @splat(0x89));
     const cert_b = try issueCertWire(org_b, node, "node-b");
     try membership.upsert(aliveTestPeer(node));
     swim.recordPeerCertificate(node, cert_b);
@@ -3253,7 +3253,7 @@ test "org revokes are scoped to vouch issuer" {
     var membership = Membership.MembershipTable.init(allocator, 5000);
     defer membership.deinit();
 
-    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, null);
     swim.enableTrust();
 
     const org_a = Org.generateOrgKeyPair();
@@ -3263,7 +3263,7 @@ test "org revokes are scoped to vouch issuer" {
     swim.addTrustedOrg(org_a_pub);
     swim.addTrustedOrg(org_b_pub);
 
-    const node = [_]u8{0x8a} ** 32;
+    const node = @as([32]u8, @splat(0x8a));
     swim.handleOrgVouch(issueVouch(org_b, node, 30));
     try membership.upsert(aliveTestPeer(node));
     try std.testing.expect(swim.isAuthorizedPeer(node, null));
@@ -3290,14 +3290,14 @@ test "queued org revoke is applied locally and retained for broadcast" {
     var membership = Membership.MembershipTable.init(allocator, 5000);
     defer membership.deinit();
 
-    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, null);
     swim.enableTrust();
 
     const org_kp = Org.generateOrgKeyPair();
     const org_pubkey = org_kp.public_key.toBytes();
     swim.addTrustedOrg(org_pubkey);
 
-    const victim = [_]u8{0x79} ** 32;
+    const victim = @as([32]u8, @splat(0x79));
     try membership.upsert(aliveTestPeer(victim));
     const cert = try issueCertWire(org_kp, victim, "victim");
     swim.recordPeerCertificate(victim, cert);
@@ -3316,10 +3316,10 @@ test "retained org revoke can be re-advertised without duplicate queue entries" 
     var membership = Membership.MembershipTable.init(allocator, 5000);
     defer membership.deinit();
 
-    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{ .org_revoke_readvertise_interval_ms = 1 }, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{ .org_revoke_readvertise_interval_ms = 1 }, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, null);
 
     const org_kp = Org.generateOrgKeyPair();
-    const victim = [_]u8{0x7a} ** 32;
+    const victim = @as([32]u8, @splat(0x7a));
     const rev = try Org.issueOrgRevoke(org_kp, victim, 2, 11);
 
     swim.queueOrgCertRevoke(rev);
@@ -3342,16 +3342,16 @@ test "org revoke fan-out resumes after rate-limit drops" {
     var socket = Udp.UdpSocket.bind(0) catch return;
     defer socket.close();
 
-    var swim = SwimProtocol.init(&membership, socket, .{ .max_gossip_broadcasts = 1 }, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    var swim = SwimProtocol.init(&membership, socket, .{ .max_gossip_broadcasts = 1 }, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, null);
 
     var i: usize = 0;
     while (i < 3) : (i += 1) {
-        var peer = aliveTestPeer([_]u8{@intCast(i + 3)} ** 32);
+        var peer = aliveTestPeer(@as([32]u8, @splat(@intCast(i + 3))));
         peer.gossip_endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, @intCast(43000 + i));
         try membership.upsert(peer);
     }
 
-    const data = [_]u8{0x42} ** Org.ORG_REVOKE_WIRE_SIZE;
+    const data = @as([Org.ORG_REVOKE_WIRE_SIZE]u8, @splat(0x42));
     swim.enqueueOrgControl(&data, swim.config.max_gossip_broadcasts);
     try std.testing.expectEqual(@as(usize, 1), swim.org_control_count);
 
@@ -3385,9 +3385,9 @@ test "gossiped dead does not instantly evict a third party (H2 regression)" {
     var socket = Udp.UdpSocket.bind(0) catch return;
     defer socket.close();
 
-    var swim = SwimProtocol.init(&membership, socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    var swim = SwimProtocol.init(&membership, socket, .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, null);
 
-    const victim = [_]u8{0x55} ** 32;
+    const victim = @as([32]u8, @splat(0x55));
     try membership.upsert(aliveTestPeer(victim));
 
     // An unauthenticated gossip "dead" about a third party must only DOWNGRADE
@@ -3407,7 +3407,7 @@ test "forged self-dead gossip with max Lamport does not overflow (S1)" {
     var membership = Membership.MembershipTable.init(allocator, 5000);
     defer membership.deinit();
 
-    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, null);
 
     // Attacker-forged gossip claiming WE are dead, with a maxed-out Lamport clock.
     // Pre-fix: `@max(lamport, u64max) + 1` overflowed -> panic (safe builds) from one packet.
@@ -3426,11 +3426,11 @@ test "collectGossip clamps to snapshot size and tolerates zero broadcasts (S3/S4
     defer membership.deinit();
 
     // Misconfiguration: per-message cap far above gossip_snap.len, and zero broadcasts.
-    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{ .max_gossip_per_message = 64, .max_gossip_broadcasts = 0 }, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{ .max_gossip_per_message = 64, .max_gossip_broadcasts = 0 }, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, null);
 
     var i: u8 = 0;
     while (i < 20) : (i += 1) {
-        swim.enqueueGossip(.{ .subject_pubkey = [_]u8{i} ** 32, .event = .alive, .lamport = 1, .endpoint = null });
+        swim.enqueueGossip(.{ .subject_pubkey = @as([32]u8, @splat(i)), .event = .alive, .lamport = 1, .endpoint = null });
     }
 
     // Pre-fix: count == 20 overflowed gossip_snap[8..]; remaining==0 underflowed on decrement.
@@ -3443,8 +3443,8 @@ test "periodic self re-advertise re-offers our wg_pubkey (heals #114)" {
     var membership = Membership.MembershipTable.init(allocator, 5000);
     defer membership.deinit();
 
-    const our_wg = [_]u8{0xAB} ** 32;
-    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{ .self_readvertise_interval_ms = 1000 }, [_]u8{1} ** 32, our_wg, .{ 127, 0, 0, 1 }, 51821, null);
+    const our_wg = @as([32]u8, @splat(0xAB));
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{ .self_readvertise_interval_ms = 1000 }, @as([32]u8, @splat(1)), our_wg, .{ 127, 0, 0, 1 }, 51821, null);
 
     // Steady state: the one-shot registration-time advertisement has already drained.
     swim.gossip_count = 0;
@@ -3470,7 +3470,7 @@ test "forged max Lamport gossip is clamped, not absorbed to the u64 ceiling (P1)
     var membership = Membership.MembershipTable.init(allocator, 5000);
     defer membership.deinit();
 
-    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, null);
     swim.membership.lamport = 100;
 
     // Forged self-dead with an attacker-maxed Lamport clock.
@@ -3487,7 +3487,7 @@ test "Lamport increments saturate and never overflow (P1)" {
     var membership = Membership.MembershipTable.init(allocator, 5000);
     defer membership.deinit();
 
-    const pk = [_]u8{3} ** 32;
+    const pk = @as([32]u8, @splat(3));
     try membership.upsert(aliveTestPeer(pk));
 
     // Drive the clock to the ceiling, then exercise every membership transition that
@@ -3532,7 +3532,7 @@ test "S2: live-tunnel restart claim never tears down; heals via re-init" {
     defer membership.deinit();
 
     var tctx = S2TestCtx{ .tunnel_live = true };
-    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, .{
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, .{
         .ctx = &tctx,
         .onPeerJoin = s2OnJoin,
         .onPeerDead = s2OnDead,
@@ -3540,9 +3540,9 @@ test "S2: live-tunnel restart claim never tears down; heals via re-init" {
         .reinitiateHandshake = s2Reinit,
     });
 
-    const v = [_]u8{0x77} ** 32;
+    const v = @as([32]u8, @splat(0x77));
     var p = aliveTestPeer(v);
-    p.wg_pubkey = [_]u8{0x88} ** 32; // we hold V's WG key — a live tunnel is possible
+    p.wg_pubkey = @as([32]u8, @splat(0x88)); // we hold V's WG key — a live tunnel is possible
     p.incarnation = 100;
     try membership.upsert(p);
 
@@ -3565,7 +3565,7 @@ test "S2: implausibly-future incarnation is rejected (pin cannot be poisoned)" {
     defer membership.deinit();
 
     var tctx = S2TestCtx{ .tunnel_live = true };
-    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, .{
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, .{
         .ctx = &tctx,
         .onPeerJoin = s2OnJoin,
         .onPeerDead = s2OnDead,
@@ -3573,9 +3573,9 @@ test "S2: implausibly-future incarnation is rejected (pin cannot be poisoned)" {
         .reinitiateHandshake = s2Reinit,
     });
 
-    const v = [_]u8{0x77} ** 32;
+    const v = @as([32]u8, @splat(0x77));
     var p = aliveTestPeer(v);
-    p.wg_pubkey = [_]u8{0x88} ** 32;
+    p.wg_pubkey = @as([32]u8, @splat(0x88));
     p.incarnation = 100;
     try membership.upsert(p);
 
@@ -3594,7 +3594,7 @@ test "S2: genuine rejoin proceeds when no live tunnel (not over-gated)" {
     defer membership.deinit();
 
     var tctx = S2TestCtx{ .tunnel_live = false }; // tunnel down/expired (e.g. past REJECT_AFTER_TIME)
-    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, .{
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, .{
         .ctx = &tctx,
         .onPeerJoin = s2OnJoin,
         .onPeerDead = s2OnDead,
@@ -3602,9 +3602,9 @@ test "S2: genuine rejoin proceeds when no live tunnel (not over-gated)" {
         .reinitiateHandshake = s2Reinit,
     });
 
-    const v = [_]u8{0x77} ** 32;
+    const v = @as([32]u8, @splat(0x77));
     var p = aliveTestPeer(v);
-    p.wg_pubkey = [_]u8{0x88} ** 32;
+    p.wg_pubkey = @as([32]u8, @splat(0x88));
     p.incarnation = 100;
     try membership.upsert(p);
 
@@ -3639,7 +3639,7 @@ test "a peer's own signed WireGuard key replaces one claimed by gossip" {
     var membership = Membership.MembershipTable.init(allocator, 5000);
     defer membership.deinit();
     var joins = JoinCounter{};
-    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, .{
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, .{
         .ctx = &joins,
         .onPeerJoin = countPeerJoin,
         .onPeerDead = countPeerDead,
@@ -3647,8 +3647,8 @@ test "a peer's own signed WireGuard key replaces one claimed by gossip" {
 
     const node_kp = keys.generate();
     const node_pubkey = node_kp.public_key.toBytes();
-    const claimed_wg = [_]u8{0xF0} ** 32;
-    const own_wg = [_]u8{0x92} ** 32;
+    const claimed_wg = @as([32]u8, @splat(0xF0));
+    const own_wg = @as([32]u8, @splat(0x92));
     const endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 43102);
 
     swim.applyGossip(.{ .subject_pubkey = node_pubkey, .event = .join, .lamport = 1, .endpoint = endpoint, .wg_pubkey = claimed_wg });
@@ -3674,17 +3674,17 @@ test "a binding signed by someone else is ignored" {
     const allocator = std.testing.allocator;
     var membership = Membership.MembershipTable.init(allocator, 5000);
     defer membership.deinit();
-    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, null);
 
     const victim = keys.generate().public_key.toBytes();
     const attacker_kp = keys.generate();
-    const victim_wg = [_]u8{0x31} ** 32;
+    const victim_wg = @as([32]u8, @splat(0x31));
     const endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 43103);
     swim.applyGossip(.{ .subject_pubkey = victim, .event = .join, .lamport = 1, .endpoint = endpoint, .wg_pubkey = victim_wg });
 
     // The attacker claims the victim's identity with its own key, signed by itself.
     var buf: [1500]u8 = undefined;
-    swim.handleMessage(try ackWithBinding(&buf, victim, try testBinding(attacker_kp, [_]u8{0x66} ** 32), null), endpoint);
+    swim.handleMessage(try ackWithBinding(&buf, victim, try testBinding(attacker_kp, @as([32]u8, @splat(0x66))), null), endpoint);
 
     const peer = membership.peers.get(victim).?;
     try std.testing.expectEqualSlices(u8, &victim_wg, &peer.wg_pubkey.?);
@@ -3695,15 +3695,15 @@ test "a self-signed binding never overrides a certificate-bound key" {
     const allocator = std.testing.allocator;
     var membership = Membership.MembershipTable.init(allocator, 5000);
     defer membership.deinit();
-    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, null);
     swim.enableTrust();
     const org_kp = Org.generateOrgKeyPair();
     swim.addTrustedOrg(org_kp.public_key.toBytes());
 
     const node_kp = keys.generate();
     const node_pubkey = node_kp.public_key.toBytes();
-    const cert_wg = [_]u8{0x92} ** 32;
-    const other_wg = [_]u8{0x93} ** 32;
+    const cert_wg = @as([32]u8, @splat(0x92));
+    const other_wg = @as([32]u8, @splat(0x93));
     const endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 43104);
 
     var buf: [1500]u8 = undefined;
@@ -3721,17 +3721,17 @@ test "our pings and acks advertise our binding and fit one datagram" {
     const allocator = std.testing.allocator;
     var membership = Membership.MembershipTable.init(allocator, 5000);
     defer membership.deinit();
-    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
-    swim.setWgBinding(.{ .wg_pubkey = [_]u8{2} ** 32, .signature = [_]u8{9} ** 64 });
-    swim.setOrgCert([_]u8{0xC7} ** messages.ORG_CERT_WIRE_SIZE);
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, null);
+    swim.setWgBinding(.{ .wg_pubkey = @as([32]u8, @splat(2)), .signature = @as([64]u8, @splat(9)) });
+    swim.setOrgCert(@as([messages.ORG_CERT_WIRE_SIZE]u8, @splat(0xC7)));
 
     for (0..12) |i| {
         swim.enqueueGossip(.{
-            .subject_pubkey = [_]u8{@intCast(i + 10)} ** 32,
+            .subject_pubkey = @as([32]u8, @splat(@intCast(i + 10))),
             .event = .alive,
             .lamport = i,
             .endpoint = messages.Endpoint.initV4(.{ 10, 0, 0, @intCast(i) }, 51821),
-            .wg_pubkey = [_]u8{@intCast(i + 40)} ** 32,
+            .wg_pubkey = @as([32]u8, @splat(@intCast(i + 40))),
         });
     }
     const gossip = swim.collectGossip();
@@ -3799,11 +3799,11 @@ const ForwardFixture = struct {
 test "mobile contexts never forward frames addressed to others" {
     var f = ForwardFixture.init() catch return;
     defer f.deinit();
-    var swim = SwimProtocol.init(&f.membership, f.relay_socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    var swim = SwimProtocol.init(&f.membership, f.relay_socket, .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, null);
     try std.testing.expectEqual(Forwarding.none, swim.forwarding);
 
-    const alice = [_]u8{0xA1} ** 32;
-    const bob = [_]u8{0xB0} ** 32;
+    const alice = @as([32]u8, @splat(0xA1));
+    const bob = @as([32]u8, @splat(0xB0));
     swim.registerOrUpdatePeerEndpoint(alice, loopback(f.alice_socket));
     swim.registerOrUpdatePeerEndpoint(bob, loopback(f.bob_socket));
 
@@ -3816,11 +3816,11 @@ test "mobile contexts never forward frames addressed to others" {
 test "endpoint-match forwarding refuses frames from anywhere but the sender's endpoint" {
     var f = ForwardFixture.init() catch return;
     defer f.deinit();
-    var swim = SwimProtocol.init(&f.membership, f.relay_socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    var swim = SwimProtocol.init(&f.membership, f.relay_socket, .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, null);
     swim.forwarding = .endpoint_match;
 
-    const alice = [_]u8{0xA1} ** 32;
-    const bob = [_]u8{0xB0} ** 32;
+    const alice = @as([32]u8, @splat(0xA1));
+    const bob = @as([32]u8, @splat(0xB0));
     swim.registerOrUpdatePeerEndpoint(alice, loopback(f.alice_socket));
     swim.registerOrUpdatePeerEndpoint(bob, loopback(f.bob_socket));
 
@@ -3843,13 +3843,13 @@ const TestRelayClient = struct {
     binding: messages.WgBinding,
 
     fn init(seed_byte: u8) !TestRelayClient {
-        const seed = [_]u8{seed_byte} ** 32;
+        const seed = @as([32]u8, @splat(seed_byte));
         const kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
         var private = seed;
         private[0] &= 248;
         private[31] &= 127;
         private[31] |= 64;
-        const public = try std.crypto.dh.X25519.recoverPublicKey(private);
+        const public = std.crypto.dh.X25519.recoverPublicKey(private);
         return .{ .identity = kp.public_key.toBytes(), .wg_private = private, .wg_public = public, .binding = try Binding.signWithSeed(seed, public) };
     }
 
@@ -3877,13 +3877,13 @@ const WgNoise = @import("../wireguard/noise.zig");
 test "authenticated relays forward only for senders proven by handshake" {
     var f = ForwardFixture.init() catch return;
     defer f.deinit();
-    var relay_private = [_]u8{0x77} ** 32;
+    var relay_private = @as([32]u8, @splat(0x77));
     relay_private[0] &= 248;
     relay_private[31] &= 127;
     relay_private[31] |= 64;
-    const relay_public = try std.crypto.dh.X25519.recoverPublicKey(relay_private);
+    const relay_public = std.crypto.dh.X25519.recoverPublicKey(relay_private);
 
-    var swim = SwimProtocol.init(&f.membership, f.relay_socket, .{}, [_]u8{1} ** 32, relay_public, .{ 127, 0, 0, 1 }, 51821, null);
+    var swim = SwimProtocol.init(&f.membership, f.relay_socket, .{}, @as([32]u8, @splat(1)), relay_public, .{ 127, 0, 0, 1 }, 51821, null);
     var core = try RelayCore.RelayCore.init(std.testing.allocator, .{ .max_clients = 64, .max_unproven = 16, .max_claims = 64, .max_handshake_sources = 64 }, relay_private, relay_public, swim.relayAdmission(), nowNs());
     defer core.deinit();
     swim.relay_core = &core;
@@ -3915,10 +3915,10 @@ test "a trust reload replaces keys and never opens a node that enforced trust" {
     const allocator = std.testing.allocator;
     var membership = Membership.MembershipTable.init(allocator, 100);
     defer membership.deinit();
-    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
-    const alice = [_]u8{0xA1} ** 32;
-    const bob = [_]u8{0xB0} ** 32;
-    const org = [_]u8{0x0C} ** 32;
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, null);
+    const alice = @as([32]u8, @splat(0xA1));
+    const bob = @as([32]u8, @splat(0xB0));
+    const org = @as([32]u8, @splat(0x0C));
     swim.addAuthorizedKey(alice);
     swim.enableTrust();
 
@@ -3936,8 +3936,8 @@ test "reload requests run once on the event loop and re-check relay clients" {
     const allocator = std.testing.allocator;
     var membership = Membership.MembershipTable.init(allocator, 100);
     defer membership.deinit();
-    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
-    var core = try RelayCore.RelayCore.init(allocator, .{ .max_clients = 16, .max_unproven = 4, .max_claims = 16, .max_handshake_sources = 16 }, [_]u8{0x40} ** 32, [_]u8{0x41} ** 32, swim.relayAdmission(), 0);
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, null);
+    var core = try RelayCore.RelayCore.init(allocator, .{ .max_clients = 16, .max_unproven = 4, .max_claims = 16, .max_handshake_sources = 16 }, @as([32]u8, @splat(0x40)), @as([32]u8, @splat(0x41)), swim.relayAdmission(), 0);
     defer core.deinit();
     swim.relay_core = &core;
 
@@ -3966,9 +3966,9 @@ test "retained revocations are re-sent once per interval, not as fresh broadcast
     const allocator = std.testing.allocator;
     var membership = Membership.MembershipTable.init(allocator, 100);
     defer membership.deinit();
-    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{ .org_revoke_readvertise_interval_ms = 1 }, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{ .org_revoke_readvertise_interval_ms = 1 }, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, null);
     const org_kp = Org.generateOrgKeyPair();
-    const rev = try Org.issueOrgRevoke(org_kp, [_]u8{0x7b} ** 32, 2, 12);
+    const rev = try Org.issueOrgRevoke(org_kp, @as([32]u8, @splat(0x7b)), 2, 12);
     swim.queueOrgCertRevoke(rev);
     try std.testing.expectEqual(swim.config.max_gossip_broadcasts, swim.org_control_queue[0].remaining);
 
@@ -3985,11 +3985,11 @@ const TestRelay = struct {
     public: [32]u8,
 
     fn init() !TestRelay {
-        var private = [_]u8{0x77} ** 32;
+        var private = @as([32]u8, @splat(0x77));
         private[0] &= 248;
         private[31] &= 127;
         private[31] |= 64;
-        return .{ .private = private, .public = try std.crypto.dh.X25519.recoverPublicKey(private) };
+        return .{ .private = private, .public = std.crypto.dh.X25519.recoverPublicKey(private) };
     }
 };
 
@@ -3997,7 +3997,7 @@ test "opaque relays keep clients out of membership and describe only themselves"
     var f = ForwardFixture.init() catch return;
     defer f.deinit();
     const relay = try TestRelay.init();
-    var swim = SwimProtocol.init(&f.membership, f.relay_socket, .{}, [_]u8{1} ** 32, relay.public, .{ 127, 0, 0, 1 }, 51821, null);
+    var swim = SwimProtocol.init(&f.membership, f.relay_socket, .{}, @as([32]u8, @splat(1)), relay.public, .{ 127, 0, 0, 1 }, 51821, null);
     var core = try RelayCore.RelayCore.init(std.testing.allocator, .{ .max_clients = 64, .max_unproven = 16, .max_claims = 64, .max_handshake_sources = 64 }, relay.private, relay.public, swim.relayAdmission(), nowNs());
     defer core.deinit();
     swim.relay_core = &core;
@@ -4018,7 +4018,7 @@ test "opaque relays keep clients out of membership and describe only themselves"
     const ack = (try codec.decode(ack_bytes)).ack;
     try std.testing.expectEqual(@as(u64, 9), ack.seq);
     try std.testing.expectEqual(@as(u8, 1), ack.gossip_count);
-    try std.testing.expectEqualSlices(u8, &([_]u8{1} ** 32), &ack.gossip()[0].subject_pubkey);
+    try std.testing.expectEqualSlices(u8, &@as([32]u8, @splat(1)), &ack.gossip()[0].subject_pubkey);
     try std.testing.expectEqual(messages.NatType.public, ack.gossip()[0].nat_type);
     try std.testing.expect(ack.wg_binding == null); // our test relay set none
     try std.testing.expect(std.mem.indexOf(u8, ack_bytes, &bob.identity) == null);
@@ -4042,7 +4042,7 @@ test "frames the relay drops are answered with a delivery status" {
     var f = ForwardFixture.init() catch return;
     defer f.deinit();
     const relay = try TestRelay.init();
-    var swim = SwimProtocol.init(&f.membership, f.relay_socket, .{}, [_]u8{1} ** 32, relay.public, .{ 127, 0, 0, 1 }, 51821, null);
+    var swim = SwimProtocol.init(&f.membership, f.relay_socket, .{}, @as([32]u8, @splat(1)), relay.public, .{ 127, 0, 0, 1 }, 51821, null);
     var core = try RelayCore.RelayCore.init(std.testing.allocator, .{ .max_clients = 64, .max_unproven = 16, .max_claims = 64, .max_handshake_sources = 64 }, relay.private, relay.public, swim.relayAdmission(), nowNs());
     defer core.deinit();
     swim.relay_core = &core;
@@ -4076,12 +4076,12 @@ test "frames the relay drops are answered with a delivery status" {
 test "answers to pings have their own budget" {
     var f = ForwardFixture.init() catch return;
     defer f.deinit();
-    var swim = SwimProtocol.init(&f.membership, f.relay_socket, .{}, [_]u8{1} ** 32, [_]u8{2} ** 32, .{ 127, 0, 0, 1 }, 51821, null);
+    var swim = SwimProtocol.init(&f.membership, f.relay_socket, .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, null);
     // Our own discovery budget is spent; answers still go out.
     swim.send_tokens = 0;
     swim.last_token_refill_ns = nowNs();
     var buf: [512]u8 = undefined;
-    const len = try codec.encodePing(&buf, .{ .sender_pubkey = [_]u8{0xA1} ** 32, .seq = 4, .gossip = &.{} });
+    const len = try codec.encodePing(&buf, .{ .sender_pubkey = @as([32]u8, @splat(0xA1)), .seq = 4, .gossip = &.{} });
     swim.handleMessage(buf[0..len], loopback(f.alice_socket));
     var recv_buf: [1500]u8 = undefined;
     const ack = testReceive(f.alice_socket, &recv_buf, 0x03) orelse return error.NoAck;

@@ -130,7 +130,7 @@ pub const BatchSender = struct {
             .family = linux.AF.INET,
             .port = std.mem.nativeToBig(u16, dest_port),
             .addr = @bitCast(dest_addr),
-            .zero = .{0} ** 8,
+            .zero = @splat(0),
         };
 
         self.msgs[i] = .{
@@ -305,7 +305,7 @@ pub const GSOSender = struct {
             .family = linux.AF.INET,
             .port = std.mem.nativeToBig(u16, dest_port),
             .addr = @bitCast(dest_addr),
-            .zero = .{0} ** 8,
+            .zero = @splat(0),
         };
 
         var iov = Iovec{
@@ -399,7 +399,7 @@ pub const ZeroCopyGSOSender = struct {
             .family = linux.AF.INET,
             .port = std.mem.nativeToBig(u16, dest_port),
             .addr = @bitCast(dest_addr),
-            .zero = .{0} ** 8,
+            .zero = @splat(0),
         };
 
         // Build cmsg with UDP_SEGMENT

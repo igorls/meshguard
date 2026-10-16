@@ -342,7 +342,7 @@ pub const UdpSocket = struct {
             // backpressure to WouldBlock and surface the rest as real failures.
             const sgn: isize = @bitCast(rc);
             if (sgn < 0) {
-                switch (@as(posix.E, @enumFromInt(@as(u16, @intCast(-sgn))))) {
+                switch (@as(posix.E, @fromBackingInt(@intCast(@as(u16, @intCast(-sgn)))))) {
                     .AGAIN, .NOBUFS, .INTR => return error.WouldBlock,
                     else => |e| return posix.unexpectedErrno(e),
                 }
@@ -366,7 +366,7 @@ pub const UdpSocket = struct {
             const rc = linux.sendto(self.fd, data.ptr, data.len, 0, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
             const sgn: isize = @bitCast(rc); // raw -errno; decode the errno (see sendTo)
             if (sgn < 0) {
-                switch (@as(posix.E, @enumFromInt(@as(u16, @intCast(-sgn))))) {
+                switch (@as(posix.E, @fromBackingInt(@intCast(@as(u16, @intCast(-sgn)))))) {
                     .AGAIN, .NOBUFS, .INTR => return error.WouldBlock,
                     else => |e| return posix.unexpectedErrno(e),
                 }
@@ -444,7 +444,7 @@ pub const UdpSocket = struct {
             if (n > buf.len) return null;
             return RecvResult{
                 .data = buf[0..n],
-                .sender_addr = .{0} ** 4,
+                .sender_addr = @splat(0),
                 .sender_addr6 = src_addr.addr,
                 .sender_port = std.mem.bigToNative(u16, src_addr.port),
             };
@@ -454,7 +454,7 @@ pub const UdpSocket = struct {
             const n: usize = @intCast(rc);
             return RecvResult{
                 .data = buf[0..n],
-                .sender_addr = .{0} ** 4,
+                .sender_addr = @splat(0),
                 .sender_addr6 = src_addr.addr,
                 .sender_port = std.mem.bigToNative(u16, src_addr.port),
             };
@@ -561,7 +561,7 @@ test "UDP bind succeeds on all platforms (Winsock init regression)" {
 
 fn sendDrainProbe(socket: UdpSocket, payload: []const u8) !void {
     if (socket.ipv6) {
-        var loopback = [_]u8{0} ** 16;
+        var loopback = @as([16]u8, @splat(0));
         loopback[15] = 1;
         _ = try socket.sendTo6(payload, loopback, socket.port);
     } else {
@@ -570,7 +570,7 @@ fn sendDrainProbe(socket: UdpSocket, payload: []const u8) !void {
 }
 
 fn expectNonBlockingDrain(comptime ipv6: bool) !void {
-    var loopback6 = [_]u8{0} ** 16;
+    var loopback6 = @as([16]u8, @splat(0));
     loopback6[15] = 1;
     var socket = if (ipv6)
         try UdpSocket.bindAddr6(loopback6, 0)

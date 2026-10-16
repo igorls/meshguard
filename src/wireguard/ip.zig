@@ -12,7 +12,7 @@ pub const default_mesh_prefix = [2]u8{ 10, 99 };
 pub const default_mesh_mask: u8 = 16;
 /// Default IPv6 ULA mesh prefix: fd99:6d67::/64 ("mg" in hex).
 pub const default_mesh_prefix6 = [8]u8{ 0xfd, 0x99, 0x6d, 0x67, 0, 0, 0, 0 };
-pub const default_mesh_network6 = default_mesh_prefix6 ++ ([_]u8{0} ** 8);
+pub const default_mesh_network6 = default_mesh_prefix6 ++ @as([8]u8, @splat(0));
 pub const default_mesh_mask6: u8 = 64;
 
 /// Derive a mesh IP from a public key.
@@ -66,7 +66,7 @@ pub fn formatCidr(ip: [4]u8, mask: u8, buf: []u8) []const u8 {
 /// Format an IPv6 mesh address as a CIDR string.
 pub fn formatIpv6Cidr(ip: [16]u8, mask: u8, buf: []u8) []const u8 {
     const result = std.fmt.bufPrint(buf, "{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}/{d}", .{
-        ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], ip[6], ip[7],
+        ip[0], ip[1], ip[2],  ip[3],  ip[4],  ip[5],  ip[6],  ip[7],
         ip[8], ip[9], ip[10], ip[11], ip[12], ip[13], ip[14], ip[15],
         mask,
     }) catch return "?::?/?";
@@ -76,7 +76,7 @@ pub fn formatIpv6Cidr(ip: [16]u8, mask: u8, buf: []u8) []const u8 {
 /// Format an IPv6 mesh address.
 pub fn formatIpv6(ip: [16]u8, buf: []u8) []const u8 {
     const result = std.fmt.bufPrint(buf, "{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}", .{
-        ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], ip[6], ip[7],
+        ip[0], ip[1], ip[2],  ip[3],  ip[4],  ip[5],  ip[6],  ip[7],
         ip[8], ip[9], ip[10], ip[11], ip[12], ip[13], ip[14], ip[15],
     }) catch return "?::?";
     return result;

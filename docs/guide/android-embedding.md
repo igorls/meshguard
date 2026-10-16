@@ -45,7 +45,7 @@ as one step under the lock and never wraps, so no nonce is ever used twice.
 ### Building from source
 
 Zig needs the NDK's sysroot (Bionic headers and libc stubs); any recent NDK
-works. With Zig 0.16.0 on Linux:
+works. With Zig 0.17.0 on Linux:
 
 ```bash
 export ANDROID_NDK_HOME=$HOME/Android/Sdk/ndk/28.2.13676358
@@ -64,9 +64,10 @@ a libc file for each ABI; a manual build does the same:
 #   include_dir=SYSROOT/usr/include
 #   sys_include_dir=SYSROOT/usr/include/aarch64-linux-android
 #   crt_dir=SYSROOT/usr/lib/aarch64-linux-android/24
+#   cc_dir=SYSROOT/usr/lib/aarch64-linux-android/24
 #   msvc_lib_dir=
 #   kernel32_lib_dir=
-#   gcc_dir=
+#   darwin_sdk_dir=
 zig build ffi -Dtarget=aarch64-linux-android.24 -Doptimize=ReleaseFast --libc libc-arm64.conf
 ```
 

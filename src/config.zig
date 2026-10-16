@@ -3,27 +3,26 @@
 const std = @import("std");
 
 pub const Config = struct {
-
-/// Returns a blocking Io instance for synchronous operations.
-fn zio() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
-}
-
-pub fn getEnvVarOwned(allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
-    const builtin = @import("builtin");
-    if (comptime builtin.os.tag == .windows) {
-        return std.process.Environ.getAlloc(.{ .block = .global }, allocator, key) catch |err| switch (err) {
-            error.EnvironmentVariableMissing => null,
-            else => |other| return other,
-        };
+    /// Returns a blocking Io instance for synchronous operations.
+    fn zio() std.Io {
+        return std.Io.Threaded.global_single_threaded.io();
     }
 
-    const key_z = try allocator.dupeZ(u8, key);
-    defer allocator.free(key_z);
+    pub fn getEnvVarOwned(allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
+        const builtin = @import("builtin");
+        if (comptime builtin.os.tag == .windows) {
+            return std.process.Environ.getAlloc(.{ .block = .global }, allocator, key) catch |err| switch (err) {
+                error.EnvironmentVariableMissing => null,
+                else => |other| return other,
+            };
+        }
 
-    const value = std.c.getenv(key_z) orelse return null;
-    return try allocator.dupe(u8, std.mem.span(value));
-}
+        const key_z = try allocator.dupeSentinel(u8, key, 0);
+        defer allocator.free(key_z);
+
+        const value = std.c.getenv(key_z) orelse return null;
+        return try allocator.dupe(u8, std.mem.span(value));
+    }
 
     pub const DEFAULT_GOSSIP_PORT: u16 = 51821;
     pub const GOSSIP_PORT_ENV = "MESHGUARD_GOSSIP_PORT";
@@ -128,7 +127,6 @@ pub fn getEnvVarOwned(allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
         return error.HomeNotFound;
     }
 
-
     /// Ensure the config directory exists and return its path.
     pub fn ensureConfigDir(allocator: std.mem.Allocator) ![]const u8 {
         const dir = try defaultConfigDir(allocator);
@@ -150,13 +148,13 @@ pub fn getEnvVarOwned(allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
 
 test "resolveGossipPort keeps default when flag and env are unset" {
     try std.testing.expectEqual(@as(u16, 51821), try Config.resolveGossipPort(&.{}, null));
-    try std.testing.expectEqual(@as(u16, 51821), try Config.resolveGossipPort(&.{"--open", "--gossip-only"}, null));
+    try std.testing.expectEqual(@as(u16, 51821), try Config.resolveGossipPort(&.{ "--open", "--gossip-only" }, null));
 }
 
 test "resolveGossipPort accepts a valid explicit flag" {
-    try std.testing.expectEqual(@as(u16, 51921), try Config.resolveGossipPort(&.{"--gossip-port", "51921"}, null));
-    try std.testing.expectEqual(@as(u16, 1), try Config.resolveGossipPort(&.{"--gossip-port", "1"}, null));
-    try std.testing.expectEqual(@as(u16, 65535), try Config.resolveGossipPort(&.{"--gossip-port", "65535"}, "51821"));
+    try std.testing.expectEqual(@as(u16, 51921), try Config.resolveGossipPort(&.{ "--gossip-port", "51921" }, null));
+    try std.testing.expectEqual(@as(u16, 1), try Config.resolveGossipPort(&.{ "--gossip-port", "1" }, null));
+    try std.testing.expectEqual(@as(u16, 65535), try Config.resolveGossipPort(&.{ "--gossip-port", "65535" }, "51821"));
 }
 
 test "resolveGossipPort accepts a valid env override" {
@@ -165,26 +163,26 @@ test "resolveGossipPort accepts a valid env override" {
 }
 
 test "resolveGossipPort flag wins over env" {
-    try std.testing.expectEqual(@as(u16, 52001), try Config.resolveGossipPort(&.{"--gossip-port", "52001"}, "51921"));
+    try std.testing.expectEqual(@as(u16, 52001), try Config.resolveGossipPort(&.{ "--gossip-port", "52001" }, "51921"));
 }
 
 test "resolveGossipPort rejects invalid explicit strings" {
-    try std.testing.expectError(error.InvalidGossipPort, Config.resolveGossipPort(&.{"--gossip-port", "abc"}, null));
+    try std.testing.expectError(error.InvalidGossipPort, Config.resolveGossipPort(&.{ "--gossip-port", "abc" }, null));
     try std.testing.expectError(error.InvalidGossipPort, Config.resolveGossipPort(&.{}, "not-a-port"));
 }
 
 test "resolveGossipPort rejects zero" {
-    try std.testing.expectError(error.InvalidGossipPort, Config.resolveGossipPort(&.{"--gossip-port", "0"}, null));
+    try std.testing.expectError(error.InvalidGossipPort, Config.resolveGossipPort(&.{ "--gossip-port", "0" }, null));
     try std.testing.expectError(error.InvalidGossipPort, Config.resolveGossipPort(&.{}, "0"));
 }
 
 test "resolveGossipPort rejects negative values" {
-    try std.testing.expectError(error.InvalidGossipPort, Config.resolveGossipPort(&.{"--gossip-port", "-1"}, null));
+    try std.testing.expectError(error.InvalidGossipPort, Config.resolveGossipPort(&.{ "--gossip-port", "-1" }, null));
     try std.testing.expectError(error.InvalidGossipPort, Config.resolveGossipPort(&.{}, "-51821"));
 }
 
 test "resolveGossipPort rejects values above 65535" {
-    try std.testing.expectError(error.InvalidGossipPort, Config.resolveGossipPort(&.{"--gossip-port", "65536"}, null));
+    try std.testing.expectError(error.InvalidGossipPort, Config.resolveGossipPort(&.{ "--gossip-port", "65536" }, null));
     try std.testing.expectError(error.InvalidGossipPort, Config.resolveGossipPort(&.{}, "100000"));
 }
 
@@ -192,5 +190,5 @@ test "resolveGossipPort rejects empty env or missing flag value" {
     try std.testing.expectError(error.InvalidGossipPort, Config.resolveGossipPort(&.{}, ""));
     try std.testing.expectError(error.InvalidGossipPort, Config.resolveGossipPort(&.{}, "   "));
     try std.testing.expectError(error.InvalidGossipPort, Config.resolveGossipPort(&.{"--gossip-port"}, null));
-    try std.testing.expectError(error.InvalidGossipPort, Config.resolveGossipPort(&.{"--gossip-port", ""}, "51921"));
+    try std.testing.expectError(error.InvalidGossipPort, Config.resolveGossipPort(&.{ "--gossip-port", "" }, "51921"));
 }

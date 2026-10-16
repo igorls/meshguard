@@ -17,7 +17,8 @@ pub fn build(b: *std.Build) void {
     wasm.max_memory = 4 * 65536;
     const install_wasm = b.addInstallArtifact(wasm, .{});
     b.step("wasm", "Build the browser-compatible portable MeshGuard core").dependOn(&install_wasm.step);
-    const wasm_check = b.addSystemCommand(&.{ "node", b.pathFromRoot("tests/wasm/smoke.mjs") });
+    const wasm_check = b.addSystemCommand(&.{"node"});
+    wasm_check.addFileArg(b.path("tests/wasm/smoke.mjs"));
     wasm_check.addArtifactArg(wasm);
     b.step("wasm-test", "Run the portable core in a JavaScript WebAssembly runtime").dependOn(&wasm_check.step);
     if (target.result.cpu.arch == .wasm32) {
@@ -246,9 +247,7 @@ pub fn build(b: *std.Build) void {
         // ─── Run step ───
         const run_cmd = b.addRunArtifact(exe);
         run_cmd.step.dependOn(b.getInstallStep());
-        if (b.args) |args| {
-            run_cmd.addArgs(args);
-        }
+        run_cmd.addPassthruArgs();
         const run_step = b.step("run", "Run meshguard");
         run_step.dependOn(&run_cmd.step);
 

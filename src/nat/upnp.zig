@@ -48,7 +48,6 @@ fn closeSocket(fd: posix.socket_t) void {
     _ = std.c.close(fd);
 }
 
-
 /// Create a socket via raw Linux syscall (replaces removed posix.socket).
 /// Returns a blocking Io instance for synchronous operations.
 fn zio() std.Io {
@@ -63,8 +62,6 @@ fn ipv4Sockaddr(ip: [4]u8, port: u16) posix.sockaddr.in {
         .zero = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
     };
 }
-
-
 
 // ─── Constants ───
 
@@ -649,5 +646,5 @@ test "parseHeader case insensitive" {
 
 test "isNewerVersion" {
     // Use direct assertions since this is an internal test
-    try std.testing.expect(parseUrl("http://x.x:1/a", &[_]u8{0} ** 64, &[_]u8{0} ** 256, &@as(u16, 0)) != null or true);
+    try std.testing.expect(parseUrl("http://x.x:1/a", &@as([64]u8, @splat(0)), &@as([256]u8, @splat(0)), &@as(u16, 0)) != null or true);
 }

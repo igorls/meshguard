@@ -64,9 +64,9 @@ pub fn isDerived(ed25519_pubkey: [32]u8, wg_pubkey: [32]u8) bool {
 // ─── Tests ───
 
 test "a binding verifies only for its own identity and key" {
-    const seed = [_]u8{7} ** 32;
+    const seed = @as([32]u8, @splat(7));
     const key_pair = try Ed25519.KeyPair.generateDeterministic(seed);
-    const wg = [_]u8{9} ** 32;
+    const wg = @as([32]u8, @splat(9));
     const binding = try signWithSeed(seed, wg);
     try std.testing.expect(verify(key_pair.public_key.toBytes(), binding));
 
@@ -74,7 +74,7 @@ test "a binding verifies only for its own identity and key" {
     other_key.wg_pubkey[0] ^= 1;
     try std.testing.expect(!verify(key_pair.public_key.toBytes(), other_key));
 
-    const stranger = try Ed25519.KeyPair.generateDeterministic([_]u8{8} ** 32);
+    const stranger = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(8)));
     try std.testing.expect(!verify(stranger.public_key.toBytes(), binding));
 
     var zero = binding;
@@ -84,20 +84,20 @@ test "a binding verifies only for its own identity and key" {
 
 test "binding signature matches the browser core's known answer" {
     // tests/web/gateway.test.mjs checks the same vector through the WASM core.
-    const binding = try signWithSeed([_]u8{7} ** 32, [_]u8{9} ** 32);
+    const binding = try signWithSeed(@as([32]u8, @splat(7)), @as([32]u8, @splat(9)));
     var expected: [64]u8 = undefined;
     _ = try std.fmt.hexToBytes(&expected, "16718f492c54ffe80a79fa28e66054faf3f94527239b0305f2b1787d05a718492025daade823f5f0ad24455594702627525cd3c51e82dbc759162537e2a00701");
     try std.testing.expectEqualSlices(u8, &expected, &binding.signature);
 }
 
 test "a binding is deterministic for a seed" {
-    const a = try signWithSeed([_]u8{3} ** 32, [_]u8{4} ** 32);
-    const b = try signWithSeed([_]u8{3} ** 32, [_]u8{4} ** 32);
+    const a = try signWithSeed(@as([32]u8, @splat(3)), @as([32]u8, @splat(4)));
+    const b = try signWithSeed(@as([32]u8, @splat(3)), @as([32]u8, @splat(4)));
     try std.testing.expectEqualSlices(u8, &a.signature, &b.signature);
 }
 
 test "daemon keys are derived; seed-clamped keys are not" {
-    const seed = [_]u8{0x21} ** 32;
+    const seed = @as([32]u8, @splat(0x21));
     const key_pair = try Ed25519.KeyPair.generateDeterministic(seed);
     const ed = key_pair.public_key.toBytes();
 
@@ -109,7 +109,7 @@ test "daemon keys are derived; seed-clamped keys are not" {
     daemon_private[0] &= 248;
     daemon_private[31] &= 127;
     daemon_private[31] |= 64;
-    const daemon_wg = try X25519.recoverPublicKey(daemon_private);
+    const daemon_wg = X25519.recoverPublicKey(daemon_private);
     try std.testing.expect(isDerived(ed, daemon_wg));
 
     // Mobile and browser derivation: the clamped seed.
@@ -117,6 +117,6 @@ test "daemon keys are derived; seed-clamped keys are not" {
     clamped[0] &= 248;
     clamped[31] &= 127;
     clamped[31] |= 64;
-    const app_wg = try X25519.recoverPublicKey(clamped);
+    const app_wg = X25519.recoverPublicKey(clamped);
     try std.testing.expect(!isDerived(ed, app_wg));
 }

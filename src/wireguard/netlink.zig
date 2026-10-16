@@ -47,7 +47,7 @@ pub fn resolveWireguardFamily() !u16 {
     });
 
     // CTRL_ATTR_FAMILY_NAME = "wireguard"
-    b.addAttrStr(@intFromEnum(nl.CTRL_ATTR.FAMILY_NAME), "wireguard");
+    b.addAttrStr(@backingInt(nl.CTRL_ATTR.FAMILY_NAME), "wireguard");
 
     const msg = b.finish();
 
@@ -76,13 +76,13 @@ pub fn setDevice(family_id: u16, config: DeviceConfig) !void {
     });
 
     // WGDEVICE_A_IFNAME
-    b.addAttrStr(@intFromEnum(nl.WGDEVICE_A.IFNAME), config.ifname);
+    b.addAttrStr(@backingInt(nl.WGDEVICE_A.IFNAME), config.ifname);
 
     // WGDEVICE_A_PRIVATE_KEY (32 bytes)
-    b.addAttr(@intFromEnum(nl.WGDEVICE_A.PRIVATE_KEY), &config.private_key);
+    b.addAttr(@backingInt(nl.WGDEVICE_A.PRIVATE_KEY), &config.private_key);
 
     // WGDEVICE_A_LISTEN_PORT (u16)
-    b.addAttrU16(@intFromEnum(nl.WGDEVICE_A.LISTEN_PORT), config.listen_port);
+    b.addAttrU16(@backingInt(nl.WGDEVICE_A.LISTEN_PORT), config.listen_port);
 
     const msg = b.finish();
     try sock.sendAndAck(msg);
@@ -104,19 +104,19 @@ pub fn addPeer(family_id: u16, ifname: []const u8, peer: PeerConfig) !void {
         .version = 1,
     });
 
-    b.addAttrStr(@intFromEnum(nl.WGDEVICE_A.IFNAME), ifname);
+    b.addAttrStr(@backingInt(nl.WGDEVICE_A.IFNAME), ifname);
 
     // WGDEVICE_A_PEERS (nested)
-    const peers_off = b.beginNested(@intFromEnum(nl.WGDEVICE_A.PEERS));
+    const peers_off = b.beginNested(@backingInt(nl.WGDEVICE_A.PEERS));
     {
         // First (only) peer entry — nested with index 0
         const peer_off = b.beginNested(0);
         {
             // WGPEER_A_PUBLIC_KEY
-            b.addAttr(@intFromEnum(nl.WGPEER_A.PUBLIC_KEY), &peer.public_key);
+            b.addAttr(@backingInt(nl.WGPEER_A.PUBLIC_KEY), &peer.public_key);
 
             // WGPEER_A_FLAGS — replace allowed IPs for this peer
-            b.addAttrU32(@intFromEnum(nl.WGPEER_A.FLAGS), nl.WGPEER_F_REPLACE_ALLOWEDIPS);
+            b.addAttrU32(@backingInt(nl.WGPEER_A.FLAGS), nl.WGPEER_F_REPLACE_ALLOWEDIPS);
 
             // WGPEER_A_ENDPOINT (sockaddr_in)
             if (peer.endpoint_addr) |addr| {
@@ -133,24 +133,24 @@ pub fn addPeer(family_id: u16, ifname: []const u8, peer: PeerConfig) !void {
                     sa[5] = addr[1];
                     sa[6] = addr[2];
                     sa[7] = addr[3];
-                    b.addAttr(@intFromEnum(nl.WGPEER_A.ENDPOINT), &sa);
+                    b.addAttr(@backingInt(nl.WGPEER_A.ENDPOINT), &sa);
                 }
             }
 
             // WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL
             if (peer.persistent_keepalive > 0) {
-                b.addAttrU16(@intFromEnum(nl.WGPEER_A.PERSISTENT_KEEPALIVE_INTERVAL), peer.persistent_keepalive);
+                b.addAttrU16(@backingInt(nl.WGPEER_A.PERSISTENT_KEEPALIVE_INTERVAL), peer.persistent_keepalive);
             }
 
             // WGPEER_A_ALLOWEDIPS (nested)
             if (peer.allowed_ips.len > 0) {
-                const aips_off = b.beginNested(@intFromEnum(nl.WGPEER_A.ALLOWEDIPS));
+                const aips_off = b.beginNested(@backingInt(nl.WGPEER_A.ALLOWEDIPS));
                 for (peer.allowed_ips, 0..) |aip, idx| {
                     const aip_off = b.beginNested(@intCast(idx));
                     {
-                        b.addAttrU16(@intFromEnum(nl.WGALLOWEDIP_A.FAMILY), @intCast(linux.AF.INET));
-                        b.addAttr(@intFromEnum(nl.WGALLOWEDIP_A.IPADDR), &aip.addr);
-                        b.addAttr(@intFromEnum(nl.WGALLOWEDIP_A.CIDR_MASK), &[_]u8{aip.cidr});
+                        b.addAttrU16(@backingInt(nl.WGALLOWEDIP_A.FAMILY), @intCast(linux.AF.INET));
+                        b.addAttr(@backingInt(nl.WGALLOWEDIP_A.IPADDR), &aip.addr);
+                        b.addAttr(@backingInt(nl.WGALLOWEDIP_A.CIDR_MASK), &[_]u8{aip.cidr});
                     }
                     b.endNested(aip_off);
                 }
@@ -181,14 +181,14 @@ pub fn removePeer(family_id: u16, ifname: []const u8, public_key: [32]u8) !void 
         .version = 1,
     });
 
-    b.addAttrStr(@intFromEnum(nl.WGDEVICE_A.IFNAME), ifname);
+    b.addAttrStr(@backingInt(nl.WGDEVICE_A.IFNAME), ifname);
 
-    const peers_off = b.beginNested(@intFromEnum(nl.WGDEVICE_A.PEERS));
+    const peers_off = b.beginNested(@backingInt(nl.WGDEVICE_A.PEERS));
     {
         const peer_off = b.beginNested(0);
         {
-            b.addAttr(@intFromEnum(nl.WGPEER_A.PUBLIC_KEY), &public_key);
-            b.addAttrU32(@intFromEnum(nl.WGPEER_A.FLAGS), nl.WGPEER_F_REMOVE_ME);
+            b.addAttr(@backingInt(nl.WGPEER_A.PUBLIC_KEY), &public_key);
+            b.addAttrU32(@backingInt(nl.WGPEER_A.FLAGS), nl.WGPEER_F_REMOVE_ME);
         }
         b.endNested(peer_off);
     }
@@ -237,7 +237,7 @@ pub fn getDevice(family_id: u16, ifname: []const u8) !DeviceInfo {
         .version = 1,
     });
 
-    b.addAttrStr(@intFromEnum(nl.WGDEVICE_A.IFNAME), ifname);
+    b.addAttrStr(@backingInt(nl.WGDEVICE_A.IFNAME), ifname);
 
     const msg = b.finish();
 
@@ -270,15 +270,15 @@ fn parseDeviceResponse(data: []const u8) !DeviceInfo {
         const payload_off = offset + @sizeOf(nl.nlattr);
         const payload_len = nla.len - @sizeOf(nl.nlattr);
 
-        if (attr_type == @intFromEnum(nl.WGDEVICE_A.PUBLIC_KEY)) {
+        if (attr_type == @backingInt(nl.WGDEVICE_A.PUBLIC_KEY)) {
             if (payload_len >= 32 and payload_off + 32 <= data.len) {
                 @memcpy(&info.public_key, data[payload_off..][0..32]);
             }
-        } else if (attr_type == @intFromEnum(nl.WGDEVICE_A.LISTEN_PORT)) {
+        } else if (attr_type == @backingInt(nl.WGDEVICE_A.LISTEN_PORT)) {
             if (payload_len >= 2 and payload_off + 2 <= data.len) {
                 info.listen_port = std.mem.readInt(u16, data[payload_off..][0..2], .little);
             }
-        } else if (attr_type == @intFromEnum(nl.WGDEVICE_A.PEERS)) {
+        } else if (attr_type == @backingInt(nl.WGDEVICE_A.PEERS)) {
             parsePeers(data, payload_off, offset + nla.len, &info);
         }
 
@@ -320,32 +320,32 @@ fn parseSinglePeer(data: []const u8, start: usize, end: usize) PeerInfo {
         const payload_off = offset + @sizeOf(nl.nlattr);
         const payload_len = nla.len - @sizeOf(nl.nlattr);
 
-        if (attr_type == @intFromEnum(nl.WGPEER_A.PUBLIC_KEY)) {
+        if (attr_type == @backingInt(nl.WGPEER_A.PUBLIC_KEY)) {
             if (payload_len >= 32 and payload_off + 32 <= data.len) {
                 @memcpy(&peer.public_key, data[payload_off..][0..32]);
             }
-        } else if (attr_type == @intFromEnum(nl.WGPEER_A.ENDPOINT)) {
+        } else if (attr_type == @backingInt(nl.WGPEER_A.ENDPOINT)) {
             if (payload_len >= 8 and payload_off + 8 <= data.len) {
                 peer.endpoint_port = std.mem.readInt(u16, data[payload_off + 2 ..][0..2], .big);
                 @memcpy(&peer.endpoint_addr, data[payload_off + 4 ..][0..4]);
             }
-        } else if (attr_type == @intFromEnum(nl.WGPEER_A.LAST_HANDSHAKE_TIME)) {
+        } else if (attr_type == @backingInt(nl.WGPEER_A.LAST_HANDSHAKE_TIME)) {
             if (payload_len >= 8 and payload_off + 8 <= data.len) {
                 peer.last_handshake_sec = std.mem.readInt(i64, data[payload_off..][0..8], .little);
             }
-        } else if (attr_type == @intFromEnum(nl.WGPEER_A.RX_BYTES)) {
+        } else if (attr_type == @backingInt(nl.WGPEER_A.RX_BYTES)) {
             if (payload_len >= 8 and payload_off + 8 <= data.len) {
                 peer.rx_bytes = std.mem.readInt(u64, data[payload_off..][0..8], .little);
             }
-        } else if (attr_type == @intFromEnum(nl.WGPEER_A.TX_BYTES)) {
+        } else if (attr_type == @backingInt(nl.WGPEER_A.TX_BYTES)) {
             if (payload_len >= 8 and payload_off + 8 <= data.len) {
                 peer.tx_bytes = std.mem.readInt(u64, data[payload_off..][0..8], .little);
             }
-        } else if (attr_type == @intFromEnum(nl.WGPEER_A.PERSISTENT_KEEPALIVE_INTERVAL)) {
+        } else if (attr_type == @backingInt(nl.WGPEER_A.PERSISTENT_KEEPALIVE_INTERVAL)) {
             if (payload_len >= 2 and payload_off + 2 <= data.len) {
                 peer.keepalive = std.mem.readInt(u16, data[payload_off..][0..2], .little);
             }
-        } else if (attr_type == @intFromEnum(nl.WGPEER_A.ALLOWEDIPS)) {
+        } else if (attr_type == @backingInt(nl.WGPEER_A.ALLOWEDIPS)) {
             parseFirstAllowedIp(data, payload_off, offset + nla.len, &peer);
         }
 
@@ -374,11 +374,11 @@ fn parseFirstAllowedIp(data: []const u8, start: usize, end: usize, peer: *PeerIn
         const a_type = a.type & 0x3FFF;
         const a_payload = aip_off + @sizeOf(nl.nlattr);
 
-        if (a_type == @intFromEnum(nl.WGALLOWEDIP_A.IPADDR)) {
+        if (a_type == @backingInt(nl.WGALLOWEDIP_A.IPADDR)) {
             if (a.len >= @sizeOf(nl.nlattr) + 4 and a_payload + 4 <= data.len) {
                 @memcpy(&peer.allowed_ip, data[a_payload..][0..4]);
             }
-        } else if (a_type == @intFromEnum(nl.WGALLOWEDIP_A.CIDR_MASK)) {
+        } else if (a_type == @backingInt(nl.WGALLOWEDIP_A.CIDR_MASK)) {
             if (a_payload < data.len) {
                 peer.allowed_cidr = data[a_payload];
             }
@@ -411,7 +411,7 @@ fn parseFamilyId(data: []const u8) !u16 {
         const attr_type = nla.type & 0x3fff; // Strip NLA_F_NESTED flag
         const payload_offset = offset + @sizeOf(nl.nlattr);
 
-        if (attr_type == @intFromEnum(nl.CTRL_ATTR.FAMILY_ID)) {
+        if (attr_type == @backingInt(nl.CTRL_ATTR.FAMILY_ID)) {
             if (payload_offset + 2 <= data.len) {
                 const id_bytes = data[payload_offset..][0..2];
                 return std.mem.readInt(u16, id_bytes, .little);

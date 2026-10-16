@@ -1083,10 +1083,7 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
     wg_private_key[31] |= 64;
 
     // Derive WG public key from clamped private key (X25519 base point mult)
-    const wg_public_key = std.crypto.dh.X25519.recoverPublicKey(wg_private_key) catch {
-        try stderr.writeStreamingAll(zio(), "error: failed to derive WG public key\n");
-        std.process.exit(1);
-    };
+    const wg_public_key = std.crypto.dh.X25519.recoverPublicKey(wg_private_key);
 
     // Setup WireGuard interface (kernel or TUN)
     if (use_kernel_wg and !gossip_only) {
@@ -1698,10 +1695,7 @@ fn cmdConnect(allocator: std.mem.Allocator, extra_args: []const []const u8) !voi
     wg_private_key[0] &= 248;
     wg_private_key[31] &= 127;
     wg_private_key[31] |= 64;
-    const wg_public_key = std.crypto.dh.X25519.recoverPublicKey(wg_private_key) catch {
-        try stderr.writeStreamingAll(zio(), "error: failed to derive WG public key\n");
-        std.process.exit(1);
-    };
+    const wg_public_key = std.crypto.dh.X25519.recoverPublicKey(wg_private_key);
 
     // Derive mesh IP
     const mesh_ip = lib.wireguard.Ip.deriveFromPubkey(kp.public_key);
@@ -1802,7 +1796,7 @@ fn cmdConnect(allocator: std.mem.Allocator, extra_args: []const []const u8) !voi
                 .nonce = nonce,
                 .stun_server = stun_server.host,
                 .stun_server_port = stun_server.port,
-                .nat_type = @intFromEnum(stun_result.nat_type),
+                .nat_type = @backingInt(stun_result.nat_type),
                 .signature = .{ 0, 0, 0, 0, 0, 0 },
             };
             CoordinatedPunch.signTokenHash(&token);
@@ -1905,7 +1899,7 @@ fn cmdConnect(allocator: std.mem.Allocator, extra_args: []const []const u8) !voi
                 .nonce = nonce,
                 .stun_server = stun_server.host,
                 .stun_server_port = stun_server.port,
-                .nat_type = @intFromEnum(stun_result.nat_type),
+                .nat_type = @backingInt(stun_result.nat_type),
                 .signature = .{ 0, 0, 0, 0, 0, 0 },
             };
             CoordinatedPunch.signTokenHash(&response_token);
@@ -2071,7 +2065,7 @@ fn installSignalHandler(swim_ref: *lib.discovery.Swim.SwimProtocol) void {
                 add: std.os.windows.BOOL,
             ) callconv(.winapi) std.os.windows.BOOL;
         };
-        _ = k32.SetConsoleCtrlHandler(&windowsCtrlHandler, @enumFromInt(1));
+        _ = k32.SetConsoleCtrlHandler(&windowsCtrlHandler, @fromBackingInt(@intCast(1)));
     }
 }
 
@@ -2079,9 +2073,9 @@ fn windowsCtrlHandler(ctrl_type: u32) callconv(.winapi) std.os.windows.BOOL {
     // CTRL_C_EVENT = 0, CTRL_CLOSE_EVENT = 2
     if (ctrl_type == 0 or ctrl_type == 2) {
         if (g_swim_stop) |swim| swim.stop();
-        return @enumFromInt(1); // Handled
+        return @fromBackingInt(@intCast(1)); // Handled
     }
-    return @enumFromInt(0); // Not handled
+    return @fromBackingInt(@intCast(0)); // Not handled
 }
 
 const WgHandlerCtx = struct {
@@ -2091,7 +2085,7 @@ const WgHandlerCtx = struct {
     socket: ?*lib.net.Udp.UdpSocket = null,
     use_kernel: bool = true,
     control_socket: ?*lib.services.Control.ControlSocket = null,
-    our_wg_private: [32]u8 = [_]u8{0} ** 32,
+    our_wg_private: [32]u8 = @as([32]u8, @splat(0)),
 };
 
 /// S2: report whether we hold a live userspace WG tunnel to `wg_pubkey`. Kernel WG
@@ -2346,7 +2340,7 @@ fn tunReaderPipeline(
 
     var tun_buf: [Offload.VNET_HDR_LEN + 65535]u8 align(@alignOf(Offload.VirtioNetHdr)) = undefined;
     // Per-peer batch building: thread-local staging
-    var local_batches: [MAX_PEERS]?u16 = .{null} ** MAX_PEERS;
+    var local_batches: [MAX_PEERS]?u16 = @splat(null);
 
     // Thread-local buffer cache to avoid per-packet mutex contention
     const BUF_CACHE_SIZE: usize = 128;
@@ -2369,7 +2363,7 @@ fn tunReaderPipeline(
         if (fds[0].revents & posix.POLL.IN == 0) continue;
 
         // Track which peers have partial batches to flush
-        var touched_peers: [MAX_PEERS]bool = .{false} ** MAX_PEERS;
+        var touched_peers: [MAX_PEERS]bool = @splat(false);
 
         // Drain available packets
         while (true) {
@@ -2500,7 +2494,7 @@ fn tunReaderIoUring(
     defer reader.deinit();
 
     // Per-peer batch building: thread-local staging
-    var local_batches: [MAX_PEERS]?u16 = .{null} ** MAX_PEERS;
+    var local_batches: [MAX_PEERS]?u16 = @splat(null);
 
     // Thread-local buffer cache to avoid per-packet mutex contention
     const BUF_CACHE_SIZE: usize = 128;
@@ -2516,7 +2510,7 @@ fn tunReaderIoUring(
         if (n_cqes == 0) continue;
 
         // Track which peers have partial batches to flush
-        var touched_peers: [MAX_PEERS]bool = .{false} ** MAX_PEERS;
+        var touched_peers: [MAX_PEERS]bool = @splat(false);
 
         // Process each completed read
         for (cqes[0..n_cqes]) |cqe| {
@@ -2757,7 +2751,7 @@ fn dispatchBatch(
     peer.tx_ring.push_lock.unlock(zio());
 
     // 2. Mark batch as Encrypting and dispatch to crypto workers
-    batch.state.store(@intFromEnum(Pipeline.BatchState.Encrypting), .release);
+    batch.state.store(@backingInt(Pipeline.BatchState.Encrypting), .release);
     crypto_q.push(batch_idx);
 }
 
@@ -2795,7 +2789,7 @@ fn cryptoWorkerPipeline(
         }
 
         // Mark batch as Ready for sequential sending
-        batch.state.store(@intFromEnum(Pipeline.BatchState.Ready), .release);
+        batch.state.store(@backingInt(Pipeline.BatchState.Ready), .release);
 
         // STAGE 3: Opportunistic Tx flush
         // If another crypto worker is already sending for this peer, tryLock fails
@@ -2835,7 +2829,7 @@ fn flushPeerTxRing(
         var head_batch = &pool.batches[head_idx];
 
         // Strict ROB: if next sequential batch isn't Ready, stop!
-        if (head_batch.state.load(.acquire) != @intFromEnum(Pipeline.BatchState.Ready)) break;
+        if (head_batch.state.load(.acquire) != @backingInt(Pipeline.BatchState.Ready)) break;
 
         if (GsoState.available and head_batch.count > 1) {
             // ── Zero-copy GSO path ──
@@ -2880,7 +2874,7 @@ fn flushPeerTxRing(
             if (GsoState.available) {
                 // GSO succeeded — free resources and advance
                 pool.freeBuffers(head_batch.buf_indices[0..head_batch.count]);
-                head_batch.state.store(@intFromEnum(Pipeline.BatchState.Empty), .release);
+                head_batch.state.store(@backingInt(Pipeline.BatchState.Empty), .release);
                 pool.freeBatch(head_idx);
                 peer.tx_ring.advanceHead();
                 continue;
@@ -2901,7 +2895,7 @@ fn flushPeerTxRing(
         }
 
         pool.freeBuffers(head_batch.buf_indices[0..head_batch.count]);
-        head_batch.state.store(@intFromEnum(Pipeline.BatchState.Empty), .release);
+        head_batch.state.store(@backingInt(Pipeline.BatchState.Empty), .release);
         pool.freeBatch(head_idx);
         peer.tx_ring.advanceHead();
     }
@@ -3518,7 +3512,7 @@ fn processIncomingPacket(
 ) void {
     const Device = lib.wireguard.Device;
 
-    if (pkt.len > 0 and pkt[0] == @intFromEnum(lib.protocol.Messages.MessageType.relay_data)) {
+    if (pkt.len > 0 and pkt[0] == @backingInt(lib.protocol.Messages.MessageType.relay_data)) {
         const relay_endpoint = @import("protocol/messages.zig").Endpoint.initV4(sender_addr, sender_port);
         if (lib.nat.Relay.decodeRelayData(pkt)) |frame| {
             if (std.mem.eql(u8, &frame.target_pubkey, &swim.our_pubkey)) {
@@ -4925,7 +4919,7 @@ fn cmdServiceShow(allocator: std.mem.Allocator, config_dir: []const u8, target: 
         const ak_path = try std.fmt.allocPrint(allocator, "{s}/authorized_keys/{s}.pub", .{ config_dir, name });
         defer allocator.free(ak_path);
 
-        var peer_pk: [32]u8 = .{0} ** 32;
+        var peer_pk: [32]u8 = @splat(0);
         var found_peer = false;
         if (std.Io.Dir.openFileAbsolute(zio(), ak_path, .{})) |file| {
             defer file.close(zio());
@@ -4951,7 +4945,7 @@ fn cmdServiceShow(allocator: std.mem.Allocator, config_dir: []const u8, target: 
             .{ .port = 27017, .name = "MongoDB" },
         };
 
-        const pk: [32]u8 = if (found_peer) peer_pk else .{0} ** 32;
+        const pk: [32]u8 = if (found_peer) peer_pk else @splat(0);
         try writeFormatted(stdout, "  {s:<6} {s:<14} {s}\n", .{ "PORT", "SERVICE", "ACCESS" });
         try writeFormatted(stdout, "  {s:<6} {s:<14} {s}\n", .{ "----", "-------", "------" });
         for (test_ports) |tp| {
@@ -5029,11 +5023,10 @@ fn cmdConfigShow(allocator: std.mem.Allocator) !void {
             wg_private_key[31] &= 127;
             wg_private_key[31] |= 64;
 
-            if (std.crypto.dh.X25519.recoverPublicKey(wg_private_key)) |wg_pub| {
-                var wg_b64: [44]u8 = undefined;
-                const wg_pub_b64 = std.base64.standard.Encoder.encode(&wg_b64, &wg_pub);
-                try writeFormatted(stdout, "  public key (WG X25519): {s}\n", .{wg_pub_b64});
-            } else |_| {}
+            const wg_pub = std.crypto.dh.X25519.recoverPublicKey(wg_private_key);
+            var wg_b64: [44]u8 = undefined;
+            const wg_pub_b64 = std.base64.standard.Encoder.encode(&wg_b64, &wg_pub);
+            try writeFormatted(stdout, "  public key (WG X25519): {s}\n", .{wg_pub_b64});
 
             // Mesh IP
             const pub_key = std.crypto.sign.Ed25519.PublicKey.fromBytes(kp.public_key.toBytes()) catch unreachable;
@@ -5870,10 +5863,7 @@ fn cmdInvite(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     wg_private_key[0] &= 248;
     wg_private_key[31] &= 127;
     wg_private_key[31] |= 64;
-    const wg_public_key = std.crypto.dh.X25519.recoverPublicKey(wg_private_key) catch {
-        try stderr.writeStreamingAll(zio(), "error: failed to derive WG key\n");
-        std.process.exit(1);
-    };
+    const wg_public_key = std.crypto.dh.X25519.recoverPublicKey(wg_private_key);
     const host_wg_hex = std.fmt.bytesToHex(wg_public_key, .lower);
 
     var json_buf: [1024]u8 = undefined;

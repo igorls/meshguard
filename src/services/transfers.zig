@@ -244,8 +244,7 @@ pub const TransferManager = struct {
 
         var id: [16]u8 = undefined;
         zio().random(&id);
-        out.* = .{ .id = id, .peer = peer, .channel = undefined, .channel_len = channel.len, .meta = undefined, .meta_len = meta.len,
-            .sha256 = sha256, .created_unix = now_unix, .data = data, .chunks = chunks, .acked = acked, .sent_at = sent_at, .retransmitted = retransmitted };
+        out.* = .{ .id = id, .peer = peer, .channel = undefined, .channel_len = channel.len, .meta = undefined, .meta_len = meta.len, .sha256 = sha256, .created_unix = now_unix, .data = data, .chunks = chunks, .acked = acked, .sent_at = sent_at, .retransmitted = retransmitted };
         @memcpy(out.channel[0..channel.len], channel);
         @memcpy(out.meta[0..meta.len], meta);
         slot.* = out;
@@ -288,8 +287,7 @@ pub const TransferManager = struct {
         self.lock.lockUncancelable(zio());
         defer self.lock.unlock(zio());
         const out = self.findOutgoing(id) orelse return null;
-        return .{ .state = out.state, .size = out.data.len, .staged = out.staged, .acked_chunks = out.acked_count,
-            .chunks = out.chunks, .retransmits = out.retransmits, .failure = out.failure };
+        return .{ .state = out.state, .size = out.data.len, .staged = out.staged, .acked_chunks = out.acked_count, .chunks = out.chunks, .retransmits = out.retransmits, .failure = out.failure };
     }
 
     /// The oldest verified incoming transfer on `channel` that the application has not released.
@@ -301,8 +299,7 @@ pub const TransferManager = struct {
             if (in.state == .complete and std.mem.eql(u8, in.channelSlice(), channel) and (best == null or in.completed_at < best.?.completed_at)) best = in;
         };
         const in = best orelse return null;
-        return .{ .id = in.id, .sender = in.sender, .size = in.size, .sha256 = in.sha256, .channel = in.channel,
-            .channel_len = in.channel_len, .meta = in.meta, .meta_len = in.meta_len };
+        return .{ .id = in.id, .sender = in.sender, .size = in.size, .sha256 = in.sha256, .channel = in.channel, .channel_len = in.channel_len, .meta = in.meta, .meta_len = in.meta_len };
     }
 
     pub fn read(self: *TransferManager, id: [16]u8, offset: u64, out_buf: []u8) Error!usize {
@@ -445,8 +442,7 @@ pub const TransferManager = struct {
         const data = try self.allocator.alloc(u8, @intCast(o.size));
         errdefer self.allocator.free(data);
         const received = try std.DynamicBitSetUnmanaged.initEmpty(self.allocator, chunks);
-        in.* = .{ .id = id, .sender = sender, .channel = undefined, .channel_len = o.channel.len, .meta = undefined, .meta_len = o.meta.len,
-            .sha256 = o.sha256, .size = o.size, .chunk_size = o.chunk_size, .chunks = chunks, .data = data, .received = received, .last_activity = now_ns };
+        in.* = .{ .id = id, .sender = sender, .channel = undefined, .channel_len = o.channel.len, .meta = undefined, .meta_len = o.meta.len, .sha256 = o.sha256, .size = o.size, .chunk_size = o.chunk_size, .chunks = chunks, .data = data, .received = received, .last_activity = now_ns };
         @memcpy(in.channel[0..o.channel.len], o.channel);
         @memcpy(in.meta[0..o.meta.len], o.meta);
         slot.* = in;
@@ -520,8 +516,7 @@ pub const TransferManager = struct {
 
     fn sendOffer(self: *TransferManager, out: *Outgoing, now_ns: i128) void {
         out.last_offer = now_ns;
-        self.sendFrame(out.peer, wire.encodeOffer(self.frameBuf(), out.id, .{ .created_unix = out.created_unix, .size = out.data.len,
-            .chunk_size = wire.CHUNK_SIZE, .sha256 = out.sha256, .channel = out.channelSlice(), .meta = out.meta[0..out.meta_len] }) catch return);
+        self.sendFrame(out.peer, wire.encodeOffer(self.frameBuf(), out.id, .{ .created_unix = out.created_unix, .size = out.data.len, .chunk_size = wire.CHUNK_SIZE, .sha256 = out.sha256, .channel = out.channelSlice(), .meta = out.meta[0..out.meta_len] }) catch return);
     }
 
     fn sendChunk(self: *TransferManager, out: *Outgoing, index: u32, now_ns: i128) void {

@@ -26,8 +26,8 @@ pub fn setAdapterIp(allocator: std.mem.Allocator, name: []const u8, ip: [4]u8, p
 
     // netsh interface ip set address "name" static ip mask
     const argv = [_][]const u8{
-        "netsh", "interface", "ip", "set", "address",
-        name, "static", ip_str, mask_str,
+        "netsh", "interface", "ip",   "set",    "address",
+        name,    "static",    ip_str, mask_str,
     };
     try runCommand(allocator, &argv);
 }
@@ -40,7 +40,7 @@ pub fn setAdapterIp6(allocator: std.mem.Allocator, name: []const u8, ip: [16]u8,
     const cidr = std.fmt.bufPrint(&cidr_buf, "{s}/{d}", .{ ip_str, prefix }) catch return error.FormatFailed;
     const argv = [_][]const u8{
         "netsh", "interface", "ipv6", "add", "address",
-        name, cidr,
+        name,    cidr,
     };
     try runCommand(allocator, &argv);
 }
@@ -55,7 +55,7 @@ pub fn addRoute(allocator: std.mem.Allocator, name: []const u8, dest: [4]u8, pre
 
     // netsh interface ipv4 add route dest/prefix "name"
     const argv = [_][]const u8{
-        "netsh", "interface", "ipv4", "add", "route",
+        "netsh",  "interface", "ipv4", "add", "route",
         dest_str, name,
     };
     // Route might already exist — that's OK
@@ -68,7 +68,7 @@ pub fn addRoute6(allocator: std.mem.Allocator, name: []const u8, dest: [16]u8, p
     const dest_ip = formatIpv6(dest, &ip_buf);
     const dest_str = std.fmt.bufPrint(&dest_buf, "{s}/{d}", .{ dest_ip, prefix }) catch return error.FormatFailed;
     const argv = [_][]const u8{
-        "netsh", "interface", "ipv6", "add", "route",
+        "netsh",  "interface", "ipv6", "add", "route",
         dest_str, name,
     };
     runCommand(allocator, &argv) catch {};
@@ -83,7 +83,7 @@ pub fn setMtu(allocator: std.mem.Allocator, name: []const u8, mtu: u32) !void {
     // netsh interface ipv4 set subinterface "name" mtu=1420
     const argv = [_][]const u8{
         "netsh", "interface", "ipv4", "set", "subinterface",
-        name, mtu_str,
+        name,    mtu_str,
     };
     try runCommand(allocator, &argv);
 }
@@ -116,7 +116,7 @@ fn prefixToMask(prefix: u8) [4]u8 {
 
 fn formatIpv6(ip: [16]u8, buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, "{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}", .{
-        ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], ip[6], ip[7],
+        ip[0], ip[1], ip[2],  ip[3],  ip[4],  ip[5],  ip[6],  ip[7],
         ip[8], ip[9], ip[10], ip[11], ip[12], ip[13], ip[14], ip[15],
     }) catch "::";
 }

@@ -195,7 +195,7 @@ pub const Handshake = struct {
         self.ephemeral_private[0] &= 248;
         self.ephemeral_private[31] &= 127;
         self.ephemeral_private[31] |= 64;
-        const ephemeral_public = try X25519.recoverPublicKey(self.ephemeral_private);
+        const ephemeral_public = X25519.recoverPublicKey(self.ephemeral_private);
         msg.ephemeral = ephemeral_public;
 
         // Mix ephemeral into hash and chaining_key
@@ -338,7 +338,7 @@ pub const Handshake = struct {
 
         // e: Generate responder ephemeral
         self.ephemeral_private = generateSecret();
-        const ephemeral_public = try X25519.recoverPublicKey(self.ephemeral_private);
+        const ephemeral_public = X25519.recoverPublicKey(self.ephemeral_private);
         msg.ephemeral = ephemeral_public;
         crypto.mixHash(&self.hash, &ephemeral_public);
         const ck_e = crypto.kdf1(self.chaining_key, &ephemeral_public);
@@ -444,7 +444,7 @@ pub const Handshake = struct {
 /// AEAD encrypt a 32-byte public key: ChaCha20-Poly1305(key, nonce=0, ad=hash, plaintext)
 fn aead_encrypt_key(key: *const [32]u8, hash: *const [32]u8, plaintext: *const [32]u8) [48]u8 {
     var ciphertext: [48]u8 = undefined;
-    const nonce: [12]u8 = .{0} ** 12;
+    const nonce: [12]u8 = @splat(0);
     ChaCha20Poly1305.encrypt(
         ciphertext[0..32],
         ciphertext[32..48],
@@ -459,7 +459,7 @@ fn aead_encrypt_key(key: *const [32]u8, hash: *const [32]u8, plaintext: *const [
 /// AEAD encrypt a 12-byte timestamp
 fn aead_encrypt_ts(key: *const [32]u8, hash: *const [32]u8, plaintext: *const [TIMESTAMP_LEN]u8) [TIMESTAMP_LEN + AUTHTAG_LEN]u8 {
     var ciphertext: [TIMESTAMP_LEN + AUTHTAG_LEN]u8 = undefined;
-    const nonce: [12]u8 = .{0} ** 12;
+    const nonce: [12]u8 = @splat(0);
     ChaCha20Poly1305.encrypt(
         ciphertext[0..TIMESTAMP_LEN],
         ciphertext[TIMESTAMP_LEN..][0..AUTHTAG_LEN],
@@ -473,7 +473,7 @@ fn aead_encrypt_ts(key: *const [32]u8, hash: *const [32]u8, plaintext: *const [T
 
 fn aead_decrypt(key: *const [32]u8, hash: *const [32]u8, ciphertext: *const [48]u8) ![32]u8 {
     var plaintext: [32]u8 = undefined;
-    const nonce: [12]u8 = .{0} ** 12;
+    const nonce: [12]u8 = @splat(0);
     ChaCha20Poly1305.decrypt(
         &plaintext,
         ciphertext[0..32],
@@ -487,7 +487,7 @@ fn aead_decrypt(key: *const [32]u8, hash: *const [32]u8, ciphertext: *const [48]
 
 fn aead_decrypt_ts(key: *const [32]u8, hash: *const [32]u8, ciphertext: *const [28]u8) ![TIMESTAMP_LEN]u8 {
     var plaintext: [TIMESTAMP_LEN]u8 = undefined;
-    const nonce: [12]u8 = .{0} ** 12;
+    const nonce: [12]u8 = @splat(0);
     ChaCha20Poly1305.decrypt(
         &plaintext,
         ciphertext[0..TIMESTAMP_LEN],
@@ -501,7 +501,7 @@ fn aead_decrypt_ts(key: *const [32]u8, hash: *const [32]u8, ciphertext: *const [
 
 fn aead_encrypt_empty(key: *const [32]u8, hash: *const [32]u8) [AEAD_LEN]u8 {
     var tag: [AEAD_LEN]u8 = undefined;
-    const nonce: [12]u8 = .{0} ** 12;
+    const nonce: [12]u8 = @splat(0);
     ChaCha20Poly1305.encrypt(
         &.{},
         &tag,
@@ -514,7 +514,7 @@ fn aead_encrypt_empty(key: *const [32]u8, hash: *const [32]u8) [AEAD_LEN]u8 {
 }
 
 fn aead_decrypt_empty(key: *const [32]u8, hash: *const [32]u8, ciphertext: *const [AEAD_LEN]u8) !void {
-    const nonce: [12]u8 = .{0} ** 12;
+    const nonce: [12]u8 = @splat(0);
     ChaCha20Poly1305.decrypt(
         &.{},
         &.{},
@@ -659,9 +659,9 @@ fn computeMacsResponse(msg: *HandshakeResponse, remote_static: [32]u8) void {
 test "handshake roundtrip" {
     // Generate two keypairs
     const alice_private = generateSecret();
-    const alice_public = try X25519.recoverPublicKey(alice_private);
+    const alice_public = X25519.recoverPublicKey(alice_private);
     const bob_private = generateSecret();
-    const bob_public = try X25519.recoverPublicKey(bob_private);
+    const bob_public = X25519.recoverPublicKey(bob_private);
 
     // Alice initiates handshake with Bob
     var alice = try Handshake.init(alice_private, alice_public, bob_public);
@@ -698,9 +698,9 @@ test "handshake roundtrip" {
 
 test "handshake replay protection" {
     const alice_private = generateSecret();
-    const alice_public = try X25519.recoverPublicKey(alice_private);
+    const alice_public = X25519.recoverPublicKey(alice_private);
     const bob_private = generateSecret();
-    const bob_public = try X25519.recoverPublicKey(bob_private);
+    const bob_public = X25519.recoverPublicKey(bob_private);
 
     var alice = try Handshake.init(alice_private, alice_public, bob_public);
     var bob = try Handshake.init(bob_private, bob_public, alice_public);
@@ -723,9 +723,9 @@ test "wire format sizes" {
 
 test "handshake deinit zeros state" {
     const alice_private = generateSecret();
-    const alice_public = try X25519.recoverPublicKey(alice_private);
+    const alice_public = X25519.recoverPublicKey(alice_private);
     const bob_private = generateSecret();
-    const bob_public = try X25519.recoverPublicKey(bob_private);
+    const bob_public = X25519.recoverPublicKey(bob_private);
 
     var alice = try Handshake.init(alice_private, alice_public, bob_public);
 

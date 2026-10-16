@@ -47,7 +47,7 @@ pub const PacketBuffer = struct {
 /// A batch of packets destined for a single peer — the unit of work in the pipeline.
 /// Uses Struct-of-Arrays layout for SIMD-friendly iteration.
 pub const PacketBatch = struct {
-    state: std.atomic.Value(u32) align(CACHE_LINE) = std.atomic.Value(u32).init(@intFromEnum(BatchState.Empty)),
+    state: std.atomic.Value(u32) align(CACHE_LINE) = std.atomic.Value(u32).init(@backingInt(BatchState.Empty)),
     peer_slot: usize = 0,
     count: u16 = 0,
 

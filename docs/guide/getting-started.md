@@ -33,7 +33,7 @@ You can also download binaries directly from the [releases page](https://github.
 
 ## Building from source
 
-Alternatively, build from source with [Zig](https://ziglang.org/download/) 0.16+:
+Alternatively, build from source with [Zig](https://ziglang.org/download/) 0.17.0+:
 
 | Target | Notes |
 |---|---|

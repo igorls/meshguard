@@ -8,7 +8,11 @@ Objective-C, C, C++, and Swift through the `MeshGuardFFI` Clang module.
 
 ## Build and packages
 
-Run these commands on macOS with Zig 0.16.0 and Xcode's command-line tools selected:
+Apple builds pin this post-0.17.0 development toolchain because the 0.17.0
+release has an iOS `std.Io.Threaded.NullFile.fd` compilation regression. The
+pinned toolchain includes the upstream fix without local standard-library patches.
+
+Run these commands on macOS with Zig `0.18.0-dev.253+16d31ceed` and Xcode's command-line tools selected:
 
 ```bash
 ./scripts/build-apple.sh

@@ -67,9 +67,9 @@ pub const WgPeer = struct {
     /// X25519 WG static public key
     wg_pubkey: [32]u8,
     /// Mesh IP address (10.99.x.y)
-    mesh_ip: [4]u8 = .{0} ** 4,
+    mesh_ip: [4]u8 = @splat(0),
     /// Mesh IPv6 address (fd99:6d67::/64)
-    mesh_ip6: [16]u8 = .{0} ** 16,
+    mesh_ip6: [16]u8 = @splat(0),
     /// Noise handshake state
     handshake: noise.Handshake,
     /// Active tunnel (after successful handshake)
@@ -77,7 +77,7 @@ pub const WgPeer = struct {
     /// Our sender index for this peer
     sender_index: u32 = 0,
     /// Peer's endpoint
-    endpoint_addr: [4]u8 = .{0} ** 4,
+    endpoint_addr: [4]u8 = @splat(0),
     endpoint_addr6: ?[16]u8 = null,
     endpoint_port: u16 = 0,
     /// Last handshake attempt time (for rate limiting)
@@ -109,8 +109,8 @@ pub const WgPeer = struct {
 const IndexTable = struct {
     const EMPTY: u32 = 0; // 0 is never a valid sender_index (we start at 1)
 
-    keys: [INDEX_TABLE_SIZE]u32 = .{EMPTY} ** INDEX_TABLE_SIZE,
-    values: [INDEX_TABLE_SIZE]usize = .{0} ** INDEX_TABLE_SIZE,
+    keys: [INDEX_TABLE_SIZE]u32 = @splat(EMPTY),
+    values: [INDEX_TABLE_SIZE]usize = @splat(0),
 
     fn hash(index: u32) usize {
         // Fibonacci hashing: multiply by golden ratio, extract TOP bits.
@@ -247,7 +247,7 @@ const HandshakeLimiter = struct {
     };
 
     mutex: std.Io.Mutex = .init,
-    buckets: [SLOTS]Bucket = .{Bucket{}} ** SLOTS,
+    buckets: [SLOTS]Bucket = @splat(Bucket{}),
     global_tokens: u32 = GLOBAL_BURST,
     global_last_ns: i128 = 0,
 
@@ -301,7 +301,7 @@ pub const WgDevice = struct {
     static_public: [32]u8,
 
     /// Per-peer state
-    peers: [MAX_PEERS]?WgPeer = .{null} ** MAX_PEERS,
+    peers: [MAX_PEERS]?WgPeer = @splat(null),
     peer_count: usize = 0,
 
     /// Sender index → peer slot mapping (for fast lookup on incoming transport)
@@ -315,7 +315,7 @@ pub const WgDevice = struct {
     /// Mesh IP → peer slot mapping (O(1) routing for data plane).
     /// Mesh prefix is 10.99.0.0/16, so the last 2 octets form a u16 host ID.
     /// Uses u8 with 0xFF sentinel (MAX_PEERS=64 fits in u8). 65536 bytes = 64KB.
-    ip_to_slot: [65536]u8 = .{0xFF} ** 65536,
+    ip_to_slot: [65536]u8 = @splat(0xFF),
 
     /// Next sender index to assign (random-ish via wrapping increment)
     next_index: u32 = 0,
@@ -378,7 +378,7 @@ pub const WgDevice = struct {
 
     /// Add or update a peer with mesh IP for O(1) data-plane routing.
     pub fn addPeerWithMeshIp(self: *WgDevice, identity_key: [32]u8, wg_pubkey: [32]u8, addr: [4]u8, port: u16, mesh_ip: [4]u8) !usize {
-        return self.addPeerWithEndpoint(identity_key, wg_pubkey, messages.Endpoint.initV4(addr, port), mesh_ip, .{0} ** 16);
+        return self.addPeerWithEndpoint(identity_key, wg_pubkey, messages.Endpoint.initV4(addr, port), mesh_ip, @splat(0));
     }
 
     /// Add or update a peer with IPv4/IPv6 endpoint and mesh addresses.
@@ -725,7 +725,7 @@ fn innerSourceAllowed(peer_mesh_ip: [4]u8, peer_mesh_ip6: [16]u8, plaintext: []c
         },
         6 => {
             if (plaintext.len < 40) return false; // too short to hold an IPv6 header
-            const zero6 = [_]u8{0} ** 16;
+            const zero6 = @as([16]u8, @splat(0));
             if (std.mem.eql(u8, &peer_mesh_ip6, &zero6)) return true;
             return std.mem.eql(u8, plaintext[8..24], &peer_mesh_ip6);
         },
@@ -737,20 +737,20 @@ fn innerSourceAllowed(peer_mesh_ip: [4]u8, peer_mesh_ip6: [16]u8, plaintext: []c
 
 test "direct authenticated handshakes refresh endpoint without accepting invalid packets" {
     const X = std.crypto.dh.X25519;
-    const secret_a = [_]u8{1} ** 32;
-    const secret_b = [_]u8{2} ** 32;
-    const pub_a = try X.recoverPublicKey(secret_a);
-    const pub_b = try X.recoverPublicKey(secret_b);
+    const secret_a = @as([32]u8, @splat(1));
+    const secret_b = @as([32]u8, @splat(2));
+    const pub_a = X.recoverPublicKey(secret_a);
+    const pub_b = X.recoverPublicKey(secret_b);
     var a = WgDevice.init(secret_a, pub_a);
     var b = WgDevice.init(secret_b, pub_b);
-    const identity_a = [_]u8{10} ** 32;
-    const identity_b = [_]u8{20} ** 32;
+    const identity_a = @as([32]u8, @splat(10));
+    const identity_b = @as([32]u8, @splat(20));
     const old_a = messages.Endpoint.initV4(.{ 198, 51, 100, 1 }, 10001);
     const old_b = messages.Endpoint.initV4(.{ 198, 51, 100, 2 }, 10002);
     const new_a = messages.Endpoint.initV4(.{ 203, 0, 113, 1 }, 20001);
     const new_b = messages.Endpoint.initV4(.{ 203, 0, 113, 2 }, 20002);
-    const sa = try a.addPeerWithEndpoint(identity_b, pub_b, old_b, .{0} ** 4, .{0} ** 16);
-    const sb = try b.addPeerWithEndpoint(identity_a, pub_a, old_a, .{0} ** 4, .{0} ** 16);
+    const sa = try a.addPeerWithEndpoint(identity_b, pub_b, old_b, @splat(0), @splat(0));
+    const sb = try b.addPeerWithEndpoint(identity_a, pub_a, old_a, @splat(0), @splat(0));
     const initiation = try a.initiateHandshake(sa);
     var forged = initiation;
     forged.mac1[0] ^= 1;
@@ -772,15 +772,15 @@ test "WgDevice add/remove peer" {
     const X25519 = std.crypto.dh.X25519;
     var secret: [32]u8 = undefined;
     zio().random(&secret);
-    const pubkey = try X25519.recoverPublicKey(secret);
+    const pubkey = X25519.recoverPublicKey(secret);
 
     var dev = WgDevice.init(secret, pubkey);
 
     var peer_secret: [32]u8 = undefined;
     zio().random(&peer_secret);
-    const peer_pub = try X25519.recoverPublicKey(peer_secret);
+    const peer_pub = X25519.recoverPublicKey(peer_secret);
 
-    const slot = try dev.addPeer(.{0} ** 32, peer_pub, .{ 10, 0, 0, 1 }, 51821);
+    const slot = try dev.addPeer(@splat(0), peer_pub, .{ 10, 0, 0, 1 }, 51821);
     try std.testing.expectEqual(dev.peer_count, 1);
     try std.testing.expect(dev.peers[slot] != null);
 
@@ -814,16 +814,16 @@ test "handshake rate limiter throttles a single-source flood (H4 regression)" {
 
 test "innerSourceAllowed enforces RX cryptokey routing (H1 regression)" {
     const peer_ip = [4]u8{ 10, 99, 1, 2 };
-    const zero6 = [_]u8{0} ** 16;
+    const zero6 = @as([16]u8, @splat(0));
 
     // Valid IPv4 packet whose source is the peer's own mesh IP → allowed.
-    var pkt: [20]u8 = .{0} ** 20;
+    var pkt: [20]u8 = @splat(0);
     pkt[0] = 0x45; // IPv4, IHL=5
     @memcpy(pkt[12..16], &peer_ip);
     try std.testing.expect(innerSourceAllowed(peer_ip, zero6, &pkt));
 
     // Spoofed inner source → rejected.
-    var spoof: [20]u8 = .{0} ** 20;
+    var spoof: [20]u8 = @splat(0);
     spoof[0] = 0x45;
     spoof[12] = 10;
     spoof[13] = 99;
@@ -839,14 +839,14 @@ test "innerSourceAllowed enforces RX cryptokey routing (H1 regression)" {
 
     // Non-IP framed payload (e.g. FFI tunnel inbox, leading-zero header) → allowed:
     // the source-IP rule only applies to IP-routed packets.
-    try std.testing.expect(innerSourceAllowed(peer_ip, zero6, &[_]u8{0x00} ** 20));
+    try std.testing.expect(innerSourceAllowed(peer_ip, zero6, &@as([20]u8, @splat(0x00))));
 
     // Unconstrained peer (zero mesh IP, e.g. interop) → not enforced.
     try std.testing.expect(innerSourceAllowed(.{ 0, 0, 0, 0 }, zero6, &spoof));
 
     // IPv6: matching source allowed, tampered source rejected.
     const peer6 = [16]u8{ 0xfd, 0x99, 0x6d, 0x67, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
-    var p6: [40]u8 = .{0} ** 40;
+    var p6: [40]u8 = @splat(0);
     p6[0] = 0x60; // IPv6
     @memcpy(p6[8..24], &peer6);
     try std.testing.expect(innerSourceAllowed(.{ 0, 0, 0, 0 }, peer6, &p6));
@@ -873,17 +873,17 @@ test "IndexTable put/get/remove" {
 
 test "PacketType classification" {
     // WG Handshake Init (type 1)
-    var init_pkt: [148]u8 = .{0} ** 148;
+    var init_pkt: [148]u8 = @splat(0);
     std.mem.writeInt(u32, init_pkt[0..4], 1, .little);
     try std.testing.expectEqual(PacketType.classify(&init_pkt), .wg_handshake_init);
 
     // WG Transport Data (type 4)
-    var data_pkt: [32]u8 = .{0} ** 32;
+    var data_pkt: [32]u8 = @splat(0);
     std.mem.writeInt(u32, data_pkt[0..4], 4, .little);
     try std.testing.expectEqual(PacketType.classify(&data_pkt), .wg_transport);
 
     // STUN with magic cookie
-    var stun_pkt: [20]u8 = .{0} ** 20;
+    var stun_pkt: [20]u8 = @splat(0);
     std.mem.writeInt(u32, stun_pkt[4..8], 0x2112A442, .big);
     try std.testing.expectEqual(PacketType.classify(&stun_pkt), .stun);
 

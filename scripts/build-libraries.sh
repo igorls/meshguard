@@ -20,8 +20,8 @@ if [[ $# -gt 1 ]]; then
   echo 'Usage: scripts/build-libraries.sh [output-directory]' >&2
   exit 1
 fi
-if [[ "$(zig version)" != 0.16.0 ]]; then
-  echo 'Library packaging requires Zig 0.16.0.' >&2
+if [[ "$(zig version)" != 0.17.0 ]]; then
+  echo 'Library packaging requires Zig 0.17.0.' >&2
   exit 1
 fi
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -90,9 +90,10 @@ if wants android; then
 include_dir=$sysroot/usr/include
 sys_include_dir=$sysroot/usr/include/$triple
 crt_dir=$sysroot/usr/lib/$triple/$android_api
+cc_dir=$sysroot/usr/lib/$triple/$android_api
 msvc_lib_dir=
 kernel32_lib_dir=
-gcc_dir=
+darwin_sdk_dir=
 EOF
     build_target "android-$abi" "$target.$android_api" --libc "$libc"
     mkdir -p "$package/jniLibs/$abi"

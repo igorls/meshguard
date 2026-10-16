@@ -123,12 +123,12 @@ pub const Stats = struct {
     claims: u64 = 0,
     proofs: u64 = 0,
     forwarded: u64 = 0,
-    dropped: [@typeInfo(DropReason).@"enum".fields.len]u64 = .{0} ** @typeInfo(DropReason).@"enum".fields.len,
+    dropped: [@typeInfo(DropReason).@"enum".field_names.len]u64 = @splat(0),
     handshakes_refused: u64 = 0,
     evicted: u64 = 0,
 
     pub fn droppedFor(self: *const Stats, reason: DropReason) u64 {
-        return self.dropped[@intFromEnum(reason)];
+        return self.dropped[@backingInt(reason)];
     }
 };
 
@@ -502,7 +502,7 @@ pub const RelayCore = struct {
         const current = self.claimOf(input.identity);
         const vouched = self.vouchedKey(input, current) orelse return false;
         const conn = self.ensureConn(vouched.wg, now_ns) orelse {
-            self.stats.dropped[@intFromEnum(DropReason.overloaded)] += 1;
+            self.stats.dropped[@backingInt(DropReason.overloaded)] += 1;
             return false;
         };
         conn.last_seen_ns = now_ns;
@@ -523,7 +523,7 @@ pub const RelayCore = struct {
         }
 
         const i = self.allocateClaim() orelse {
-            self.stats.dropped[@intFromEnum(DropReason.overloaded)] += 1;
+            self.stats.dropped[@backingInt(DropReason.overloaded)] += 1;
             return false;
         };
         self.claims.items[i] = .{
@@ -721,7 +721,7 @@ pub const RelayCore = struct {
         const decision = self.decide(sender, destination, len, src, now_ns);
         switch (decision) {
             .forward => self.stats.forwarded += 1,
-            .drop => |reason| self.stats.dropped[@intFromEnum(reason)] += 1,
+            .drop => |reason| self.stats.dropped[@backingInt(reason)] += 1,
         }
         return decision;
     }
@@ -855,13 +855,13 @@ const TestClient = struct {
     ts: u64 = 1,
 
     fn init(seed_byte: u8) !TestClient {
-        const seed = [_]u8{seed_byte} ** 32;
+        const seed = @as([32]u8, @splat(seed_byte));
         const kp = try Ed25519.KeyPair.generateDeterministic(seed);
         var private = seed;
         private[0] &= 248;
         private[31] &= 127;
         private[31] |= 64;
-        const public = try X25519.recoverPublicKey(private);
+        const public = X25519.recoverPublicKey(private);
         return .{
             .identity = kp.public_key.toBytes(),
             .wg_private = private,
@@ -894,11 +894,11 @@ const TestRelay = struct {
     public: [32]u8,
 
     fn init() !TestRelay {
-        var private = [_]u8{0x55} ** 32;
+        var private = @as([32]u8, @splat(0x55));
         private[0] &= 248;
         private[31] &= 127;
         private[31] |= 64;
-        return .{ .private = private, .public = try X25519.recoverPublicKey(private) };
+        return .{ .private = private, .public = X25519.recoverPublicKey(private) };
     }
 
     fn core(self: *TestRelay, config: Config) !RelayCore {
@@ -1016,7 +1016,7 @@ test "vouching for someone else's key neither locks them out nor lets anyone sen
     defer core.deinit();
     var victim = try TestClient.init(1);
     var bob = try TestClient.init(2);
-    const attacker_seed = [_]u8{9} ** 32;
+    const attacker_seed = @as([32]u8, @splat(9));
     const attacker = try Ed25519.KeyPair.generateDeterministic(attacker_seed);
 
     // The attacker signs the victim's public WireGuard key as its own, first.
@@ -1038,7 +1038,7 @@ test "derived keys and certificate-bound keys are vouched for" {
     var core = try relay.core(smallConfig());
     defer core.deinit();
 
-    const daemon = try Ed25519.KeyPair.generateDeterministic([_]u8{0x31} ** 32);
+    const daemon = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x31)));
     const derived = try X25519.publicKeyFromEd25519(daemon.public_key);
     try testing.expect(core.claim(.{ .identity = daemon.public_key.toBytes(), .known_wg = derived }, 0));
     try testing.expectEqual(KeySource.derived, core.keySourceOf(daemon.public_key.toBytes()).?);

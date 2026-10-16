@@ -9,8 +9,8 @@ if [[ "$(uname -s)" != Darwin ]]; then
   echo 'Apple packaging requires macOS and Xcode.' >&2
   exit 1
 fi
-if [[ "$(zig version)" != 0.16.0 ]]; then
-  echo 'Apple packaging requires Zig 0.16.0.' >&2
+if [[ "$(zig version)" != 0.18.0-dev.253+16d31ceed ]]; then
+  echo 'Apple packaging requires Zig 0.18.0-dev.253+16d31ceed.' >&2
   exit 1
 fi
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

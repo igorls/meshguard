@@ -162,7 +162,7 @@ pub const NatType = enum(u8) {
 
 /// Network endpoint (IP:port pair).
 pub const Endpoint = struct {
-    addr: [4]u8 = .{0} ** 4,
+    addr: [4]u8 = @splat(0),
     addr6: ?[16]u8 = null,
     port: u16,
 
@@ -268,11 +268,11 @@ pub const OrgTrustVouch = struct {
 };
 
 test "message type values" {
-    try std.testing.expectEqual(@as(u8, 0x01), @intFromEnum(MessageType.ping));
-    try std.testing.expectEqual(@as(u8, 0x10), @intFromEnum(MessageType.handshake_init));
-    try std.testing.expectEqual(@as(u8, 0x30), @intFromEnum(MessageType.relay_request));
-    try std.testing.expectEqual(@as(u8, 0x31), @intFromEnum(MessageType.relay_data));
-    try std.testing.expectEqual(@as(u8, 0x33), @intFromEnum(MessageType.holepunch_request));
-    try std.testing.expectEqual(@as(u8, 0x34), @intFromEnum(MessageType.holepunch_response));
-    try std.testing.expectEqual(@as(u8, 0x43), @intFromEnum(MessageType.org_trust_vouch));
+    try std.testing.expectEqual(@as(u8, 0x01), @backingInt(MessageType.ping));
+    try std.testing.expectEqual(@as(u8, 0x10), @backingInt(MessageType.handshake_init));
+    try std.testing.expectEqual(@as(u8, 0x30), @backingInt(MessageType.relay_request));
+    try std.testing.expectEqual(@as(u8, 0x31), @backingInt(MessageType.relay_data));
+    try std.testing.expectEqual(@as(u8, 0x33), @backingInt(MessageType.holepunch_request));
+    try std.testing.expectEqual(@as(u8, 0x34), @backingInt(MessageType.holepunch_response));
+    try std.testing.expectEqual(@as(u8, 0x43), @backingInt(MessageType.org_trust_vouch));
 }

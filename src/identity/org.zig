@@ -423,7 +423,7 @@ pub fn issueDelegatedCertificateV2(
 
 test "certificate validity tolerates clock skew both ways" {
     const org_kp = generateOrgKeyPair();
-    var cert = try issueCertificateV2(org_kp, [_]u8{1} ** 32, [_]u8{2} ** 32, "n", 2_000);
+    var cert = try issueCertificateV2(org_kp, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), "n", 2_000);
     cert.issued_at = 1_000;
     try std.testing.expect(cert.isValidAt(1_500, 300));
     try std.testing.expect(cert.isValidAt(2_299, 300)); // just expired, within skew
@@ -654,7 +654,7 @@ test "cert serialize/deserialize round-trip" {
 test "v2 cert binds WireGuard key and detects tampering" {
     const org_kp = generateOrgKeyPair();
     const node_kp = Ed25519.KeyPair.generate(zio());
-    const wg_pubkey = [_]u8{0x44} ** 32;
+    const wg_pubkey = @as([32]u8, @splat(0x44));
 
     const cert = try issueCertificateV2(
         org_kp,
@@ -692,7 +692,7 @@ test "delegated v2 cert verifies issuer and org grant signatures" {
     const org_kp = generateOrgKeyPair();
     const issuer_kp = generateOrgKeyPair();
     const node_kp = Ed25519.KeyPair.generate(zio());
-    const wg_pubkey = [_]u8{0x45} ** 32;
+    const wg_pubkey = @as([32]u8, @splat(0x45));
 
     const cert = try issueDelegatedCertificateV2(
         org_kp,
@@ -778,7 +778,7 @@ test "format mesh domain" {
 
 test "org revoke signing uses canonical payload" {
     const org_kp = generateOrgKeyPair();
-    const node_pubkey = [_]u8{0x42} ** 32;
+    const node_pubkey = @as([32]u8, @splat(0x42));
     const lamport: u64 = 0x0102030405060708;
 
     const rev = try issueOrgRevoke(org_kp, node_pubkey, 1, lamport);
@@ -808,7 +808,7 @@ test "org revoke save and load round-trip" {
     defer allocator.free(tmp_path);
 
     const org_kp = generateOrgKeyPair();
-    const node_pubkey = [_]u8{0x24} ** 32;
+    const node_pubkey = @as([32]u8, @splat(0x24));
     const rev = try issueOrgRevoke(org_kp, node_pubkey, 2, 123);
 
     const saved_path = try saveOrgRevoke(allocator, tmp_path, rev);

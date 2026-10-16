@@ -4,7 +4,7 @@ const packet = @import("app_packet.zig");
 const noise = @import("wireguard/noise.zig");
 const Slot = struct { identity: packet.Identity = undefined, live: bool = false, generation: u32 = 0, handshake: ?noise.Handshake = null };
 var slots: [16]Slot = @splat(Slot{});
-var scratch: [8192]u8 align(16) = .{0} ** 8192;
+var scratch: [8192]u8 align(16) = @splat(0);
 
 // Status: -1 bad handle, -2 bad buffer, -3 size, -4 pool full,
 // -5 invalid key/packet, -6 authentication, -7 wrong recipient/sender.
