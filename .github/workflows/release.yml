@@ -137,7 +137,7 @@ jobs:
         with:
           version: 0.17.0
 
-      - name: Build Apple libraries and XCFramework
+      - name: Build macOS libraries (iOS blocked by Zig 0.17.0)
         run: ./scripts/build-apple.sh
 
       - name: Upload Apple artifacts
@@ -149,7 +149,6 @@ jobs:
             zig-out/apple/meshguard-ffi-macos-arm64.tar.gz
             zig-out/apple/meshguard-ffi-macos-x86_64.tar.gz
             zig-out/apple/meshguard-ffi-macos-universal.tar.gz
-            zig-out/apple/meshguard-ffi-ios-xcframework.zip
 
   libraries:
     name: Linux, FreeBSD and Android FFI release artifacts

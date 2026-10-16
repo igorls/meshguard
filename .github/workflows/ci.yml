@@ -162,7 +162,7 @@ jobs:
       - name: Unit and FFI tests (std.crypto)
         run: zig build test -Dcrypto-backend=std
 
-      - name: Build Apple libraries and XCFramework
+      - name: Build macOS libraries (iOS blocked by Zig 0.17.0)
         run: ./scripts/build-apple.sh
 
       - name: Test Apple consumer linking

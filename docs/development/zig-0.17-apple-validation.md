@@ -32,3 +32,22 @@ Constructing the `Threaded` I/O table pulls in `processReplace`, even when
 an application only asks for a clock. `std.process.can_replace` is true for
 iOS, while `processSpawn` is explicitly unsupported there. `spawnDarwin`
 references `getDevNullFd`, but iOS `NullFile` has no `fd` member.
+
+## Workaround investigation and packaging decision
+
+Two standalone experiments still failed with the same `NullFile.fd` diagnostic:
+
+- Copy `Threaded.io().vtable.*` at compile time and replace `processReplace`
+  with the public `std.Io.failingProcessReplace` before exposing the copy.
+- Select only `Threaded.io().vtable.now` and call that clock function directly.
+
+Both require the original table, which still instantiates `processReplace`.
+The implementation functions behind that table are private. A replacement I/O
+backend would also have to preserve clocks, sleep, secure randomness, file I/O
+and contended locks throughout the FFI's dependencies; it is not a narrow
+workaround for this compiler upgrade. No working scoped workaround was found.
+
+The Apple scripts therefore omit iOS device/simulator builds, the XCFramework
+and its zip, remove stale generated iOS artifacts, and explicitly report skipped
+iOS links. CI and release packaging advertise only the macOS outputs. The Zig
+standard library remains unmodified. Direct iOS FFI builds remain blocked.

@@ -8,6 +8,12 @@ Objective-C, C, C++, and Swift through the `MeshGuardFFI` Clang module.
 
 ## Build and packages
 
+> iOS device and simulator builds are currently blocked by a Zig 0.17.0
+> standard-library regression (`std.Io.Threaded.NullFile.fd`). The Apple scripts
+> build and test macOS libraries only and omit the XCFramework and its zip.
+> The iOS integration instructions below describe the expected package layout
+> once iOS builds are restored; they cannot be completed with this toolchain.
+
 Run these commands on macOS with Zig 0.16.0 and Xcode's command-line tools selected:
 
 ```bash
@@ -17,21 +23,22 @@ Run these commands on macOS with Zig 0.16.0 and Xcode's command-line tools selec
 
 Both scripts accept an optional output directory; the default is `zig-out/apple`.
 The link test compiles and runs C and Swift hosts against the macOS libraries,
-and links Swift hosts against both iOS slices.
+and reports the skipped iOS device/simulator links.
 The iOS slices require the iPhoneOS and iPhoneSimulator SDKs from Xcode. The build
 targets iOS 15 and macOS 13 as minimum deployment versions and uses Zig
 `std.crypto`; no libsodium dependency is needed.
 
 | Output under `zig-out/apple` | Contents |
 | --- | --- |
-| `MeshGuardFFI.xcframework` | Static `libmeshguard-ffi.a`, public header and module map for iOS arm64 devices and arm64 simulators |
+| `MeshGuardFFI.xcframework` (currently omitted) | Static `libmeshguard-ffi.a`, public header and module map for iOS arm64 devices and arm64 simulators |
 | `macos-arm64` | `lib/libmeshguard-ffi.dylib`, `lib/libmeshguard-ffi.a`, and `include/` |
 | `macos-x86_64` | The same layout for Intel macOS |
 | `macos-universal` | Both macOS architectures in each library, plus `include/` |
 
-The release asset names are `meshguard-ffi-ios-xcframework.zip`,
+The current release asset names are
 `meshguard-ffi-macos-arm64.tar.gz`, `meshguard-ffi-macos-x86_64.tar.gz`, and
-`meshguard-ffi-macos-universal.tar.gz`. The iOS XCFramework contains an arm64
+`meshguard-ffi-macos-universal.tar.gz`. The currently omitted
+`meshguard-ffi-ios-xcframework.zip` would contain an arm64 device and an arm64
 simulator slice; an Intel simulator slice is not included.
 
 ## Add the library to an Xcode app
