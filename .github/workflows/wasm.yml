@@ -7,19 +7,22 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   wasm:
     name: Portable core and native packet interoperability
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.17.0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: 1.4.2
       - name: Build WASM and exercise the ABI
@@ -42,7 +45,7 @@ jobs:
           MESHGUARD_BINARY: ${{ github.workspace }}/zig-out/bin/meshguard
           MESHGUARD_NATIVE_LIBRARY: ${{ github.workspace }}/zig-out/lib/libmeshguard-ffi.so
         run: ./scripts/build-web.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: meshguard-wasm
           path: |
@@ -50,7 +53,7 @@ jobs:
             web/meshguard.mjs
             web/relay-protocol.mjs
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: meshguard-web-packages
           path: |
