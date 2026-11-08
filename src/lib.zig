@@ -98,6 +98,19 @@ test {
     _ = identity.Binding;
     @import("std").testing.refAllDecls(net.Dns);
     @import("std").testing.refAllDecls(nat.Stun);
+    // Referencing the namespace structs above does not pull in these files'
+    // tests; name them so `zig build test` actually runs them.
+    _ = nat.UPnP;
+    _ = nat.CoordinatedPunch;
+    _ = nat.Holepunch;
+    _ = nat.Relay;
+    _ = discovery.Membership;
+    _ = protocol.Codec;
+    _ = protocol.Messages;
+    _ = identity.Keys;
+    _ = identity.Trust;
+    _ = identity.Org;
+    _ = config;
     if (is_linux) {
         _ = wireguard.Config;
         _ = wireguard.Netlink;

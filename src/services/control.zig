@@ -177,6 +177,30 @@ const win = if (is_windows) struct {
     extern "kernel32" fn CreateFileW(lpFileName: LPCWSTR, dwDesiredAccess: DWORD, dwShareMode: DWORD, lpSecurityAttributes: ?*anyopaque, dwCreationDisposition: DWORD, dwFlagsAndAttributes: DWORD, hTemplateFile: ?HANDLE) callconv(.winapi) HANDLE;
     extern "kernel32" fn WaitNamedPipeW(lpNamedPipeName: LPCWSTR, nTimeOut: DWORD) callconv(.winapi) BOOL;
     extern "kernel32" fn CancelSynchronousIo(hThread: HANDLE) callconv(.winapi) BOOL;
+    extern "kernel32" fn GetNamedPipeServerProcessId(Pipe: HANDLE, ServerProcessId: *DWORD) callconv(.winapi) BOOL;
+    extern "kernel32" fn OpenProcess(dwDesiredAccess: DWORD, bInheritHandle: BOOL, dwProcessId: DWORD) callconv(.winapi) ?HANDLE;
+    extern "kernel32" fn GetCurrentProcess() callconv(.winapi) HANDLE;
+    extern "advapi32" fn OpenProcessToken(ProcessHandle: HANDLE, DesiredAccess: DWORD, TokenHandle: *HANDLE) callconv(.winapi) BOOL;
+    extern "advapi32" fn GetTokenInformation(TokenHandle: HANDLE, TokenInformationClass: c_int, TokenInformation: ?*anyopaque, TokenInformationLength: DWORD, ReturnLength: *DWORD) callconv(.winapi) BOOL;
+    extern "advapi32" fn EqualSid(pSid1: *anyopaque, pSid2: *anyopaque) callconv(.winapi) BOOL;
+    extern "advapi32" fn IsWellKnownSid(pSid: *anyopaque, WellKnownSidType: c_int) callconv(.winapi) BOOL;
+    extern "advapi32" fn CreateWellKnownSid(WellKnownSidType: c_int, DomainSid: ?*anyopaque, pSid: ?*anyopaque, cbSid: *DWORD) callconv(.winapi) BOOL;
+    extern "advapi32" fn DuplicateToken(ExistingTokenHandle: HANDLE, ImpersonationLevel: c_int, DuplicateTokenHandle: *HANDLE) callconv(.winapi) BOOL;
+    extern "advapi32" fn CheckTokenMembership(TokenHandle: ?HANDLE, SidToCheck: *anyopaque, IsMember: *BOOL) callconv(.winapi) BOOL;
+
+    const FALSE: BOOL = @fromBackingInt(@intCast(0));
+    const PROCESS_QUERY_LIMITED_INFORMATION: DWORD = 0x1000;
+    const TOKEN_QUERY: DWORD = 0x0008;
+    const TOKEN_DUPLICATE: DWORD = 0x0002;
+    const TokenUser: c_int = 1;
+    const SecurityIdentification: c_int = 1;
+    const WinLocalSystemSid: c_int = 22;
+    const WinBuiltinAdministratorsSid: c_int = 26;
+    const SECURITY_MAX_SID_SIZE: usize = 68;
+    /// CreateFileW flags: ask for identification-level impersonation only, so a
+    /// rogue pipe server cannot impersonate the connecting (administrator) client.
+    const SECURITY_SQOS_PRESENT: DWORD = 0x00100000;
+    const SECURITY_IDENTIFICATION: DWORD = 0x00010000;
 } else struct {};
 
 pub const DEFAULT_SOCKET_PATH = if (is_windows) "\\\\.\\pipe\\meshguard" else "/run/meshguard/meshguard.sock";
@@ -753,19 +777,20 @@ pub const ControlSocket = struct {
             try setNonBlocking(sock);
         }
 
-        if (std.c.bind(sock, @ptrCast(&addr.addr), addr.len) != 0) {
+        // The socket is created world-writable (0666): STATUS and PEERS are public,
+        // and every command that acts as this node checks peer credentials. The mode
+        // is set through umask at bind time rather than chmod on the path afterwards,
+        // which would follow a symlink planted in a writable control directory.
+        const previous_umask = std.c.umask(0o111);
+        const bind_result = std.c.bind(sock, @ptrCast(&addr.addr), addr.len);
+        _ = std.c.umask(previous_umask);
+        if (bind_result != 0) {
             return error.BindFailed;
         }
         const bound_stat = (try existingUnixSocket(self.socket_path)) orelse return error.BindFailed;
         errdefer unlinkOwnedUnixSocket(self.socket_path, bound_stat);
         if (std.c.listen(sock, 64) != 0) {
             return error.ListenFailed;
-        }
-
-        if (self.socket_path.len < 256) {
-            var path_buf = std.mem.zeroes([256:0]u8);
-            @memcpy(path_buf[0..self.socket_path.len], self.socket_path);
-            _ = std.c.fchmodat(posix.AT.FDCWD, &path_buf, 0o666, 0);
         }
 
         self.server = sock;
@@ -863,9 +888,10 @@ pub const ControlSocket = struct {
 
         const cmd = std.mem.trimEnd(u8, buf[0..n], "\r\n");
         const resp_buf = self.response_buf.?;
-        const trimmed = std.mem.trim(u8, cmd, " \t");
-        // STOP and transfers (file contents) need the daemon owner; the socket itself is world-writable.
-        const owner = (std.mem.eql(u8, trimmed, "STOP") or std.mem.eql(u8, trimmed, "RELOAD") or std.mem.startsWith(u8, trimmed, "XFER")) and stopAuthorizedUnix(client);
+        // The socket itself is world-writable so that any local user can read STATUS
+        // and PEERS. Everything that acts as this node (messaging, transfers, reload,
+        // stop) requires the daemon owner: same uid, or root.
+        const owner = stopAuthorizedUnix(client);
         const resp_len = self.formatCommandResponse(cmd, resp_buf, owner);
         if (resp_len > 0) {
             writeAllSocket(client, resp_buf[0..resp_len]);
@@ -904,8 +930,11 @@ pub const ControlSocket = struct {
             @memcpy(buf[0..msg.len], msg);
             return msg.len;
         } else if (std.mem.eql(u8, cmd, "MSGS")) {
+            // Reading or sending messages is acting as this node's identity: owner only.
+            if (!owner_authorized) return formatError(buf, "unauthorized: messaging requires the daemon owner");
             return self.formatMsgs(buf);
         } else if (std.mem.eql(u8, cmd, "RECV") or std.mem.startsWith(u8, cmd, "RECV ")) {
+            if (!owner_authorized) return formatError(buf, "unauthorized: messaging requires the daemon owner");
             var timeout_ms: u32 = 0;
             if (cmd.len > 4) {
                 const arg = std.mem.trim(u8, cmd[4..], " \t\r\n");
@@ -913,13 +942,16 @@ pub const ControlSocket = struct {
             }
             return self.handleRecv(timeout_ms, buf);
         } else if (std.mem.startsWith(u8, cmd, "SEND ")) {
+            if (!owner_authorized) return formatError(buf, "unauthorized: messaging requires the daemon owner");
             return self.handleSend(cmd[5..], buf);
         } else if (std.mem.eql(u8, cmd, "APPINFO")) {
             return formatAppInfo(buf);
         } else if (std.mem.eql(u8, cmd, "APPRECV") or std.mem.startsWith(u8, cmd, "APPRECV ")) {
+            if (!owner_authorized) return formatError(buf, "unauthorized: messaging requires the daemon owner");
             const channel = if (cmd.len > 7) std.mem.trim(u8, cmd[7..], " \t\r\n") else "";
             return self.handleAppRecv(channel, buf);
         } else if (std.mem.startsWith(u8, cmd, "APPSEND ")) {
+            if (!owner_authorized) return formatError(buf, "unauthorized: messaging requires the daemon owner");
             return self.handleAppSend(cmd["APPSEND ".len..], buf);
         } else if (std.mem.startsWith(u8, cmd, "XFER")) {
             if (!owner_authorized) return formatError(buf, "unauthorized: transfers require the daemon owner");
@@ -1576,7 +1608,7 @@ fn requestWindows(path: []const u8, command: []const u8, out: []u8) !usize {
             0,
             null,
             3, // OPEN_EXISTING
-            0x00000080, // FILE_ATTRIBUTE_NORMAL
+            0x00000080 | win.SECURITY_SQOS_PRESENT | win.SECURITY_IDENTIFICATION, // FILE_ATTRIBUTE_NORMAL + no impersonation
             null,
         );
         if (handle != win.windows.INVALID_HANDLE_VALUE) break;
@@ -1596,6 +1628,12 @@ fn requestWindows(path: []const u8, command: []const u8, out: []u8) !usize {
     }
     defer _ = win.CloseHandle(handle);
 
+    // Any local process can create "\\.\pipe\meshguard" while the daemon is not
+    // running and answer as if it were the daemon (feeding RECV results to an
+    // administrator's `meshguard agent`, for example). Only talk to a server that
+    // runs as this user, as LocalSystem, or as an administrator.
+    if (!windowsPipeServerTrusted(handle)) return error.ControlSocketUntrusted;
+
     var bytes_written: win.DWORD = 0;
     if (win.WriteFile(handle, @ptrCast(command.ptr), @intCast(command.len), &bytes_written, null) == @as(win.BOOL, @fromBackingInt(@intCast(0)))) {
         return error.WriteFailed;
@@ -1605,6 +1643,60 @@ fn requestWindows(path: []const u8, command: []const u8, out: []u8) !usize {
     }
 
     return readWindowsLine(handle, out);
+}
+
+/// TOKEN_USER (a SID_AND_ATTRIBUTES whose first field is the PSID) plus the SID it
+/// points at, which GetTokenInformation lays out right after the header.
+const TokenUserBuffer = [128]u8;
+
+fn tokenUserSid(token: win.HANDLE, buf: *align(8) TokenUserBuffer) ?*anyopaque {
+    var needed: win.DWORD = 0;
+    if (win.GetTokenInformation(token, win.TokenUser, @ptrCast(buf), @intCast(buf.len), &needed) == win.FALSE) return null;
+    const sid_field: *const ?*anyopaque = @ptrCast(@alignCast(buf));
+    return sid_field.*;
+}
+
+/// True when the process serving `handle` runs as the same user as we do, as
+/// LocalSystem, or as a member of BUILTIN\Administrators.
+fn windowsPipeServerTrusted(handle: win.HANDLE) bool {
+    if (comptime !is_windows) return false;
+
+    var server_pid: win.DWORD = 0;
+    if (win.GetNamedPipeServerProcessId(handle, &server_pid) == win.FALSE) return false;
+    const process = win.OpenProcess(win.PROCESS_QUERY_LIMITED_INFORMATION, win.FALSE, server_pid) orelse return false;
+    defer _ = win.CloseHandle(process);
+
+    var server_token: win.HANDLE = undefined;
+    if (win.OpenProcessToken(process, win.TOKEN_QUERY | win.TOKEN_DUPLICATE, &server_token) == win.FALSE) return false;
+    defer _ = win.CloseHandle(server_token);
+
+    var server_user: TokenUserBuffer align(8) = undefined;
+    const server_sid = tokenUserSid(server_token, &server_user) orelse return false;
+
+    // Same account as the caller.
+    var our_token: win.HANDLE = undefined;
+    if (win.OpenProcessToken(win.GetCurrentProcess(), win.TOKEN_QUERY, &our_token) != win.FALSE) {
+        defer _ = win.CloseHandle(our_token);
+        var our_user: TokenUserBuffer align(8) = undefined;
+        if (tokenUserSid(our_token, &our_user)) |our_sid| {
+            if (win.EqualSid(server_sid, our_sid) != win.FALSE) return true;
+        }
+    }
+
+    // The daemon as a service.
+    if (win.IsWellKnownSid(server_sid, win.WinLocalSystemSid) != win.FALSE) return true;
+
+    // An elevated daemon started by another administrator. CheckTokenMembership
+    // needs an impersonation-level token, so duplicate the server's.
+    var impersonation: win.HANDLE = undefined;
+    if (win.DuplicateToken(server_token, win.SecurityIdentification, &impersonation) == win.FALSE) return false;
+    defer _ = win.CloseHandle(impersonation);
+    var admins: [win.SECURITY_MAX_SID_SIZE]u8 align(8) = undefined;
+    var admins_len: win.DWORD = @intCast(admins.len);
+    if (win.CreateWellKnownSid(win.WinBuiltinAdministratorsSid, null, @ptrCast(&admins), &admins_len) == win.FALSE) return false;
+    var is_member: win.BOOL = win.FALSE;
+    if (win.CheckTokenMembership(impersonation, @ptrCast(&admins), &is_member) == win.FALSE) return false;
+    return is_member != win.FALSE;
 }
 
 fn readWindowsLine(handle: win.HANDLE, out: []u8) !usize {
@@ -1723,6 +1815,39 @@ test "control STOP allows same uid or root" {
     try std.testing.expect(peerUidCanStop(1000, 1000));
     try std.testing.expect(peerUidCanStop(0, 1000));
     try std.testing.expect(!peerUidCanStop(1001, 1000));
+}
+
+test "control messaging and transfer commands require the daemon owner" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+
+    var control = try ControlSocket.init(allocator, &membership, @as([32]u8, @splat(0x42)), .{ 10, 99, 1, 2 }, @as([32]u8, @splat(0)), "test.sock");
+
+    const peer_hex = "4242424242424242424242424242424242424242424242424242424242424242";
+    const gated = [_][]const u8{
+        "MSGS",
+        "RECV",
+        "RECV 10",
+        "SEND " ++ peer_hex ++ " hello",
+        "APPRECV example-v1",
+        "APPSEND " ++ peer_hex ++ " example-v1 hello",
+        "XFERINFO",
+        "RELOAD",
+    };
+    var buf: [8192]u8 = undefined;
+    for (gated) |cmd| {
+        const n = control.formatCommandResponse(cmd, &buf, false);
+        try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "unauthorized") != null);
+    }
+
+    // Read-only queries stay available to every local user.
+    const open = [_][]const u8{ "STATUS", "PEERS", "APPINFO" };
+    for (open) |cmd| {
+        const n = control.formatCommandResponse(cmd, &buf, false);
+        try std.testing.expect(n > 0);
+        try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "unauthorized") == null);
+    }
 }
 
 test "control STATUS response includes peer counts" {

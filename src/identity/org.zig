@@ -291,6 +291,8 @@ pub fn loadOrgKeyPair(allocator: std.mem.Allocator, config_dir: []const u8) !Org
     var sk_raw: [89]u8 = undefined;
     const sk_read = try readFileBytes(sk_file, &sk_raw);
     const sk_b64 = std.mem.trimEnd(u8, sk_raw[0..sk_read], "\n\r ");
+    // The decoder does not bound its output: check the exact lengths first.
+    if (sk_b64.len != 88) return error.InvalidKeyFile;
 
     var sk_bytes: [64]u8 = undefined;
     try std.base64.standard.Decoder.decode(&sk_bytes, sk_b64);
@@ -304,6 +306,7 @@ pub fn loadOrgKeyPair(allocator: std.mem.Allocator, config_dir: []const u8) !Org
     var pk_raw: [45]u8 = undefined;
     const pk_read = try readFileBytes(pk_file, &pk_raw);
     const pk_b64 = std.mem.trimEnd(u8, pk_raw[0..pk_read], "\n\r ");
+    if (pk_b64.len != 44) return error.InvalidKeyFile;
 
     var pk_bytes: [32]u8 = undefined;
     try std.base64.standard.Decoder.decode(&pk_bytes, pk_b64);

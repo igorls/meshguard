@@ -102,6 +102,9 @@ export class MeshguardRelayClient extends EventTarget {
   }
   control(message) {
     if (message.type === 'challenge') {
+      // One challenge per connection: a gateway that asks again after admitting us is
+      // trying to collect signatures (and the pass and binding) for another session.
+      if (this.endpoint) throw new Error('Unexpected gateway challenge');
       const challenge = fromB64(message.challenge);
       if (challenge.length !== 32) throw new Error('Invalid gateway challenge');
       this.socket.send(JSON.stringify({ type: 'authenticate', publicKey: b64(this.identity.publicKey()),

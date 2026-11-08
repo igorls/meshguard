@@ -412,14 +412,39 @@ label. Without `--seed` the command exits with an error.
 ## `meshguard join`
 
 Join a host from an invite token. Starts a `--gossip-only --open` daemon with
-the token's seed if none is running, then greets the host.
+the token's seed if none is running, greets the host, then runs the agent loop
+(see `meshguard agent`) for that host only.
 
 ```bash
 meshguard join <invite-token>
 ```
 
-A token without a seed address is rejected; ask the host for a new token made
-with `meshguard invite --seed <host:port>`.
+A token without a seed address, or whose host public key does not parse, is
+rejected; ask the host for a new token made with
+`meshguard invite --seed <host:port>`. The label in the token is shown and sent
+back as plain text (at most 64 printable characters; anything else becomes
+`agent`).
+
+---
+
+## `meshguard agent`
+
+Run the agent worker loop: every `{"id": ..., "command": ...}` message that the
+daemon delivers from the host is executed with `/bin/sh -c` (`cmd.exe /c` on
+Windows) as the user running `meshguard agent`, and the exit code and output are
+sent back. This is remote command execution by design, so the loop refuses to
+start without an explicit choice of who may send commands:
+
+```bash
+meshguard agent --host <pubkey>   # execute commands from this identity only
+meshguard agent --any-host        # execute commands from every peer the daemon admits
+```
+
+Messages are authenticated end to end against the sender's identity; a message
+from any other sender is logged and ignored. Run the agent on hosts you are
+willing to hand to the named identity, and keep the daemon's control socket to
+yourself: on Unix, sending and receiving messages through it requires the
+daemon's owner.
 
 ---
 
@@ -427,11 +452,16 @@ with `meshguard invite --seed <host:port>`.
 
 Upgrade meshguard to the latest release from GitHub.
 
-> **Platform:** Linux (amd64) only. This command downloads the `meshguard-linux-amd64` asset from the latest GitHub release. It is not supported on other operating systems or architectures.
+> **Platform:** Linux amd64 and arm64 release builds only. The command picks the
+> asset matching the running binary (`meshguard-linux-amd64` or
+> `meshguard-linux-arm64`). On other platforms it exits with an error.
 >
-> **Privileges:** Requires write access to `/usr/local/bin/meshguard`. Run with `sudo` if the current user does not have sufficient permissions.
+> **Privileges:** Requires write access to `/usr/local/bin`. Run with `sudo` if
+> the current user does not have sufficient permissions.
 >
-> **Service management:** Uses `systemctl` to stop the `meshguard` service before installing the new binary and restart it afterwards. Ensure `systemd` is available on your system.
+> **Service management:** Uses `systemctl` to stop the `meshguard` service before
+> installing the new binary and restart it afterwards. Ensure `systemd` is
+> available on your system.
 
 ```bash
 meshguard upgrade
@@ -440,8 +470,12 @@ sudo meshguard upgrade
 ```
 
 The command:
-1. Queries the GitHub Releases API for the latest tag.
-2. Downloads `meshguard-linux-amd64` from that release.
-3. Stops the `meshguard` systemd service.
-4. Installs the new binary to `/usr/local/bin/meshguard`.
-5. Restarts the `meshguard` systemd service.
+1. Queries the GitHub Releases API for the latest tag (accepting only tags of
+   the form `vX.Y.Z`).
+2. Downloads the asset for this platform and the release's `checksums.txt` into
+   a private staging file inside `/usr/local/bin` (root-owned, never `/tmp`).
+3. Verifies the SHA-256 of the download against `checksums.txt`. On a mismatch
+   nothing is executed or installed.
+4. Stops the `meshguard` systemd service.
+5. Replaces `/usr/local/bin/meshguard` with a single atomic rename.
+6. Restarts the `meshguard` systemd service.

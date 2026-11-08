@@ -100,6 +100,11 @@ pub const Tunnel = struct {
     /// Whether this tunnel needs rekeying
     needs_rekey: bool = false,
 
+    /// Identifies this key set. The device bumps it whenever a handshake replaces
+    /// the tunnel; pipelined batches record the generation their nonces were
+    /// reserved under so they are never encrypted with newer keys (nonce reuse).
+    generation: u32 = 0,
+
     /// Securely zero out key material.
     pub fn deinit(self: *Tunnel) void {
         std.crypto.secureZero(u8, &self.keys.sending_key);
@@ -217,6 +222,10 @@ pub const Tunnel = struct {
         if (msg_type != 4) return error.InvalidMessageType;
 
         const counter = std.mem.readInt(u64, packet[8..16], .little);
+
+        // Counters past REJECT_AFTER_MESSAGES are never legitimately sent; accepting
+        // one would park the replay window near 2^64 and reject every later packet.
+        if (counter >= REJECT_AFTER_MESSAGES) return error.KeyExpired;
 
         // Early anti-replay reject (optimization: avoid decrypting an obvious
         // replay). NOT authoritative — the counter is re-checked and marked

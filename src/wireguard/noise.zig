@@ -379,32 +379,41 @@ pub const Handshake = struct {
         const recv_idx = std.mem.littleToNative(u32, msg.receiver_index);
         if (recv_idx != self.sender_index) return error.IndexMismatch;
 
+        // Work on copies and commit only after the AEAD authenticates the
+        // response. A forged response (anyone can read our sender index off the
+        // wire) must not disturb the pending transcript, or the genuine responder's
+        // reply could never complete this handshake.
+        var hash = self.hash;
+        var chaining_key = self.chaining_key;
+
         // e: Extract responder ephemeral
         const e = msg.ephemeral;
-        crypto.mixHash(&self.hash, &e);
-        const ck_e = crypto.kdf1(self.chaining_key, &e);
-        self.chaining_key = ck_e.ck;
+        crypto.mixHash(&hash, &e);
+        const ck_e = crypto.kdf1(chaining_key, &e);
+        chaining_key = ck_e.ck;
 
         // ee: DH(our_ephemeral, responder_ephemeral)
         const dh_ee = try X25519.scalarmult(self.ephemeral_private, e);
-        const ck_ee = crypto.kdf1(self.chaining_key, &dh_ee);
-        self.chaining_key = ck_ee.ck;
+        const ck_ee = crypto.kdf1(chaining_key, &dh_ee);
+        chaining_key = ck_ee.ck;
 
         // se: DH(our_static, responder_ephemeral)
         const dh_se = try X25519.scalarmult(self.static_private, e);
-        const ck_se = crypto.kdf1(self.chaining_key, &dh_se);
-        self.chaining_key = ck_se.ck;
+        const ck_se = crypto.kdf1(chaining_key, &dh_se);
+        chaining_key = ck_se.ck;
 
         // psk: Mix pre-shared key
-        const psk_result = crypto.kdf3(self.chaining_key, &self.preshared_key);
-        self.chaining_key = psk_result.ck;
-        crypto.mixHash(&self.hash, &psk_result.key1);
+        const psk_result = crypto.kdf3(chaining_key, &self.preshared_key);
+        chaining_key = psk_result.ck;
+        crypto.mixHash(&hash, &psk_result.key1);
         const key = psk_result.key2;
 
         // {}: Decrypt empty payload (verification)
-        _ = try aead_decrypt_empty(&key, &self.hash, &msg.encrypted_nothing);
-        crypto.mixHash(&self.hash, &msg.encrypted_nothing);
+        _ = try aead_decrypt_empty(&key, &hash, &msg.encrypted_nothing);
+        crypto.mixHash(&hash, &msg.encrypted_nothing);
 
+        self.hash = hash;
+        self.chaining_key = chaining_key;
         self.remote_ephemeral = e;
         self.remote_index = std.mem.littleToNative(u32, msg.sender_index);
         self.state = .consumed_response;
@@ -622,6 +631,28 @@ pub fn verifyMac1(our_static_public: [32]u8, msg: *const HandshakeInitiation) bo
     return std.crypto.timing_safe.eql([16]u8, expected, msg.mac1);
 }
 
+/// Verify MAC1 on an incoming handshake response. The responder keys it with the
+/// initiator's (our) static public key, so a forged response is rejected before
+/// the two X25519 operations in consumeResponse.
+pub fn verifyMac1Response(our_static_public: [32]u8, msg: *const HandshakeResponse) bool {
+    var mac1_key: [32]u8 = undefined;
+    var h = Blake2s256.init(.{});
+    h.update("mac1----");
+    h.update(&our_static_public);
+    h.final(&mac1_key);
+
+    const msg_bytes = std.mem.asBytes(msg);
+    var expected: [16]u8 = undefined;
+    Blake2s128.hash(msg_bytes[0..60], &expected, .{ .key = &mac1_key });
+
+    return std.crypto.timing_safe.eql([16]u8, expected, msg.mac1);
+}
+
+/// Test helper: recompute MAC1 on a response after a test tampered with its fields.
+pub fn recomputeResponseMac1ForTest(msg: *HandshakeResponse, initiator_static: [32]u8) void {
+    computeMacsResponse(msg, initiator_static);
+}
+
 // ─── MAC computation ───
 
 fn computeMacs(msg: *HandshakeInitiation, remote_static: [32]u8) void {
@@ -712,6 +743,36 @@ test "handshake replay protection" {
     // Replay of the same initiation should fail (timestamp not newer)
     const result = bob.consumeInitiation(&init1);
     try std.testing.expectError(error.ReplayAttack, result);
+}
+
+test "a forged response does not poison a pending initiation" {
+    const alice_private = generateSecret();
+    const alice_public = X25519.recoverPublicKey(alice_private);
+    const bob_private = generateSecret();
+    const bob_public = X25519.recoverPublicKey(bob_private);
+
+    var alice = try Handshake.init(alice_private, alice_public, bob_public);
+    var bob = try Handshake.init(bob_private, bob_public, alice_public);
+
+    const initiation = try alice.createInitiation(7);
+    try bob.consumeInitiation(&initiation);
+    const genuine = try bob.createResponse(8);
+
+    // An attacker who saw our sender index replies first with garbage.
+    var forged = genuine;
+    forged.ephemeral = X25519.recoverPublicKey(generateSecret());
+    try std.testing.expectError(error.DecryptionFailed, alice.consumeResponse(&forged));
+    try std.testing.expectEqual(HandshakeState.created_initiation, alice.state);
+    // MAC1 on the forged response no longer matches its contents either.
+    try std.testing.expect(!verifyMac1Response(alice_public, &forged));
+
+    // The genuine response still completes the handshake with agreed keys.
+    try std.testing.expect(verifyMac1Response(alice_public, &genuine));
+    try alice.consumeResponse(&genuine);
+    const alice_keys = try alice.deriveTransportKeys();
+    const bob_keys = try bob.deriveTransportKeys();
+    try std.testing.expectEqualSlices(u8, &alice_keys.sending_key, &bob_keys.receiving_key);
+    try std.testing.expectEqualSlices(u8, &alice_keys.receiving_key, &bob_keys.sending_key);
 }
 
 test "wire format sizes" {

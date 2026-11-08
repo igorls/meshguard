@@ -13,14 +13,23 @@
 const std = @import("std");
 const Dns = @import("../net/dns.zig");
 const Udp = @import("../net/udp.zig");
+const Ip = @import("../wireguard/ip.zig");
 const messages = @import("../protocol/messages.zig");
 
 fn zio() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
 }
 
+fn nowMs() i64 {
+    return @intCast(std.Io.Timestamp.now(zio(), .awake).toMilliseconds());
+}
+
 /// STUN magic cookie (RFC 5389 §6)
 const MAGIC_COOKIE: u32 = 0x2112A442;
+
+/// How long one Binding Request waits for its response. Stray datagrams on the
+/// shared gossip socket are discarded without ending the wait early.
+const STUN_TIMEOUT_MS: i64 = 2000;
 
 /// STUN message types
 const BINDING_REQUEST: u16 = 0x0001;
@@ -246,6 +255,26 @@ fn parseMappedAddress(attr: []const u8) StunDecodeError!ExternalAddress {
 
 // ─── High-level API ───
 
+/// Whether `addr` could plausibly be our public endpoint as seen from outside.
+/// Rejects unspecified (0/8), loopback (127/8), link-local (169.254/16),
+/// multicast (224/4), reserved + broadcast (240/4 incl. 255.255.255.255) and
+/// the mesh prefix itself (a STUN-mapped address inside the mesh can only be a
+/// spoof or a loop). RFC1918 and CGNAT (100.64/10) are deliberately accepted:
+/// nodes behind the same corporate NAT or CGNAT legitimately see those.
+pub fn isPlausiblePublicAddress(addr: [4]u8) bool {
+    if (addr[0] == 0) return false;
+    if (addr[0] == 127) return false;
+    if (addr[0] == 169 and addr[1] == 254) return false;
+    if (addr[0] >= 224) return false;
+    if (addr[0] == Ip.default_mesh_prefix[0] and addr[1] == Ip.default_mesh_prefix[1]) return false;
+    return true;
+}
+
+/// Whether a datagram came from the STUN server we queried (address AND port).
+pub fn isFromServer(sender_addr: [4]u8, sender_port: u16, server: StunServer) bool {
+    return sender_port == server.port and std.mem.eql(u8, &sender_addr, &server.host);
+}
+
 /// Query a STUN server to discover our external endpoint.
 /// Uses the provided UDP socket (already bound to the gossip port).
 pub fn discoverPublicEndpoint(socket: *Udp.UdpSocket, server: StunServer) !ExternalAddress {
@@ -255,19 +284,21 @@ pub fn discoverPublicEndpoint(socket: *Udp.UdpSocket, server: StunServer) !Exter
     // Send Binding Request
     _ = try socket.sendTo(&req_buf, server.host, server.port);
 
-    // Wait for response (2 second timeout)
-    if (!try socket.pollRead(2000)) return error.Timeout;
-
+    // SECURITY: the gossip socket is shared with peer traffic, so keep reading
+    // until the deadline and discard every datagram that is not from the queried
+    // server (address AND port) or does not echo our 96-bit transaction id. Before
+    // this, any host could answer the query, and one unrelated datagram failed it.
+    const deadline = nowMs() + STUN_TIMEOUT_MS;
     var recv_buf: [512]u8 = undefined;
-    const result = try socket.recvFrom(&recv_buf);
-    if (result == null) return error.NoResponse;
+    while (true) {
+        const remaining = deadline - nowMs();
+        if (remaining <= 0) return error.Timeout;
+        if (!try socket.pollRead(@intCast(remaining))) return error.Timeout;
 
-    const recv = result.?;
-    return decodeBindingResponse(recv.data, txn_id) catch |err| switch (err) {
-        error.TransactionIdMismatch => error.NoResponse,
-        error.NotBindingResponse => error.NoResponse,
-        else => error.NoResponse,
-    };
+        const recv = (try socket.recvFrom(&recv_buf)) orelse continue;
+        if (!isFromServer(recv.sender_addr, recv.sender_port, server)) continue;
+        return decodeBindingResponse(recv.data, txn_id) catch continue;
+    }
 }
 
 pub fn externalAddressEql(a: ExternalAddress, b: ExternalAddress) bool {
@@ -278,16 +309,30 @@ pub fn externalAddressEql(a: ExternalAddress, b: ExternalAddress) bool {
 ///
 /// A single server can only distinguish "same mapped port" from "mapped port";
 /// two different server observations are needed to identify endpoint-dependent
-/// mappings. If the external mapping changes across servers, peers should stop
+/// mappings. If the external port changes across servers, peers should stop
 /// spending time on hole punching and move to relay fallback.
+///
+/// SECURITY: if the servers disagree on the public IP, at least one of them is
+/// wrong and we cannot tell which; the result is `.unknown` (no public endpoint)
+/// rather than trusting the first server, so a single hostile STUN server cannot
+/// choose the address we advertise to the mesh.
 pub fn classifyMapping(local_port: u16, observations: []const ExternalAddress) NatType {
     if (observations.len == 0) return .unknown;
     const first = observations[0];
+    var port_changed = false;
     for (observations[1..]) |obs| {
-        if (!externalAddressEql(first, obs)) return .symmetric;
+        if (!std.mem.eql(u8, &first.addr, &obs.addr)) return .unknown;
+        if (obs.port != first.port) port_changed = true;
     }
+    if (port_changed) return .symmetric;
     return if (first.port == local_port) .public else .cone;
 }
+
+const UNKNOWN_RESULT = StunResult{
+    .external = .{ .addr = .{ 0, 0, 0, 0 }, .port = 0 },
+    .nat_type = .unknown,
+    .server = null,
+};
 
 /// Try multiple STUN servers and determine our NAT type.
 /// `local_port` is the port we're bound to locally.
@@ -298,6 +343,9 @@ pub fn discover(socket: *Udp.UdpSocket, local_port: u16, servers: []const StunSe
 
     for (servers) |server| {
         const ext = discoverPublicEndpoint(socket, server) catch continue;
+        // SECURITY: a mapped address that cannot be a public endpoint comes from
+        // a lying or broken server; it is not an observation.
+        if (!isPlausiblePublicAddress(ext.addr)) continue;
         if (observation_count == 0) first_server = server;
         if (observation_count < observations.len) {
             observations[observation_count] = ext;
@@ -306,17 +354,14 @@ pub fn discover(socket: *Udp.UdpSocket, local_port: u16, servers: []const StunSe
         if (observation_count >= 2) break;
     }
 
-    if (observation_count == 0) {
-        return .{
-            .external = .{ .addr = .{ 0, 0, 0, 0 }, .port = 0 },
-            .nat_type = .unknown,
-            .server = null,
-        };
-    }
+    if (observation_count == 0) return UNKNOWN_RESULT;
+
+    const nat_type = classifyMapping(local_port, observations[0..observation_count]);
+    if (nat_type == .unknown) return UNKNOWN_RESULT;
 
     return .{
         .external = observations[0],
-        .nat_type = classifyMapping(local_port, observations[0..observation_count]),
+        .nat_type = nat_type,
         .server = first_server,
     };
 }
@@ -477,4 +522,64 @@ test "classify mapping keeps stable mappings direct or cone" {
     const cone = ExternalAddress{ .addr = .{ 203, 0, 113, 10 }, .port = 40000 };
     try std.testing.expectEqual(NatType.cone, classifyMapping(51821, &.{cone}));
     try std.testing.expectEqual(NatType.cone, classifyMapping(51821, &.{ cone, cone }));
+}
+
+test "classify mapping returns unknown when servers disagree on the public IP" {
+    // Two servers reporting different IPs: one is lying (or we are multi-homed).
+    // Neither observation may be trusted, even with identical ports.
+    const a = ExternalAddress{ .addr = .{ 203, 0, 113, 10 }, .port = 51821 };
+    const b = ExternalAddress{ .addr = .{ 198, 51, 100, 7 }, .port = 51821 };
+    try std.testing.expectEqual(NatType.unknown, classifyMapping(51821, &.{ a, b }));
+    try std.testing.expectEqual(NatType.unknown, classifyMapping(51821, &.{ b, a }));
+
+    // A different IP *and* port is still "unknown", not "symmetric".
+    const c = ExternalAddress{ .addr = .{ 198, 51, 100, 7 }, .port = 40001 };
+    try std.testing.expectEqual(NatType.unknown, classifyMapping(51821, &.{ a, c }));
+}
+
+test "isPlausiblePublicAddress rejects addresses that cannot be a public endpoint" {
+    const rejected = [_][4]u8{
+        .{ 0, 0, 0, 0 }, // unspecified
+        .{ 0, 1, 2, 3 }, // 0.0.0.0/8
+        .{ 127, 0, 0, 1 }, // loopback
+        .{ 127, 255, 255, 254 },
+        .{ 169, 254, 1, 1 }, // link-local
+        .{ 224, 0, 0, 251 }, // multicast
+        .{ 239, 255, 255, 250 },
+        .{ 240, 0, 0, 1 }, // reserved
+        .{ 255, 255, 255, 255 }, // broadcast
+        .{ 10, 99, 1, 2 }, // mesh prefix
+        .{ 10, 99, 0, 0 },
+    };
+    for (rejected) |addr| {
+        try std.testing.expect(!isPlausiblePublicAddress(addr));
+    }
+
+    // RFC1918 (other than the mesh /16) and CGNAT stay accepted: peers behind the
+    // same corporate NAT or carrier-grade NAT legitimately observe them.
+    const accepted = [_][4]u8{
+        .{ 203, 0, 113, 42 },
+        .{ 8, 8, 8, 8 },
+        .{ 1, 0, 0, 1 },
+        .{ 223, 255, 255, 255 },
+        .{ 192, 168, 1, 100 },
+        .{ 172, 16, 0, 1 },
+        .{ 10, 0, 0, 1 },
+        .{ 10, 98, 255, 255 },
+        .{ 10, 100, 0, 1 },
+        .{ 100, 64, 0, 1 },
+        .{ 100, 127, 255, 254 },
+        .{ 169, 253, 0, 1 },
+    };
+    for (accepted) |addr| {
+        try std.testing.expect(isPlausiblePublicAddress(addr));
+    }
+}
+
+test "isFromServer requires the queried server's address and port" {
+    const server = StunServer{ .host = .{ 74, 125, 250, 129 }, .port = 19302 };
+    try std.testing.expect(isFromServer(.{ 74, 125, 250, 129 }, 19302, server));
+    try std.testing.expect(!isFromServer(.{ 74, 125, 250, 129 }, 3478, server)); // wrong port
+    try std.testing.expect(!isFromServer(.{ 74, 125, 250, 130 }, 19302, server)); // wrong host
+    try std.testing.expect(!isFromServer(.{ 0, 0, 0, 0 }, 19302, server));
 }

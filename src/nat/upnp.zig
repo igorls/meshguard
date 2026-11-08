@@ -54,6 +54,91 @@ fn zio() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
 }
 
+fn nowMs() i64 {
+    return @intCast(std.Io.Timestamp.now(zio(), .awake).toMilliseconds());
+}
+
+const Stun = @import("stun.zig");
+
+/// Bound every TCP socket operation against the gateway (connect included on
+/// Linux, where SO_SNDTIMEO applies to connect()) so a black-holed router
+/// cannot hang startup.
+fn setSocketTimeouts(fd: posix.socket_t, timeout_ms: u32) void {
+    if (comptime is_windows) {
+        // Winsock takes a DWORD of milliseconds.
+        _ = std.c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, @ptrCast(&timeout_ms), @sizeOf(u32));
+        _ = std.c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, @ptrCast(&timeout_ms), @sizeOf(u32));
+    } else {
+        const tv = std.c.timeval{
+            .sec = @intCast(timeout_ms / 1000),
+            .usec = @intCast((timeout_ms % 1000) * 1000),
+        };
+        posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
+        posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+    }
+}
+
+/// Milliseconds to hand to the next poll(): never past `deadline_ms`, never more
+/// than one slice, 0 once the deadline has passed.
+pub fn pollSliceMs(deadline_ms: i64, now_ms: i64) i32 {
+    const remaining = deadline_ms - now_ms;
+    if (remaining <= 0) return 0;
+    return @intCast(@min(remaining, SSDP_POLL_SLICE_MS));
+}
+
+/// RFC1918 (10/8, 172.16/12, 192.168/16) or link-local (169.254/16): the only
+/// address space a real UPnP gateway can answer an M-SEARCH from.
+pub fn isLanAddress(addr: [4]u8) bool {
+    if (addr[0] == 10) return true;
+    if (addr[0] == 172 and addr[1] >= 16 and addr[1] <= 31) return true;
+    if (addr[0] == 192 and addr[1] == 168) return true;
+    if (addr[0] == 169 and addr[1] == 254) return true;
+    return false;
+}
+
+/// Safe to splice into an HTTP request line or header: printable ASCII without
+/// whitespace or control bytes (0x21..0x7E). Rejects CR/LF (header injection),
+/// SP (request-line splitting), DEL, NUL and every other control byte.
+pub fn isRequestTokenSafe(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| {
+        if (c < 0x21 or c > 0x7E) return false;
+    }
+    return true;
+}
+
+/// Strict dotted-quad parser: exactly four all-digit octets without leading
+/// zeros, no signs, no separators, no hostnames.
+fn parseIpv4Literal(s: []const u8) ?[4]u8 {
+    var addr: [4]u8 = undefined;
+    var octets = std.mem.splitScalar(u8, s, '.');
+    var i: usize = 0;
+    while (octets.next()) |octet| {
+        if (i >= 4 or octet.len == 0 or octet.len > 3) return null;
+        if (octet.len > 1 and octet[0] == '0') return null;
+        for (octet) |c| {
+            if (c < '0' or c > '9') return null;
+        }
+        addr[i] = std.fmt.parseInt(u8, octet, 10) catch return null;
+        i += 1;
+    }
+    if (i != 4) return null;
+    return addr;
+}
+
+/// Whether a LOCATION URL points back at the device that sent it: its host must
+/// be an IPv4 literal equal to `responder`. A hostname or a different address
+/// would let a rogue SSDP responder redirect the description fetch and the SOAP
+/// control requests to a host of its choosing.
+pub fn locationHostIs(location: []const u8, responder: [4]u8) bool {
+    var host_buf: [64]u8 = undefined;
+    var path_buf: [256]u8 = undefined;
+    var port: u16 = 80;
+    const parts = parseUrl(location, &host_buf, &path_buf, &port) orelse return false;
+    const host_ip = parseIpv4Literal(parts.host) orelse return false;
+    return std.mem.eql(u8, &host_ip, &responder);
+}
+
 fn ipv4Sockaddr(ip: [4]u8, port: u16) posix.sockaddr.in {
     return .{
         .family = posix.AF.INET,
@@ -68,6 +153,12 @@ fn ipv4Sockaddr(ip: [4]u8, port: u16) posix.sockaddr.in {
 const SSDP_ADDR = [4]u8{ 239, 255, 255, 250 };
 const SSDP_PORT: u16 = 1900;
 const SSDP_TIMEOUT_MS: i32 = 3000;
+/// Total wall-clock budget for SSDP discovery, fixed when discovery starts.
+const SSDP_DISCOVERY_DEADLINE_MS: i64 = 5000;
+/// Longest single poll() inside the discovery loop.
+const SSDP_POLL_SLICE_MS: i64 = 500;
+/// SO_SNDTIMEO / SO_RCVTIMEO applied to the TCP socket used for HTTP/SOAP.
+const HTTP_SOCKET_TIMEOUT_MS: u32 = 3000;
 
 const SSDP_SEARCH =
     "M-SEARCH * HTTP/1.1\r\n" ++
@@ -218,35 +309,28 @@ fn ssdpDiscover(gateway_ip: *[4]u8, location_buf: *[512]u8) ?[]const u8 {
     }
     _ = std.c.sendto(fd, SSDP_SEARCH_V2.ptr, SSDP_SEARCH_V2.len, 0, @ptrCast(&dest_addr), @sizeOf(posix.sockaddr.in));
 
-    // Receive responses, filtering for an IGD device.
-    // Many non-IGD devices (TVs, speakers) respond instantly — only count
-    // poll timeouts (no data available) toward the give-up threshold.
-    var timeouts: u32 = 0;
-    while (timeouts < 10) { // 10 timeouts × 500ms = 5s of silence gives up
+    // Receive responses, filtering for an IGD device. Many non-IGD devices (TVs,
+    // speakers) respond instantly and are skipped.
+    // SECURITY: the give-up point is an absolute deadline computed once. The old
+    // loop reset a "silence" counter on every datagram, so a trickle of junk SSDP
+    // kept discovery running indefinitely.
+    const deadline = nowMs() + SSDP_DISCOVERY_DEADLINE_MS;
+    while (true) {
+        const slice = pollSliceMs(deadline, nowMs());
+        if (slice == 0) break;
+
         if (comptime is_linux or is_darwin) {
             const POLLIN: i16 = 0x0001;
             var fds = [1]posix.pollfd{.{ .fd = fd, .events = POLLIN, .revents = 0 }};
-            _ = posix.poll(&fds, 500) catch 0;
-            if ((fds[0].revents & POLLIN) == 0) {
-                timeouts += 1;
-                continue;
-            }
+            _ = posix.poll(&fds, slice) catch 0;
+            if ((fds[0].revents & POLLIN) == 0) continue;
         } else if (comptime is_windows) {
             const POLLIN: i16 = 0x0100 | 0x0200; // POLLRDNORM | POLLRDBAND (Winsock)
             var fds = [1]win.pollfd{.{ .fd = fd, .events = POLLIN, .revents = 0 }};
-            const rc = win.WSAPoll(&fds, 1, 500);
-            if (rc <= 0) {
-                timeouts += 1;
-                continue;
-            }
-            if ((fds[0].revents & POLLIN) == 0) {
-                timeouts += 1;
-                continue;
-            }
+            const rc = win.WSAPoll(&fds, 1, slice);
+            if (rc <= 0) continue;
+            if ((fds[0].revents & POLLIN) == 0) continue;
         }
-
-        // Reset timeout counter — we're still getting responses
-        timeouts = 0;
 
         var recv_buf: [2048]u8 = undefined;
         var src_addr: posix.sockaddr.in = undefined;
@@ -257,15 +341,27 @@ fn ssdpDiscover(gateway_ip: *[4]u8, location_buf: *[512]u8) ?[]const u8 {
         if (n == 0) continue;
 
         const response = recv_buf[0..n];
+        const src_ip: [4]u8 = @bitCast(src_addr.addr);
+
+        // SECURITY: a gateway lives on the LAN. A unicast "response" from a public
+        // address (spoofed, or a hostile peer on a shared segment) must not be able
+        // to hand us a control URL.
+        if (!isLanAddress(src_ip)) continue;
 
         // Only accept responses that contain InternetGatewayDevice or WANIPConnection
         const is_igd = std.mem.indexOf(u8, response, "InternetGatewayDevice") != null;
         const is_wan = std.mem.indexOf(u8, response, "WANIPConnection") != null;
         if (!is_igd and !is_wan) continue;
 
-        // Found the gateway — extract IP and LOCATION
-        gateway_ip.* = @bitCast(src_addr.addr);
-        return parseHeader(response, "LOCATION:", location_buf);
+        // SECURITY: LOCATION must point back at the responder itself (IPv4 literal
+        // equal to the source address), so the description fetch and the SOAP
+        // control requests can only ever reach the LAN host that answered.
+        const location = parseHeader(response, "LOCATION:", location_buf) orelse continue;
+        if (!locationHostIs(location, src_ip)) continue;
+
+        // Found the gateway
+        gateway_ip.* = src_ip;
+        return location;
     }
 
     return null;
@@ -289,9 +385,15 @@ fn parseUrl(url: []const u8, host_buf: *[64]u8, path_buf: *[256]u8, port: *u16) 
     const host_port = rest[0..path_start];
     const path = if (path_start < rest.len) rest[path_start..] else "/";
 
+    // SECURITY: host and path are spliced verbatim into the request line and the
+    // Host header. Reject whitespace and control bytes so a crafted LOCATION
+    // cannot inject headers or split the request.
+    if (!isRequestTokenSafe(path)) return null;
+
     // Parse port if present
     if (std.mem.indexOfScalar(u8, host_port, ':')) |colon| {
         const host = host_port[0..colon];
+        if (!isRequestTokenSafe(host)) return null;
         port.* = std.fmt.parseInt(u16, host_port[colon + 1 ..], 10) catch 80;
         if (host.len > host_buf.len) return null;
         @memcpy(host_buf[0..host.len], host);
@@ -300,6 +402,7 @@ fn parseUrl(url: []const u8, host_buf: *[64]u8, path_buf: *[256]u8, port: *u16) 
         return .{ .host = host_buf[0..host.len], .path = path_buf[0..path.len] };
     } else {
         port.* = 80;
+        if (!isRequestTokenSafe(host_port)) return null;
         if (host_port.len > host_buf.len) return null;
         @memcpy(host_buf[0..host_port.len], host_port);
         if (path.len > path_buf.len) return null;
@@ -331,6 +434,10 @@ fn httpRequest(
         }
     };
     defer closeSocket(fd);
+
+    // Bound connect()/write()/read() so an unresponsive gateway cannot block
+    // startup (previously connect() was blocking with no timeout at all).
+    setSocketTimeouts(fd, HTTP_SOCKET_TIMEOUT_MS);
 
     const addr = ipv4Sockaddr(ip, port);
     if (std.c.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in)) != 0) {
@@ -428,6 +535,8 @@ fn findControlUrl(xml: []const u8, out: *[256]u8) ?[]const u8 {
         const alt_start = alt_pos + control_tag.len;
         const alt_end = std.mem.indexOfPos(u8, xml, alt_start, control_end_tag) orelse return null;
         const alt_url = xml[alt_start..alt_end];
+        // SECURITY: controlURL becomes the SOAP request target verbatim.
+        if (!isRequestTokenSafe(alt_url)) return null;
         if (alt_url.len > out.len) return null;
         @memcpy(out[0..alt_url.len], alt_url);
         return out[0..alt_url.len];
@@ -435,6 +544,7 @@ fn findControlUrl(xml: []const u8, out: *[256]u8) ?[]const u8 {
     const start = ctrl_pos + control_tag.len;
     const end = std.mem.indexOfPos(u8, xml, start, control_end_tag) orelse return null;
     const url = xml[start..end];
+    if (!isRequestTokenSafe(url)) return null;
     if (url.len > out.len) return null;
     @memcpy(out[0..url.len], url);
     return out[0..url.len];
@@ -497,6 +607,10 @@ fn getExternalIp(ip: [4]u8, port: u16, host: []const u8, control_path: []const u
         parts[i] = std.fmt.parseInt(u8, part, 10) catch return error.ParseError;
         rest = if (dot) |d| rest[d + 1 ..] else rest[rest.len..];
     }
+    // SECURITY: an "external" address that cannot be a public endpoint (loopback,
+    // link-local, multicast, the mesh prefix, ...) is treated as no external IP at
+    // all, so the caller keeps the STUN result instead of advertising it.
+    if (!Stun.isPlausiblePublicAddress(parts)) return error.ParseError;
     ext_ip.* = parts;
 }
 
@@ -586,6 +700,9 @@ fn parseHeader(data: []const u8, name: []const u8, out: *[512]u8) ?[]const u8 {
             // Read until \r\n
             const end = std.mem.indexOfPos(u8, data, pos, "\r\n") orelse data.len;
             const val = std.mem.trimEnd(u8, data[pos..end], " \t");
+            // SECURITY: the (LOCATION) value feeds the HTTP request line; refuse
+            // anything with whitespace or control bytes inside it.
+            if (!isRequestTokenSafe(val)) return null;
             if (val.len > out.len) return null;
             @memcpy(out[0..val.len], val);
             return out[0..val.len];
@@ -644,7 +761,141 @@ test "parseHeader case insensitive" {
     try std.testing.expectEqualStrings("http://192.168.1.1:5000/rootDesc.xml", val);
 }
 
-test "isNewerVersion" {
-    // Use direct assertions since this is an internal test
-    try std.testing.expect(parseUrl("http://x.x:1/a", &@as([64]u8, @splat(0)), &@as([256]u8, @splat(0)), &@as(u16, 0)) != null or true);
+test "parseUrl enforces host and path buffer limits" {
+    // (Formerly a no-op "isNewerVersion" test that did not compile: it passed
+    // const buffers to parseUrl and asserted `... or true`.)
+    var host_buf: [64]u8 = undefined;
+    var path_buf: [256]u8 = undefined;
+    var port: u16 = 0;
+    try std.testing.expect(parseUrl("http://x.x:1/a", &host_buf, &path_buf, &port) != null);
+    try std.testing.expectEqual(@as(u16, 1), port);
+
+    // A host longer than the 64-byte buffer is rejected rather than truncated.
+    const long_host: []const u8 = "http://" ++ @as([65]u8, @splat('a')) ++ "/x";
+    try std.testing.expect(parseUrl(long_host, &host_buf, &path_buf, &port) == null);
+    // A path longer than the 256-byte buffer is rejected too.
+    const long_path: []const u8 = "http://192.168.1.1/" ++ @as([256]u8, @splat('p'));
+    try std.testing.expect(parseUrl(long_path, &host_buf, &path_buf, &port) == null);
+}
+
+test "isLanAddress accepts only RFC1918 and link-local responders" {
+    try std.testing.expect(isLanAddress(.{ 192, 168, 1, 1 }));
+    try std.testing.expect(isLanAddress(.{ 10, 0, 0, 1 }));
+    try std.testing.expect(isLanAddress(.{ 172, 16, 0, 1 }));
+    try std.testing.expect(isLanAddress(.{ 172, 31, 255, 254 }));
+    try std.testing.expect(isLanAddress(.{ 169, 254, 10, 20 }));
+
+    try std.testing.expect(!isLanAddress(.{ 172, 15, 0, 1 }));
+    try std.testing.expect(!isLanAddress(.{ 172, 32, 0, 1 }));
+    try std.testing.expect(!isLanAddress(.{ 192, 169, 0, 1 }));
+    try std.testing.expect(!isLanAddress(.{ 203, 0, 113, 1 })); // public
+    try std.testing.expect(!isLanAddress(.{ 127, 0, 0, 1 })); // loopback
+    try std.testing.expect(!isLanAddress(.{ 100, 64, 0, 1 })); // CGNAT is not a LAN gateway
+    try std.testing.expect(!isLanAddress(.{ 0, 0, 0, 0 }));
+}
+
+test "locationHostIs requires an IPv4 literal equal to the responder" {
+    const gw = [4]u8{ 192, 168, 1, 1 };
+    try std.testing.expect(locationHostIs("http://192.168.1.1:5000/rootDesc.xml", gw));
+    try std.testing.expect(locationHostIs("http://192.168.1.1/rootDesc.xml", gw));
+    try std.testing.expect(locationHostIs("http://192.168.1.1", gw));
+
+    try std.testing.expect(!locationHostIs("http://192.168.1.2:5000/rootDesc.xml", gw)); // other host
+    try std.testing.expect(!locationHostIs("http://router.local:5000/rootDesc.xml", gw)); // hostname
+    try std.testing.expect(!locationHostIs("http://192.168.1.1.evil.example/x", gw)); // not a literal
+    try std.testing.expect(!locationHostIs("http://192.168.1/x", gw)); // too few octets
+    try std.testing.expect(!locationHostIs("http://192.168.001.1/x", gw)); // keep it strict: no padding
+    try std.testing.expect(!locationHostIs("https://192.168.1.1/x", gw)); // only http://
+    try std.testing.expect(!locationHostIs("http://:5000/x", gw)); // empty host
+}
+
+test "isRequestTokenSafe rejects whitespace and control bytes" {
+    try std.testing.expect(isRequestTokenSafe("/ctl/IPConn"));
+    try std.testing.expect(isRequestTokenSafe("192.168.1.1"));
+    try std.testing.expect(isRequestTokenSafe("/a?b=c&d=%20"));
+    try std.testing.expect(isRequestTokenSafe("!~")); // 0x21 and 0x7E are the bounds
+
+    try std.testing.expect(!isRequestTokenSafe(""));
+    try std.testing.expect(!isRequestTokenSafe("/a b"));
+    try std.testing.expect(!isRequestTokenSafe("/a\r\nX-Injected: 1"));
+    try std.testing.expect(!isRequestTokenSafe("/a\n"));
+    try std.testing.expect(!isRequestTokenSafe("/a\t"));
+    try std.testing.expect(!isRequestTokenSafe("/a\x00"));
+    try std.testing.expect(!isRequestTokenSafe("/a\x7f"));
+    try std.testing.expect(!isRequestTokenSafe("/a\x80"));
+}
+
+test "parseUrl rejects hosts and paths that could inject into the request" {
+    var host_buf: [64]u8 = undefined;
+    var path_buf: [256]u8 = undefined;
+    var port: u16 = 80;
+    // CRLF in path -> header injection
+    try std.testing.expect(parseUrl("http://192.168.1.1/desc.xml\r\nHost: evil", &host_buf, &path_buf, &port) == null);
+    // Space in path -> request-line splitting
+    try std.testing.expect(parseUrl("http://192.168.1.1/a b", &host_buf, &path_buf, &port) == null);
+    // Control byte / space in host (with and without an explicit port)
+    try std.testing.expect(parseUrl("http://192.168.1.1\x01:80/x", &host_buf, &path_buf, &port) == null);
+    try std.testing.expect(parseUrl("http://192.168 .1.1/x", &host_buf, &path_buf, &port) == null);
+    // Empty host
+    try std.testing.expect(parseUrl("http:///x", &host_buf, &path_buf, &port) == null);
+    try std.testing.expect(parseUrl("http://:80/x", &host_buf, &path_buf, &port) == null);
+    // A clean URL still parses
+    try std.testing.expect(parseUrl("http://192.168.1.1:5000/rootDesc.xml", &host_buf, &path_buf, &port) != null);
+}
+
+test "findControlUrl rejects control URLs with whitespace or control bytes" {
+    var out: [256]u8 = undefined;
+    const injected =
+        "<serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType>" ++
+        "<controlURL>/ctl\r\nX-Injected: 1</controlURL>";
+    try std.testing.expect(findControlUrl(injected, &out) == null);
+
+    const spaced =
+        "<serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType>" ++
+        "<controlURL>/ctl IPConn</controlURL>";
+    try std.testing.expect(findControlUrl(spaced, &out) == null);
+
+    const empty =
+        "<serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType>" ++
+        "<controlURL></controlURL>";
+    try std.testing.expect(findControlUrl(empty, &out) == null);
+
+    // The fallback branch (controlURL listed before the serviceType) is covered too.
+    const alt_injected =
+        "<controlURL>/ctl\nX</controlURL>" ++
+        "<serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType>";
+    try std.testing.expect(findControlUrl(alt_injected, &out) == null);
+    const alt_ok =
+        "<controlURL>/ctl/IPConn</controlURL>" ++
+        "<serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType>";
+    try std.testing.expectEqualStrings("/ctl/IPConn", findControlUrl(alt_ok, &out) orelse unreachable);
+}
+
+test "parseHeader rejects LOCATION values with control bytes" {
+    var out: [512]u8 = undefined;
+    const data = "HTTP/1.1 200 OK\r\nLOCATION: http://192.168.1.1/\x01desc.xml\r\n\r\n";
+    try std.testing.expect(parseHeader(data, "LOCATION:", &out) == null);
+    const spaced = "HTTP/1.1 200 OK\r\nLOCATION: http://192.168.1.1/desc.xml HTTP/1.0\r\n\r\n";
+    try std.testing.expect(parseHeader(spaced, "LOCATION:", &out) == null);
+}
+
+test "pollSliceMs never outlives the deadline and never exceeds one slice" {
+    try std.testing.expectEqual(@as(i32, 500), pollSliceMs(5000, 0));
+    try std.testing.expectEqual(@as(i32, 500), pollSliceMs(5000, 4500));
+    try std.testing.expectEqual(@as(i32, 200), pollSliceMs(5000, 4800));
+    try std.testing.expectEqual(@as(i32, 1), pollSliceMs(5000, 4999));
+    try std.testing.expectEqual(@as(i32, 0), pollSliceMs(5000, 5000));
+    try std.testing.expectEqual(@as(i32, 0), pollSliceMs(5000, 6000)); // past the deadline: stop
+
+    // A deadline fixed at start is unaffected by how many datagrams arrived: the
+    // slice only ever shrinks as the clock advances.
+    var now: i64 = 0;
+    var total: i64 = 0;
+    while (true) {
+        const slice = pollSliceMs(5000, now);
+        if (slice == 0) break;
+        now += slice;
+        total += slice;
+    }
+    try std.testing.expectEqual(@as(i64, 5000), total);
 }

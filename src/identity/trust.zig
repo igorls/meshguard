@@ -78,6 +78,54 @@ pub const ExistingKeyInfo = struct {
     key_matches: bool,
 };
 
+/// Base64 length of a 32-byte public key.
+pub const PUBLIC_KEY_B64_LEN: usize = 44;
+pub const MAX_NAME_LEN: usize = 64;
+
+/// True when `name` is safe to use as a file name under the config directory:
+/// 1-64 characters from [A-Za-z0-9._-], not starting with '-' or '.', so it can
+/// neither escape the directory (`../identity`) nor look like a flag or hidden file.
+pub fn isValidName(name: []const u8) bool {
+    if (name.len == 0 or name.len > MAX_NAME_LEN) return false;
+    if (name[0] == '-' or name[0] == '.') return false;
+    for (name) |c| {
+        const ok = std.ascii.isAlphanumeric(c) or c == '.' or c == '_' or c == '-';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+fn requireValidName(name: []const u8) !void {
+    if (!isValidName(name)) return error.InvalidName;
+}
+
+test "isValidName keeps names inside the config directory" {
+    try std.testing.expect(isValidName("validator-3"));
+    try std.testing.expect(isValidName("node_1.example"));
+    try std.testing.expect(isValidName("A"));
+    try std.testing.expect(!isValidName(""));
+    try std.testing.expect(!isValidName("../identity"));
+    try std.testing.expect(!isValidName("..")); // starts with '.'
+    try std.testing.expect(!isValidName("a/b"));
+    try std.testing.expect(!isValidName("a\\b"));
+    try std.testing.expect(!isValidName("-flag"));
+    try std.testing.expect(!isValidName(".hidden"));
+    try std.testing.expect(!isValidName("with space"));
+    try std.testing.expect(!isValidName("nul\x00byte"));
+    var long_name: [65]u8 = undefined;
+    @memset(&long_name, 'x');
+    try std.testing.expect(!isValidName(&long_name));
+    try std.testing.expect(isValidName(long_name[0..64]));
+}
+
+test "validateKey rejects keys that are not exactly 44 base64 characters" {
+    var key_b64: [44]u8 = undefined;
+    var pk: [32]u8 = undefined;
+    // 45 characters: would have overflowed the 44-byte output copy before decoding.
+    try std.testing.expect(validateKey("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==", &key_b64, &pk) != null);
+    try std.testing.expect(validateKey("AAAA", &key_b64, &pk) != null);
+}
+
 /// Validate a key input and return the base64 key string and auto-derived name.
 /// Returns a user-friendly error message on failure, or null on success.
 pub fn validateKey(key_or_path: []const u8, key_b64_out: *[44]u8, pk_bytes_out: *[32]u8) ?[]const u8 {
@@ -95,6 +143,12 @@ pub fn validateKey(key_or_path: []const u8, key_b64_out: *[44]u8, pk_bytes_out: 
         key_b64 = std.mem.trimEnd(u8, file_buf[0..read], "\n\r ");
     } else {
         key_b64 = key_or_path;
+    }
+
+    // A 32-byte key is exactly 44 base64 characters. Check before decoding: the
+    // decoder does not bound its output, and the copy below is into a 44-byte buffer.
+    if (key_b64.len != PUBLIC_KEY_B64_LEN) {
+        return "invalid key length — expected 44 base64 characters";
     }
 
     // Validate base64 encoding
@@ -178,6 +232,7 @@ pub fn checkNameConflict(allocator: std.mem.Allocator, config_dir: []const u8, n
 /// `key_or_path` can be a base64 key string or a path to a .pub file.
 /// `peer_name` optionally overrides the derived filename.
 pub fn addAuthorizedKey(allocator: std.mem.Allocator, config_dir: []const u8, key_b64: []const u8, name: []const u8) !void {
+    try requireValidName(name);
     const auth_dir = try ensureAuthorizedKeysDir(allocator, config_dir);
     defer allocator.free(auth_dir);
 
@@ -195,6 +250,7 @@ pub fn addAuthorizedKey(allocator: std.mem.Allocator, config_dir: []const u8, ke
 
 /// Remove an old key file when renaming (dedup).
 pub fn removeKeyFile(allocator: std.mem.Allocator, config_dir: []const u8, name: []const u8) !void {
+    try requireValidName(name);
     const auth_dir = try ensureAuthorizedKeysDir(allocator, config_dir);
     defer allocator.free(auth_dir);
 
@@ -212,6 +268,12 @@ pub fn removeKeyFile(allocator: std.mem.Allocator, config_dir: []const u8, name:
 pub fn removeAuthorizedKey(allocator: std.mem.Allocator, config_dir: []const u8, key_or_name: []const u8) !void {
     const auth_dir = try ensureAuthorizedKeysDir(allocator, config_dir);
     defer allocator.free(auth_dir);
+
+    // Anything that is not a valid name can only be a key: match it by content.
+    if (!isValidName(key_or_name)) {
+        try removeByKeyContent(allocator, auth_dir, key_or_name);
+        return;
+    }
 
     // Try to delete by name first
     const pub_name = try std.fmt.allocPrint(allocator, "{s}.pub", .{key_or_name});
@@ -260,6 +322,7 @@ pub fn loadAuthorizedKeys(allocator: std.mem.Allocator, config_dir: []const u8) 
         var buf: [256]u8 = undefined;
         const read = readFileBytes(file, &buf) catch continue;
         const key_b64 = std.mem.trimEnd(u8, buf[0..read], "\n\r ");
+        if (key_b64.len != PUBLIC_KEY_B64_LEN) continue; // the decoder does not bound its output
 
         var pk_bytes: [32]u8 = undefined;
         std.base64.standard.Decoder.decode(&pk_bytes, key_b64) catch continue;
@@ -357,9 +420,12 @@ pub fn loadTrustedOrgs(allocator: std.mem.Allocator, config_dir: []const u8) ![]
         var buf: [256]u8 = undefined;
         const read = readFileBytes(file, &buf) catch continue;
         const key_b64 = std.mem.trimEnd(u8, buf[0..read], "\n\r ");
+        if (key_b64.len != PUBLIC_KEY_B64_LEN) continue; // the decoder does not bound its output
 
         var pk_bytes: [32]u8 = undefined;
         std.base64.standard.Decoder.decode(&pk_bytes, key_b64) catch continue;
+        // An org key must be a usable Ed25519 point, like authorized peer keys.
+        _ = std.crypto.sign.Ed25519.PublicKey.fromBytes(pk_bytes) catch continue;
 
         const name = try allocator.dupe(u8, std.fs.path.stem(entry.name));
         temp[count] = .{ .name = name, .public_key = pk_bytes };
@@ -373,6 +439,7 @@ pub fn loadTrustedOrgs(allocator: std.mem.Allocator, config_dir: []const u8) ![]
 
 /// Add a trusted org to the trusted_orgs/ directory.
 pub fn addTrustedOrg(allocator: std.mem.Allocator, config_dir: []const u8, key_b64: []const u8, name: []const u8) !void {
+    try requireValidName(name);
     const org_dir = try std.fs.path.join(allocator, &.{ config_dir, "trusted_orgs" });
     defer allocator.free(org_dir);
     makeDirPath(org_dir) catch |err| {
@@ -393,6 +460,7 @@ pub fn addTrustedOrg(allocator: std.mem.Allocator, config_dir: []const u8, key_b
 
 /// Remove a trusted org from the trusted_orgs/ directory.
 pub fn removeTrustedOrg(allocator: std.mem.Allocator, config_dir: []const u8, name: []const u8) !void {
+    try requireValidName(name);
     const org_dir = try std.fs.path.join(allocator, &.{ config_dir, "trusted_orgs" });
     defer allocator.free(org_dir);
 
@@ -457,7 +525,7 @@ test "add and load authorized key" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(zio(), ".", allocator);
     defer allocator.free(tmp_path);
 
     // Generate a key and add it

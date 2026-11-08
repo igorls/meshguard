@@ -53,6 +53,8 @@ const DONE_PROBE_NS: i128 = 1000 * ms;
 const ACK_DELAY_NS: i128 = 10 * ms;
 const ACK_EVERY: u32 = 16;
 const MAX_RESTARTS: u8 = 3;
+/// How far ahead of our clock an offer may be dated (sender clock skew).
+const OFFER_CLOCK_SKEW_SECS: i64 = 300;
 
 pub const SendFn = *const fn (ctx: *anyopaque, peer: [32]u8, plaintext: []const u8) bool;
 
@@ -409,7 +411,10 @@ pub const TransferManager = struct {
             return;
         }
         const reason: ?wire.Reason = blk: {
-            if (now_unix - o.created_unix > self.limits.max_offer_age_secs) break :blk .expired;
+            // `created_unix` comes off the wire: saturate so no value can
+            // overflow, and refuse dates further ahead than clock skew explains.
+            const age = now_unix -| o.created_unix;
+            if (age > self.limits.max_offer_age_secs or age < -OFFER_CLOCK_SKEW_SECS) break :blk .expired;
             const listener = self.findListener(o.channel) orelse break :blk .no_listener;
             if (o.size > listener.max_bytes) break :blk .too_large;
             if (o.chunk_size != wire.CHUNK_SIZE) break :blk .invalid;
@@ -1008,4 +1013,26 @@ test "acknowledgements from another peer are ignored and replayed offers are not
     const stale = try wire.encodeOffer(&buf, @splat(5), .{ .created_unix = 1_780_000_000, .size = 10, .chunk_size = wire.CHUNK_SIZE, .sha256 = @splat(1), .channel = "files", .meta = "" });
     pair.b.handleFrame(testKey(0), stale, pair.net.now, 1_790_000_000);
     for (pair.b.incoming) |slot| try std.testing.expect(slot == null);
+}
+
+test "offers dated absurdly or in the future are refused without overflowing" {
+    const allocator = std.testing.allocator;
+    var pair: Pair = undefined;
+    pair.init(allocator, .{});
+    defer pair.deinit();
+    try pair.b.listen("files", 1024 * 1024);
+    var buf: [wire.MAX_FRAME]u8 = undefined;
+    const now: i64 = 1_790_000_000;
+    const dates = [_]i64{ std.math.minInt(i64), std.math.maxInt(i64), now + 24 * 60 * 60, now - OFFER_CLOCK_SKEW_SECS - pair.b.limits.max_offer_age_secs };
+    for (dates, 0..) |created, n| {
+        var id: [16]u8 = @splat(0);
+        id[0] = @intCast(n + 1);
+        const offer = try wire.encodeOffer(&buf, id, .{ .created_unix = created, .size = 10, .chunk_size = wire.CHUNK_SIZE, .sha256 = @splat(1), .channel = "files", .meta = "" });
+        pair.b.handleFrame(testKey(0), offer, pair.net.now, now);
+    }
+    for (pair.b.incoming) |slot| try std.testing.expect(slot == null);
+    // A sender clock slightly ahead of ours is tolerated.
+    const skewed = try wire.encodeOffer(&buf, @splat(9), .{ .created_unix = now + OFFER_CLOCK_SKEW_SECS - 1, .size = 10, .chunk_size = wire.CHUNK_SIZE, .sha256 = @splat(1), .channel = "files", .meta = "" });
+    pair.b.handleFrame(testKey(0), skewed, pair.net.now, now);
+    try std.testing.expect(pair.b.findIncoming(@splat(9)) != null);
 }

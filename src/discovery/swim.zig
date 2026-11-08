@@ -59,6 +59,21 @@ fn incarnationNow() u64 {
 // ceiling nor ahead of a genuine future restart's (later) startup time.
 const INCARNATION_SKEW_NS: u64 = 300 * std.time.ns_per_s; // 5 minutes
 
+// Minimum time between two accepted restarts (incarnation bumps) of one peer.
+// Ping/ack are not origin-authenticated and an accepted bump tears the peer's
+// tunnel down and rebuilds it, so without this a spoofer could repeat the
+// teardown at line rate. A genuine restart inside the window is picked up by
+// the first ping after it.
+const INCARNATION_BUMP_COOLDOWN_NS: i128 = 60 * std.time.ns_per_s;
+
+// Org-scoped revocations and vouches kept in memory. The tables used to hold
+// 64 entries and silently skipped the 65th valid revocation.
+const MAX_REVOCATIONS: usize = 1024;
+const MAX_VOUCHES: usize = 1024;
+// A full table is an operator-visible error. The test runner fails any test
+// that logs an error, so tests exercising the full-table paths log a warning.
+const tableFullLog = if (builtin.is_test) log.warn else log.err;
+
 pub const SwimConfig = struct {
     gossip_port: u16 = 51821,
     gossip_interval_ms: u32 = 5000, // 5s — reasonable for WAN
@@ -239,9 +254,11 @@ pub const SwimProtocol = struct {
     org_control_count: usize = 0,
 
     // Verified/signed revocations retained for periodic re-broadcast.
-    org_revokes: [Org.MAX_ORG_REVOKES]messages.OrgCertRevoke = std.mem.zeroes([Org.MAX_ORG_REVOKES]messages.OrgCertRevoke),
+    org_revokes: [MAX_REVOCATIONS]messages.OrgCertRevoke = std.mem.zeroes([MAX_REVOCATIONS]messages.OrgCertRevoke),
     org_revoke_count: usize = 0,
     last_org_revoke_readvertise_ns: i128 = 0,
+    // Where the next re-advertisement round starts in `org_revokes`.
+    org_revoke_readvertise_cursor: usize = 0,
 
     // Unauthenticated gossip endpoint hints. These are never exposed as members,
     // never re-gossiped, and only exist to trigger bounded direct certificate probes.
@@ -273,12 +290,15 @@ pub const SwimProtocol = struct {
     alias_count: usize = 0,
 
     // Org-scoped revoked node pubkeys (propagated via gossip)
-    revoked_nodes: [64]OrgRevokedNode = std.mem.zeroes([64]OrgRevokedNode),
+    revoked_nodes: [MAX_REVOCATIONS]OrgRevokedNode = std.mem.zeroes([MAX_REVOCATIONS]OrgRevokedNode),
     revoked_count: usize = 0,
+    // A revocation the table could not take, while it is applied to current
+    // members (see applyOrgRevoke); consulted by orgRevokesNode.
+    applying_revoke: ?OrgRevokedNode = null,
 
     // Vouched external nodes: org admin vouches for standalone nodes (propagated via gossip)
-    vouched_org_keys: [64][32]u8 = std.mem.zeroes([64][32]u8),
-    vouched_node_keys: [64][32]u8 = std.mem.zeroes([64][32]u8),
+    vouched_org_keys: [MAX_VOUCHES][32]u8 = std.mem.zeroes([MAX_VOUCHES][32]u8),
+    vouched_node_keys: [MAX_VOUCHES][32]u8 = std.mem.zeroes([MAX_VOUCHES][32]u8),
     vouched_count: usize = 0,
 
     // Node's own org certificate (if any, loaded at init)
@@ -383,6 +403,10 @@ pub const SwimProtocol = struct {
                 return true;
             }
         }
+        if (self.applying_revoke) |revoked| {
+            return std.mem.eql(u8, &revoked.org_pubkey, &org_pubkey) and
+                std.mem.eql(u8, &revoked.node_pubkey, &node_pubkey);
+        }
         return false;
     }
 
@@ -485,8 +509,8 @@ pub const SwimProtocol = struct {
         if (!self.enforce_trust) return true;
         // Always allow our own pubkey
         if (std.mem.eql(u8, &pubkey, &self.our_pubkey)) return true;
-        // Allow zero pubkey (initial seed hello pings)
-        if (std.mem.eql(u8, &pubkey, &@as([32]u8, @splat(0)))) return true;
+        // The all-zero "hello" sender is answered minimally by handleMessage
+        // before any trust check and is authorized for nothing else.
         // Check authorized set (individual keys)
         for (self.authorized_keys[0..self.authorized_count]) |key| {
             if (std.mem.eql(u8, &key, &pubkey)) return true;
@@ -513,12 +537,19 @@ pub const SwimProtocol = struct {
 
     /// Admission callback for the relay core.
     pub fn relayAdmission(self: *SwimProtocol) RelayCore.Admission {
-        return .{ .ctx = self, .admits = admitsForRelay };
+        return .{ .ctx = self, .admits = admitsForRelay, .trustsOrg = trustsOrgForRelay };
     }
 
     fn admitsForRelay(ctx: *anyopaque, identity: [32]u8) bool {
         const self: *SwimProtocol = @ptrCast(@alignCast(ctx));
         return self.isAuthorizedPeer(identity, null);
+    }
+
+    /// Certificates from these organizations may vouch for WireGuard keys at
+    /// the relay core: the same trusted-org list that admits their holders.
+    fn trustsOrgForRelay(ctx: *anyopaque, org_pubkey: [32]u8) bool {
+        const self: *SwimProtocol = @ptrCast(@alignCast(ctx));
+        return self.isOrgAuthorizedPeer(org_pubkey);
     }
 
     /// Answers a Noise initiation for a relay client the WireGuard device does
@@ -532,8 +563,15 @@ pub const SwimProtocol = struct {
 
     fn claimForRelay(self: *SwimProtocol, sender: [32]u8, binding: ?messages.WgBinding, cert: ?*const [messages.ORG_CERT_WIRE_SIZE]u8) void {
         const core = self.relay_core orelse return;
+        // A certificate vouches for a key only when its organization is trusted
+        // here and it is neither revoked nor expired; the core checks its
+        // signature, not our trust.
+        const trusted_cert: ?*const [messages.ORG_CERT_WIRE_SIZE]u8 = if (cert) |c|
+            (if (self.certAuthorizesPeer(sender, c.*)) c else null)
+        else
+            null;
         const known_wg = if (self.membership.peers.get(sender)) |p| p.wg_pubkey else null;
-        _ = core.claim(.{ .identity = sender, .wg_binding = binding, .org_cert = cert, .known_wg = known_wg }, nowNs());
+        _ = core.claim(.{ .identity = sender, .wg_binding = binding, .org_cert = trusted_cert, .known_wg = known_wg }, nowNs());
     }
 
     pub fn isKnownRelayParticipant(self: *const SwimProtocol, pubkey: [32]u8) bool {
@@ -931,6 +969,16 @@ pub const SwimProtocol = struct {
             .org_cert_revoke => |rev| rev.org_pubkey,
             .org_trust_vouch => |v| v.org_pubkey,
         };
+        // An anonymous (all-zero) sender can only say hello. It is answered
+        // with a minimal ACK and nothing else runs for it: no gossip,
+        // membership, probing or rendezvous.
+        if (std.mem.eql(u8, &sender_pubkey, &@as([32]u8, @splat(0)))) {
+            switch (decoded) {
+                .ping => |p| self.sendMinimalAck(p.seq, sender_endpoint),
+                else => {},
+            }
+            return;
+        }
         const presented_cert: ?[messages.ORG_CERT_WIRE_SIZE]u8 = switch (decoded) {
             .ping => |p| if (p.has_org_cert) p.org_cert else null,
             .ack => |a| if (a.has_org_cert) a.org_cert else null,
@@ -1102,7 +1150,9 @@ pub const SwimProtocol = struct {
         // Check for existing entry for this org (different alias name)
         for (0..self.alias_count) |i| {
             if (std.mem.eql(u8, &self.alias_org_pubkeys[i], &ann.org_pubkey)) {
-                // Update alias name for this org
+                // Rename only on a newer announcement: a replayed older one
+                // must not roll the name back.
+                if (ann.lamport <= self.alias_lamports[i]) return;
                 self.alias_names[i] = ann.alias;
                 self.alias_lamports[i] = ann.lamport;
                 return;
@@ -1135,46 +1185,74 @@ pub const SwimProtocol = struct {
         }
         if (self.orgRevokesNode(rev.org_pubkey, rev.node_pubkey)) return;
 
-        // Add to revocation set
-        if (self.revoked_count < self.revoked_nodes.len) {
-            self.revoked_nodes[self.revoked_count] = .{
-                .org_pubkey = rev.org_pubkey,
-                .node_pubkey = rev.node_pubkey,
-            };
-            self.revoked_count += 1;
+        // Add to revocation set. When the table cannot take it, the revocation
+        // is still enforced against current members below, through
+        // `applying_revoke`, but it will not be remembered.
+        const entry = OrgRevokedNode{ .org_pubkey = rev.org_pubkey, .node_pubkey = rev.node_pubkey };
+        if (self.rememberRevokedNode(entry)) {
             log.warn("node revoked by org (reason={d})", .{rev.reason});
-
-            // If the revoked node, or any leaf cert issued by that node, is
-            // currently authorized only by this org's cert/vouch, mark it dead.
-            // Other orgs or explicit key trust are independent authorization
-            // boundaries. Affected peers are collected in batches, so the
-            // membership is walked once per batch, not once per peer.
-            var batch: [256][32]u8 = undefined;
-            while (true) {
-                var n: usize = 0;
-                var iter = self.membership.peers.iterator();
-                while (iter.next()) |entry| {
-                    const peer = entry.value_ptr.*;
-                    if (peer.state != .alive and peer.state != .suspected) continue;
-                    if (!revokedOrgGrantAffectsPeer(rev, entry.key_ptr.*, peer)) continue;
-                    if (self.isAuthorizedPeer(entry.key_ptr.*, null)) continue;
-                    batch[n] = entry.key_ptr.*;
-                    n += 1;
-                    if (n == batch.len) break;
-                }
-                for (batch[0..n]) |key| {
-                    self.membership.markDead(key);
-                    if (self.handler) |h| {
-                        h.onPeerDead(h.ctx, key);
-                    }
-                }
-                if (n < batch.len) break;
-            }
-            if (self.relay_core) |core| core.bumpTrustEpoch();
+        } else {
+            tableFullLog("revocation table full ({d} entries): org revocation (reason={d}) is enforced against current members only and will not be remembered", .{ self.revoked_nodes.len, rev.reason });
+            self.applying_revoke = entry;
         }
+        defer self.applying_revoke = null;
+
+        // If the revoked node, or any leaf cert issued by that node, is
+        // currently authorized only by this org's cert/vouch, mark it dead.
+        // Other orgs or explicit key trust are independent authorization
+        // boundaries. Affected peers are collected in batches, so the
+        // membership is walked once per batch, not once per peer.
+        var batch: [256][32]u8 = undefined;
+        while (true) {
+            var n: usize = 0;
+            var iter = self.membership.peers.iterator();
+            while (iter.next()) |member| {
+                const peer = member.value_ptr.*;
+                if (peer.state != .alive and peer.state != .suspected) continue;
+                if (!revokedOrgGrantAffectsPeer(rev, member.key_ptr.*, peer)) continue;
+                if (self.isAuthorizedPeer(member.key_ptr.*, null)) continue;
+                batch[n] = member.key_ptr.*;
+                n += 1;
+                if (n == batch.len) break;
+            }
+            for (batch[0..n]) |key| {
+                self.membership.markDead(key);
+                if (self.handler) |h| {
+                    h.onPeerDead(h.ctx, key);
+                }
+            }
+            if (n < batch.len) break;
+        }
+        if (self.relay_core) |core| core.bumpTrustEpoch();
         if (rebroadcast) {
             self.enqueueOrgRevokeBroadcast(rev, self.config.max_gossip_broadcasts);
         }
+    }
+
+    /// Records an org-scoped revocation for enforcement. A full table drops
+    /// its oldest entry whose node's recorded certificate from that org has
+    /// expired (such a certificate is refused anyway). Returns false when the
+    /// table is full and nothing could be dropped.
+    fn rememberRevokedNode(self: *SwimProtocol, entry: OrgRevokedNode) bool {
+        if (self.revoked_count >= self.revoked_nodes.len and !self.evictExpiredRevocation()) return false;
+        self.revoked_nodes[self.revoked_count] = entry;
+        self.revoked_count += 1;
+        return true;
+    }
+
+    fn evictExpiredRevocation(self: *SwimProtocol) bool {
+        // Entries are appended in arrival order, so the first match is the oldest.
+        for (self.revoked_nodes[0..self.revoked_count], 0..) |revoked, i| {
+            const peer = self.membership.peers.get(revoked.node_pubkey) orelse continue;
+            const org_pubkey = peer.org_pubkey orelse continue;
+            if (!std.mem.eql(u8, &org_pubkey, &revoked.org_pubkey)) continue;
+            const expires_at = peer.cert_expires_at orelse continue;
+            if (expires_at == 0 or self.certExpiryValid(expires_at)) continue;
+            std.mem.copyForwards(OrgRevokedNode, self.revoked_nodes[i .. self.revoked_count - 1], self.revoked_nodes[i + 1 .. self.revoked_count]);
+            self.revoked_count -= 1;
+            return true;
+        }
+        return false;
     }
 
     /// Handle an OrgTrustVouch: org admin vouches for an external standalone node.
@@ -1209,10 +1287,19 @@ pub const SwimProtocol = struct {
             self.vouched_node_keys[self.vouched_count] = vouch.vouched_pubkey;
             self.vouched_count += 1;
             log.info("org vouched for external node", .{});
+        } else {
+            tableFullLog("vouch table full ({d} entries): org vouch dropped, the node is not admitted", .{self.vouched_org_keys.len});
         }
     }
 
     fn handlePing(self: *SwimProtocol, ping: *const codec.DecodedPing, sender_endpoint: messages.Endpoint) void {
+        // Only a member pinging from the endpoint we recorded for it gets the
+        // full answer (gossip, certificate, binding: many times the ping's
+        // size). Senders we do not know yet and spoofed sources get a minimal
+        // ACK, so a ping cannot be amplified toward a third party. Decided
+        // before the sender is registered below.
+        const full_answer = self.isMemberAtEndpoint(ping.sender_pubkey, sender_endpoint);
+
         // Register sender FIRST so gossip callbacks see the real network address
         if (!std.mem.eql(u8, &ping.sender_pubkey, &@as([32]u8, @splat(0)))) {
             self.registerOrUpdatePeerEndpoint(ping.sender_pubkey, sender_endpoint);
@@ -1225,13 +1312,15 @@ pub const SwimProtocol = struct {
             self.claimForRelay(ping.sender_pubkey, ping.wg_binding, if (ping.has_org_cert) &ping.org_cert else null);
             self.removeCandidatePeer(ping.sender_pubkey);
             // Authenticated contact: detect + heal a peer restart.
-            self.handleSenderIncarnation(ping.sender_pubkey, ping.incarnation);
+            self.handleSenderIncarnation(ping.sender_pubkey, ping.incarnation, sender_endpoint);
         }
 
         // Process piggybacked gossip (onPeerJoin may fire here)
         for (ping.gossip()) |entry| {
             self.applyGossip(entry);
         }
+
+        if (!full_answer) return self.sendMinimalAck(ping.seq, sender_endpoint);
 
         // Send ACK back
         const gossip = self.collectGossip();
@@ -1267,7 +1356,7 @@ pub const SwimProtocol = struct {
             self.claimForRelay(ack.sender_pubkey, ack.wg_binding, if (ack.has_org_cert) &ack.org_cert else null);
             self.removeCandidatePeer(ack.sender_pubkey);
             // Authenticated contact: detect + heal a peer restart.
-            self.handleSenderIncarnation(ack.sender_pubkey, ack.incarnation);
+            self.handleSenderIncarnation(ack.sender_pubkey, ack.incarnation, sender_endpoint);
         }
 
         // Process piggybacked gossip (onPeerJoin may fire here)
@@ -1347,10 +1436,24 @@ pub const SwimProtocol = struct {
     // ─── Hole Punching ───
 
     fn handleHolepunchRequest(self: *SwimProtocol, req: messages.HolepunchRequest, sender_endpoint: messages.Endpoint) void {
+        // Requests are unsigned. Act only for a current member, and only when
+        // the request comes from an endpoint we recorded for a member: the
+        // rendezvous forwarding it to us, or the initiator itself when we are
+        // the rendezvous. Anyone else could otherwise start a punch toward an
+        // endpoint of their choosing in a member's name.
+        const initiator = self.membership.peers.get(req.sender_pubkey) orelse return;
+        if (initiator.state == .dead or initiator.state == .left) return;
+        if (!self.isMemberEndpoint(sender_endpoint)) return;
+
         // Are we the target?
         if (std.mem.eql(u8, &req.target_pubkey, &self.our_pubkey)) {
             // We're the target — respond with our public endpoint
             if (self.our_public_endpoint) |our_ep| {
+                // Start probing the initiator's endpoint. A live session for
+                // this peer keeps its token, so a request that would take it
+                // over is neither accepted nor answered.
+                if (!self.holepuncher.acceptRequest(self.our_pubkey, req, our_ep)) return;
+
                 const resp = messages.HolepunchResponse{
                     .sender_pubkey = self.our_pubkey,
                     .public_endpoint = our_ep,
@@ -1360,9 +1463,6 @@ pub const SwimProtocol = struct {
                 const written = codec.encodeHolepunchResponse(&buf, resp) catch return;
                 // Send response back through the rendezvous (sender)
                 self.gossipSend(buf[0..written], sender_endpoint);
-
-                // Also start probing the initiator's endpoint
-                _ = self.holepuncher.acceptRequest(self.our_pubkey, req, our_ep);
             }
         } else {
             // We're the rendezvous — forward to the target
@@ -1491,16 +1591,9 @@ pub const SwimProtocol = struct {
             // Don't fire onPeerJoin yet — wait for wg_pubkey via gossip
             // The callback will fire from applyGossip when wg_pubkey is received
 
-            // Enqueue join gossip with our WG pubkey + public endpoint
-            self.enqueueGossip(.{
-                .subject_pubkey = self.our_pubkey,
-                .event = .alive,
-                .lamport = self.membership.lamport,
-                .endpoint = self.our_public_endpoint orelse messages.Endpoint.initV6(self.our_mesh_ip6, self.config.gossip_port),
-                .wg_pubkey = self.our_wg_pubkey,
-                .public_endpoint = self.our_public_endpoint,
-                .nat_type = self.our_nat_type,
-            });
+            // Enqueue (or refresh) our own advertisement: identity, WG pubkey,
+            // public endpoint.
+            self.enqueueSelfGossip();
 
             // Also enqueue gossip about the new peer (include wg/nat info if already known)
             const peer_info = self.membership.peers.get(pubkey);
@@ -1625,6 +1718,38 @@ pub const SwimProtocol = struct {
             if (seed.eql(endpoint)) return true;
         }
         return false;
+    }
+
+    /// True when `endpoint` is the gossip endpoint we recorded for a member.
+    fn isMemberEndpoint(self: *const SwimProtocol, endpoint: messages.Endpoint) bool {
+        var iter = self.membership.peers.iterator();
+        while (iter.next()) |entry| {
+            const known = entry.value_ptr.gossip_endpoint orelse continue;
+            if (known.eql(endpoint)) return true;
+        }
+        return false;
+    }
+
+    /// True when `pubkey` is a member whose recorded gossip endpoint is `endpoint`.
+    fn isMemberAtEndpoint(self: *const SwimProtocol, pubkey: [32]u8, endpoint: messages.Endpoint) bool {
+        const peer = self.membership.peers.get(pubkey) orelse return false;
+        const known = peer.gossip_endpoint orelse return false;
+        return known.eql(endpoint);
+    }
+
+    /// Answers a ping with our identity, sequence and incarnation only: no
+    /// gossip, certificate or binding. For anonymous senders and for senders
+    /// we do not know at the endpoint they use, so an unauthenticated ping
+    /// cannot be amplified into a full answer.
+    fn sendMinimalAck(self: *SwimProtocol, seq: u64, endpoint: messages.Endpoint) void {
+        var buf: [128]u8 = undefined;
+        const written = codec.encodeAck(&buf, .{
+            .sender_pubkey = self.our_pubkey,
+            .seq = seq,
+            .incarnation = self.our_incarnation,
+            .gossip = &.{},
+        }) catch return;
+        if (self.replySend(buf[0..written], endpoint)) self.acks_sent +%= 1;
     }
 
     /// An opaque relay's answer to a client ping: refresh the client's claim
@@ -1944,7 +2069,10 @@ pub const SwimProtocol = struct {
 
     fn rememberOrgRevoke(self: *SwimProtocol, rev: messages.OrgCertRevoke) void {
         if (self.orgRevokeKnown(rev)) return;
-        if (self.org_revoke_count >= self.org_revokes.len) return;
+        if (self.org_revoke_count >= self.org_revokes.len) {
+            log.warn("revocation re-broadcast list full ({d} entries): the newest org revocation is enforced but will not be re-advertised", .{self.org_revokes.len});
+            return;
+        }
         self.org_revokes[self.org_revoke_count] = rev;
         self.org_revoke_count += 1;
     }
@@ -2038,8 +2166,13 @@ pub const SwimProtocol = struct {
         if (now - self.last_org_revoke_readvertise_ns < interval_ns) return;
         self.last_org_revoke_readvertise_ns = now;
 
-        for (self.org_revokes[0..self.org_revoke_count]) |rev| {
-            self.enqueueOrgRevokeBroadcast(rev, 1);
+        // Round-robin through the retained list, so every revocation is re-sent
+        // in turn even when more are retained than the control queue holds.
+        const total = self.org_revoke_count;
+        if (self.org_revoke_readvertise_cursor >= total) self.org_revoke_readvertise_cursor = 0;
+        for (0..@min(total, MAX_ORG_CONTROL_QUEUE)) |_| {
+            self.enqueueOrgRevokeBroadcast(self.org_revokes[self.org_revoke_readvertise_cursor], 1);
+            self.org_revoke_readvertise_cursor = (self.org_revoke_readvertise_cursor + 1) % total;
         }
     }
 
@@ -2049,7 +2182,7 @@ pub const SwimProtocol = struct {
     /// handshake. Bounded and queued (max_gossip_broadcasts), unlike a
     /// per-packet injection.
     fn enqueueSelfGossip(self: *SwimProtocol) void {
-        self.enqueueGossip(.{
+        const entry = messages.GossipEntry{
             .subject_pubkey = self.our_pubkey,
             .event = .alive,
             .lamport = self.membership.lamport,
@@ -2057,7 +2190,18 @@ pub const SwimProtocol = struct {
             .wg_pubkey = self.our_wg_pubkey,
             .public_endpoint = self.our_public_endpoint,
             .nat_type = self.our_nat_type,
-        });
+        };
+        // One queued advertisement of ourselves is enough: refresh it in place
+        // rather than letting repeated triggers (forged suspect/dead entries
+        // about us, joins, restarts) fill the queue with copies that crowd out
+        // other gossip.
+        for (self.gossip_queue[0..self.gossip_count]) |*slot| {
+            if (slot.entry.event == .alive and std.mem.eql(u8, &slot.entry.subject_pubkey, &self.our_pubkey)) {
+                slot.* = .{ .entry = entry, .remaining = self.config.max_gossip_broadcasts };
+                return;
+            }
+        }
+        self.enqueueGossip(entry);
     }
 
     /// Periodically re-advertise our own identity + wg_pubkey into gossip (issue
@@ -2132,20 +2276,34 @@ pub const SwimProtocol = struct {
     ///      teardown (WG supersedes the stale session; a spoof costs at most one
     ///      device-rate-limited rekey). Verified: heal ~1 interval in both tie-break
     ///      directions.
+    ///   3. The claim must come from the endpoint we recorded for the peer; unsigned
+    ///      ping/ack never move that endpoint, so a spoofer elsewhere is ignored.
+    ///   4. Accepted restarts are rate limited per peer (INCARNATION_BUMP_COOLDOWN_NS),
+    ///      so the teardown cannot be repeated at line rate.
     /// A forged GOSSIP rejoin still cannot reach this path at all (never called from
     /// applyGossip).
-    fn handleSenderIncarnation(self: *SwimProtocol, sender_pubkey: [32]u8, incarnation: u64) void {
+    fn handleSenderIncarnation(self: *SwimProtocol, sender_pubkey: [32]u8, incarnation: u64, sender_endpoint: messages.Endpoint) void {
         if (incarnation == 0) return; // peer predates incarnation support
         if (std.mem.eql(u8, &sender_pubkey, &self.our_pubkey)) return;
         // Guard 1: reject an implausibly-future incarnation (bounds any pin to ~now).
         if (incarnation > incarnationNow() +| INCARNATION_SKEW_NS) return;
         const peer = self.membership.peers.getPtr(sender_pubkey) orelse return;
+        // Guard 3: only the peer's recorded endpoint may speak for it.
+        if (peer.gossip_endpoint) |known| {
+            if (!known.eql(sender_endpoint)) return;
+        }
         if (peer.incarnation == 0) {
             // First incarnation seen for this peer — record it (not a restart).
             peer.incarnation = incarnation;
             return;
         }
         if (incarnation <= peer.incarnation) return; // steady state
+        // Guard 4: at most one accepted restart per cooldown. The stored
+        // incarnation is not advanced meanwhile, so a genuine restart inside
+        // the window is picked up by the first ping after it.
+        const now = nowNs();
+        if (now - peer.last_incarnation_bump_ns < INCARNATION_BUMP_COOLDOWN_NS) return;
+        peer.last_incarnation_bump_ns = now;
 
         // Higher (and plausibly-timed) incarnation => the peer restarted. Pin it now
         // — safe because it is bounded to ~now above, so steady-state pings stop
@@ -2234,12 +2392,10 @@ pub const SwimProtocol = struct {
                 // can't pin our Lamport clock at the ceiling.
                 const cap = self.membership.lamport +| LAMPORT_MAX_REMOTE_JUMP;
                 self.membership.lamport = @max(self.membership.lamport, @min(entry.lamport, cap)) +| 1;
-                self.enqueueGossip(.{
-                    .subject_pubkey = self.our_pubkey,
-                    .event = .alive,
-                    .lamport = self.membership.lamport,
-                    .endpoint = self.our_public_endpoint,
-                });
+                // One queued refutation is enough: enqueueSelfGossip refreshes
+                // an already queued advertisement of ourselves instead of adding
+                // a copy per forged entry, which would flush the gossip queue.
+                self.enqueueSelfGossip();
             }
             return;
         }
@@ -2283,10 +2439,18 @@ pub const SwimProtocol = struct {
                         peer.is_relay_capable = (entry.nat_type == .public);
                     }
 
-                    // Update WG pubkey if present in gossip
+                    // Update WG pubkey if present in gossip. Third-party gossip
+                    // vouches for nothing, so the key is taken only when it is
+                    // derived from the subject's identity, as daemon keys are:
+                    // only the identity holder can use such a key. Any other
+                    // key waits for the subject's own signed binding or a
+                    // trusted certificate (recordWgBinding, recordPeerCertificate),
+                    // so gossip cannot build a tunnel for an identity toward an
+                    // attacker's key and endpoint. onPeerJoin fires only then.
                     if (entry.wg_pubkey) |wg_key| {
-                        if (peer.wg_pubkey == null) {
+                        if (peer.wg_pubkey == null and Binding.isDerived(entry.subject_pubkey, wg_key)) {
                             peer.wg_pubkey = wg_key;
+                            peer.wg_key_source = .derived;
                             // Re-gossip this peer's alive event so all peers learn its WG pubkey
                             self.enqueueGossip(.{
                                 .subject_pubkey = entry.subject_pubkey,
@@ -2361,12 +2525,20 @@ test "swim creates sequential pings" {
     try std.testing.expectEqual(@as(u64, 2), swim.pending[1].seq);
 }
 
+const test_peer_endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 40000);
+
+/// The X25519 form of an Ed25519 identity: the WireGuard key a daemon derives.
+fn derivedWgKey(ed25519_pubkey: [32]u8) [32]u8 {
+    const pk = std.crypto.sign.Ed25519.PublicKey.fromBytes(ed25519_pubkey) catch unreachable;
+    return std.crypto.dh.X25519.publicKeyFromEd25519(pk) catch unreachable;
+}
+
 fn aliveTestPeer(pk: [32]u8) Membership.Peer {
     return .{
         .pubkey = pk,
         .name = "",
         .state = .alive,
-        .gossip_endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 40000),
+        .gossip_endpoint = test_peer_endpoint,
         .wg_pubkey = null,
         .mesh_ip = .{ 10, 99, 0, 1 },
         .wg_port = 51830,
@@ -2567,36 +2739,36 @@ test "peer restart is detected by incarnation and steady state is not" {
     try membership.upsert(aliveTestPeer(peer_pk));
 
     // First incarnation observed: recorded, NOT treated as a restart.
-    swim.handleSenderIncarnation(peer_pk, 100);
+    swim.handleSenderIncarnation(peer_pk, 100, test_peer_endpoint);
     try std.testing.expectEqual(@as(u64, 100), membership.peers.get(peer_pk).?.incarnation);
     try std.testing.expectEqual(@as(usize, 0), counter.count);
 
     // Same incarnation (steady-state pings): no rejoin.
-    swim.handleSenderIncarnation(peer_pk, 100);
+    swim.handleSenderIncarnation(peer_pk, 100, test_peer_endpoint);
     try std.testing.expectEqual(@as(usize, 0), counter.count);
 
     // Lower incarnation (reordered/stale packet): no rejoin, no downgrade.
-    swim.handleSenderIncarnation(peer_pk, 50);
+    swim.handleSenderIncarnation(peer_pk, 50, test_peer_endpoint);
     try std.testing.expectEqual(@as(usize, 0), counter.count);
     try std.testing.expectEqual(@as(u64, 100), membership.peers.get(peer_pk).?.incarnation);
 
     // Higher incarnation => the peer RESTARTED: rejoin (onPeerJoin re-fires) and
     // the stored incarnation advances.
-    swim.handleSenderIncarnation(peer_pk, 200);
+    swim.handleSenderIncarnation(peer_pk, 200, test_peer_endpoint);
     try std.testing.expectEqual(@as(usize, 1), counter.count);
     try std.testing.expectEqual(peer_pk, counter.last_pubkey.?);
     try std.testing.expectEqual(@as(u64, 200), membership.peers.get(peer_pk).?.incarnation);
 
     // Incarnation 0 (peer predates the feature) is ignored.
-    swim.handleSenderIncarnation(peer_pk, 0);
+    swim.handleSenderIncarnation(peer_pk, 0, test_peer_endpoint);
     try std.testing.expectEqual(@as(usize, 1), counter.count);
 
     // Our own pubkey is ignored.
-    swim.handleSenderIncarnation(@as([32]u8, @splat(1)), 999);
+    swim.handleSenderIncarnation(@as([32]u8, @splat(1)), 999, test_peer_endpoint);
     try std.testing.expectEqual(@as(usize, 1), counter.count);
 
     // An unknown peer is ignored (no rejoin, no crash).
-    swim.handleSenderIncarnation(@as([32]u8, @splat(9)), 999);
+    swim.handleSenderIncarnation(@as([32]u8, @splat(9)), 999, test_peer_endpoint);
     try std.testing.expectEqual(@as(usize, 1), counter.count);
 }
 
@@ -2874,7 +3046,8 @@ test "cert-only gossip candidate is probed then graduates on direct cert" {
     const node_pubkey = node_kp.public_key.toBytes();
     const cert_wire = try issueCertWire(org_kp, node_pubkey, "node-1");
     const endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 43000);
-    const wg_key = @as([32]u8, @splat(0x77));
+    // A daemon's derived key: gossip may install it once the node is admitted.
+    const wg_key = derivedWgKey(node_pubkey);
 
     swim.applyGossip(.{
         .subject_pubkey = node_pubkey,
@@ -2986,7 +3159,8 @@ test "v2 org cert overrides preseeded gossip WireGuard key" {
     const node_pubkey = node_kp.public_key.toBytes();
     swim.addAuthorizedKey(node_pubkey);
 
-    const fake_wg = @as([32]u8, @splat(0xF0));
+    // Gossip installs the node's derived key; the certificate binds another.
+    const gossip_wg = derivedWgKey(node_pubkey);
     const signed_wg = @as([32]u8, @splat(0x92));
     const endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 43101);
 
@@ -2995,9 +3169,9 @@ test "v2 org cert overrides preseeded gossip WireGuard key" {
         .event = .join,
         .lamport = 1,
         .endpoint = endpoint,
-        .wg_pubkey = fake_wg,
+        .wg_pubkey = gossip_wg,
     });
-    try std.testing.expectEqualSlices(u8, &fake_wg, &membership.peers.get(node_pubkey).?.wg_pubkey.?);
+    try std.testing.expectEqualSlices(u8, &gossip_wg, &membership.peers.get(node_pubkey).?.wg_pubkey.?);
     try std.testing.expectEqual(@as(usize, 1), joins.count);
 
     const cert_wire = try issueCertV2Wire(org_kp, node_pubkey, signed_wg, "node-v2");
@@ -3086,7 +3260,7 @@ test "gossiped join still admits an individually authorized subject" {
 
     const peer_kp = keys.generate();
     const peer = peer_kp.public_key.toBytes();
-    const wg_key = @as([32]u8, @splat(0x44));
+    const wg_key = derivedWgKey(peer); // a daemon key, which gossip may install
     swim.addAuthorizedKey(peer);
     swim.applyGossip(.{
         .subject_pubkey = peer,
@@ -3098,6 +3272,7 @@ test "gossiped join still admits an individually authorized subject" {
 
     const recorded = membership.peers.get(peer).?;
     try std.testing.expectEqualSlices(u8, &wg_key, &recorded.wg_pubkey.?);
+    try std.testing.expectEqual(Membership.WgKeySource.derived, recorded.wg_key_source);
     try std.testing.expectEqual(@as(usize, 1), joins.count);
     try std.testing.expectEqualSlices(u8, &peer, &joins.last_pubkey.?);
 }
@@ -3549,7 +3724,7 @@ test "S2: live-tunnel restart claim never tears down; heals via re-init" {
     // Higher (plausible) incarnation while our tunnel to V is live. A spoofer cannot
     // forge V's live WG session, so we must NOT tear the tunnel down; we heal via a
     // handshake RE-INIT (covers a restarted tie-break loser), never a teardown.
-    swim.handleSenderIncarnation(v, 12345);
+    swim.handleSenderIncarnation(v, 12345, test_peer_endpoint);
 
     try std.testing.expectEqual(@as(usize, 0), tctx.dead_count); // never tears the tunnel down
     try std.testing.expectEqual(@as(usize, 0), tctx.join_count); // no rebuild
@@ -3582,7 +3757,7 @@ test "S2: implausibly-future incarnation is rejected (pin cannot be poisoned)" {
     // A node cannot have started in the future: maxInt(u64) is implausible -> rejected
     // outright, so a forged value can't pin our incarnation near the ceiling and blind
     // us to V's real restarts.
-    swim.handleSenderIncarnation(v, std.math.maxInt(u64));
+    swim.handleSenderIncarnation(v, std.math.maxInt(u64), test_peer_endpoint);
     try std.testing.expectEqual(@as(u64, 100), membership.peers.get(v).?.incarnation); // unchanged
     try std.testing.expectEqual(@as(usize, 0), tctx.reinit_count);
     try std.testing.expectEqual(@as(usize, 0), tctx.dead_count);
@@ -3608,7 +3783,7 @@ test "S2: genuine rejoin proceeds when no live tunnel (not over-gated)" {
     p.incarnation = 100;
     try membership.upsert(p);
 
-    swim.handleSenderIncarnation(v, 200);
+    swim.handleSenderIncarnation(v, 200, test_peer_endpoint);
 
     // No live tunnel to protect -> full rebuild (teardown + re-add) and the incarnation
     // advances. Proves the gate doesn't over-suppress recovery.
@@ -3616,6 +3791,224 @@ test "S2: genuine rejoin proceeds when no live tunnel (not over-gated)" {
     try std.testing.expectEqual(@as(usize, 1), tctx.join_count);
     try std.testing.expectEqual(@as(usize, 0), tctx.reinit_count); // rebuild path, not re-init
     try std.testing.expectEqual(@as(u64, 200), membership.peers.get(v).?.incarnation);
+}
+
+test "restart claims need the peer's endpoint and are accepted once per cooldown" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+
+    var tctx = S2TestCtx{ .tunnel_live = false };
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, .{
+        .ctx = &tctx,
+        .onPeerJoin = s2OnJoin,
+        .onPeerDead = s2OnDead,
+        .hasActiveTunnel = s2HasTunnel,
+        .reinitiateHandshake = s2Reinit,
+    });
+    try std.testing.expect(INCARNATION_BUMP_COOLDOWN_NS >= 60 * std.time.ns_per_s);
+
+    const v = @as([32]u8, @splat(0x77));
+    var p = aliveTestPeer(v);
+    p.wg_pubkey = @as([32]u8, @splat(0x88));
+    p.incarnation = 100;
+    try membership.upsert(p);
+
+    // A higher incarnation from anywhere but V's recorded endpoint is not V's.
+    swim.handleSenderIncarnation(v, 200, messages.Endpoint.initV4(.{ 203, 0, 113, 7 }, 40000));
+    try std.testing.expectEqual(@as(u64, 100), membership.peers.get(v).?.incarnation);
+    try std.testing.expectEqual(@as(usize, 0), tctx.dead_count);
+
+    // From V's endpoint it is accepted once...
+    swim.handleSenderIncarnation(v, 200, test_peer_endpoint);
+    try std.testing.expectEqual(@as(u64, 200), membership.peers.get(v).?.incarnation);
+    try std.testing.expectEqual(@as(usize, 1), tctx.dead_count);
+    try std.testing.expectEqual(@as(usize, 1), tctx.join_count);
+
+    // ...and further bumps inside the cooldown are ignored, however many arrive.
+    for (0..8) |i| swim.handleSenderIncarnation(v, 300 + @as(u64, @intCast(i)), test_peer_endpoint);
+    try std.testing.expectEqual(@as(u64, 200), membership.peers.get(v).?.incarnation);
+    try std.testing.expectEqual(@as(usize, 1), tctx.dead_count);
+    try std.testing.expectEqual(@as(usize, 1), tctx.join_count);
+
+    // Once the cooldown has passed, the restart is picked up.
+    membership.peers.getPtr(v).?.last_incarnation_bump_ns -= INCARNATION_BUMP_COOLDOWN_NS;
+    swim.handleSenderIncarnation(v, 300, test_peer_endpoint);
+    try std.testing.expectEqual(@as(u64, 300), membership.peers.get(v).?.incarnation);
+    try std.testing.expectEqual(@as(usize, 2), tctx.dead_count);
+    try std.testing.expectEqual(@as(usize, 2), tctx.join_count);
+}
+
+test "gossip installs a WireGuard key only when it is derived from the identity" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+    var joins = JoinCounter{};
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, .{
+        .ctx = &joins,
+        .onPeerJoin = countPeerJoin,
+        .onPeerDead = countPeerDead,
+    });
+
+    // Anyone can gossip any key for an identity. Such a key is not installed
+    // and no tunnel is built, so the identity cannot be impersonated on the
+    // data plane by whoever gossips first.
+    const node_kp = keys.generate();
+    const node_pubkey = node_kp.public_key.toBytes();
+    const claimed_wg = @as([32]u8, @splat(0x5A));
+    const endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 43110);
+    swim.applyGossip(.{ .subject_pubkey = node_pubkey, .event = .join, .lamport = 1, .endpoint = endpoint, .wg_pubkey = claimed_wg });
+    try std.testing.expect(membership.peers.get(node_pubkey).?.wg_pubkey == null);
+    try std.testing.expectEqual(@as(usize, 0), joins.count);
+    swim.applyGossip(.{ .subject_pubkey = node_pubkey, .event = .alive, .lamport = 2, .endpoint = endpoint, .wg_pubkey = claimed_wg });
+    try std.testing.expect(membership.peers.get(node_pubkey).?.wg_pubkey == null);
+    try std.testing.expectEqual(@as(usize, 0), joins.count);
+
+    // The identity's own signed binding installs the key and builds the tunnel.
+    var buf: [1500]u8 = undefined;
+    swim.handleMessage(try ackWithBinding(&buf, node_pubkey, try testBinding(node_kp, claimed_wg), null), endpoint);
+    const bound = membership.peers.get(node_pubkey).?;
+    try std.testing.expectEqualSlices(u8, &claimed_wg, &bound.wg_pubkey.?);
+    try std.testing.expectEqual(Membership.WgKeySource.binding, bound.wg_key_source);
+    try std.testing.expectEqual(@as(usize, 1), joins.count);
+    try std.testing.expectEqual(@as(usize, 0), joins.dead_count);
+
+    // A daemon's key is the X25519 form of its identity: only its holder can
+    // use it, so gossip may install it and the tunnel is built at once.
+    const daemon_pubkey = keys.generate().public_key.toBytes();
+    const derived_wg = derivedWgKey(daemon_pubkey);
+    swim.applyGossip(.{ .subject_pubkey = daemon_pubkey, .event = .join, .lamport = 3, .endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 43111), .wg_pubkey = derived_wg });
+    const daemon = membership.peers.get(daemon_pubkey).?;
+    try std.testing.expectEqualSlices(u8, &derived_wg, &daemon.wg_pubkey.?);
+    try std.testing.expectEqual(Membership.WgKeySource.derived, daemon.wg_key_source);
+    try std.testing.expectEqual(@as(usize, 2), joins.count);
+}
+
+test "forged suspicion about us queues a single refutation" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, null);
+
+    for (0..20) |i| {
+        swim.enqueueGossip(.{ .subject_pubkey = @as([32]u8, @splat(@intCast(i + 10))), .event = .alive, .lamport = 1, .endpoint = null });
+    }
+    // Eight forged entries used to queue eight self-alive slots, so four pings
+    // flushed the 32-slot queue. One refutation is kept and refreshed instead.
+    const events = [_]messages.MemberEvent{ .suspect, .dead };
+    for (0..8) |i| {
+        swim.applyGossip(.{ .subject_pubkey = swim.our_pubkey, .event = events[i % 2], .lamport = @intCast(100 + i), .endpoint = null });
+    }
+    try std.testing.expectEqual(@as(usize, 21), swim.gossip_count);
+    var self_entries: usize = 0;
+    for (swim.gossip_queue[0..swim.gossip_count]) |slot| {
+        if (std.mem.eql(u8, &slot.entry.subject_pubkey, &swim.our_pubkey)) {
+            self_entries += 1;
+            try std.testing.expectEqual(swim.membership.lamport, slot.entry.lamport);
+            try std.testing.expectEqual(swim.config.max_gossip_broadcasts, slot.remaining);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), self_entries);
+    // The other gossip is still queued, in order.
+    try std.testing.expectEqual(@as(u8, 10), swim.gossip_queue[0].entry.subject_pubkey[0]);
+    try std.testing.expectEqual(@as(u8, 29), swim.gossip_queue[19].entry.subject_pubkey[0]);
+}
+
+fn issueAlias(org_kp: Org.OrgKeyPair, name: []const u8, lamport: u64) messages.OrgAliasAnnounce {
+    var ann = messages.OrgAliasAnnounce{
+        .org_pubkey = org_kp.public_key.toBytes(),
+        .alias = std.mem.zeroes([32]u8),
+        .lamport = lamport,
+        .signature = undefined,
+    };
+    @memcpy(ann.alias[0..name.len], name);
+    const signed = codec.orgAliasSignedBytes(ann);
+    ann.signature = keys.sign(&signed, org_kp.secret_key) catch unreachable;
+    return ann;
+}
+
+test "an org alias is renamed only by a newer announcement" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, null);
+    const org_kp = Org.generateOrgKeyPair();
+    swim.addTrustedOrg(org_kp.public_key.toBytes());
+
+    swim.handleOrgAlias(issueAlias(org_kp, "acme", 5));
+    try std.testing.expectEqual(@as(usize, 1), swim.alias_count);
+    try std.testing.expectEqualStrings("acme", std.mem.trimEnd(u8, &swim.alias_names[0], "\x00"));
+
+    // A replayed or stale announcement does not roll the name back.
+    swim.handleOrgAlias(issueAlias(org_kp, "stale", 3));
+    try std.testing.expectEqualStrings("acme", std.mem.trimEnd(u8, &swim.alias_names[0], "\x00"));
+    try std.testing.expectEqual(@as(u64, 5), swim.alias_lamports[0]);
+    swim.handleOrgAlias(issueAlias(org_kp, "stale", 5));
+    try std.testing.expectEqualStrings("acme", std.mem.trimEnd(u8, &swim.alias_names[0], "\x00"));
+
+    // A newer one renames.
+    swim.handleOrgAlias(issueAlias(org_kp, "acme-eu", 6));
+    try std.testing.expectEqualStrings("acme-eu", std.mem.trimEnd(u8, &swim.alias_names[0], "\x00"));
+    try std.testing.expectEqual(@as(u64, 6), swim.alias_lamports[0]);
+    try std.testing.expectEqual(@as(usize, 1), swim.alias_count);
+}
+
+test "revocations are enforced when the table is full and expired entries make room" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+    var joins = JoinCounter{};
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, .{
+        .ctx = &joins,
+        .onPeerJoin = countPeerJoin,
+        .onPeerDead = countPeerDead,
+    });
+    swim.enableTrust();
+    const org_kp = Org.generateOrgKeyPair();
+    const org_pubkey = org_kp.public_key.toBytes();
+    swim.addTrustedOrg(org_pubkey);
+    try std.testing.expect(swim.revoked_nodes.len >= 1024);
+
+    // Fill the table with revocations of other nodes.
+    for (swim.revoked_nodes[0..], 0..) |*slot, i| {
+        var node = @as([32]u8, @splat(0x10));
+        std.mem.writeInt(u32, node[0..4], @intCast(i), .little);
+        slot.* = .{ .org_pubkey = org_pubkey, .node_pubkey = node };
+    }
+    swim.revoked_count = swim.revoked_nodes.len;
+
+    // A member admitted by this org's certificate.
+    const victim = @as([32]u8, @splat(0x7c));
+    try membership.upsert(aliveTestPeer(victim));
+    swim.recordPeerCertificate(victim, try issueCertWire(org_kp, victim, "victim"));
+    try std.testing.expect(swim.isAuthorizedPeer(victim, null));
+
+    // Nothing in the table has expired: the revocation cannot be remembered,
+    // but the member is still torn down.
+    swim.handleOrgRevoke(try Org.issueOrgRevoke(org_kp, victim, 2, 40));
+    try std.testing.expectEqual(swim.revoked_nodes.len, swim.revoked_count);
+    try std.testing.expect(!swim.orgRevokesNode(org_pubkey, victim));
+    try std.testing.expect(swim.applying_revoke == null);
+    try std.testing.expect(membership.peers.get(victim).?.state == .dead);
+    try std.testing.expectEqual(@as(usize, 1), joins.dead_count);
+
+    // The oldest entry whose node's certificate from this org has expired makes
+    // room for the next revocation, which is then remembered.
+    const expired_node = swim.revoked_nodes[0].node_pubkey;
+    var expired = aliveTestPeer(expired_node);
+    expired.org_pubkey = org_pubkey;
+    expired.cert_expires_at = 1;
+    try membership.upsert(expired);
+    const victim2 = @as([32]u8, @splat(0x7d));
+    try membership.upsert(aliveTestPeer(victim2));
+    swim.recordPeerCertificate(victim2, try issueCertWire(org_kp, victim2, "victim2"));
+    swim.handleOrgRevoke(try Org.issueOrgRevoke(org_kp, victim2, 2, 41));
+    try std.testing.expectEqual(swim.revoked_nodes.len, swim.revoked_count);
+    try std.testing.expect(!swim.orgRevokesNode(org_pubkey, expired_node));
+    try std.testing.expect(swim.orgRevokesNode(org_pubkey, victim2));
+    try std.testing.expect(!swim.isAuthorizedPeer(victim2, null));
+    try std.testing.expect(membership.peers.get(victim2).?.state == .dead);
+    try std.testing.expectEqual(@as(usize, 2), joins.dead_count);
 }
 
 fn testBinding(node_kp: keys.KeyPair, wg_pubkey: [32]u8) !messages.WgBinding {
@@ -3647,7 +4040,7 @@ test "a peer's own signed WireGuard key replaces one claimed by gossip" {
 
     const node_kp = keys.generate();
     const node_pubkey = node_kp.public_key.toBytes();
-    const claimed_wg = @as([32]u8, @splat(0xF0));
+    const claimed_wg = derivedWgKey(node_pubkey); // a daemon key, which gossip may install
     const own_wg = @as([32]u8, @splat(0x92));
     const endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 43102);
 
@@ -3678,7 +4071,7 @@ test "a binding signed by someone else is ignored" {
 
     const victim = keys.generate().public_key.toBytes();
     const attacker_kp = keys.generate();
-    const victim_wg = @as([32]u8, @splat(0x31));
+    const victim_wg = derivedWgKey(victim); // a daemon key, which gossip may install
     const endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 43103);
     swim.applyGossip(.{ .subject_pubkey = victim, .event = .join, .lamport = 1, .endpoint = endpoint, .wg_pubkey = victim_wg });
 
@@ -3688,7 +4081,7 @@ test "a binding signed by someone else is ignored" {
 
     const peer = membership.peers.get(victim).?;
     try std.testing.expectEqualSlices(u8, &victim_wg, &peer.wg_pubkey.?);
-    try std.testing.expectEqual(Membership.WgKeySource.gossip, peer.wg_key_source);
+    try std.testing.expectEqual(Membership.WgKeySource.derived, peer.wg_key_source);
 }
 
 test "a self-signed binding never overrides a certificate-bound key" {
@@ -4086,4 +4479,165 @@ test "answers to pings have their own budget" {
     var recv_buf: [1500]u8 = undefined;
     const ack = testReceive(f.alice_socket, &recv_buf, 0x03) orelse return error.NoAck;
     try std.testing.expectEqual(@as(u64, 4), (try codec.decode(ack)).ack.seq);
+}
+
+test "only members pinging from their recorded endpoint get a full answer" {
+    var f = ForwardFixture.init() catch return;
+    defer f.deinit();
+    var swim = SwimProtocol.init(&f.membership, f.relay_socket, .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, null);
+    swim.setWgBinding(.{ .wg_pubkey = @as([32]u8, @splat(2)), .signature = @as([64]u8, @splat(9)) });
+    swim.setOrgCert(@as([messages.ORG_CERT_WIRE_SIZE]u8, @splat(0xC7)));
+    swim.setPublicEndpoint(loopback(f.relay_socket), .public);
+    const alice = @as([32]u8, @splat(0xA1));
+    var buf: [1500]u8 = undefined;
+    var recv_buf: [1500]u8 = undefined;
+
+    // First contact: Alice is not a member yet, so she gets a minimal ACK (and
+    // becomes a member at her endpoint).
+    var len = try codec.encodePing(&buf, .{ .sender_pubkey = alice, .seq = 1, .gossip = &.{} });
+    swim.handleMessage(buf[0..len], loopback(f.alice_socket));
+    var ack = (try codec.decode(testReceive(f.alice_socket, &recv_buf, 0x03) orelse return error.NoAck)).ack;
+    try std.testing.expectEqual(@as(u64, 1), ack.seq);
+    try std.testing.expectEqual(@as(u8, 0), ack.gossip_count);
+    try std.testing.expect(!ack.has_org_cert);
+    try std.testing.expect(ack.wg_binding == null);
+    try std.testing.expect(f.membership.peers.get(alice) != null);
+
+    // From her endpoint, a member gets gossip, our certificate and our binding.
+    len = try codec.encodePing(&buf, .{ .sender_pubkey = alice, .seq = 2, .gossip = &.{} });
+    swim.handleMessage(buf[0..len], loopback(f.alice_socket));
+    ack = (try codec.decode(testReceive(f.alice_socket, &recv_buf, 0x03) orelse return error.NoAck)).ack;
+    try std.testing.expectEqual(@as(u64, 2), ack.seq);
+    try std.testing.expect(ack.gossip_count > 0);
+    try std.testing.expect(ack.has_org_cert);
+    try std.testing.expect(ack.wg_binding != null);
+
+    // Alice's identity from another source gets the minimal answer there.
+    len = try codec.encodePing(&buf, .{ .sender_pubkey = alice, .seq = 3, .gossip = &.{} });
+    swim.handleMessage(buf[0..len], loopback(f.bob_socket));
+    ack = (try codec.decode(testReceive(f.bob_socket, &recv_buf, 0x03) orelse return error.NoAck)).ack;
+    try std.testing.expectEqual(@as(u64, 3), ack.seq);
+    try std.testing.expectEqual(@as(u8, 0), ack.gossip_count);
+    try std.testing.expect(!ack.has_org_cert);
+    try std.testing.expect(ack.wg_binding == null);
+}
+
+test "an all-zero sender is authorized for nothing and its requests are dropped" {
+    var f = ForwardFixture.init() catch return;
+    defer f.deinit();
+    var swim = SwimProtocol.init(&f.membership, f.relay_socket, .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, null);
+    swim.setPublicEndpoint(loopback(f.relay_socket), .cone);
+    const bob = @as([32]u8, @splat(0xB0));
+    swim.registerOrUpdatePeerEndpoint(bob, loopback(f.bob_socket));
+    const zero = @as([32]u8, @splat(0));
+    var buf: [1500]u8 = undefined;
+    var recv_buf: [1500]u8 = undefined;
+
+    // A rendezvous request in nobody's name, even from a member's endpoint,
+    // starts no session and gets no answer.
+    var len = try codec.encodeHolepunchRequest(&buf, .{ .sender_pubkey = zero, .target_pubkey = swim.our_pubkey, .public_endpoint = loopback(f.alice_socket), .token = @as([16]u8, @splat(0x42)) });
+    swim.handleMessage(buf[0..len], loopback(f.bob_socket));
+    try std.testing.expectEqual(@as(usize, 0), swim.holepuncher.activeCount());
+    try std.testing.expect(testReceive(f.bob_socket, &recv_buf, 0x34) == null);
+    // Nor is one forwarded on its behalf.
+    len = try codec.encodeHolepunchRequest(&buf, .{ .sender_pubkey = zero, .target_pubkey = bob, .public_endpoint = loopback(f.alice_socket), .token = @as([16]u8, @splat(0x42)) });
+    swim.handleMessage(buf[0..len], loopback(f.bob_socket));
+    try std.testing.expect(testReceive(f.bob_socket, &recv_buf, 0x33) == null);
+
+    // On the wire a ping, ack or ping-req from the all-zero sender starts with
+    // 0x0N 00 00 00, the header of a WireGuard packet of type N, so the data
+    // plane takes it before SWIM ever sees it: no answer, no gossip applied.
+    const hint = [1]messages.GossipEntry{.{ .subject_pubkey = @as([32]u8, @splat(0xD1)), .event = .join, .lamport = 5, .endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 45000) }};
+    len = try codec.encodePing(&buf, .{ .sender_pubkey = zero, .seq = 7, .gossip = &hint });
+    swim.handleMessage(buf[0..len], loopback(f.alice_socket));
+    try std.testing.expect(testReceive(f.alice_socket, &recv_buf, 0x03) == null);
+    try std.testing.expectEqual(@as(usize, 1), f.membership.count());
+    try std.testing.expectEqual(@as(usize, 0), swim.candidate_count);
+
+    // Under trust enforcement the zero identity is authorized for nothing, so
+    // it cannot be admitted as a relay client either.
+    swim.enableTrust();
+    try std.testing.expect(!swim.isAuthorizedPeer(zero, null));
+    try std.testing.expect(!swim.isAllowedRelayParticipant(zero));
+}
+
+test "holepunch requests act only for members and only from a member's endpoint" {
+    var f = ForwardFixture.init() catch return;
+    defer f.deinit();
+    var swim = SwimProtocol.init(&f.membership, f.relay_socket, .{}, @as([32]u8, @splat(1)), @as([32]u8, @splat(2)), .{ 127, 0, 0, 1 }, 51821, null);
+    swim.setPublicEndpoint(loopback(f.relay_socket), .cone);
+
+    const alice = @as([32]u8, @splat(0xA1));
+    const bob = @as([32]u8, @splat(0xB0));
+    const stranger = @as([32]u8, @splat(0xC3));
+    swim.registerOrUpdatePeerEndpoint(alice, loopback(f.alice_socket));
+    const attacker_ep = messages.Endpoint.initV4(.{ 203, 0, 113, 9 }, 4444);
+    const token = @as([16]u8, @splat(0x42));
+    var buf: [128]u8 = undefined;
+    var recv_buf: [1500]u8 = undefined;
+
+    // A non-member initiator, even from Alice's endpoint: nothing happens.
+    var len = try codec.encodeHolepunchRequest(&buf, .{ .sender_pubkey = stranger, .target_pubkey = swim.our_pubkey, .public_endpoint = attacker_ep, .token = token });
+    swim.handleMessage(buf[0..len], loopback(f.alice_socket));
+    try std.testing.expectEqual(@as(usize, 0), swim.holepuncher.activeCount());
+    try std.testing.expect(testReceive(f.alice_socket, &recv_buf, 0x34) == null);
+
+    // Alice named as initiator, but from an endpoint that is no member's.
+    len = try codec.encodeHolepunchRequest(&buf, .{ .sender_pubkey = alice, .target_pubkey = swim.our_pubkey, .public_endpoint = attacker_ep, .token = token });
+    swim.handleMessage(buf[0..len], loopback(f.bob_socket));
+    try std.testing.expectEqual(@as(usize, 0), swim.holepuncher.activeCount());
+    try std.testing.expect(testReceive(f.bob_socket, &recv_buf, 0x34) == null);
+
+    // From Alice's recorded endpoint: accepted and answered.
+    len = try codec.encodeHolepunchRequest(&buf, .{ .sender_pubkey = alice, .target_pubkey = swim.our_pubkey, .public_endpoint = loopback(f.alice_socket), .token = token });
+    swim.handleMessage(buf[0..len], loopback(f.alice_socket));
+    try std.testing.expectEqual(@as(usize, 1), swim.holepuncher.activeCount());
+    const resp = (try codec.decode(testReceive(f.alice_socket, &recv_buf, 0x34) orelse return error.NoResponse)).holepunch_response;
+    try std.testing.expectEqualSlices(u8, &token, &resp.token_echo);
+
+    // A second request in Alice's name with another token, pointing elsewhere,
+    // neither takes the live session over nor is answered.
+    len = try codec.encodeHolepunchRequest(&buf, .{ .sender_pubkey = alice, .target_pubkey = swim.our_pubkey, .public_endpoint = attacker_ep, .token = @as([16]u8, @splat(0x43)) });
+    swim.handleMessage(buf[0..len], loopback(f.alice_socket));
+    try std.testing.expectEqual(@as(usize, 1), swim.holepuncher.activeCount());
+    try std.testing.expect(testReceive(f.alice_socket, &recv_buf, 0x34) == null);
+    const session = swim.holepuncher.active[0].?;
+    try std.testing.expectEqualSlices(u8, &token, &session.token);
+    try std.testing.expect(messages.Endpoint.eql(loopback(f.alice_socket), session.target_public_endpoint.?));
+
+    // As rendezvous: a request for Bob is forwarded only from a member's endpoint.
+    swim.registerOrUpdatePeerEndpoint(bob, loopback(f.bob_socket));
+    len = try codec.encodeHolepunchRequest(&buf, .{ .sender_pubkey = alice, .target_pubkey = bob, .public_endpoint = loopback(f.alice_socket), .token = token });
+    swim.handleMessage(buf[0..len], messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 9));
+    try std.testing.expect(testReceive(f.bob_socket, &recv_buf, 0x33) == null);
+    swim.handleMessage(buf[0..len], loopback(f.alice_socket));
+    try std.testing.expect(testReceive(f.bob_socket, &recv_buf, 0x33) != null);
+}
+
+test "a certificate from an untrusted org does not vouch for a relay key" {
+    const allocator = std.testing.allocator;
+    var membership = Membership.MembershipTable.init(allocator, 5000);
+    defer membership.deinit();
+    const relay = try TestRelay.init();
+    var swim = SwimProtocol.init(&membership, inertTestSocket(), .{}, @as([32]u8, @splat(1)), relay.public, .{ 127, 0, 0, 1 }, 51821, null);
+    var core = try RelayCore.RelayCore.init(allocator, .{ .max_clients = 16, .max_unproven = 4, .max_claims = 16, .max_handshake_sources = 16 }, relay.private, relay.public, swim.relayAdmission(), nowNs());
+    defer core.deinit();
+    swim.relay_core = &core;
+
+    // Open trust admits the node, but a v2 certificate from an org we do not
+    // trust must not vouch for the WireGuard key it binds.
+    const org_kp = Org.generateOrgKeyPair();
+    const node_pubkey = keys.generate().public_key.toBytes();
+    const cert_wire = try issueCertV2Wire(org_kp, node_pubkey, @as([32]u8, @splat(0x92)), "node");
+    const endpoint = messages.Endpoint.initV4(.{ 127, 0, 0, 1 }, 43120);
+    var buf: [1500]u8 = undefined;
+    var len = try codec.encodePing(&buf, .{ .sender_pubkey = node_pubkey, .seq = 1, .gossip = &.{}, .org_cert = cert_wire, .has_org_cert = true });
+    swim.handleMessage(buf[0..len], endpoint);
+    try std.testing.expectEqual(@as(u32, 0), core.claimCount());
+
+    // Once the org is trusted, the same certificate vouches.
+    swim.addTrustedOrg(org_kp.public_key.toBytes());
+    len = try codec.encodePing(&buf, .{ .sender_pubkey = node_pubkey, .seq = 2, .gossip = &.{}, .org_cert = cert_wire, .has_org_cert = true });
+    swim.handleMessage(buf[0..len], endpoint);
+    try std.testing.expectEqual(@as(u32, 1), core.claimCount());
 }

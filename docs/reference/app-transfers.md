@@ -14,9 +14,11 @@ stores the file, then sends its own `file-ack` on its `example-v1` channel).
 ## IPC commands
 
 Commands and responses are newline-delimited, like the rest of the control
-socket. On Unix they require the daemon's owner (same uid, or root) because the
-control socket is world-writable and transfers carry file contents; other local
-users get `unauthorized`.
+socket. On Unix they require the daemon's owner (same uid, or root), like every
+other command that acts as this node (`SEND`, `RECV`, `MSGS`, `APPSEND`,
+`APPRECV`, `RELOAD`, `STOP`): the control socket is world-writable so that any
+local user can run `STATUS` and `PEERS`, but transfers carry file contents, and
+other local users get `unauthorized`.
 
 | Command | Response |
 | ------- | -------- |
