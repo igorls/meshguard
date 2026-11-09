@@ -12,14 +12,24 @@
 
 const std = @import("std");
 
+/// Fixed size of every path buffer built from the config directory.
+const PATH_BUF_LEN: usize = 512;
+
 /// Read all available bytes from an Io.File into buf. Returns bytes read.
-fn readFileBytes(f: std.Io.File, buf: []u8) !usize {
+/// A file that does not fit is an error: truncating a policy would silently
+/// drop its trailing rules (e.g. the final `deny all`).
+fn readFileBytes(f: std.Io.File, buf: []u8) ReadError!usize {
     var reader = f.reader(zio(), &.{});
     var total: usize = 0;
     while (total < buf.len) {
-        const n = reader.interface.readSliceShort(buf[total..]) catch break;
+        const n = reader.interface.readSliceShort(buf[total..]) catch return ReadError.Unreadable;
         if (n == 0) break;
         total += n;
+    }
+    if (total == buf.len) {
+        var probe: [1]u8 = undefined;
+        const n = reader.interface.readSliceShort(&probe) catch return ReadError.Unreadable;
+        if (n != 0) return ReadError.FileTooLarge;
     }
     return total;
 }
@@ -169,16 +179,155 @@ pub fn parseRule(line: []const u8) ParseError!?Rule {
 
 /// Parse a full policy file content into a Policy struct.
 pub fn parsePolicy(content: []const u8) ParseError!Policy {
+    return parsePolicyLines(content, null);
+}
+
+/// parsePolicy that also reports the 1-based line of the first bad rule.
+fn parsePolicyLines(content: []const u8, bad_line: ?*usize) ParseError!Policy {
     var policy = Policy{};
     var lines = std.mem.splitScalar(u8, content, '\n');
+    var line_no: usize = 0;
     while (lines.next()) |line| {
-        if (try parseRule(line)) |rule| {
-            if (policy.count >= MAX_RULES) return ParseError.TooManyRules;
+        line_no += 1;
+        const parsed = parseRule(line) catch |err| {
+            if (bad_line) |p| p.* = line_no;
+            return err;
+        };
+        if (parsed) |rule| {
+            if (policy.count >= MAX_RULES) {
+                if (bad_line) |p| p.* = line_no;
+                return ParseError.TooManyRules;
+            }
             policy.rules[policy.count] = rule;
             policy.count += 1;
         }
     }
     return policy;
+}
+
+/// Parse the `services/default` file: exactly one value line reading `allow`
+/// or `deny` (any case, surrounding whitespace ignored), with blank lines and
+/// `#` comments skipped. Anything else is an error, so a typo such as `Deny `
+/// or `dny` can never silently mean allow.
+pub fn parseDefaultAction(content: []const u8) error{InvalidDefault}!Action {
+    var action: ?Action = null;
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |raw| {
+        const code = if (std.mem.indexOfScalar(u8, raw, '#')) |hash| raw[0..hash] else raw;
+        const word = std.mem.trim(u8, code, " \t\r");
+        if (word.len == 0) continue;
+        if (action != null) return error.InvalidDefault; // a second value line
+        if (std.ascii.eqlIgnoreCase(word, "allow")) {
+            action = .allow;
+        } else if (std.ascii.eqlIgnoreCase(word, "deny")) {
+            action = .deny;
+        } else {
+            return error.InvalidDefault;
+        }
+    }
+    return action orelse error.InvalidDefault;
+}
+
+// ─── Policy loading errors ───
+
+/// Why a policy file could not be read into the fixed buffer.
+const ReadError = error{
+    /// The file exists but could not be opened or read.
+    Unreadable,
+    /// The file is larger than the fixed read buffer.
+    FileTooLarge,
+};
+
+/// Why loadFromDir refused the services/ directory. Every variant must fail
+/// closed: the caller refuses to start instead of running allow-all.
+pub const LoadError = ParseError || ReadError || error{
+    /// A path built from config_dir does not fit the fixed path buffer.
+    PathTooLong,
+    /// services/default holds something other than allow/deny.
+    InvalidDefault,
+    /// More .policy files than the filter can hold.
+    TooManyPolicies,
+};
+
+/// Where a load failure came from, for the caller's error message.
+pub const LoadDiagnostics = struct {
+    path_buf: [PATH_BUF_LEN]u8 = undefined,
+    path_len: usize = 0,
+    /// 1-based line of the offending rule; 0 when the whole file (or the
+    /// directory) is at fault.
+    line: usize = 0,
+
+    /// The offending file or directory (the config dir for PathTooLong).
+    pub fn path(self: *const LoadDiagnostics) []const u8 {
+        return self.path_buf[0..self.path_len];
+    }
+
+    /// `{f}` prints `path` or `path:line`.
+    pub fn format(self: *const LoadDiagnostics, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.writeAll(self.path());
+        if (self.line != 0) try w.print(":{d}", .{self.line});
+    }
+
+    fn note(self: *LoadDiagnostics, p: []const u8, line: usize) void {
+        const n = @min(p.len, self.path_buf.len);
+        @memcpy(self.path_buf[0..n], p[0..n]);
+        self.path_len = n;
+        self.line = line;
+    }
+};
+
+fn noteDiag(diag: ?*LoadDiagnostics, path: []const u8, line: usize) void {
+    if (diag) |d| d.note(path, line);
+}
+
+/// Build `dir/name` into buf; PathTooLong (recorded against dir) on overflow.
+fn joinPath(buf: []u8, dir: []const u8, name: []const u8, diag: ?*LoadDiagnostics) LoadError![]const u8 {
+    return std.fmt.bufPrint(buf, "{s}/{s}", .{ dir, name }) catch {
+        noteDiag(diag, dir, 0);
+        return LoadError.PathTooLong;
+    };
+}
+
+/// Read a policy file. Null when it does not exist; read failures are
+/// recorded against the path and returned.
+fn readPolicyFile(path: []const u8, diag: ?*LoadDiagnostics) LoadError!?SmallFile {
+    return readSmallFile(path) catch |err| {
+        noteDiag(diag, path, 0);
+        return err;
+    };
+}
+
+/// Parse a policy file's content, recording path and line on failure.
+fn parsePolicyFile(content: []const u8, path: []const u8, diag: ?*LoadDiagnostics) LoadError!Policy {
+    var line: usize = 0;
+    return parsePolicyLines(content, &line) catch |err| {
+        noteDiag(diag, path, line);
+        return err;
+    };
+}
+
+/// Open a policy sub-directory for iteration. Null when it does not exist.
+fn openPolicyDir(dir_path: []const u8, diag: ?*LoadDiagnostics) LoadError!?std.Io.Dir {
+    return openDirAbsolute(dir_path) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => null,
+        else => {
+            noteDiag(diag, dir_path, 0);
+            return LoadError.Unreadable;
+        },
+    };
+}
+
+/// Next `.policy` entry of a policy directory, or null at the end. An
+/// iteration failure is an error: ending early would drop policies.
+fn nextPolicyEntry(iter: *std.Io.Dir.Iterator, dir_path: []const u8, diag: ?*LoadDiagnostics) LoadError!?std.Io.Dir.Entry {
+    while (true) {
+        const next = iter.next(zio()) catch {
+            noteDiag(diag, dir_path, 0);
+            return LoadError.Unreadable;
+        };
+        const entry = next orelse return null;
+        if (std.mem.endsWith(u8, entry.name, ".policy")) return entry;
+    }
 }
 
 // ─── ServiceFilter — the main filter engine ───
@@ -277,115 +426,125 @@ pub const ServiceFilter = struct {
     /// Load all service policies from the config directory.
     /// Expects: config_dir/services/{default, global.policy, peer/*.policy, org/*.policy}
     /// If the services/ directory doesn't exist, returns a default allow-all filter.
-    pub fn loadFromDir(config_dir: []const u8) ServiceFilter {
+    ///
+    /// SECURITY: this loader fails closed. Any malformed input — an oversized
+    /// path, a `default` file that is not allow/deny, an unreadable, oversized
+    /// or unparsable policy file, or more policy files than fit — is an error;
+    /// `diag` (optional) then names the offending file and line. The caller
+    /// must refuse to start rather than fall back to an allow-all filter.
+    pub fn loadFromDir(config_dir: []const u8, diag: ?*LoadDiagnostics) LoadError!ServiceFilter {
         var filter = ServiceFilter{};
 
         // Build services path: config_dir + "/services"
-        var services_path_buf: [512]u8 = undefined;
-        const services_path = std.fmt.bufPrint(&services_path_buf, "{s}/services", .{config_dir}) catch return filter;
+        var services_path_buf: [PATH_BUF_LEN]u8 = undefined;
+        const services_path = try joinPath(&services_path_buf, config_dir, "services", diag);
 
-        // Check if services/ directory exists
-        std.Io.Dir.accessAbsolute(zio(), services_path, .{}) catch return filter; // no dir = allow-all
+        // No services/ directory = unconfigured = allow-all (documented).
+        std.Io.Dir.accessAbsolute(zio(), services_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return filter,
+            else => {
+                noteDiag(diag, services_path, 0);
+                return LoadError.Unreadable;
+            },
+        };
 
         // Load default action
-        var default_path_buf: [512]u8 = undefined;
-        const default_path = std.fmt.bufPrint(&default_path_buf, "{s}/default", .{services_path}) catch return filter;
-        if (readSmallFile(default_path)) |content| {
-            const trimmed = std.mem.trim(u8, content.slice(), " \t\r\n");
-            if (std.mem.eql(u8, trimmed, "deny")) {
-                filter.default_action = .deny;
-            }
+        var default_path_buf: [PATH_BUF_LEN]u8 = undefined;
+        const default_path = try joinPath(&default_path_buf, services_path, "default", diag);
+        if (try readPolicyFile(default_path, diag)) |content| {
+            filter.default_action = parseDefaultAction(content.slice()) catch {
+                noteDiag(diag, default_path, 0);
+                return LoadError.InvalidDefault;
+            };
         }
 
         // Load global policy
-        var global_path_buf: [512]u8 = undefined;
-        const global_path = std.fmt.bufPrint(&global_path_buf, "{s}/global.policy", .{services_path}) catch return filter;
-        if (readSmallFile(global_path)) |content| {
-            filter.global = parsePolicy(content.slice()) catch null;
+        var global_path_buf: [PATH_BUF_LEN]u8 = undefined;
+        const global_path = try joinPath(&global_path_buf, services_path, "global.policy", diag);
+        if (try readPolicyFile(global_path, diag)) |content| {
+            filter.global = try parsePolicyFile(content.slice(), global_path, diag);
         }
 
         // Load peer policies
-        var peer_dir_buf: [512]u8 = undefined;
-        const peer_dir_path = std.fmt.bufPrint(&peer_dir_buf, "{s}/peer", .{services_path}) catch return filter;
-        filter.loadPeerPolicies(peer_dir_path);
+        var peer_dir_buf: [PATH_BUF_LEN]u8 = undefined;
+        const peer_dir_path = try joinPath(&peer_dir_buf, services_path, "peer", diag);
+        try filter.loadPeerPolicies(peer_dir_path, diag);
 
         // Load org policies
-        var org_dir_buf: [512]u8 = undefined;
-        const org_dir_path = std.fmt.bufPrint(&org_dir_buf, "{s}/org", .{services_path}) catch return filter;
-        filter.loadOrgPolicies(org_dir_path);
+        var org_dir_buf: [PATH_BUF_LEN]u8 = undefined;
+        const org_dir_path = try joinPath(&org_dir_buf, services_path, "org", diag);
+        try filter.loadOrgPolicies(org_dir_path, diag);
 
         return filter;
     }
 
-    fn loadPeerPolicies(self: *ServiceFilter, dir_path: []const u8) void {
-        const dir = openDirAbsolute(dir_path) catch return;
+    /// Validate every peer/*.policy file and index the base64-named ones by
+    /// pubkey. Alias-named files are validated here too and indexed later by
+    /// resolveAliases (which needs authorized_keys/).
+    fn loadPeerPolicies(self: *ServiceFilter, dir_path: []const u8, diag: ?*LoadDiagnostics) LoadError!void {
+        const dir = (try openPolicyDir(dir_path, diag)) orelse return;
         defer dir.close(zio());
 
+        var seen: usize = 0;
         var iter = dir.iterate();
-        while (iter.next(zio()) catch null) |entry| {
-            if (!std.mem.endsWith(u8, entry.name, ".policy")) continue;
-            if (self.peer_count >= MAX_PEER_POLICIES) break;
+        while (try nextPolicyEntry(&iter, dir_path, diag)) |entry| {
+            // Count every file: aliases are added later and must fit too.
+            seen += 1;
+            if (seen > MAX_PEER_POLICIES) {
+                noteDiag(diag, dir_path, 0);
+                return LoadError.TooManyPolicies;
+            }
 
-            // Read policy file
-            var file_path_buf: [512]u8 = undefined;
-            const file_path = std.fmt.bufPrint(&file_path_buf, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
-            const content = readSmallFile(file_path) orelse continue;
-            const policy = parsePolicy(content.slice()) catch continue;
+            // Read and validate the policy file
+            var file_path_buf: [PATH_BUF_LEN]u8 = undefined;
+            const file_path = try joinPath(&file_path_buf, dir_path, entry.name, diag);
+            const content = (try readPolicyFile(file_path, diag)) orelse continue; // vanished since listing
+            const policy = try parsePolicyFile(content.slice(), file_path, diag);
 
             // Extract name (strip .policy extension)
             const name = entry.name[0 .. entry.name.len - 7];
 
-            // Try to decode as base64 pubkey (44 chars)
+            // A 44-char base64 name is a pubkey; anything else is an alias
+            // resolved by resolveAliases.
             if (name.len == 44) {
                 var pubkey: [32]u8 = undefined;
-                if (std.base64.standard.Decoder.decode(&pubkey, name) catch null) |_| {
-                    // This is unused, the decode writes to pubkey directly
-                }
-                // Try base64 decode — if it works, use as pubkey
-                const decoded = std.base64.standard.Decoder.decode(&pubkey, name) catch {
-                    // Not valid base64 — treat as alias (handled via authorized_keys lookup)
-                    // For now, skip non-base64 peer policies (alias resolution requires allocator)
-                    continue;
-                };
-                _ = decoded;
+                std.base64.standard.Decoder.decode(&pubkey, name) catch continue;
                 self.peer_policies[self.peer_count] = .{
                     .pubkey = pubkey,
                     .policy = policy,
                 };
                 self.peer_count += 1;
             }
-            // Alias-based peer policies would require looking up the pubkey from
-            // authorized_keys/<alias>.pub — done at a higher level during init
         }
     }
 
-    fn loadOrgPolicies(self: *ServiceFilter, dir_path: []const u8) void {
-        const dir = openDirAbsolute(dir_path) catch return;
+    /// Validate every org/*.policy file and index the base64-named ones by
+    /// org pubkey. Name-based files are indexed later by resolveOrgNames.
+    fn loadOrgPolicies(self: *ServiceFilter, dir_path: []const u8, diag: ?*LoadDiagnostics) LoadError!void {
+        const dir = (try openPolicyDir(dir_path, diag)) orelse return;
         defer dir.close(zio());
 
+        var seen: usize = 0;
         var iter = dir.iterate();
-        while (iter.next(zio()) catch null) |entry| {
-            if (!std.mem.endsWith(u8, entry.name, ".policy")) continue;
-            if (self.org_count >= MAX_ORG_POLICIES) break;
+        while (try nextPolicyEntry(&iter, dir_path, diag)) |entry| {
+            seen += 1;
+            if (seen > MAX_ORG_POLICIES) {
+                noteDiag(diag, dir_path, 0);
+                return LoadError.TooManyPolicies;
+            }
 
-            var file_path_buf: [512]u8 = undefined;
-            const file_path = std.fmt.bufPrint(&file_path_buf, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
-            const content = readSmallFile(file_path) orelse continue;
-            const policy = parsePolicy(content.slice()) catch continue;
+            var file_path_buf: [PATH_BUF_LEN]u8 = undefined;
+            const file_path = try joinPath(&file_path_buf, dir_path, entry.name, diag);
+            const content = (try readPolicyFile(file_path, diag)) orelse continue;
+            const policy = try parsePolicyFile(content.slice(), file_path, diag);
 
-            // Org policy filename = org name. We need the org pubkey.
-            // Load from trusted_orgs/<name>.org which contains the base64 pubkey.
-            // For now, the org name is the filename stem — the caller maps name→pubkey
-            // by loading trusted_orgs/ at startup.
-            //
-            // We store the name hash temporarily; the caller resolves it.
-            // Alternative: use base64 pubkey as filename (same as peer policies).
+            // Org policy filename = org name or base64 org pubkey. Names are
+            // mapped to pubkeys via trusted_orgs/<name>.org in resolveOrgNames.
             const org_name = entry.name[0 .. entry.name.len - 7];
 
-            // Try base64 decode first (if 44 chars)
             if (org_name.len == 44) {
                 var org_pubkey: [32]u8 = undefined;
-                _ = std.base64.standard.Decoder.decode(&org_pubkey, org_name) catch continue;
+                std.base64.standard.Decoder.decode(&org_pubkey, org_name) catch continue;
                 self.org_policies[self.org_count] = .{
                     .org_pubkey = org_pubkey,
                     .policy = policy,
@@ -399,7 +558,7 @@ pub const ServiceFilter = struct {
     /// Call after loadFromDir to convert peer/<alias>.policy files to pubkey-indexed entries.
     pub fn resolveAliases(self: *ServiceFilter, config_dir: []const u8) void {
         // Re-scan the peer policy directory looking for non-base64 names
-        var peer_dir_buf: [512]u8 = undefined;
+        var peer_dir_buf: [PATH_BUF_LEN]u8 = undefined;
         const peer_dir_path = std.fmt.bufPrint(&peer_dir_buf, "{s}/services/peer", .{config_dir}) catch return;
 
         const dir = openDirAbsolute(peer_dir_path) catch return;
@@ -419,18 +578,18 @@ pub const ServiceFilter = struct {
             }
 
             // This is an alias — look up pubkey from authorized_keys/<name>.pub
-            var ak_path_buf: [512]u8 = undefined;
+            var ak_path_buf: [PATH_BUF_LEN]u8 = undefined;
             const ak_path = std.fmt.bufPrint(&ak_path_buf, "{s}/authorized_keys/{s}.pub", .{ config_dir, name }) catch continue;
-            const ak_content = readSmallFile(ak_path) orelse continue;
+            const ak_content = (readSmallFile(ak_path) catch continue) orelse continue;
             const trimmed = std.mem.trim(u8, ak_content.slice(), " \t\r\n");
 
             var pubkey: [32]u8 = undefined;
             _ = std.base64.standard.Decoder.decode(&pubkey, trimmed) catch continue;
 
             // Read and parse the policy file
-            var file_path_buf: [512]u8 = undefined;
+            var file_path_buf: [PATH_BUF_LEN]u8 = undefined;
             const file_path = std.fmt.bufPrint(&file_path_buf, "{s}/{s}", .{ peer_dir_path, entry.name }) catch continue;
-            const content = readSmallFile(file_path) orelse continue;
+            const content = (readSmallFile(file_path) catch continue) orelse continue;
             const policy = parsePolicy(content.slice()) catch continue;
 
             self.peer_policies[self.peer_count] = .{
@@ -443,7 +602,7 @@ pub const ServiceFilter = struct {
 
     /// Resolve org policies by name (maps org name to pubkey via trusted_orgs/).
     pub fn resolveOrgNames(self: *ServiceFilter, config_dir: []const u8) void {
-        var org_dir_buf: [512]u8 = undefined;
+        var org_dir_buf: [PATH_BUF_LEN]u8 = undefined;
         const org_policy_dir = std.fmt.bufPrint(&org_dir_buf, "{s}/services/org", .{config_dir}) catch return;
 
         const dir = openDirAbsolute(org_policy_dir) catch return;
@@ -463,17 +622,17 @@ pub const ServiceFilter = struct {
             }
 
             // Look up org pubkey from trusted_orgs/<name>.org
-            var to_path_buf: [512]u8 = undefined;
+            var to_path_buf: [PATH_BUF_LEN]u8 = undefined;
             const to_path = std.fmt.bufPrint(&to_path_buf, "{s}/trusted_orgs/{s}.org", .{ config_dir, org_name }) catch continue;
-            const to_content = readSmallFile(to_path) orelse continue;
+            const to_content = (readSmallFile(to_path) catch continue) orelse continue;
             const trimmed = std.mem.trim(u8, to_content.slice(), " \t\r\n");
 
             var org_pubkey: [32]u8 = undefined;
             _ = std.base64.standard.Decoder.decode(&org_pubkey, trimmed) catch continue;
 
-            var file_path_buf: [512]u8 = undefined;
+            var file_path_buf: [PATH_BUF_LEN]u8 = undefined;
             const file_path = std.fmt.bufPrint(&file_path_buf, "{s}/{s}", .{ org_policy_dir, entry.name }) catch continue;
-            const content = readSmallFile(file_path) orelse continue;
+            const content = (readSmallFile(file_path) catch continue) orelse continue;
             const policy = parsePolicy(content.slice()) catch continue;
 
             self.org_policies[self.org_count] = .{
@@ -494,6 +653,9 @@ pub const TransportInfo = struct {
 
 /// Extract protocol and destination port from a decrypted IPv4 packet.
 /// Returns null for non-TCP/UDP packets (ICMP, etc.) — they pass unfiltered.
+///
+/// Legacy, IPv4-only and kept for its tests: it cannot express "unclassified"
+/// and does not understand fragments. The filter uses classifyPacket.
 pub fn parseTransportHeader(ip_packet: []const u8) ?TransportInfo {
     if (ip_packet.len < 20) return null;
 
@@ -538,9 +700,19 @@ fn classifyL4(protocol: u8, ip_packet: []const u8, l4_off: usize) FilterClass {
     }
 }
 
+/// Upper bound on IPv6 extension headers walked before giving up.
+pub const MAX_IPV6_EXT_HEADERS: usize = 8;
+
 /// Parse an inner IP packet (IPv4 or IPv6) for the service filter. Unlike
 /// parseTransportHeader (IPv4-only, used by its tests), this classifies IPv6 too
 /// and distinguishes "pass" (ICMP) from "unclassified" so callers can fail closed.
+///
+/// SECURITY: a non-first fragment (IPv4 offset != 0, or an IPv6 Fragment header
+/// with offset != 0) carries no transport header; the bytes at the "port"
+/// offset are payload chosen by the sender, so it is never matched against a
+/// port rule and is `.unclassified` instead. IPv6 extension headers are walked
+/// (bounded, bounds-checked) so a Hop-by-Hop header cannot hide a TCP port
+/// from a deny rule.
 pub fn classifyPacket(ip_packet: []const u8) FilterClass {
     if (ip_packet.len < 1) return .unclassified;
     switch (ip_packet[0] >> 4) {
@@ -548,16 +720,56 @@ pub fn classifyPacket(ip_packet: []const u8) FilterClass {
             if (ip_packet.len < 20) return .unclassified;
             const ihl = @as(usize, ip_packet[0] & 0x0F) * 4;
             if (ihl < 20) return .unclassified;
+            // Flags/fragment offset: low 13 bits are the offset in 8-octet units.
+            const frag_offset = std.mem.readInt(u16, ip_packet[6..8], .big) & 0x1FFF;
+            if (frag_offset != 0) return .unclassified;
             return classifyL4(ip_packet[9], ip_packet, ihl);
         },
         6 => {
             if (ip_packet.len < 40) return .unclassified;
-            // Note: a chain of IPv6 extension headers makes the L4 offset != 40;
-            // classifyL4 will treat such next-header values as `.unclassified`,
-            // which fails closed under default-deny.
-            return classifyL4(ip_packet[6], ip_packet, 40);
+            return classifyIpv6(ip_packet);
         },
         else => return .unclassified,
+    }
+}
+
+/// Walk the IPv6 extension-header chain (ip_packet.len >= 40) to the upper
+/// layer header and classify it. ESP, No Next Header and unknown next-header
+/// values end in classifyL4's `.unclassified`.
+fn classifyIpv6(ip_packet: []const u8) FilterClass {
+    var next: u8 = ip_packet[6];
+    var off: usize = 40;
+    var hops: usize = 0;
+    while (true) {
+        switch (next) {
+            // Hop-by-Hop (0), Routing (43), Destination Options (60):
+            // Hdr Ext Len counts 8-octet units beyond the first 8.
+            0, 43, 60 => {
+                if (ip_packet.len < off + 2) return .unclassified;
+                next = ip_packet[off];
+                off += (@as(usize, ip_packet[off + 1]) + 1) * 8;
+            },
+            // Fragment (44): fixed 8 octets; only the first fragment carries L4.
+            44 => {
+                if (ip_packet.len < off + 8) return .unclassified;
+                const frag_offset = std.mem.readInt(u16, ip_packet[off + 2 ..][0..2], .big) >> 3;
+                if (frag_offset != 0) return .unclassified;
+                next = ip_packet[off];
+                off += 8;
+            },
+            // Authentication Header (51): Payload Len counts 4-octet units
+            // beyond the first 8.
+            51 => {
+                if (ip_packet.len < off + 2) return .unclassified;
+                next = ip_packet[off];
+                off += (@as(usize, ip_packet[off + 1]) + 2) * 4;
+            },
+            else => return classifyL4(next, ip_packet, off),
+        }
+        hops += 1;
+        // A header that runs past the packet, or an absurdly long chain, is
+        // not something we will read a port out of.
+        if (hops > MAX_IPV6_EXT_HEADERS or off > ip_packet.len) return .unclassified;
     }
 }
 
@@ -572,11 +784,16 @@ const SmallFile = struct {
     }
 };
 
-fn readSmallFile(path: []const u8) ?SmallFile {
-    const file = std.Io.Dir.openFileAbsolute(zio(), path, .{}) catch return null;
+/// Read a whole file into a fixed buffer. Returns null when the file does not
+/// exist; a file that exists but cannot be read, or does not fit, is an error.
+fn readSmallFile(path: []const u8) ReadError!?SmallFile {
+    const file = std.Io.Dir.openFileAbsolute(zio(), path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return ReadError.Unreadable,
+    };
     defer file.close(zio());
     var result = SmallFile{ .buf = undefined, .len = 0 };
-    result.len = readFileBytes(file, &result.buf) catch return null;
+    result.len = try readFileBytes(file, &result.buf);
     return result;
 }
 
@@ -752,7 +969,8 @@ test "classifyPacket handles IPv6 and allowPacket fails closed (M5 regression)" 
     try std.testing.expectEqual(@as(u16, 80), c.transport.dst_port);
     try std.testing.expectEqual(Proto.tcp, c.transport.proto);
 
-    // IPv6 with an extension/unknown next header → unclassified (fail-closed input).
+    // IPv6 whose Hop-by-Hop header chain runs past the packet → unclassified
+    // (fail-closed input; a complete chain is walked, see the ext-header tests).
     var v6ext = std.mem.zeroes([44]u8);
     v6ext[0] = 0x60;
     v6ext[6] = 0; // hop-by-hop extension header
@@ -774,4 +992,387 @@ test "classifyPacket handles IPv6 and allowPacket fails closed (M5 regression)" 
     // Under default-allow (unconfigured), behavior is unchanged (passes).
     const allow = ServiceFilter{ .default_action = .allow, .peer_count = 0, .org_count = 0 };
     try std.testing.expect(allow.allowPacket(@splat(0), null, &v6ext));
+}
+
+// ─── Fragment / extension-header tests ───
+
+/// Minimal IPv4 TCP packet to `dst_port` with the given flags/fragment field.
+fn testIpv4Tcp(frag_field: u16, dst_port: u16) [28]u8 {
+    var pkt = std.mem.zeroes([28]u8);
+    pkt[0] = 0x45; // Version 4, IHL 5
+    std.mem.writeInt(u16, pkt[6..8], frag_field, .big);
+    pkt[9] = 6; // TCP
+    std.mem.writeInt(u16, pkt[22..24], dst_port, .big);
+    return pkt;
+}
+
+test "classifyPacket: IPv4 non-first fragment never yields a port" {
+    // Under default-deny with `allow tcp 22`, a non-first fragment whose payload
+    // bytes happen to read as port 22 must NOT be allowed: it has no TCP header.
+    var filter = ServiceFilter{ .default_action = .deny, .peer_count = 0, .org_count = 0 };
+    filter.global = try parsePolicy("allow tcp 22");
+    const pk: [32]u8 = @splat(0x11);
+
+    const non_first = testIpv4Tcp(0x0001, 22); // offset 1 (8 octets), MF clear
+    try std.testing.expect(classifyPacket(&non_first) == .unclassified);
+    try std.testing.expect(!filter.allowPacket(pk, null, &non_first));
+
+    const mid_with_mf = testIpv4Tcp(0x2005, 22); // MF set, offset 5
+    try std.testing.expect(classifyPacket(&mid_with_mf) == .unclassified);
+    try std.testing.expect(!filter.allowPacket(pk, null, &mid_with_mf));
+
+    // Non-first ICMP fragments are unclassified too (not blanket-passed).
+    var icmp_frag = testIpv4Tcp(0x0002, 0);
+    icmp_frag[9] = 1;
+    try std.testing.expect(classifyPacket(&icmp_frag) == .unclassified);
+
+    // Unfragmented and first fragments are classified normally.
+    const whole = testIpv4Tcp(0x4000, 22); // DF set, offset 0
+    const c = classifyPacket(&whole);
+    try std.testing.expect(c == .transport);
+    try std.testing.expectEqual(@as(u16, 22), c.transport.dst_port);
+    try std.testing.expect(filter.allowPacket(pk, null, &whole));
+
+    const first = testIpv4Tcp(0x2000, 22); // MF set, offset 0
+    const cf = classifyPacket(&first);
+    try std.testing.expect(cf == .transport);
+    try std.testing.expectEqual(Proto.tcp, cf.transport.proto);
+    try std.testing.expectEqual(@as(u16, 22), cf.transport.dst_port);
+    try std.testing.expect(filter.allowPacket(pk, null, &first));
+}
+
+test "classifyPacket: IPv4 honors IHL and bounds-checks the L4 header" {
+    // IHL=6 (24-byte header with options): the port lives at offset 26.
+    var pkt = std.mem.zeroes([32]u8);
+    pkt[0] = 0x46;
+    pkt[9] = 17; // UDP
+    std.mem.writeInt(u16, pkt[22..24], 9999, .big); // where IHL=5 would look
+    std.mem.writeInt(u16, pkt[26..28], 53, .big);
+    const c = classifyPacket(&pkt);
+    try std.testing.expect(c == .transport);
+    try std.testing.expectEqual(Proto.udp, c.transport.proto);
+    try std.testing.expectEqual(@as(u16, 53), c.transport.dst_port);
+
+    // IHL=15 (60 bytes) on a 32-byte packet: L4 header out of range → unclassified.
+    pkt[0] = 0x4F;
+    try std.testing.expect(classifyPacket(&pkt) == .unclassified);
+
+    // IHL<5 is malformed → unclassified.
+    pkt[0] = 0x44;
+    try std.testing.expect(classifyPacket(&pkt) == .unclassified);
+}
+
+/// Build an IPv6 packet: fixed header with `first_next`, then `ext` bytes
+/// verbatim, then an 8-byte L4 header whose dst port is `dst_port`.
+fn testIpv6(buf: []u8, first_next: u8, ext: []const u8, dst_port: u16) []u8 {
+    @memset(buf, 0);
+    buf[0] = 0x60;
+    buf[6] = first_next;
+    @memcpy(buf[40 .. 40 + ext.len], ext);
+    const l4 = 40 + ext.len;
+    std.mem.writeInt(u16, buf[l4 + 2 ..][0..2], dst_port, .big);
+    return buf[0 .. l4 + 8];
+}
+
+test "classifyPacket: IPv6 Hop-by-Hop before TCP is still TCP (deny applies)" {
+    // default allow + `deny tcp 22`: prepending a Hop-by-Hop header used to make
+    // the packet unclassified, which the default then allowed.
+    var filter = ServiceFilter{ .default_action = .allow, .peer_count = 0, .org_count = 0 };
+    filter.global = try parsePolicy("deny tcp 22");
+    const pk: [32]u8 = @splat(0x22);
+
+    var buf: [128]u8 = undefined;
+    // HBH: next=TCP(6), Hdr Ext Len=0 (8 octets), 6 bytes of padding.
+    const hbh = [_]u8{ 6, 0, 0, 0, 0, 0, 0, 0 };
+    const pkt = testIpv6(&buf, 0, &hbh, 22);
+    const c = classifyPacket(pkt);
+    try std.testing.expect(c == .transport);
+    try std.testing.expectEqual(Proto.tcp, c.transport.proto);
+    try std.testing.expectEqual(@as(u16, 22), c.transport.dst_port);
+    try std.testing.expect(!filter.allowPacket(pk, null, pkt));
+
+    // Other ports are still allowed by the default.
+    const ok = testIpv6(&buf, 0, &hbh, 443);
+    try std.testing.expect(filter.allowPacket(pk, null, ok));
+
+    // Routing (43) with Hdr Ext Len=1 (16 octets) then Dest Opts (60) then UDP.
+    var chain: [24]u8 = @splat(0);
+    chain[0] = 60; // routing → dest opts
+    chain[1] = 1; // 16 octets
+    chain[16] = 17; // dest opts → UDP
+    chain[17] = 0; // 8 octets
+    const c2 = classifyPacket(testIpv6(&buf, 43, &chain, 53));
+    try std.testing.expect(c2 == .transport);
+    try std.testing.expectEqual(Proto.udp, c2.transport.proto);
+    try std.testing.expectEqual(@as(u16, 53), c2.transport.dst_port);
+}
+
+test "classifyPacket: IPv6 fragments" {
+    var buf: [128]u8 = undefined;
+
+    // Fragment header: next=TCP, reserved, offset(13 bits)<<3 | res(2) | M.
+    // Non-first fragment (offset 1): the payload bytes are NOT a TCP header.
+    var frag = [_]u8{ 6, 0, 0, 0, 0, 0, 0, 0 };
+    std.mem.writeInt(u16, frag[2..4], (1 << 3) | 1, .big);
+    try std.testing.expect(classifyPacket(testIpv6(&buf, 44, &frag, 22)) == .unclassified);
+
+    const deny = ServiceFilter{ .default_action = .deny, .peer_count = 0, .org_count = 0 };
+    try std.testing.expect(!deny.allowPacket(@splat(0), null, testIpv6(&buf, 44, &frag, 22)));
+
+    // First fragment (offset 0, M=1): classified normally.
+    std.mem.writeInt(u16, frag[2..4], 1, .big);
+    const c = classifyPacket(testIpv6(&buf, 44, &frag, 22));
+    try std.testing.expect(c == .transport);
+    try std.testing.expectEqual(Proto.tcp, c.transport.proto);
+    try std.testing.expectEqual(@as(u16, 22), c.transport.dst_port);
+
+    // Truncated fragment header (less than 8 bytes) → unclassified, no OOB.
+    var short = std.mem.zeroes([44]u8);
+    short[0] = 0x60;
+    short[6] = 44;
+    try std.testing.expect(classifyPacket(&short) == .unclassified);
+}
+
+test "classifyPacket: IPv6 AH then UDP, ESP and no-next-header" {
+    var buf: [128]u8 = undefined;
+
+    // AH: next=UDP(17), Payload Len=4 → (4+2)*4 = 24 octets.
+    var ah: [24]u8 = @splat(0);
+    ah[0] = 17;
+    ah[1] = 4;
+    const c = classifyPacket(testIpv6(&buf, 51, &ah, 53));
+    try std.testing.expect(c == .transport);
+    try std.testing.expectEqual(Proto.udp, c.transport.proto);
+    try std.testing.expectEqual(@as(u16, 53), c.transport.dst_port);
+
+    // ESP (50) and No Next Header (59): nothing to match → unclassified.
+    try std.testing.expect(classifyPacket(testIpv6(&buf, 50, &.{}, 22)) == .unclassified);
+    try std.testing.expect(classifyPacket(testIpv6(&buf, 59, &.{}, 22)) == .unclassified);
+
+    // HBH then ICMPv6 → pass.
+    const hbh = [_]u8{ 58, 0, 0, 0, 0, 0, 0, 0 };
+    try std.testing.expect(classifyPacket(testIpv6(&buf, 0, &hbh, 0)) == .pass);
+}
+
+test "classifyPacket: IPv6 extension chain is bounded and bounds-checked" {
+    var buf: [256]u8 = undefined;
+
+    // Exactly MAX_IPV6_EXT_HEADERS Hop-by-Hop headers then TCP → classified.
+    var chain: [MAX_IPV6_EXT_HEADERS * 8 + 8]u8 = @splat(0); // next=HBH, len=0 each
+    chain[(MAX_IPV6_EXT_HEADERS - 1) * 8] = 6; // last one → TCP
+    const ok = classifyPacket(testIpv6(&buf, 0, chain[0 .. MAX_IPV6_EXT_HEADERS * 8], 22));
+    try std.testing.expect(ok == .transport);
+    try std.testing.expectEqual(@as(u16, 22), ok.transport.dst_port);
+
+    // One more header than the bound → unclassified (the loop terminates).
+    chain[(MAX_IPV6_EXT_HEADERS - 1) * 8] = 0;
+    chain[MAX_IPV6_EXT_HEADERS * 8] = 6;
+    try std.testing.expect(classifyPacket(testIpv6(&buf, 0, &chain, 22)) == .unclassified);
+
+    // A header that claims to run past the packet → unclassified, no OOB read.
+    const huge = [_]u8{ 6, 0xFF, 0, 0, 0, 0, 0, 0 }; // 2048 octets
+    try std.testing.expect(classifyPacket(testIpv6(&buf, 0, &huge, 22)) == .unclassified);
+
+    // Truncated right after the fixed header with an ext next-header → unclassified.
+    var bare = std.mem.zeroes([40]u8);
+    bare[0] = 0x60;
+    bare[6] = 60;
+    try std.testing.expect(classifyPacket(&bare) == .unclassified);
+    // AH with only one byte of header present.
+    var ah_short = std.mem.zeroes([41]u8);
+    ah_short[0] = 0x60;
+    ah_short[6] = 51;
+    try std.testing.expect(classifyPacket(&ah_short) == .unclassified);
+}
+
+// ─── Loader tests ───
+
+test "parseDefaultAction: case, whitespace, comments; rejects anything else" {
+    try std.testing.expectEqual(Action.deny, try parseDefaultAction("deny\n"));
+    try std.testing.expectEqual(Action.deny, try parseDefaultAction("Deny "));
+    try std.testing.expectEqual(Action.deny, try parseDefaultAction("  DENY\r\n"));
+    try std.testing.expectEqual(Action.deny, try parseDefaultAction("deny # comment\n"));
+    try std.testing.expectEqual(Action.deny, try parseDefaultAction("# header\n\ndeny\n"));
+    try std.testing.expectEqual(Action.allow, try parseDefaultAction("allow\n"));
+    try std.testing.expectEqual(Action.allow, try parseDefaultAction("Allow"));
+
+    try std.testing.expectError(error.InvalidDefault, parseDefaultAction("maybe"));
+    try std.testing.expectError(error.InvalidDefault, parseDefaultAction("deny all"));
+    try std.testing.expectError(error.InvalidDefault, parseDefaultAction("denyy"));
+    try std.testing.expectError(error.InvalidDefault, parseDefaultAction("allow\ndeny\n"));
+    try std.testing.expectError(error.InvalidDefault, parseDefaultAction(""));
+    try std.testing.expectError(error.InvalidDefault, parseDefaultAction("# nothing\n"));
+}
+
+/// Temporary config dir for loader tests. `root` is absolute; policy files are
+/// written relative to it.
+const TestConfig = struct {
+    tmp: std.testing.TmpDir,
+    root: [:0]u8,
+
+    fn init() !TestConfig {
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        const root = try tmp.dir.realPathFileAlloc(zio(), ".", std.testing.allocator);
+        return .{ .tmp = tmp, .root = root };
+    }
+
+    fn deinit(self: *TestConfig) void {
+        std.testing.allocator.free(self.root);
+        self.tmp.cleanup();
+    }
+
+    fn mkdir(self: *TestConfig, sub_path: []const u8) !void {
+        try self.tmp.dir.createDirPath(zio(), sub_path);
+    }
+
+    fn write(self: *TestConfig, sub_path: []const u8, data: []const u8) !void {
+        try self.tmp.dir.writeFile(zio(), .{ .sub_path = sub_path, .data = data });
+    }
+};
+
+test "loadFromDir: missing or empty services/ loads as allow-all" {
+    var cfg = try TestConfig.init();
+    defer cfg.deinit();
+
+    var diag = LoadDiagnostics{};
+    const none = try ServiceFilter.loadFromDir(cfg.root, &diag);
+    try std.testing.expectEqual(Action.allow, none.default_action);
+    try std.testing.expect(none.global == null);
+
+    try cfg.mkdir("services");
+    const empty = try ServiceFilter.loadFromDir(cfg.root, &diag);
+    try std.testing.expectEqual(Action.allow, empty.default_action);
+    try std.testing.expect(empty.global == null);
+    try std.testing.expectEqual(@as(u8, 0), empty.peer_count);
+    try std.testing.expectEqual(@as(u8, 0), empty.org_count);
+
+    // Empty sub-directories are fine too; a null diag is accepted.
+    try cfg.mkdir("services/peer");
+    try cfg.mkdir("services/org");
+    const dirs = try ServiceFilter.loadFromDir(cfg.root, null);
+    try std.testing.expectEqual(@as(u8, 0), dirs.peer_count);
+}
+
+test "loadFromDir: valid files load with the documented semantics" {
+    var cfg = try TestConfig.init();
+    defer cfg.deinit();
+    try cfg.mkdir("services/peer");
+    try cfg.mkdir("services/org");
+    try cfg.write("services/default", "Deny # allowlist mode\n");
+    try cfg.write("services/global.policy", "# ssh only\nallow tcp 22\ndeny all\n");
+
+    const peer_pk: [32]u8 = @splat(0xAB);
+    var b64: [44]u8 = undefined;
+    _ = std.base64.standard.Encoder.encode(&b64, &peer_pk);
+    var name_buf: [80]u8 = undefined;
+    const name = try std.fmt.bufPrint(&name_buf, "services/peer/{s}.policy", .{b64});
+    try cfg.write(name, "allow tcp 5432\n");
+    try cfg.write("services/peer/notes.txt", "not a policy\n"); // ignored
+
+    const filter = try ServiceFilter.loadFromDir(cfg.root, null);
+    try std.testing.expectEqual(Action.deny, filter.default_action);
+    try std.testing.expect(filter.global != null);
+    try std.testing.expectEqual(@as(u8, 1), filter.peer_count);
+    try std.testing.expect(filter.check(peer_pk, null, .tcp, 5432));
+    try std.testing.expect(filter.check(peer_pk, null, .tcp, 22));
+    try std.testing.expect(!filter.check(@splat(0xCD), null, .tcp, 5432));
+    try std.testing.expect(filter.check(@splat(0xCD), null, .tcp, 22));
+}
+
+test "loadFromDir: unrecognized default value fails closed" {
+    var cfg = try TestConfig.init();
+    defer cfg.deinit();
+    try cfg.mkdir("services");
+    try cfg.write("services/default", "maybe\n");
+
+    var diag = LoadDiagnostics{};
+    try std.testing.expectError(error.InvalidDefault, ServiceFilter.loadFromDir(cfg.root, &diag));
+    try std.testing.expect(std.mem.endsWith(u8, diag.path(), "/services/default"));
+    try std.testing.expectEqual(@as(usize, 0), diag.line);
+
+    // The accepted spellings load.
+    try cfg.write("services/default", "deny # comment\n");
+    try std.testing.expectEqual(Action.deny, (try ServiceFilter.loadFromDir(cfg.root, &diag)).default_action);
+    try cfg.write("services/default", "Deny \n");
+    try std.testing.expectEqual(Action.deny, (try ServiceFilter.loadFromDir(cfg.root, &diag)).default_action);
+}
+
+test "loadFromDir: a malformed rule in any policy file fails the load" {
+    var cfg = try TestConfig.init();
+    defer cfg.deinit();
+    try cfg.mkdir("services/peer");
+    try cfg.mkdir("services/org");
+
+    // Global: bad action on line 2.
+    try cfg.write("services/global.policy", "allow tcp 22\nalow tcp 80\n");
+    var diag = LoadDiagnostics{};
+    try std.testing.expectError(error.InvalidAction, ServiceFilter.loadFromDir(cfg.root, &diag));
+    try std.testing.expect(std.mem.endsWith(u8, diag.path(), "/services/global.policy"));
+    try std.testing.expectEqual(@as(usize, 2), diag.line);
+    var fmt_buf: [600]u8 = undefined;
+    const rendered = try std.fmt.bufPrint(&fmt_buf, "{f}", .{&diag});
+    try std.testing.expect(std.mem.endsWith(u8, rendered, "global.policy:2"));
+
+    // Alias-named peer policy (not base64): still validated at load time.
+    try cfg.write("services/global.policy", "allow tcp 22\n");
+    try cfg.write("services/peer/laptop.policy", "allow tcp 22\n\ndeny udp 1-x\n");
+    try std.testing.expectError(error.InvalidPort, ServiceFilter.loadFromDir(cfg.root, &diag));
+    try std.testing.expect(std.mem.endsWith(u8, diag.path(), "/services/peer/laptop.policy"));
+    try std.testing.expectEqual(@as(usize, 3), diag.line);
+
+    // Org policy with a bad protocol.
+    try cfg.write("services/peer/laptop.policy", "deny all\n");
+    try cfg.write("services/org/acme.policy", "allow sctp 22\n");
+    try std.testing.expectError(error.InvalidProto, ServiceFilter.loadFromDir(cfg.root, &diag));
+    try std.testing.expect(std.mem.endsWith(u8, diag.path(), "/services/org/acme.policy"));
+    try std.testing.expectEqual(@as(usize, 1), diag.line);
+
+    // Fixed → loads.
+    try cfg.write("services/org/acme.policy", "allow tcp 22\n");
+    _ = try ServiceFilter.loadFromDir(cfg.root, &diag);
+}
+
+test "loadFromDir: too many rules and oversized files fail instead of being dropped" {
+    var cfg = try TestConfig.init();
+    defer cfg.deinit();
+    try cfg.mkdir("services");
+
+    // MAX_RULES + 1 rules: the old loader dropped the whole global policy.
+    var content: [(MAX_RULES + 1) * 16]u8 = undefined;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i <= MAX_RULES) : (i += 1) {
+        const line = try std.fmt.bufPrint(content[n..], "allow tcp {d}\n", .{1000 + i});
+        n += line.len;
+    }
+    try cfg.write("services/global.policy", content[0..n]);
+    var diag = LoadDiagnostics{};
+    try std.testing.expectError(error.TooManyRules, ServiceFilter.loadFromDir(cfg.root, &diag));
+    try std.testing.expectEqual(MAX_RULES + 1, diag.line);
+
+    // Larger than the read buffer: the old loader silently truncated it,
+    // losing the trailing `deny all`.
+    var big: [4480 + 16]u8 = undefined;
+    var off: usize = 0;
+    while (off < 4480) : (off += 64) { // 70 comment lines of 64 bytes
+        big[off] = '#';
+        big[off + 1] = ' ';
+        @memset(big[off + 2 .. off + 63], 'x');
+        big[off + 63] = '\n';
+    }
+    const tail = "deny all\n";
+    @memcpy(big[off .. off + tail.len], tail);
+    try cfg.write("services/global.policy", big[0 .. off + tail.len]);
+    try std.testing.expectError(error.FileTooLarge, ServiceFilter.loadFromDir(cfg.root, &diag));
+    try std.testing.expect(std.mem.endsWith(u8, diag.path(), "/services/global.policy"));
+}
+
+test "loadFromDir: oversized config path is an error, not allow-all" {
+    var long_dir: [PATH_BUF_LEN + 10]u8 = @splat('d');
+    long_dir[0] = '/';
+    var diag = LoadDiagnostics{};
+    try std.testing.expectError(error.PathTooLong, ServiceFilter.loadFromDir(&long_dir, &diag));
+    try std.testing.expectEqual(PATH_BUF_LEN, diag.path().len);
+    try std.testing.expect(std.mem.startsWith(u8, &long_dir, diag.path()));
 }

@@ -22,12 +22,24 @@ fn zio() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
 }
 
+/// Monotonic nanoseconds — for intervals and elapsed time only.
 fn nowNs() i128 {
     return @intCast(std.Io.Timestamp.now(zio(), .awake).toNanoseconds());
 }
 
+/// Wall-clock nanoseconds since the unix epoch — for comparing against the
+/// token's `punch_time`, which is unix time. (The 0.16 port had replaced the
+/// wall clock with the monotonic one here, so the wait never ended.)
+fn nowUnixNs() i128 {
+    return @intCast(std.Io.Timestamp.now(zio(), .real).toNanoseconds());
+}
+
 fn nowUnixSecs() i64 {
     return @intCast(std.Io.Timestamp.now(zio(), .real).toSeconds());
+}
+
+fn nowUnixSecsClamped() u64 {
+    return @intCast(@max(nowUnixSecs(), 0));
 }
 
 /// Protocol version for tokens.
@@ -51,6 +63,35 @@ const MAX_ATTEMPTS: u8 = 3;
 const IDLE_BETWEEN_SECS: u16 = 60; // 1 minute idle between attempts
 const PROBE_INTERVAL_MS: i32 = 100; // send probe every 100ms
 const STUN_KEEPALIVE_INTERVAL_NS: i128 = 20_000_000_000; // 20s
+
+/// An NTP answer further than this from the local clock is ignored: a (correctly
+/// echoed) NTP response must not be able to move our idea of "now" by hours.
+pub const MAX_NTP_SKEW_SECS: u64 = 3600;
+
+/// A token's `punch_time` is only honoured inside this window around the local
+/// clock. A far-future value would park the CLI for days; a stale one is useless
+/// because the peer's window has already closed.
+pub const MAX_PUNCH_FUTURE_SECS: u64 = 300;
+pub const MAX_PUNCH_PAST_SECS: u64 = 60;
+
+pub const PunchTimeError = error{ PunchTimeTooFarInFuture, PunchTimeInPast };
+
+/// Validate a punch time against `now_secs` (both unix seconds). Pure.
+pub fn validatePunchTime(punch_time: u64, now_secs: u64) PunchTimeError!void {
+    if (punch_time > now_secs and punch_time - now_secs > MAX_PUNCH_FUTURE_SECS) return error.PunchTimeTooFarInFuture;
+    if (punch_time < now_secs and now_secs - punch_time > MAX_PUNCH_PAST_SECS) return error.PunchTimeInPast;
+}
+
+/// Validate a punch time against the local clock.
+pub fn checkPunchTime(punch_time: u64) PunchTimeError!void {
+    return validatePunchTime(punch_time, nowUnixSecsClamped());
+}
+
+/// Whether an NTP reading is close enough to the local clock to be used. Pure.
+pub fn ntpAgreesWithSystemClock(ntp_secs: u64, system_secs: u64) bool {
+    const diff = if (ntp_secs > system_secs) ntp_secs - system_secs else system_secs - ntp_secs;
+    return diff <= MAX_NTP_SKEW_SECS;
+}
 
 /// Connection token — exchanged out-of-band between peers.
 pub const Token = struct {
@@ -334,52 +375,98 @@ fn base64UrlDecode(input: []const u8, output: []u8) !usize {
 
 // ─── NTP client ───
 
+const NTP_PORT: u16 = 123;
+const NTP_EPOCH_OFFSET: u64 = 2208988800; // seconds from 1900 to 1970
+
+/// Build a 48-byte SNTPv4 client request whose Transmit Timestamp field
+/// (bytes 40..48) carries `origin`, 8 random bytes the server must echo back
+/// in its Originate Timestamp. Pure.
+fn buildNtpRequest(origin: [8]u8) [48]u8 {
+    var req: [48]u8 = @splat(0);
+    req[0] = 0x23; // LI=0, VN=4, Mode=3 (client)
+    @memcpy(req[40..48], &origin);
+    return req;
+}
+
+/// Validate an SNTP reply against the request we sent and extract unix seconds.
+/// SECURITY: the Originate Timestamp (bytes 24..32) must echo our random
+/// Transmit Timestamp, so an off-path attacker who cannot see the request cannot
+/// forge the answer; a stratum-0 (kiss-o'-death) or non-server packet is
+/// rejected too. Pure.
+pub fn parseNtpResponse(resp: []const u8, origin: [8]u8) ?u64 {
+    if (resp.len < 48) return null;
+    if ((resp[0] & 0x07) != 4) return null; // Mode must be 4 (server)
+    if (resp[1] == 0) return null; // stratum 0: kiss-o'-death / unsynchronised
+    if (!std.mem.eql(u8, resp[24..32], &origin)) return null;
+
+    // Transmit Timestamp: bytes 40-43 (seconds), 44-47 (fraction)
+    const ntp_seconds = std.mem.readInt(u32, resp[40..44], .big);
+    if (ntp_seconds < NTP_EPOCH_OFFSET) return null;
+    return @as(u64, ntp_seconds) - NTP_EPOCH_OFFSET;
+}
+
 /// Minimal SNTPv4 query — returns unix epoch seconds.
-/// Queries pool.ntp.org (or fallback servers).
+/// Queries time.google.com / NIST by address.
 /// Returns null if all servers fail (caller should use system time).
 pub fn ntpQuery() ?u64 {
     const NTP_SERVERS = [_][4]u8{
         .{ 162, 159, 200, 1 }, // time.google.com
         .{ 129, 6, 15, 28 }, // time-a-g.nist.gov
     };
-    const NTP_PORT: u16 = 123;
-    const NTP_EPOCH_OFFSET: u64 = 2208988800; // seconds from 1900 to 1970
-
-    var socket = Udp.UdpSocket.bind(0) catch return null;
-    defer socket.close();
 
     for (NTP_SERVERS) |server| {
-        // Build SNTP request (48 bytes)
-        var req: [48]u8 = @splat(0);
-        req[0] = 0x23; // LI=0, VN=4, Mode=3 (client)
+        // One fresh socket per server: connect() it so the kernel only delivers
+        // datagrams from THAT server (source filtering, like dns.zig does), then
+        // send to the connected peer.
+        var socket = Udp.UdpSocket.bind(0) catch continue;
+        defer socket.close();
 
-        _ = socket.sendTo(&req, server, NTP_PORT) catch continue;
+        const addr = posix.sockaddr.in{
+            .family = posix.AF.INET,
+            .port = std.mem.nativeToBig(u16, NTP_PORT),
+            .addr = @bitCast(server),
+            .zero = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+        };
+        if (std.c.connect(socket.fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in)) != 0) continue;
+
+        var origin: [8]u8 = undefined;
+        zio().random(&origin);
+        const req = buildNtpRequest(origin);
+        if (std.c.sendto(socket.fd, &req, req.len, 0, null, 0) < 0) continue;
 
         if (!(socket.pollRead(2000) catch continue)) continue;
 
         var resp_buf: [512]u8 = undefined;
         const result = (socket.recvFrom(&resp_buf) catch continue) orelse continue;
-        if (result.data.len < 48) continue;
+        // Belt and braces on top of the connected socket's kernel filter.
+        if (result.sender_port != NTP_PORT or !std.mem.eql(u8, &result.sender_addr, &server)) continue;
 
-        // Transmit Timestamp: bytes 40-43 (seconds), 44-47 (fraction)
-        const ntp_seconds = std.mem.readInt(u32, result.data[40..44], .big);
-        if (ntp_seconds < NTP_EPOCH_OFFSET) continue;
-
-        return @as(u64, ntp_seconds) - NTP_EPOCH_OFFSET;
+        if (parseNtpResponse(result.data, origin)) |secs| return secs;
     }
 
     return null;
 }
 
 /// Get current time as unix epoch seconds, preferring NTP.
+/// SECURITY: an NTP reading more than MAX_NTP_SKEW_SECS away from the system
+/// clock is ignored (the system clock wins) so a bad or hostile time source
+/// cannot push the punch far into the future or the past.
 pub fn currentTimeSecs() u64 {
-    if (ntpQuery()) |ntp_time| return ntp_time;
-    // Fallback to system clock
-    const ts = nowUnixSecs();
-    return @intCast(@max(ts, 0));
+    const system_secs = nowUnixSecsClamped();
+    if (ntpQuery()) |ntp_time| {
+        if (ntpAgreesWithSystemClock(ntp_time, system_secs)) return ntp_time;
+    }
+    return system_secs;
 }
 
 // ─── Probe loop ───
+
+/// First 4 bytes of BLAKE3(pubkey): the sender tag carried in every probe.
+fn pubkeyTag(pubkey: [32]u8) [4]u8 {
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(&pubkey, &hash, .{});
+    return hash[0..4].*;
+}
 
 /// Build a probe packet.
 fn buildProbe(nonce: [8]u8, pubkey: [32]u8) [PROBE_SIZE]u8 {
@@ -387,9 +474,7 @@ fn buildProbe(nonce: [8]u8, pubkey: [32]u8) [PROBE_SIZE]u8 {
     @memcpy(probe[0..4], &PROBE_MAGIC);
     @memcpy(probe[4..12], &nonce);
     // First 4 bytes of pubkey hash for sender identification
-    var hash: [32]u8 = undefined;
-    std.crypto.hash.Blake3.hash(&pubkey, &hash, .{});
-    @memcpy(probe[12..16], hash[0..4]);
+    @memcpy(probe[12..16], &pubkeyTag(pubkey));
     return probe;
 }
 
@@ -405,6 +490,25 @@ pub fn probeMatchesNonce(data: []const u8, expected_nonce: [8]u8) bool {
     return std.mem.eql(u8, data[4..12], &expected_nonce);
 }
 
+/// Whether a datagram is the expected peer's probe: magic, the peer's nonce AND
+/// the 4-byte tag of the peer's pubkey, sent from the peer's STUN-mapped
+/// address (any port — cone NATs may remap it).
+/// SECURITY: the nonce alone is not a secret (it travels inside the token), so
+/// anyone who saw the token could otherwise forge the "hole punched" probe and
+/// make us save their endpoint as the peer's.
+pub fn probeMatchesPeer(
+    data: []const u8,
+    sender_addr: [4]u8,
+    peer_addr: [4]u8,
+    peer_nonce: [8]u8,
+    peer_pubkey: [32]u8,
+) bool {
+    if (!std.mem.eql(u8, &sender_addr, &peer_addr)) return false;
+    if (!isCoordinatedProbe(data)) return false;
+    if (!probeMatchesNonce(data, peer_nonce)) return false;
+    return std.mem.eql(u8, data[12..16], &pubkeyTag(peer_pubkey));
+}
+
 /// Sleep for the given number of milliseconds (cross-platform).
 fn sleepMs(ms: u32) void {
     std.Io.sleep(zio(), std.Io.Duration.fromNanoseconds(@as(i96, ms) * std.time.ns_per_ms), .awake) catch {};
@@ -414,19 +518,34 @@ fn sleepMs(ms: u32) void {
 ///
 /// Waits until `punch_time`, then sends probes to `peer_addr:peer_port`
 /// while listening for incoming probes. Retries up to MAX_ATTEMPTS times.
+/// Only a probe from `peer_addr` carrying `peer_nonce` and the tag of
+/// `peer_pubkey` counts as the peer (see `probeMatchesPeer`).
 ///
-/// Returns the confirmed peer endpoint on success, or null on failure.
+/// Returns the confirmed peer endpoint on success, or null on failure
+/// (including a `punch_time` outside the accepted window, which is reported
+/// on `stdout` before returning).
 pub fn runPunchLoop(
     socket: *Udp.UdpSocket,
     our_pubkey: [32]u8,
     our_nonce: [8]u8,
     peer_nonce: [8]u8,
+    peer_pubkey: [32]u8,
     peer_addr: [4]u8,
     peer_port: u16,
     punch_time: u64,
     stun_server: Stun.StunServer,
     stdout: std.Io.File,
 ) ?PunchResult {
+    // SECURITY: never wait on an unbounded, peer-supplied punch time.
+    checkPunchTime(punch_time) catch |err| {
+        const now_secs = nowUnixSecsClamped();
+        switch (err) {
+            error.PunchTimeTooFarInFuture => writeMsg(stdout, "  error: punch time is {d}s in the future (max {d}s) — refusing to wait\n", .{ punch_time - now_secs, MAX_PUNCH_FUTURE_SECS }),
+            error.PunchTimeInPast => writeMsg(stdout, "  error: punch time passed {d}s ago (max {d}s) — token is stale\n", .{ now_secs - punch_time, MAX_PUNCH_PAST_SECS }),
+        }
+        return null;
+    };
+
     const probe_pkt = buildProbe(our_nonce, our_pubkey);
 
     for (0..MAX_ATTEMPTS) |attempt| {
@@ -456,14 +575,14 @@ pub fn runPunchLoop(
             }
         }
 
-        // Wait until punch_time
+        // Wait until punch_time (unix time, so compare against the wall clock)
         const target_ns: i128 = @as(i128, punch_time) * 1_000_000_000;
         // Add attempt offset to avoid tight retry overlap
         const attempt_offset_ns: i128 = @as(i128, attempt) * @as(i128, IDLE_BETWEEN_SECS + PUNCH_WINDOW_SECS) * 1_000_000_000;
         const effective_target = target_ns + attempt_offset_ns;
 
         while (true) {
-            const now = nowNs();
+            const now = nowUnixNs();
             if (now >= effective_target) break;
 
             const wait_secs = @divTrunc(effective_target - now, 1_000_000_000);
@@ -516,7 +635,8 @@ pub fn runPunchLoop(
             if (socket.pollRead(50) catch false) {
                 var recv_buf: [512]u8 = undefined;
                 if (socket.recvFrom(&recv_buf) catch null) |recv| {
-                    if (!detected and isCoordinatedProbe(recv.data) and probeMatchesNonce(recv.data, peer_nonce)) {
+                    // SECURITY: source address + nonce + peer pubkey tag must all match.
+                    if (!detected and probeMatchesPeer(recv.data, recv.sender_addr, peer_addr, peer_nonce, peer_pubkey)) {
                         detected = true;
                         detect_time = now;
                         result_addr = recv.sender_addr;
@@ -728,11 +848,104 @@ test "probe building and detection" {
 
 test "NTP packet format" {
     // Verify our NTP request packet structure
-    var req: [48]u8 = @splat(0);
-    req[0] = 0x23; // LI=0, VN=4, Mode=3
+    const origin = [8]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const req = buildNtpRequest(origin);
 
     // Check LI (bits 7-6) = 0, VN (bits 5-3) = 4, Mode (bits 2-0) = 3
     try std.testing.expectEqual(req[0] & 0xC0, 0x00); // LI = 0
     try std.testing.expectEqual((req[0] >> 3) & 0x07, 4); // VN = 4
     try std.testing.expectEqual(req[0] & 0x07, 3); // Mode = 3
+    // Our random origin rides in the Transmit Timestamp field
+    try std.testing.expectEqualSlices(u8, &origin, req[40..48]);
+    // Everything else is zero
+    for (req[1..40]) |b| try std.testing.expectEqual(@as(u8, 0), b);
+}
+
+test "parseNtpResponse requires an echoed origin, server mode and a real stratum" {
+    const origin = [8]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04 };
+    var resp: [48]u8 = @splat(0);
+    resp[0] = 0x24; // LI=0, VN=4, Mode=4 (server)
+    resp[1] = 2; // stratum 2
+    @memcpy(resp[24..32], &origin); // Originate Timestamp echoes our Transmit Timestamp
+    // Transmit Timestamp = 1740000000 unix -> NTP seconds
+    std.mem.writeInt(u32, resp[40..44], @intCast(1740000000 + NTP_EPOCH_OFFSET), .big);
+
+    try std.testing.expectEqual(@as(?u64, 1740000000), parseNtpResponse(&resp, origin));
+
+    // Wrong / unechoed origin (what an off-path forger would send) is rejected.
+    var wrong_origin = resp;
+    wrong_origin[31] ^= 0x01;
+    try std.testing.expect(parseNtpResponse(&wrong_origin, origin) == null);
+    var zero_origin = resp;
+    @memset(zero_origin[24..32], 0);
+    try std.testing.expect(parseNtpResponse(&zero_origin, origin) == null);
+
+    // Not a server reply (mode 3 = client echo) is rejected.
+    var client_mode = resp;
+    client_mode[0] = 0x23;
+    try std.testing.expect(parseNtpResponse(&client_mode, origin) == null);
+
+    // Kiss-o'-death (stratum 0) is rejected.
+    var kod = resp;
+    kod[1] = 0;
+    try std.testing.expect(parseNtpResponse(&kod, origin) == null);
+
+    // Pre-1970 timestamps and short packets are rejected.
+    var pre_epoch = resp;
+    std.mem.writeInt(u32, pre_epoch[40..44], 1000, .big);
+    try std.testing.expect(parseNtpResponse(&pre_epoch, origin) == null);
+    try std.testing.expect(parseNtpResponse(resp[0..47], origin) == null);
+}
+
+test "NTP readings far from the system clock are ignored" {
+    const now: u64 = 1_740_000_000;
+    try std.testing.expect(ntpAgreesWithSystemClock(now, now));
+    try std.testing.expect(ntpAgreesWithSystemClock(now + 5, now));
+    try std.testing.expect(ntpAgreesWithSystemClock(now - 5, now));
+    try std.testing.expect(ntpAgreesWithSystemClock(now + MAX_NTP_SKEW_SECS, now)); // boundary inclusive
+    try std.testing.expect(ntpAgreesWithSystemClock(now - MAX_NTP_SKEW_SECS, now));
+
+    try std.testing.expect(!ntpAgreesWithSystemClock(now + MAX_NTP_SKEW_SECS + 1, now));
+    try std.testing.expect(!ntpAgreesWithSystemClock(now - MAX_NTP_SKEW_SECS - 1, now));
+    try std.testing.expect(!ntpAgreesWithSystemClock(0, now)); // bogus epoch answer
+    try std.testing.expect(!ntpAgreesWithSystemClock(std.math.maxInt(u64), now));
+}
+
+test "validatePunchTime bounds peer-supplied punch times" {
+    const now: u64 = 1_740_000_000;
+    try validatePunchTime(now, now);
+    try validatePunchTime(now + 60, now); // the default --in 1
+    try validatePunchTime(now + MAX_PUNCH_FUTURE_SECS, now); // boundary inclusive
+    try validatePunchTime(now - MAX_PUNCH_PAST_SECS, now);
+
+    try std.testing.expectError(error.PunchTimeTooFarInFuture, validatePunchTime(now + MAX_PUNCH_FUTURE_SECS + 1, now));
+    try std.testing.expectError(error.PunchTimeTooFarInFuture, validatePunchTime(std.math.maxInt(u64), now)); // no overflow
+    try std.testing.expectError(error.PunchTimeInPast, validatePunchTime(now - MAX_PUNCH_PAST_SECS - 1, now));
+    try std.testing.expectError(error.PunchTimeInPast, validatePunchTime(0, now));
+}
+
+test "probeMatchesPeer requires source address, nonce and peer pubkey tag" {
+    const peer_nonce = @as([8]u8, @splat(0xAB));
+    const peer_pubkey = @as([32]u8, @splat(0xCD));
+    const peer_addr = [4]u8{ 203, 0, 113, 10 };
+    const probe = buildProbe(peer_nonce, peer_pubkey);
+
+    // The real peer's probe, from the peer's STUN-mapped address, is accepted.
+    try std.testing.expect(probeMatchesPeer(&probe, peer_addr, peer_addr, peer_nonce, peer_pubkey));
+
+    // Same probe bytes from a different source address: someone who saw the token.
+    try std.testing.expect(!probeMatchesPeer(&probe, .{ 198, 51, 100, 7 }, peer_addr, peer_nonce, peer_pubkey));
+
+    // Correct nonce and address but a different sender pubkey (token leaked, key not).
+    const forged = buildProbe(peer_nonce, @as([32]u8, @splat(0xEE)));
+    try std.testing.expect(!probeMatchesPeer(&forged, peer_addr, peer_addr, peer_nonce, peer_pubkey));
+
+    // Wrong nonce, right key.
+    const wrong_nonce = buildProbe(@as([8]u8, @splat(0x00)), peer_pubkey);
+    try std.testing.expect(!probeMatchesPeer(&wrong_nonce, peer_addr, peer_addr, peer_nonce, peer_pubkey));
+
+    // Not a probe at all / truncated.
+    const not_probe = @as([16]u8, @splat(0x01));
+    try std.testing.expect(!probeMatchesPeer(&not_probe, peer_addr, peer_addr, peer_nonce, peer_pubkey));
+    try std.testing.expect(!probeMatchesPeer(probe[0..15], peer_addr, peer_addr, peer_nonce, peer_pubkey));
 }

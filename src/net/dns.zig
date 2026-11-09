@@ -214,31 +214,49 @@ pub fn queryMDNS(allocator: std.mem.Allocator, service_name: []const u8) ![][]co
         }
     }
 
-    // Collect responses with a short timeout (500ms)
+    // Collect responses for up to MDNS_COLLECT_MS, gathering multiple responders
     var results: std.ArrayList([]const u8) = .empty;
 
-    // Poll for up to 1 second, collecting multiple responses
-    var deadline: i32 = 1000;
-    while (deadline > 0) {
-        const poll_start = nowMs();
-        const n_ready = pollReadFd(sock_fd, deadline);
-        const elapsed: i32 = @intCast(@min(nowMs() - poll_start, deadline));
-        deadline -= elapsed;
-
+    // SECURITY: absolute deadline computed once and re-checked on every pass.
+    // The old loop only subtracted the time spent inside poll(), so a steady
+    // stream of multicast datagrams (poll returning immediately) never advanced
+    // it, and `results` grew without bound. Capped at MDNS_MAX_RESULTS entries.
+    const deadline = nowMs() + MDNS_COLLECT_MS;
+    while (results.items.len < MDNS_MAX_RESULTS) {
+        const remaining = mdnsRemainingMs(deadline, nowMs());
+        if (remaining == 0) break;
+        const n_ready = pollReadFd(sock_fd, remaining);
         if (n_ready <= 0) break; // timeout or error
 
         var resp_buf: [MAX_RESPONSE]u8 = undefined;
         const resp_n = recvFromSocket(sock_fd, &resp_buf) orelse break;
         if (resp_n > HEADER_LEN) {
             const parsed = parseTXTResponse(allocator, &resp_buf, resp_n) catch continue;
+            defer if (parsed.len > 0) allocator.free(parsed);
             for (parsed) |txt| {
-                results.append(allocator, txt) catch {};
+                if (results.items.len >= MDNS_MAX_RESULTS) {
+                    allocator.free(txt);
+                    continue;
+                }
+                results.append(allocator, txt) catch allocator.free(txt);
             }
-            if (parsed.len > 0) allocator.free(parsed);
         }
     }
 
     return results.toOwnedSlice(allocator);
+}
+
+/// Total time spent collecting mDNS answers.
+const MDNS_COLLECT_MS: i64 = 1000;
+/// Upper bound on collected TXT strings, so a chatty or hostile LAN cannot make
+/// the result set (and the allocations behind it) grow without limit.
+pub const MDNS_MAX_RESULTS: usize = 64;
+
+/// Milliseconds left until `deadline_ms`, clamped to [0, MDNS_COLLECT_MS]. Pure.
+pub fn mdnsRemainingMs(deadline_ms: i64, now_ms: i64) i32 {
+    const remaining = deadline_ms - now_ms;
+    if (remaining <= 0) return 0;
+    return @intCast(@min(remaining, MDNS_COLLECT_MS));
 }
 
 // ─── DNS Wire Encoding ───
@@ -671,6 +689,19 @@ test "parse resolv.conf nameservers" {
     // depends on the host system
     var buf: [3][4]u8 = undefined;
     _ = getNameservers(&buf);
+}
+
+test "mDNS deadline is absolute and reaches zero" {
+    // Remaining time shrinks with the clock regardless of how many datagrams
+    // arrived in between, and is never negative or above the total budget.
+    try std.testing.expectEqual(@as(i32, 1000), mdnsRemainingMs(1000, 0));
+    try std.testing.expectEqual(@as(i32, 400), mdnsRemainingMs(1000, 600));
+    try std.testing.expectEqual(@as(i32, 1), mdnsRemainingMs(1000, 999));
+    try std.testing.expectEqual(@as(i32, 0), mdnsRemainingMs(1000, 1000));
+    try std.testing.expectEqual(@as(i32, 0), mdnsRemainingMs(1000, 5000));
+    // A deadline further out than one budget is still handed to poll() in
+    // budget-sized slices (defensive clamp for a jumped clock).
+    try std.testing.expectEqual(@as(i32, 1000), mdnsRemainingMs(10_000, 0));
 }
 
 test "skip domain name" {

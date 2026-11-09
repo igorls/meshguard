@@ -30,6 +30,9 @@ pub const PeerState = enum {
 pub const WgKeySource = enum(u8) {
     /// Third-party gossip; unauthenticated.
     gossip,
+    /// The X25519 form of the peer's Ed25519 identity, as daemons derive it.
+    /// Learned from gossip, but only the identity holder can use it.
+    derived,
     /// The peer's own signed binding (identity/binding.zig).
     binding,
     /// A trusted organization certificate that binds the key.
@@ -69,6 +72,10 @@ pub const Peer = struct {
     /// with a higher incarnation than this, the peer has restarted and must be
     /// re-integrated. 0 = not yet known.
     incarnation: u64 = 0,
+    /// When we last accepted a higher incarnation (a restart) for this peer,
+    /// in monotonic nanoseconds. Restart handling is rate limited per peer.
+    /// 0 = no restart accepted yet; it is a sentinel, not a timestamp.
+    last_incarnation_bump_ns: i128 = 0,
     /// STUN-discovered public endpoint (NAT traversal)
     public_endpoint: ?messages.Endpoint = null,
     /// NAT type classification

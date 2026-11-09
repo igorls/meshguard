@@ -56,7 +56,8 @@ pub const Config = struct {
     /// room; proven connections are never displaced by new claims.
     max_unproven: u32 = 4096,
     /// Identity claims tracked at once. When full, the oldest claim whose key
-    /// is not proven makes room first.
+    /// is not proven makes room; claims of proven keys are never displaced,
+    /// and a new claim is refused when only those remain.
     max_claims: u32 = 32768,
     /// A proven connection silent for this long is forgotten.
     client_idle_timeout_ns: i128 = 120 * ns_per_s,
@@ -117,6 +118,15 @@ pub const KeySource = enum(u8) { legacy_gossip, derived, binding, certificate };
 pub const Admission = struct {
     ctx: *anyopaque,
     admits: *const fn (ctx: *anyopaque, identity: [32]u8) bool,
+    /// Whether certificates issued by this organisation vouch for WireGuard
+    /// keys here. Anyone can mint an organisation and certify a victim's
+    /// identity with a key they hold, so until the caller supplies this no
+    /// certificate vouches.
+    trustsOrg: *const fn (ctx: *anyopaque, org_pubkey: [32]u8) bool = trustNoOrg,
+
+    fn trustNoOrg(_: *anyopaque, _: [32]u8) bool {
+        return false;
+    }
 };
 
 pub const Stats = struct {
@@ -147,6 +157,11 @@ const TokenBucket = struct {
         if (self.tokens < cost) return false;
         self.tokens -= cost;
         return true;
+    }
+
+    /// Returns a charge that was not used after all.
+    fn refund(self: *TokenBucket, burst: f64, cost: f64) void {
+        self.tokens = @min(burst, self.tokens + cost);
     }
 };
 
@@ -207,19 +222,25 @@ const SourceLimiter = struct {
     max_sources: u32,
     trusted: ?[16]u8,
 
+    /// The source's own bucket is charged first: a source past its share is
+    /// refused before it can touch the budget everyone shares, so one
+    /// flooding address cannot starve every other client.
     fn allow(self: *SourceLimiter, allocator: std.mem.Allocator, ctx: KeyContext(EndpointKey), src: messages.Endpoint, now_ns: i128) bool {
-        if (!self.overall_bucket.take(self.overall, self.overall_burst, 1, now_ns)) return false;
         const key = if (self.isTrusted(src)) EndpointKey.of(src) else EndpointKey.sourceOf(src);
-        if (self.map.getPtrContext(key, ctx)) |bucket| {
-            return bucket.take(self.per_source, self.source_burst, 1, now_ns);
+        const bucket = self.map.getPtrContext(key, ctx) orelse blk: {
+            if (self.map.count() >= self.max_sources) {
+                self.prune(ctx, now_ns);
+                if (self.map.count() >= self.max_sources) return false;
+            }
+            const entry = self.map.getOrPutContext(allocator, key, ctx) catch return false;
+            entry.value_ptr.* = TokenBucket.full(self.source_burst, now_ns);
+            break :blk entry.value_ptr;
+        };
+        if (!bucket.take(self.per_source, self.source_burst, 1, now_ns)) return false;
+        if (!self.overall_bucket.take(self.overall, self.overall_burst, 1, now_ns)) {
+            bucket.refund(self.source_burst, 1);
+            return false;
         }
-        if (self.map.count() >= self.max_sources) {
-            self.prune(ctx, now_ns);
-            if (self.map.count() >= self.max_sources) return false;
-        }
-        var bucket = TokenBucket.full(self.source_burst, now_ns);
-        _ = bucket.take(self.per_source, self.source_burst, 1, now_ns);
-        self.map.putContext(allocator, key, bucket, ctx) catch return false;
         return true;
     }
 
@@ -549,13 +570,17 @@ pub const RelayCore = struct {
     fn vouchedKey(self: *const RelayCore, input: ClaimInput, current: ?*const Claim) ?Vouched {
         if (input.org_cert) |cert_wire| {
             const cert = Org.NodeCertificate.deserialize(cert_wire);
-            if (cert.boundWgPubkey()) |wg| {
+            // Only a trusted organisation's certificate vouches, whether or
+            // not this key was recorded from one before: a certificate from an
+            // organisation of the sender's own making must not rebind an
+            // admitted identity to a key the sender holds.
+            if (cert.boundWgPubkey()) |wg| if (self.admission.trustsOrg(self.admission.ctx, cert.org_pubkey)) {
                 const seen = if (current) |c| c.key_source == .certificate and std.mem.eql(u8, &c.wg, &wg) else false;
                 const valid = cert.isValidAt(wallSeconds(), self.config.cert_skew_s);
                 if (valid and (seen or (std.mem.eql(u8, &cert.node_pubkey, &input.identity) and Org.verifyCertificate(&cert)))) {
                     return .{ .wg = wg, .source = .certificate, .cert_expires_at = cert.expires_at };
                 }
-            }
+            };
         }
         if (input.wg_binding) |binding| {
             // Verify only when the binding would change what is recorded.
@@ -608,19 +633,18 @@ pub const RelayCore = struct {
         self.stats.evicted += 1;
     }
 
-    /// Takes a claim slot, evicting first the oldest claim whose key is not
-    /// proven (looking at a bounded number of the oldest), then the oldest.
+    /// Takes a claim slot, evicting the oldest claim whose key is not proven
+    /// when the pool is full. A claim whose key is proven is never displaced:
+    /// when only those remain the new claim is refused (overloaded). The scan
+    /// is bounded by the pool and runs only on a full pool, at claim rate.
     fn allocateClaim(self: *RelayCore) ?u32 {
         if (self.claims.take()) |i| return i;
         var i = self.claim_lru.head;
-        var looked: u32 = 0;
-        while (i != NONE and looked < 32) : (looked += 1) {
+        while (i != NONE) : (i = self.claims.items[i].next) {
             const c = &self.claims.items[i];
             const proven = if (self.connOf(c.wg)) |conn| conn.endpoint != null else false;
             if (!proven) break;
-            i = c.next;
         }
-        if (i == NONE or looked == 32) i = self.claim_lru.head;
         if (i == NONE) return null;
         self.releaseClaim(i);
         self.stats.evicted += 1;
@@ -738,6 +762,9 @@ pub const RelayCore = struct {
         if (!conn.bytes.take(self.config.client_bytes_per_s, self.config.client_byte_burst, bytes, now_ns)) return .{ .drop = .rate_limited };
         conn.last_seen_ns = now_ns;
         self.touchConn(conn);
+        // An active sender is neither the oldest claim nor an idle one.
+        claim_.last_seen_ns = now_ns;
+        self.touchClaim(claim_);
 
         const dest_ep = self.endpointOf(destination) orelse return .{ .drop = .unknown_destination };
         if (!self.forward_budget.take(self.config.forward_pps, self.config.forward_burst, 1, now_ns)) return .{ .drop = .overloaded };
@@ -802,6 +829,12 @@ pub const RelayCore = struct {
         list.pushBack(self.conns.items, i);
     }
 
+    fn touchClaim(self: *RelayCore, c: *Claim) void {
+        const i: u32 = @intCast((@intFromPtr(c) - @intFromPtr(self.claims.items.ptr)) / @sizeOf(Claim));
+        self.claim_lru.remove(self.claims.items, i);
+        self.claim_lru.pushBack(self.claims.items, i);
+    }
+
     fn releaseConn(self: *RelayCore, i: u32) void {
         const conn = &self.conns.items[i];
         if (!conn.in_use) return;
@@ -834,6 +867,8 @@ const Ed25519 = std.crypto.sign.Ed25519;
 
 const TestAdmission = struct {
     denied: ?[32]u8 = null,
+    /// The one organisation whose certificates vouch (none by default).
+    trusted_org: ?[32]u8 = null,
 
     fn admits(ctx: *anyopaque, identity: [32]u8) bool {
         const self: *TestAdmission = @ptrCast(@alignCast(ctx));
@@ -841,8 +876,14 @@ const TestAdmission = struct {
         return true;
     }
 
+    fn trustsOrg(ctx: *anyopaque, org_pubkey: [32]u8) bool {
+        const self: *TestAdmission = @ptrCast(@alignCast(ctx));
+        const trusted = self.trusted_org orelse return false;
+        return std.mem.eql(u8, &trusted, &org_pubkey);
+    }
+
     fn get(self: *TestAdmission) Admission {
-        return .{ .ctx = self, .admits = admits };
+        return .{ .ctx = self, .admits = admits, .trustsOrg = trustsOrg };
     }
 };
 
@@ -1044,6 +1085,7 @@ test "derived keys and certificate-bound keys are vouched for" {
     try testing.expectEqual(KeySource.derived, core.keySourceOf(daemon.public_key.toBytes()).?);
 
     const org = Org.generateOrgKeyPair();
+    relay.admission.trusted_org = org.public_key.toBytes();
     const node = try TestClient.init(4);
     const cert = try Org.issueCertificateV2(org, node.identity, node.wg_public, "n", 0);
     var wire: [messages.ORG_CERT_WIRE_SIZE]u8 = undefined;
@@ -1054,6 +1096,45 @@ test "derived keys and certificate-bound keys are vouched for" {
     // A certificate for someone else does not vouch.
     const other = try TestClient.init(5);
     try testing.expect(!core.claim(.{ .identity = other.identity, .org_cert = &wire }, 0));
+}
+
+test "a certificate from an untrusted organisation does not vouch and cannot rebind an existing claim" {
+    var relay = try TestRelay.init();
+    var core = try relay.core(smallConfig());
+    defer core.deinit();
+    var victim = try TestClient.init(1);
+    var bob = try TestClient.init(2);
+    var attacker = try TestClient.init(9);
+    try proveClient(&core, relay.public, &victim, addr(1, 4000), 0);
+    try proveClient(&core, relay.public, &bob, addr(2, 4000), 0);
+
+    // The attacker mints an organisation of its own and certifies the
+    // victim's identity with a WireGuard key the attacker holds.
+    const rogue = Org.generateOrgKeyPair();
+    const cert = try Org.issueCertificateV2(rogue, victim.identity, attacker.wg_public, "v", 0);
+    var wire: [messages.ORG_CERT_WIRE_SIZE]u8 = undefined;
+    cert.serialize(&wire);
+
+    // Presented on a ping in the victim's name, it leaves the earlier binding in place.
+    try testing.expect(core.claim(.{ .identity = victim.identity, .org_cert = &wire }, 1));
+    try testing.expectEqual(KeySource.binding, core.keySourceOf(victim.identity).?);
+    // The attacker proves its own key, yet cannot send as the victim, and
+    // the victim keeps receiving at its own endpoint.
+    try testing.expect(core.claim(attacker.claimInput(), 1));
+    const init_bytes = try attacker.initiation(relay.public);
+    try testing.expect(core.handleInitiation(&init_bytes, addr(66, 5000), 1) != null);
+    try testing.expectEqual(Route{ .drop = .spoofed_sender }, core.route(victim.identity, bob.identity, 100, addr(66, 5000), 2));
+    const to_victim = core.route(bob.identity, victim.identity, 100, addr(2, 4000), 2);
+    try testing.expect(to_victim == .forward and to_victim.forward.eql(addr(1, 4000)));
+
+    // Without an earlier claim the certificate vouches for nothing at all.
+    core.forget(victim.identity);
+    try testing.expect(!core.claim(.{ .identity = victim.identity, .org_cert = &wire }, 3));
+    try testing.expect(core.keySourceOf(victim.identity) == null);
+    // The same certificate vouches once its organisation is trusted.
+    relay.admission.trusted_org = rogue.public_key.toBytes();
+    try testing.expect(core.claim(.{ .identity = victim.identity, .org_cert = &wire }, 3));
+    try testing.expectEqual(KeySource.certificate, core.keySourceOf(victim.identity).?);
 }
 
 test "legacy gossip keys are accepted only when enabled" {
@@ -1164,7 +1245,8 @@ test "a flood of unproven claims never displaces proven clients" {
     var config = smallConfig();
     config.max_clients = 8;
     config.max_unproven = 4;
-    config.max_claims = 8;
+    // One claim slot beyond the proven clients: every spammer recycles it.
+    config.max_claims = 4;
     var core = try relay.core(config);
     defer core.deinit();
     var proven: [3]TestClient = undefined;
@@ -1178,8 +1260,51 @@ test "a flood of unproven claims never displaces proven clients" {
     }
     try testing.expectEqual(@as(u32, 3), core.provenCount());
     try testing.expect(core.connCount() <= 8);
-    try testing.expect(core.claimCount() <= 8);
+    try testing.expectEqual(@as(u32, 4), core.claimCount());
+    for (proven, 0..) |c, n| try testing.expect(core.endpointOf(c.identity).?.eql(addr(@intCast(n + 1), 4000)));
     try testing.expect(core.route(proven[0].identity, proven[1].identity, 100, addr(1, 4000), 2) == .forward);
+}
+
+test "when every claim's key is proven, new claims are refused rather than evicting one" {
+    var relay = try TestRelay.init();
+    var config = smallConfig();
+    config.max_clients = 8;
+    config.max_unproven = 4;
+    config.max_claims = 3;
+    var core = try relay.core(config);
+    defer core.deinit();
+    var proven: [3]TestClient = undefined;
+    for (&proven, 0..) |*c, n| {
+        c.* = try TestClient.init(@intCast(n + 1));
+        try proveClient(&core, relay.public, c, addr(@intCast(n + 1), 4000), 0);
+    }
+    for (0..40) |n| {
+        const spammer = try TestClient.init(@intCast(n + 50));
+        try testing.expect(!core.claim(spammer.claimInput(), 1));
+    }
+    try testing.expectEqual(@as(u64, 40), core.stats.droppedFor(.overloaded));
+    try testing.expectEqual(@as(u32, 3), core.claimCount());
+    try testing.expectEqual(@as(u32, 3), core.provenCount());
+    for (proven, 0..) |c, n| try testing.expect(core.endpointOf(c.identity).?.eql(addr(@intCast(n + 1), 4000)));
+    try testing.expect(core.route(proven[2].identity, proven[0].identity, 100, addr(3, 4000), 2) == .forward);
+}
+
+test "forwarding keeps an active client's claim from expiring" {
+    var relay = try TestRelay.init();
+    var core = try relay.core(smallConfig());
+    defer core.deinit();
+    var alice = try TestClient.init(1);
+    var bob = try TestClient.init(2);
+    try proveClient(&core, relay.public, &alice, addr(1, 4000), 0);
+    try proveClient(&core, relay.public, &bob, addr(2, 4000), 0);
+    // Alice forwards frames without ever pinging again; Bob stays silent.
+    try testing.expect(core.route(alice.identity, bob.identity, 100, addr(1, 4000), 60 * ns_per_s) == .forward);
+    try testing.expect(core.route(alice.identity, bob.identity, 100, addr(1, 4000), 119 * ns_per_s) == .forward);
+
+    core.expire(125 * ns_per_s, 64);
+    try testing.expectEqual(@as(u32, 1), core.claimCount());
+    try testing.expect(core.endpointOf(alice.identity) != null);
+    try testing.expect(core.endpointOf(bob.identity) == null);
 }
 
 test "silent clients expire, unproven ones sooner" {
@@ -1238,6 +1363,7 @@ test "expired certificates stop vouching once past the skew" {
     var core = try relay.core(smallConfig());
     defer core.deinit();
     const org = Org.generateOrgKeyPair();
+    relay.admission.trusted_org = org.public_key.toBytes();
     const node = try TestClient.init(4);
     const now = wallSeconds();
     var wire: [messages.ORG_CERT_WIRE_SIZE]u8 = undefined;
@@ -1284,6 +1410,33 @@ test "handshakes are limited per source address except a trusted gateway" {
         if (core.handleInitiation(&bytes, at, 0) != null) accepted += 1;
     }
     try testing.expectEqual(@as(u32, 4), accepted);
+}
+
+test "a source over its handshake limit does not spend other sources' share" {
+    var relay = try TestRelay.init();
+    var config = smallConfig();
+    config.handshakes_per_source_per_s = 1;
+    config.handshake_source_burst = 2;
+    config.handshake_pps = 1000;
+    config.handshake_burst = 4;
+    var core = try relay.core(config);
+    defer core.deinit();
+
+    // One address floods well-formed (mac1-valid) initiations: two reach the
+    // decryption step, the rest are refused at its own limit.
+    var flooder = try TestClient.init(9);
+    for (0..100) |_| {
+        const bytes = try flooder.initiation(relay.public);
+        try testing.expect(core.handleInitiation(&bytes, addr(66, 5000), 0) == null);
+    }
+    try testing.expectEqual(@as(u64, 98), core.stats.handshakes_refused);
+
+    // The shared budget still has room for other addresses at the same instant.
+    var alice = try TestClient.init(1);
+    var bob = try TestClient.init(2);
+    try proveClient(&core, relay.public, &alice, addr(1, 4000), 0);
+    try proveClient(&core, relay.public, &bob, addr(2, 4000), 0);
+    try testing.expectEqual(@as(u64, 98), core.stats.handshakes_refused);
 }
 
 test "the handshake response completes the client's Noise session" {

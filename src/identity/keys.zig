@@ -21,6 +21,35 @@ pub const KeyPair = struct {
     secret_key: SecretKey,
 };
 
+const log = std.log.scoped(.identity);
+
+/// True on targets whose file permissions are POSIX mode bits. Windows and
+/// freestanding targets have no mode to restrict.
+const has_posix_modes = @hasDecl(std.Io.File.Permissions, "fromMode");
+
+/// Permissions for files that hold secret key material: owner read/write only.
+pub fn secretFilePermissions() std.Io.File.Permissions {
+    if (comptime !has_posix_modes) return .default_file;
+    return .fromMode(0o600);
+}
+
+/// Restricts an already-open secret file to its owner. Creating a file with
+/// owner-only permissions does not change the mode of a file that already
+/// existed and was truncated, so writers call this too.
+pub fn restrictSecretFile(file: std.Io.File, io: std.Io) !void {
+    if (comptime !has_posix_modes) return;
+    try file.setPermissions(io, .fromMode(0o600));
+}
+
+/// Warns when a secret file can be read by other users of the machine.
+pub fn warnIfSecretFileExposed(file: std.Io.File, io: std.Io, path: []const u8) void {
+    if (comptime !has_posix_modes) return;
+    const info = file.stat(io) catch return;
+    if (info.permissions.toMode() & 0o077 != 0) {
+        log.warn("{s} is accessible to other users; restrict it with: chmod 600 {s}", .{ path, path });
+    }
+}
+
 /// Generate a new Ed25519 identity keypair.
 pub fn generate() KeyPair {
     const kp = Ed25519.KeyPair.generate(ioInstance());
@@ -41,10 +70,12 @@ pub fn save(allocator: std.mem.Allocator, config_dir: []const u8, kp: KeyPair) !
     var sk_buf: [88]u8 = undefined;
     const sk_b64 = std.base64.standard.Encoder.encode(&sk_buf, &kp.secret_key.toBytes());
 
-    // Restrict permissions to owner-only (0o600) at creation time
+    // Owner-only (0o600) from creation, and tightened again in case the file
+    // already existed with a wider mode.
     const zio = ioInstance();
-    const sk_file = try std.Io.Dir.cwd().createFile(zio, sk_path, .{});
+    const sk_file = try std.Io.Dir.cwd().createFile(zio, sk_path, .{ .permissions = secretFilePermissions() });
     defer sk_file.close(zio);
+    try restrictSecretFile(sk_file, zio);
     try sk_file.writeStreamingAll(zio, sk_b64);
     try sk_file.writeStreamingAll(zio, "\n");
 
@@ -70,6 +101,7 @@ pub fn load(allocator: std.mem.Allocator, config_dir: []const u8) !KeyPair {
     const zio = ioInstance();
     const sk_file = try std.Io.Dir.cwd().openFile(zio, sk_path, .{});
     defer sk_file.close(zio);
+    warnIfSecretFileExposed(sk_file, zio, sk_path);
 
     var sk_raw: [89]u8 = undefined; // 88 b64 chars + possible newline
     var sk_reader = sk_file.reader(zio, &.{});
@@ -80,6 +112,8 @@ pub fn load(allocator: std.mem.Allocator, config_dir: []const u8) !KeyPair {
         sk_read += n;
     }
     const sk_b64 = std.mem.trimEnd(u8, sk_raw[0..sk_read], "\n\r ");
+    // The decoder does not bound its output: check the exact length first.
+    if (sk_b64.len != 88) return error.InvalidKeyFile;
 
     var sk_bytes: [64]u8 = undefined;
     try std.base64.standard.Decoder.decode(&sk_bytes, sk_b64);
@@ -102,6 +136,7 @@ pub fn load(allocator: std.mem.Allocator, config_dir: []const u8) !KeyPair {
         pk_read += n;
     }
     const pk_b64 = std.mem.trimEnd(u8, pk_raw[0..pk_read], "\n\r ");
+    if (pk_b64.len != 44) return error.InvalidKeyFile;
 
     var pk_bytes: [32]u8 = undefined;
     try std.base64.standard.Decoder.decode(&pk_bytes, pk_b64);

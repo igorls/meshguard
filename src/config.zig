@@ -127,17 +127,25 @@ pub const Config = struct {
         return error.HomeNotFound;
     }
 
-    /// Ensure the config directory exists and return its path.
+    /// Permissions for the config directory, which holds the identity secret
+    /// key: owner-only on POSIX targets. Windows has no mode bits.
+    pub fn privateDirPermissions() std.Io.File.Permissions {
+        if (comptime !@hasDecl(std.Io.File.Permissions, "fromMode")) return .default_dir;
+        return .fromMode(0o700);
+    }
+
+    /// Ensure the config directory exists and return its path. Directories
+    /// created here are owner-only; an existing directory keeps its mode.
     pub fn ensureConfigDir(allocator: std.mem.Allocator) ![]const u8 {
         const dir = try defaultConfigDir(allocator);
-        std.Io.Dir.cwd().createDirPath(zio(), dir) catch |err| {
+        _ = std.Io.Dir.cwd().createDirPathStatus(zio(), dir, privateDirPermissions()) catch |err| {
             if (err != error.PathAlreadyExists) {
                 // Try creating parent directories
                 const parent = std.fs.path.dirname(dir) orelse return err;
                 std.Io.Dir.cwd().createDirPath(zio(), parent) catch |e| {
                     if (e != error.PathAlreadyExists) return e;
                 };
-                std.Io.Dir.cwd().createDirPath(zio(), dir) catch |e| {
+                _ = std.Io.Dir.cwd().createDirPathStatus(zio(), dir, privateDirPermissions()) catch |e| {
                     if (e != error.PathAlreadyExists) return e;
                 };
             }

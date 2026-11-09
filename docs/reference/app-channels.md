@@ -28,7 +28,10 @@ Newline-delimited text commands, JSON responses (same style as `SEND`/`RECV`).
 ```
 
 CLI wrappers (`meshguard appsend`, `meshguard apprecv`, `meshguard appinfo`)
-talk to the daemon through the same control socket as `send`/`recv`.
+talk to the daemon through the same control socket as `send`/`recv`. On Unix,
+sending and receiving (`APPSEND`, `APPRECV`, `SEND`, `RECV`, `MSGS`) require the
+daemon's owner (same uid, or root); other local users get `unauthorized`, while
+`APPINFO`, `STATUS` and `PEERS` stay open to every local user.
 For `apprecv`, the first argument is always the channel, including names such
 as `-alerts` or `--wait`; place an optional `--wait <ms>` after it. Receive
 buffers allow for JSON escaping of the full payload. Unix sockets and Windows
