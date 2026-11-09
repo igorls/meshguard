@@ -74,6 +74,7 @@ pub const Peer = struct {
     incarnation: u64 = 0,
     /// When we last accepted a higher incarnation (a restart) for this peer,
     /// in monotonic nanoseconds. Restart handling is rate limited per peer.
+    /// 0 = no restart accepted yet; it is a sentinel, not a timestamp.
     last_incarnation_bump_ns: i128 = 0,
     /// STUN-discovered public endpoint (NAT traversal)
     public_endpoint: ?messages.Endpoint = null,

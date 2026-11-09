@@ -2300,9 +2300,12 @@ pub const SwimProtocol = struct {
         if (incarnation <= peer.incarnation) return; // steady state
         // Guard 4: at most one accepted restart per cooldown. The stored
         // incarnation is not advanced meanwhile, so a genuine restart inside
-        // the window is picked up by the first ping after it.
+        // the window is picked up by the first ping after it. A peer whose
+        // restart was never accepted (0) is in no cooldown: the awake clock
+        // counts from boot, so comparing against the zero sentinel would
+        // drop every first restart claim during our first minute of uptime.
         const now = nowNs();
-        if (now - peer.last_incarnation_bump_ns < INCARNATION_BUMP_COOLDOWN_NS) return;
+        if (peer.last_incarnation_bump_ns != 0 and now - peer.last_incarnation_bump_ns < INCARNATION_BUMP_COOLDOWN_NS) return;
         peer.last_incarnation_bump_ns = now;
 
         // Higher (and plausibly-timed) incarnation => the peer restarted. Pin it now
@@ -3819,7 +3822,8 @@ test "restart claims need the peer's endpoint and are accepted once per cooldown
     try std.testing.expectEqual(@as(u64, 100), membership.peers.get(v).?.incarnation);
     try std.testing.expectEqual(@as(usize, 0), tctx.dead_count);
 
-    // From V's endpoint it is accepted once...
+    // From V's endpoint it is accepted once, whatever our uptime: a peer
+    // whose restart was never accepted is not in a cooldown...
     swim.handleSenderIncarnation(v, 200, test_peer_endpoint);
     try std.testing.expectEqual(@as(u64, 200), membership.peers.get(v).?.incarnation);
     try std.testing.expectEqual(@as(usize, 1), tctx.dead_count);
