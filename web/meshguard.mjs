@@ -1,7 +1,12 @@
 const encoder = new TextEncoder();
-const bytes = value =>
-  typeof value === 'string' ? encoder.encode(value)
-    : value instanceof Uint8Array ? value : new Uint8Array(value);
+const bytes = value => {
+  if (typeof value === 'string') return encoder.encode(value);
+  if (value instanceof Uint8Array) return value;
+  // `new Uint8Array(32)` would be 32 zero bytes: an all-zero seed or payload
+  // created by accident. Only byte containers are accepted.
+  if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer || Array.isArray(value)) return new Uint8Array(value);
+  throw new TypeError('Expected a string, Uint8Array, ArrayBuffer or array of bytes');
+};
 
 const statusNames = {
   '-1': 'Invalid or destroyed identity',

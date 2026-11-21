@@ -143,21 +143,30 @@ pub const Holepuncher = struct {
     /// Accept an incoming request as the target peer and start a session keyed to
     /// the initiator identity and token. This mirrors initiate(), but preserves
     /// the initiator's token so later probes can be bound to the same session.
+    ///
+    /// Requests are unsigned, so a live session for a peer keeps its token: a
+    /// request naming the same peer with another token is refused rather than
+    /// letting it point the session's probes (and its success) at an endpoint of
+    /// the requester's choosing. A re-sent request with the same token refreshes
+    /// the session, and an expired session is replaced.
     pub fn acceptRequest(
         self: *Holepuncher,
         our_pubkey: [32]u8,
         request: messages.HolepunchRequest,
         our_public_endpoint: messages.Endpoint,
     ) bool {
+        const now = nowNs();
         for (&self.active) |*slot| {
             if (slot.*) |*state| {
                 if (std.mem.eql(u8, &state.initiator_pubkey, &our_pubkey) and
                     std.mem.eql(u8, &state.target_pubkey, &request.sender_pubkey))
                 {
+                    const same_token = std.mem.eql(u8, &state.token, &request.token);
+                    if (!same_token and now - state.started_at_ns <= PUNCH_TIMEOUT_NS) return false;
                     state.our_public_endpoint = our_public_endpoint;
                     state.target_public_endpoint = request.public_endpoint;
                     state.token = request.token;
-                    state.started_at_ns = nowNs();
+                    state.started_at_ns = now;
                     state.probes_sent = 0;
                     state.response_received = true;
                     return true;
@@ -175,7 +184,7 @@ pub const Holepuncher = struct {
             .our_public_endpoint = our_public_endpoint,
             .target_public_endpoint = request.public_endpoint,
             .token = request.token,
-            .started_at_ns = nowNs(),
+            .started_at_ns = now,
             .probes_sent = 0,
             .response_received = true,
         };
@@ -398,4 +407,56 @@ test "target accepts request with initiator session token" {
     try std.testing.expectEqualSlices(u8, &initiator_pubkey, &success.peer_pubkey);
     try std.testing.expect(messages.Endpoint.eql(initiator_ep, success.endpoint));
     try std.testing.expectEqual(@as(usize, 0), puncher.activeCount());
+}
+
+test "a live session is not taken over by a request with another token" {
+    var puncher = Holepuncher{};
+    const our_pubkey = @as([32]u8, @splat(0xBB));
+    const initiator_pubkey = @as([32]u8, @splat(0xAA));
+    const our_ep = messages.Endpoint.initV4(.{ 5, 6, 7, 8 }, 51821);
+    const initiator_ep = messages.Endpoint.initV4(.{ 1, 2, 3, 4 }, 51821);
+    const attacker_ep = messages.Endpoint.initV4(.{ 203, 0, 113, 9 }, 4444);
+    const token = @as([16]u8, @splat(0x99));
+    const other_token = @as([16]u8, @splat(0x55));
+
+    try std.testing.expect(puncher.acceptRequest(our_pubkey, .{
+        .sender_pubkey = initiator_pubkey,
+        .target_pubkey = our_pubkey,
+        .public_endpoint = initiator_ep,
+        .token = token,
+    }, our_ep));
+
+    // Another token for the same peer while the session is live: refused, and
+    // the session still points at the initiator with its own token.
+    try std.testing.expect(!puncher.acceptRequest(our_pubkey, .{
+        .sender_pubkey = initiator_pubkey,
+        .target_pubkey = our_pubkey,
+        .public_endpoint = attacker_ep,
+        .token = other_token,
+    }, our_ep));
+    try std.testing.expectEqual(@as(usize, 1), puncher.activeCount());
+    try std.testing.expectEqualSlices(u8, &token, &puncher.active[0].?.token);
+    try std.testing.expect(messages.Endpoint.eql(initiator_ep, puncher.active[0].?.target_public_endpoint.?));
+    try std.testing.expect(puncher.markProbeSuccess(.{ .token = other_token }, attacker_ep) == null);
+    try std.testing.expectEqual(@as(usize, 1), puncher.activeCount());
+
+    // The initiator re-sending its own request refreshes the session.
+    try std.testing.expect(puncher.acceptRequest(our_pubkey, .{
+        .sender_pubkey = initiator_pubkey,
+        .target_pubkey = our_pubkey,
+        .public_endpoint = initiator_ep,
+        .token = token,
+    }, our_ep));
+    try std.testing.expectEqual(@as(usize, 1), puncher.activeCount());
+
+    // Once the session has expired, a new request for the peer replaces it.
+    puncher.active[0].?.started_at_ns = nowNs() - PUNCH_TIMEOUT_NS - 1;
+    try std.testing.expect(puncher.acceptRequest(our_pubkey, .{
+        .sender_pubkey = initiator_pubkey,
+        .target_pubkey = our_pubkey,
+        .public_endpoint = initiator_ep,
+        .token = other_token,
+    }, our_ep));
+    try std.testing.expectEqual(@as(usize, 1), puncher.activeCount());
+    try std.testing.expectEqualSlices(u8, &other_token, &puncher.active[0].?.token);
 }

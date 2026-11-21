@@ -29,8 +29,21 @@ meshguard's security model is built on three pillars: **cryptographic identity**
 ### Identity Keys
 
 - **Never share `identity.key`** — this is your node's long-term identity
+- **Owner-only on disk** — `identity.key` is created with mode 0600 inside a 0700
+  config directory; the daemon warns at startup when other users can read it
 - **Use `--force` carefully** — `meshguard keygen --force` overwrites your identity
 - **Backups** — store identity.key offline, not in git
+
+### Local Control Socket
+
+- The control socket (`/run/meshguard/meshguard.sock`, or the named pipe on
+  Windows) is reachable by every local user so that `meshguard status` works
+  without privileges, but every command that acts as this node — sending or
+  receiving messages, transfers, reload, stop — requires the daemon's owner
+  (same uid, or root). On Windows the CLI only talks to a pipe server running
+  as the same user, LocalSystem or an administrator.
+- `meshguard agent` executes shell commands from its host identity; run it only
+  with `--host <pubkey>` on machines you are willing to hand to that identity.
 
 ### WireGuard Transport Keys
 

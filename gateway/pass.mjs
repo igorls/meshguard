@@ -46,7 +46,9 @@ function signedPayload(pass) {
 function delegationPayload(pass) {
   const out = new Uint8Array(1 + 32 + 32 + 8 + 1);
   out[0] = pass.version; out.set(pass.orgPublicKey, 1); out.set(pass.issuerPublicKey, 33);
-  new DataView(out.buffer).setBigInt64(65, BigInt(pass.expiresAt), true);
+  // The signed bytes are the certificate's own expires_at field, copied verbatim:
+  // re-encoding through Number would lose precision above 2^53 and diverge from org.zig.
+  out.set(pass.wire.subarray(105, 113), 65);
   out[73] = pass.flags;
   return out;
 }

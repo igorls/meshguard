@@ -69,13 +69,16 @@ fn zio() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
 }
 
-fn fillIdentitySeed(out: *[32]u8) void {
+/// Fills a fresh identity seed from the operating system's entropy source.
+/// Fails rather than degrade: `std.Io.random` falls back to seeding from the
+/// pid and clock when no entropy is available, which no identity may rest on.
+fn fillIdentitySeed(out: *[32]u8) error{EntropyUnavailable}!void {
     if (builtin.os.tag.isDarwin()) {
         std.c.arc4random_buf(out, out.len);
         return;
     }
 
-    zio().random(out);
+    zio().randomSecure(out) catch return error.EntropyUnavailable;
 }
 
 const crypto = lib.wireguard.Crypto;
@@ -249,6 +252,19 @@ fn destroyContext(ctx: *MeshguardContext) void {
     closeContextSocket(ctx);
     ctx.membership.deinit();
     ctx.contacts.deinit(ctx.alloc);
+    // Wipe key material before the memory returns to the allocator: every
+    // peer's handshake and session keys, then the static secrets.
+    if (ctx.wg_device) |*dev| {
+        ctx.wg_lock.lockUncancelable(zio());
+        for (&dev.peers) |*slot| {
+            if (slot.*) |*peer| peer.deinit();
+            slot.* = null;
+        }
+        std.crypto.secureZero(u8, &dev.static_private);
+        ctx.wg_lock.unlock(zio());
+    }
+    std.crypto.secureZero(u8, &ctx.ed25519_seed);
+    std.crypto.secureZero(u8, &ctx.x25519_private);
     ctx.alloc.destroy(ctx);
 }
 
@@ -425,18 +441,24 @@ export fn meshguard_init(
     const ctx = allocator.create(MeshguardContext) catch return null;
     initContextStorage(ctx, allocator);
 
-    // Identity: use provided seed or generate.
+    // Identity: use provided seed or generate. The stack copies of the seed
+    // and the keys derived from it are wiped on every exit path.
     var identity_seed_bytes: [32]u8 = undefined;
+    defer std.crypto.secureZero(u8, &identity_seed_bytes);
     if (identity_seed) |seed| {
         @memcpy(&identity_seed_bytes, seed[0..32]);
     } else {
-        fillIdentitySeed(&identity_seed_bytes);
+        fillIdentitySeed(&identity_seed_bytes) catch {
+            destroyContext(ctx);
+            return null;
+        };
     }
 
-    const kp = Ed25519.KeyPair.generateDeterministic(identity_seed_bytes) catch {
+    var kp = Ed25519.KeyPair.generateDeterministic(identity_seed_bytes) catch {
         destroyContext(ctx);
         return null;
     };
+    defer std.crypto.secureZero(u8, &kp.secret_key.bytes);
     const pub_bytes = kp.public_key.toBytes();
     @memcpy(&ctx.ed25519_seed, &identity_seed_bytes);
     @memcpy(&ctx.ed25519_public, &pub_bytes);
@@ -444,6 +466,7 @@ export fn meshguard_init(
     // Derive X25519 keys for Noise handshakes
     // Use first 32 bytes of Ed25519 seed, clamped for Curve25519
     var x_priv = ctx.ed25519_seed;
+    defer std.crypto.secureZero(u8, &x_priv);
     x_priv[0] &= 248;
     x_priv[31] &= 127;
     x_priv[31] |= 64;
@@ -759,7 +782,15 @@ export fn meshguard_leave(ctx: ?*MeshguardContext) void {
     const c = ctx orelse return;
     if (!c.running.load(.acquire)) return;
 
-    // Broadcast leave to peers
+    // Stop the event loop first: SWIM and LAN state belong to that thread,
+    // so nothing below may touch them while it can still be ticking.
+    c.running.store(false, .release);
+    if (c.event_loop_thread) |t| {
+        t.join();
+    }
+    c.event_loop_thread = null;
+
+    // Broadcast leave to peers (the socket stays open until destroy).
     if (c.swim) |*swim| {
         swim.broadcastLeave();
         swim.stop();
@@ -771,13 +802,6 @@ export fn meshguard_leave(ctx: ?*MeshguardContext) void {
     }
     c.lan_discovery = null;
 
-    c.running.store(false, .release);
-
-    // Wait for event loop thread
-    if (c.event_loop_thread) |t| {
-        t.join();
-    }
-    c.event_loop_thread = null;
     c.swim = null;
     forgetNetwork(c);
 }
@@ -907,8 +931,10 @@ fn sendApp(ctx: ?*MeshguardContext, peer_pubkey: [*]const u8, data: [*]const u8,
 
     var msg_buf: [AppPacket.max_packet]u8 = undefined;
     var nonce: [12]u8 = undefined;
-    zio().random(&nonce);
-    const peer_x25519 = contact_wg orelse peer.wg_pubkey orelse {
+    // Fresh OS entropy for every nonce: under the static pairwise key a
+    // repeated nonce would be fatal, so fail the send rather than fall back.
+    zio().randomSecure(&nonce) catch return -7;
+    const peer_x25519 = contact_wg orelse vouchedWgKey(target_key, peer) orelse {
         if (c.on_undeliverable_cb) |cb| cb(peer_pubkey, data, len, -6);
         return -6;
     };
@@ -1580,14 +1606,25 @@ fn eventLoop(ctx: *MeshguardContext) void {
     }
 }
 
-/// The pinned relay's WireGuard key, if the relay vouched for it: signed with
+/// A peer's WireGuard key when the peer itself vouched for it: signed with
 /// its identity (binding or certificate) or derived from it. A key that only
-/// third-party gossip claimed could belong to anyone impersonating the relay.
-fn trustedRelayWgKey(pin: [32]u8, peer: Membership.Peer) ?[32]u8 {
+/// third-party gossip claimed could belong to anyone impersonating the peer,
+/// so it seals no app frame and opens no tunnel. `identity` is the key the
+/// peer was looked up by.
+fn vouchedWgKey(identity: [32]u8, peer: Membership.Peer) ?[32]u8 {
     const wg_key = peer.wg_pubkey orelse return null;
     if (peer.wg_key_source != .gossip) return wg_key;
-    if (lib.identity.Binding.isDerived(pin, wg_key)) return wg_key;
+    if (lib.identity.Binding.isDerived(identity, wg_key)) return wg_key;
     return null;
+}
+
+/// The key to register a tunnel peer under when the network, not the host,
+/// asks for it: a registered contact's key first, else one the peer vouched
+/// for. In contacts-only mode nobody but a contact is registered.
+fn autoRegisterWgKey(c: *MeshguardContext, peer: Membership.Peer) ?[32]u8 {
+    if (contactKey(c, peer.pubkey)) |wg| return wg;
+    if (c.contacts_only.load(.acquire)) return null;
+    return vouchedWgKey(peer.pubkey, peer);
 }
 
 /// A pinned public relay needs a fresh authenticated source endpoint after
@@ -1607,7 +1644,7 @@ fn maintainPinnedRelayAuthentication(ctx: *MeshguardContext) void {
         break :blk ctx.membership.peers.get(pin) orelse return;
     };
     if (peer.state != .alive) return;
-    const wg_key = trustedRelayWgKey(pin, peer) orelse return;
+    const wg_key = contactKey(ctx, pin) orelse vouchedWgKey(pin, peer) orelse return;
     const ep = peer.gossip_endpoint orelse peer.public_endpoint orelse return;
     ctx.last_relay_auth_ns = now;
     ctx.wg_lock.lockUncancelable(zio());
@@ -1666,7 +1703,7 @@ pub fn handleAppMessage(ctx: *MeshguardContext, data: []const u8) void {
     const peer_x25519 = contactKey(ctx, peer_key) orelse blk: {
         if (ctx.contacts_only.load(.acquire)) return;
         const peer = ctx.membership.peers.get(peer_key) orelse return;
-        break :blk peer.wg_pubkey orelse return;
+        break :blk vouchedWgKey(peer_key, peer) orelse return;
     };
     var plaintext: [1024]u8 = undefined;
     _ = AppPacket.open(ctx.ed25519_public, ctx.x25519_private, peer_x25519, data, &plaintext) catch return;
@@ -1831,24 +1868,24 @@ fn handleWgPacket(ctx: *MeshguardContext, data: []const u8, sender_addr: [4]u8, 
                         dev.static_public,
                         msg,
                     )) |preamble| {
-                        // Look up in membership by X25519 key
+                        // Look up in membership by X25519 key, registering only
+                        // a peer whose key a contact entry or the peer itself
+                        // vouched for; a key only gossip claimed is nobody's.
                         var iter = ctx.membership.peers.iterator();
                         while (iter.next()) |entry| {
                             const m_peer = entry.value_ptr;
-                            if (m_peer.wg_pubkey) |wg_pk| {
-                                if (std.mem.eql(u8, &wg_pk, &preamble.initiator_static)) {
-                                    if (m_peer.gossip_endpoint) |ep| {
-                                        _ = dev.addPeerWithMeshIp(
-                                            m_peer.pubkey,
-                                            wg_pk,
-                                            ep.addr,
-                                            ep.port,
-                                            m_peer.mesh_ip,
-                                        ) catch {};
-                                    }
-                                    break;
-                                }
+                            const wg_pk = autoRegisterWgKey(ctx, m_peer.*) orelse continue;
+                            if (!std.mem.eql(u8, &wg_pk, &preamble.initiator_static)) continue;
+                            if (m_peer.gossip_endpoint) |ep| {
+                                _ = dev.addPeerWithMeshIp(
+                                    m_peer.pubkey,
+                                    wg_pk,
+                                    ep.addr,
+                                    ep.port,
+                                    m_peer.mesh_ip,
+                                ) catch {};
                             }
+                            break;
                         }
                     } else |_| {}
                 }
@@ -1937,7 +1974,7 @@ fn handleRelayWgPacket(ctx: *MeshguardContext, data: []const u8, sender_pubkey: 
                 if (err != error.UnknownPeer) return;
 
                 if (ctx.membership.peers.get(sender_pubkey)) |m_peer| {
-                    if (m_peer.wg_pubkey) |wg_pk| {
+                    if (autoRegisterWgKey(ctx, m_peer)) |wg_pk| {
                         const ep = m_peer.gossip_endpoint orelse m_peer.public_endpoint orelse relay_endpoint;
                         _ = dev.addPeerWithEndpoint(
                             m_peer.pubkey,
@@ -2019,7 +2056,7 @@ fn enqueueTunnelMessage(ctx: *MeshguardContext, sender_identity: [32]u8, data: [
 ///   -1: null context
 ///   -2: not running
 ///   -3: peer not found in membership
-///   -4: peer has no WG pubkey
+///   -4: peer has no WG pubkey it vouched for (and is not a contact)
 ///   -5: peer has no endpoint
 ///   -6: failed to add peer to WG device
 ///   -7: handshake initiation failed
@@ -2043,7 +2080,8 @@ export fn meshguard_tunnel_open(
         defer c.membership.lock.unlockShared(zio());
         break :blk c.membership.peers.get(target_key);
     } orelse return -3;
-    const peer_x25519 = peer.wg_pubkey orelse return -4;
+    // A registered contact's key first; otherwise one the peer vouched for.
+    const peer_x25519 = contactKey(c, target_key) orelse vouchedWgKey(target_key, peer) orelse return -4;
     const ep = peer.gossip_endpoint orelse return -5;
 
     // Derive mesh IP for the peer
@@ -2296,6 +2334,7 @@ test "authenticated direct and relay copies enqueue only once" {
     var peer = routeTestPeer(1);
     peer.pubkey = sender.ed25519_public;
     peer.wg_pubkey = sender.x25519_public;
+    peer.wg_key_source = .binding;
     try receiver.membership.upsert(peer);
     const text = "native relay copy test";
     var packet: [93 + text.len]u8 = undefined;
@@ -2343,22 +2382,61 @@ test "FFI lifecycle fits a small mobile host thread stack" {
     thread.join();
 }
 
-test "pinned relay WireGuard key is used only when signed or derived" {
+test "a peer's WireGuard key is used only when signed or derived" {
     const relay = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(5)));
     const pin = relay.public_key.toBytes();
     var peer = routeTestPeer(3);
 
     peer.wg_pubkey = @as([32]u8, @splat(0x66));
     peer.wg_key_source = .gossip;
-    try std.testing.expect(trustedRelayWgKey(pin, peer) == null);
+    try std.testing.expect(vouchedWgKey(pin, peer) == null);
 
     peer.wg_key_source = .binding;
-    try std.testing.expectEqualSlices(u8, &peer.wg_pubkey.?, &trustedRelayWgKey(pin, peer).?);
+    try std.testing.expectEqualSlices(u8, &peer.wg_pubkey.?, &vouchedWgKey(pin, peer).?);
+    peer.wg_key_source = .certificate;
+    try std.testing.expectEqualSlices(u8, &peer.wg_pubkey.?, &vouchedWgKey(pin, peer).?);
 
     const derived = try X25519.publicKeyFromEd25519(relay.public_key);
     peer.wg_pubkey = derived;
     peer.wg_key_source = .gossip;
-    try std.testing.expectEqualSlices(u8, &derived, &trustedRelayWgKey(pin, peer).?);
+    try std.testing.expectEqualSlices(u8, &derived, &vouchedWgKey(pin, peer).?);
+}
+
+test "tunnels open only to contacts or peers that vouched for their WireGuard key" {
+    var seed = @as([32]u8, @splat(0x2b));
+    const ctx = meshguard_init(&seed, 0) orelse return error.InitFailed;
+    defer meshguard_destroy(ctx);
+    const other = try AppPacket.Identity.fromSeed(@as([32]u8, @splat(0x2c)));
+    var peer = routeTestPeer(0x2c);
+    peer.pubkey = other.public_key;
+    peer.wg_pubkey = other.wg_public; // a mobile-style key: not derived from the identity
+    try ctx.membership.upsert(peer);
+    // Exercise the lookups without an event loop.
+    ctx.running.store(true, .release);
+    defer ctx.running.store(false, .release);
+
+    // Known only through gossip: refused.
+    try std.testing.expectEqual(@as(i32, -4), meshguard_tunnel_open(ctx, &other.public_key));
+    try std.testing.expectEqual(@as(usize, 0), ctx.wg_device.?.peer_count);
+    // Vouched for by the peer itself: a handshake goes out.
+    peer.wg_key_source = .binding;
+    peer.lamport = 2;
+    try ctx.membership.upsert(peer);
+    try std.testing.expectEqual(@as(i32, 0), meshguard_tunnel_open(ctx, &other.public_key));
+    try std.testing.expectEqual(@as(usize, 1), ctx.wg_device.?.peer_count);
+
+    // A registered contact's key wins over whatever gossip says.
+    const friend = try AppPacket.Identity.fromSeed(@as([32]u8, @splat(0x2d)));
+    var impostor = routeTestPeer(0x2d);
+    impostor.pubkey = friend.public_key;
+    impostor.wg_pubkey = @as([32]u8, @splat(0x77));
+    try ctx.membership.upsert(impostor);
+    try std.testing.expectEqual(@as(i32, -4), meshguard_tunnel_open(ctx, &friend.public_key));
+    try std.testing.expectEqual(@as(i32, 0), meshguard_add_contact(ctx, &friend.public_key, &friend.wg_public));
+    try std.testing.expectEqual(@as(i32, 0), meshguard_tunnel_open(ctx, &friend.public_key));
+    try std.testing.expect(ctx.wg_device.?.hasActiveTunnel(friend.wg_public) == false);
+    try std.testing.expect(ctx.wg_device.?.static_map.get(friend.wg_public) != null);
+    try std.testing.expect(ctx.wg_device.?.static_map.get(@as([32]u8, @splat(0x77))) == null);
 }
 
 test "certificates are checked against this context before they are installed" {
@@ -2468,10 +2546,19 @@ test "frames from a contact open with its registered key, and contacts-only drop
     handleAppMessage(ctx, try sealedFrom(friend, ctx, "hello", &buf));
     try std.testing.expectEqual(@as(u32, 1), ctx.inbox_write.load(.acquire));
 
-    // A stranger known to membership is accepted unless contacts-only is on.
+    // A stranger whose key only third-party gossip claimed is refused: that
+    // key could be anyone's.
     var known = routeTestPeer(0x25);
     known.pubkey = stranger.public_key;
-    known.wg_pubkey = stranger.wg_public;
+    known.wg_pubkey = stranger.wg_public; // a mobile-style key: not derived from the identity
+    try ctx.membership.upsert(known);
+    handleAppMessage(ctx, try sealedFrom(stranger, ctx, "hi", &buf));
+    try std.testing.expectEqual(@as(u32, 1), ctx.inbox_write.load(.acquire));
+
+    // Once the stranger vouched for its own key it is accepted, unless
+    // contacts-only is on.
+    known.wg_key_source = .binding;
+    known.lamport = 2;
     try ctx.membership.upsert(known);
     meshguard_set_contacts_only(ctx, true);
     handleAppMessage(ctx, try sealedFrom(stranger, ctx, "hi", &buf));

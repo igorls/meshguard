@@ -23,7 +23,12 @@ const BOOL = windows.BOOL;
 const BYTE = u8;
 const LPCWSTR = [*:0]const u16;
 
-extern "kernel32" fn LoadLibraryW(lpLibFileName: LPCWSTR) callconv(.winapi) ?HMODULE;
+extern "kernel32" fn LoadLibraryExW(lpLibFileName: LPCWSTR, hFile: ?windows.HANDLE, dwFlags: windows.DWORD) callconv(.winapi) ?HMODULE;
+/// Search only the directory holding meshguard.exe and System32, never the
+/// current directory or PATH: an administrator running `meshguard up` from a
+/// directory with a planted wintun.dll must not load it.
+const LOAD_LIBRARY_SEARCH_APPLICATION_DIR: windows.DWORD = 0x00000200;
+const LOAD_LIBRARY_SEARCH_SYSTEM32: windows.DWORD = 0x00000800;
 extern "kernel32" fn FreeLibrary(hLibModule: HMODULE) callconv(.winapi) BOOL;
 extern "kernel32" fn GetProcAddress(hModule: HMODULE, lpProcName: [*:0]const u8) callconv(.winapi) ?windows.FARPROC;
 extern "kernel32" fn GetLastError() callconv(.winapi) windows.Win32Error;
@@ -100,7 +105,7 @@ const WintunApi = struct {
 
 fn loadWintunApi() !WintunApi {
     const dll_name = std.unicode.utf8ToUtf16LeStringLiteral("wintun.dll");
-    const dll = LoadLibraryW(dll_name) orelse
+    const dll = LoadLibraryExW(dll_name, null, LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32) orelse
         return error.WintunDllNotFound;
     errdefer _ = FreeLibrary(dll);
 

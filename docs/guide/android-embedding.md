@@ -221,7 +221,7 @@ MeshGuardFFI.meshguard_tunnel_close(ctx, peerPubkey)
 | `0`  | Success                      |
 | `-2` | Not running                  |
 | `-3` | Peer not found in membership |
-| `-4` | Peer has no WG public key    |
+| `-4` | Peer has no WireGuard key that a contact entry or the peer itself (binding, certificate or derived key) vouched for |
 | `-5` | Peer has no endpoint         |
 | `-6` | Peer table full              |
 | `-7` | Handshake failed             |

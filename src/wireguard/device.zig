@@ -84,6 +84,12 @@ pub const WgPeer = struct {
     last_handshake_ns: i128 = 0,
     /// Number of handshake attempts
     handshake_attempts: u32 = 0,
+    /// Our previous sender index, kept mapped while a refreshing handshake we
+    /// initiated is in flight so the live session keeps receiving until the
+    /// response arrives (handleResponseAt unmaps it).
+    prev_sender_index: u32 = 0,
+    /// Bumped whenever active_tunnel is replaced (see Tunnel.generation).
+    tunnel_generation: u32 = 0,
     /// Per-peer Tx ring for parallel pipeline ordering (only used when --encrypt-workers > 0)
     tx_ring: @import("../net/pipeline.zig").PeerTxRing = .{},
 
@@ -362,8 +368,19 @@ pub const WgDevice = struct {
         self.next_index = std.mem.readInt(u32, &seed, .little) | 1;
     }
 
-    /// Allocate a new random-ish sender index.
+    /// Allocate a fresh sender index: random, like kernel WireGuard, so an index
+    /// seen on the wire for one peer does not predict the ones we hand to others
+    /// (forged responses must guess it), and never one that is currently mapped.
     fn allocIndex(self: *WgDevice) u32 {
+        var attempts: usize = 0;
+        while (attempts < 16) : (attempts += 1) {
+            var raw: [4]u8 = undefined;
+            zio().random(&raw);
+            const idx = std.mem.readInt(u32, &raw, .little);
+            if (idx == 0) continue; // 0 is the table sentinel
+            if (self.index_map.get(idx) == null) return idx;
+        }
+        // Practically unreachable; fall back to the sequential counter.
         const idx = self.next_index;
         self.next_index +%= 1;
         if (self.next_index == 0) self.next_index = 1; // Never use 0 (sentinel)
@@ -388,6 +405,10 @@ pub const WgDevice = struct {
         // Check if peer already exists
         if (self.static_map.get(wg_pubkey)) |existing| {
             if (self.peers[existing]) |*peer| {
+                if (mesh_ip[0] != 0 or mesh_ip[1] != 0) {
+                    const owner = self.ip_to_slot[meshIpHostId(mesh_ip)];
+                    if (owner != 0xFF and owner != existing) return error.MeshIpCollision;
+                }
                 peer.endpoint_addr = endpoint.addr;
                 peer.endpoint_addr6 = endpoint.addr6;
                 peer.endpoint_port = endpoint.port;
@@ -404,6 +425,15 @@ pub const WgDevice = struct {
                 }
                 return existing;
             }
+        }
+
+        // SECURITY: the 16-bit mesh host id is first-claim. A second identity whose
+        // key hashes to an occupied host id (about 65k key generations for an
+        // attacker, or an accidental collision) must not take over the routing
+        // slot, which would hand it every packet addressed to the first peer and
+        // let it source that peer's address.
+        if (mesh_ip[0] != 0 or mesh_ip[1] != 0) {
+            if (self.ip_to_slot[meshIpHostId(mesh_ip)] != 0xFF) return error.MeshIpCollision;
         }
 
         // Find empty slot
@@ -446,8 +476,10 @@ pub const WgDevice = struct {
     /// refresh a stale-but-unexpired session without tearing it down. initiateHandshake
     /// applies its own 5s rate limit and returns error.HandshakeRateLimited when hot.
     pub fn reinitiate(self: *WgDevice, wg_pubkey: [32]u8) !noise.HandshakeInitiation {
+        self.lock.lockUncancelable(zio()); // H6: the static_map read and the mutation share one critical section
+        defer self.lock.unlock(zio());
         const slot = self.static_map.get(wg_pubkey) orelse return error.PeerNotFound;
-        return self.initiateHandshake(slot);
+        return self.initiateHandshakeLocked(slot);
     }
 
     pub fn hasActiveTunnel(self: *WgDevice, wg_pubkey: [32]u8) bool {
@@ -473,6 +505,7 @@ pub const WgDevice = struct {
         if (self.static_map.get(wg_pubkey)) |slot| {
             if (self.peers[slot]) |*peer| {
                 self.index_map.remove(peer.sender_index);
+                self.index_map.remove(peer.prev_sender_index);
                 // Clear mesh IP routing
                 if (peer.mesh_ip[0] != 0 or peer.mesh_ip[1] != 0) {
                     self.ip_to_slot[meshIpHostId(peer.mesh_ip)] = 0xFF;
@@ -490,6 +523,10 @@ pub const WgDevice = struct {
     pub fn initiateHandshake(self: *WgDevice, slot: usize) !noise.HandshakeInitiation {
         self.lock.lockUncancelable(zio()); // H6: exclusive — mutates index_map + peer
         defer self.lock.unlock(zio());
+        return self.initiateHandshakeLocked(slot);
+    }
+
+    fn initiateHandshakeLocked(self: *WgDevice, slot: usize) !noise.HandshakeInitiation {
         const peer = if (self.peers[slot]) |*p| p else return error.PeerNotFound;
         const now = nowNs();
 
@@ -498,8 +535,13 @@ pub const WgDevice = struct {
             return error.HandshakeRateLimited;
         }
 
-        // Remove old index mapping, allocate new one
-        self.index_map.remove(peer.sender_index);
+        // Allocate a fresh index for the new handshake but keep the current one
+        // mapped: the live session must keep receiving until the response arrives
+        // (handleResponseAt unmaps it). Only one previous index is retained.
+        if (peer.prev_sender_index != 0 and peer.prev_sender_index != peer.sender_index) {
+            self.index_map.remove(peer.prev_sender_index);
+        }
+        peer.prev_sender_index = peer.sender_index;
         peer.sender_index = self.allocIndex();
         self.index_map.put(peer.sender_index, slot);
 
@@ -579,9 +621,11 @@ pub const WgDevice = struct {
 
         const response = try peer.handshake.createResponse(peer.sender_index);
 
-        // Derive transport keys
-        const keys = try peer.handshake.deriveTransportKeys();
-        peer.active_tunnel = tunnel.Tunnel{ .keys = keys };
+        // Derive transport keys (the stack copy is wiped once installed)
+        var keys = try peer.handshake.deriveTransportKeys();
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&keys));
+        peer.tunnel_generation +%= 1;
+        peer.active_tunnel = tunnel.Tunnel{ .keys = keys, .generation = peer.tunnel_generation };
 
         // NOTE: We do NOT insert remote sender_index into our index_map.
         // The index_map only contains indices WE generated. Remote indices
@@ -605,6 +649,10 @@ pub const WgDevice = struct {
     }
 
     fn handleResponseAt(self: *WgDevice, msg: *const noise.HandshakeResponse, endpoint: ?messages.Endpoint) !AuthenticatedPeerResult {
+        // MAC1 on a response is keyed with our public key: reject forgeries before
+        // the lock and the two X25519 operations in consumeResponse.
+        if (!noise.verifyMac1Response(self.static_public, msg)) return error.InvalidMac;
+
         self.lock.lockUncancelable(zio()); // H6: exclusive — sets active_tunnel
         defer self.lock.unlock(zio());
         // Look up by receiver_index (which is our sender_index)
@@ -614,9 +662,18 @@ pub const WgDevice = struct {
 
         try peer.handshake.consumeResponse(msg);
 
-        // Derive transport keys
-        const keys = try peer.handshake.deriveTransportKeys();
-        peer.active_tunnel = tunnel.Tunnel{ .keys = keys };
+        // The refreshed handshake completed: the previous session's index is no
+        // longer needed.
+        if (peer.prev_sender_index != 0 and peer.prev_sender_index != peer.sender_index) {
+            self.index_map.remove(peer.prev_sender_index);
+        }
+        peer.prev_sender_index = 0;
+
+        // Derive transport keys (the stack copy is wiped once installed)
+        var keys = try peer.handshake.deriveTransportKeys();
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&keys));
+        peer.tunnel_generation +%= 1;
+        peer.active_tunnel = tunnel.Tunnel{ .keys = keys, .generation = peer.tunnel_generation };
         peer.handshake_attempts = 0;
 
         // NOTE: We do NOT insert remote sender_index into our index_map.
@@ -735,6 +792,66 @@ fn innerSourceAllowed(peer_mesh_ip: [4]u8, peer_mesh_ip6: [16]u8, plaintext: []c
 
 // ─── Tests ───
 
+test "a second peer cannot claim an occupied mesh host id" {
+    const X = std.crypto.dh.X25519;
+    var device = WgDevice.init(@as([32]u8, @splat(3)), X.recoverPublicKey(@as([32]u8, @splat(3))));
+    const first_wg = X.recoverPublicKey(@as([32]u8, @splat(4)));
+    const second_wg = X.recoverPublicKey(@as([32]u8, @splat(5)));
+    const mesh_ip = [4]u8{ 10, 99, 7, 7 };
+    const endpoint = messages.Endpoint.initV4(.{ 198, 51, 100, 9 }, 51821);
+
+    const first = try device.addPeerWithEndpoint(@as([32]u8, @splat(10)), first_wg, endpoint, mesh_ip, @splat(0));
+    try std.testing.expectEqual(first, device.lookupByMeshIp(mesh_ip).?);
+
+    // Same host id, different identity and key: refused, routing untouched.
+    try std.testing.expectError(error.MeshIpCollision, device.addPeerWithEndpoint(@as([32]u8, @splat(11)), second_wg, endpoint, mesh_ip, @splat(0)));
+    try std.testing.expectEqual(first, device.lookupByMeshIp(mesh_ip).?);
+    try std.testing.expect(device.findByWgPubkey(second_wg) == null);
+
+    // The owner may re-register itself, and the slot is released when it leaves.
+    try std.testing.expectEqual(first, try device.addPeerWithEndpoint(@as([32]u8, @splat(10)), first_wg, endpoint, mesh_ip, @splat(0)));
+    device.removePeer(first_wg);
+    _ = try device.addPeerWithEndpoint(@as([32]u8, @splat(11)), second_wg, endpoint, mesh_ip, @splat(0));
+}
+
+test "a refreshing handshake keeps the live session index mapped until the response" {
+    const X = std.crypto.dh.X25519;
+    const secret_a = @as([32]u8, @splat(21));
+    const secret_b = @as([32]u8, @splat(22));
+    const pub_a = X.recoverPublicKey(secret_a);
+    const pub_b = X.recoverPublicKey(secret_b);
+    var a = WgDevice.init(secret_a, pub_a);
+    var b = WgDevice.init(secret_b, pub_b);
+    const ep_a = messages.Endpoint.initV4(.{ 198, 51, 100, 1 }, 10001);
+    const ep_b = messages.Endpoint.initV4(.{ 198, 51, 100, 2 }, 10002);
+    const slot_ab = try a.addPeerWithEndpoint(@as([32]u8, @splat(1)), pub_b, ep_b, .{ 10, 99, 0, 2 }, @splat(0));
+    _ = try b.addPeerWithEndpoint(@as([32]u8, @splat(2)), pub_a, ep_a, .{ 10, 99, 0, 1 }, @splat(0));
+
+    // Establish a session.
+    const init1 = try a.initiateHandshake(slot_ab);
+    const resp1 = (try b.handleInitiation(&init1, ep_a.addr)).response;
+    _ = try a.handleResponse(&resp1);
+    const live_index = a.peers[slot_ab].?.sender_index;
+
+    // Refresh: the live index stays mapped while the new handshake is pending.
+    a.peers[slot_ab].?.last_handshake_ns = 0;
+    const init2 = try a.initiateHandshake(slot_ab);
+    try std.testing.expectEqual(slot_ab, a.index_map.get(live_index).?);
+    try std.testing.expect(a.peers[slot_ab].?.sender_index != live_index);
+
+    // A forged response for the pending index is rejected by MAC1 and changes nothing.
+    var forged = resp1;
+    forged.receiver_index = init2.sender_index;
+    try std.testing.expectError(error.InvalidMac, a.handleResponse(&forged));
+    try std.testing.expectEqual(slot_ab, a.index_map.get(live_index).?);
+
+    // The genuine response completes the refresh and retires the old index.
+    const resp2 = (try b.handleInitiation(&init2, ep_a.addr)).response;
+    _ = try a.handleResponse(&resp2);
+    try std.testing.expect(a.index_map.get(live_index) == null);
+    try std.testing.expectEqual(@as(u32, 2), a.peers[slot_ab].?.tunnel_generation);
+}
+
 test "direct authenticated handshakes refresh endpoint without accepting invalid packets" {
     const X = std.crypto.dh.X25519;
     const secret_a = @as([32]u8, @splat(1));
@@ -759,9 +876,16 @@ test "direct authenticated handshakes refresh endpoint without accepting invalid
     const accepted = try b.handleInitiationFromEndpoint(&initiation, new_a);
     try std.testing.expectEqual(identity_a, accepted.identity_key);
     try std.testing.expectEqual(new_a, b.peers[sb].?.endpoint().?);
+    // A tampered response fails MAC1 (which covers the receiver index) before any lookup.
     var invalid_response = accepted.response;
     invalid_response.receiver_index = 0xffffffff;
-    try std.testing.expectError(error.UnknownIndex, a.handleResponseFromEndpoint(&invalid_response, new_b));
+    try std.testing.expectError(error.InvalidMac, a.handleResponseFromEndpoint(&invalid_response, new_b));
+    try std.testing.expectEqual(old_b, a.peers[sa].?.endpoint().?);
+    // A response with a valid MAC1 but an unknown index is still rejected.
+    var unknown_index = accepted.response;
+    unknown_index.receiver_index = 0xffffffff;
+    noise.recomputeResponseMac1ForTest(&unknown_index, pub_a);
+    try std.testing.expectError(error.UnknownIndex, a.handleResponseFromEndpoint(&unknown_index, new_b));
     try std.testing.expectEqual(old_b, a.peers[sa].?.endpoint().?);
     const response = try a.handleResponseFromEndpoint(&accepted.response, new_b);
     try std.testing.expectEqual(identity_b, response.identity_key);

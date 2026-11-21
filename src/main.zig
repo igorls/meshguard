@@ -45,7 +45,7 @@ const usage =
     \\  appinfo     Print application-channel protocol and maxPayload
     \\  invite      Create an agent invite link (meshguard invite --seed <host:port> [--name <label>])
     \\  join        Join via an agent invite link (meshguard join <token>)
-    \\  agent       Run autonomous agent worker loop (meshguard agent)
+    \\  agent       Run the agent worker loop; executes the host's commands (meshguard agent --host <pubkey>)
     \\  upgrade     Upgrade to the latest release from GitHub
     \\  version     Print version
     \\
@@ -479,6 +479,14 @@ fn cmdTrust(allocator: std.mem.Allocator, key_or_path: []const u8, extra_args: [
         }
     }
 
+    // Names become file names under the config directory ("<name>.pub" / "<name>.org").
+    if (peer_name) |requested| {
+        if (!lib.identity.Trust.isValidName(requested)) {
+            try getStdErr().writeStreamingAll(zio(), "error: invalid --name: use 1-64 characters from A-Z a-z 0-9 . _ - (not starting with '-' or '.')\n");
+            std.process.exit(1);
+        }
+    }
+
     if (is_org) {
         return cmdTrustOrg(allocator, config_dir, key_or_path, peer_name);
     }
@@ -506,7 +514,13 @@ fn cmdTrust(allocator: std.mem.Allocator, key_or_path: []const u8, extra_args: [
     else
         key_or_path;
 
-    const name = peer_name orelse auto_name;
+    // A derived name must also be a safe file name: a key's first eight base64
+    // characters may contain '/' or '+', so fall back to hex of the key then.
+    var auto_hex: [8]u8 = undefined;
+    const name: []const u8 = peer_name orelse if (lib.identity.Trust.isValidName(auto_name)) auto_name else blk: {
+        auto_hex = std.fmt.bytesToHex(pk_bytes[0..4].*, .lower);
+        break :blk &auto_hex;
+    };
     const stdout = getStdOut();
     const stderr = getStdErr();
 
@@ -637,6 +651,8 @@ fn loadRaw32KeyArg(key_or_path: []const u8, out: *[32]u8) !void {
         }
         break :blk std.mem.trim(u8, raw_buf[0..total], "\n\r \t");
     };
+    // The decoder does not bound its output: a 32-byte key is exactly 44 characters.
+    if (key_text.len != lib.identity.Trust.PUBLIC_KEY_B64_LEN) return error.InvalidKey;
     try std.base64.standard.Decoder.decode(out, key_text);
 }
 
@@ -661,7 +677,15 @@ fn cmdOrgSign(allocator: std.mem.Allocator, node_key_path: []const u8, extra_arg
             }
         } else if (std.mem.eql(u8, extra_args[j], "--expires")) {
             if (j + 1 < extra_args.len) {
-                expires_at = std.fmt.parseInt(i64, extra_args[j + 1], 10) catch 0;
+                // A typo here must not silently issue a never-expiring certificate.
+                expires_at = std.fmt.parseInt(i64, extra_args[j + 1], 10) catch {
+                    try stderr.writeStreamingAll(zio(), "error: --expires must be a Unix timestamp in seconds (0 = never)\n");
+                    std.process.exit(1);
+                };
+                if (expires_at < 0) {
+                    try stderr.writeStreamingAll(zio(), "error: --expires must not be negative\n");
+                    std.process.exit(1);
+                }
                 j += 1;
             }
         } else if (std.mem.eql(u8, extra_args[j], "--wg-pubkey")) {
@@ -682,6 +706,12 @@ fn cmdOrgSign(allocator: std.mem.Allocator, node_key_path: []const u8, extra_arg
                 std.process.exit(1);
             }
         }
+    }
+
+    // The name becomes "<name>.cert" under the config directory.
+    if (!lib.identity.Trust.isValidName(node_name)) {
+        try stderr.writeStreamingAll(zio(), "error: invalid --name: use 1-64 characters from A-Z a-z 0-9 . _ - (not starting with '-' or '.')\n");
+        std.process.exit(1);
     }
 
     // Load org keypair
@@ -1272,9 +1302,14 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
         try stdout.writeStreamingAll(zio(), "  trust: OPEN (accepting all peers)\n");
     }
 
-    // Load service access policies
+    // Load service access policies. A malformed policy fails closed: refuse to
+    // start rather than run with an allow-all filter the operator did not write.
     const ServicePolicy = lib.services.Policy;
-    var service_filter = ServicePolicy.ServiceFilter.loadFromDir(config_dir);
+    var policy_diag = ServicePolicy.LoadDiagnostics{};
+    var service_filter = ServicePolicy.ServiceFilter.loadFromDir(config_dir, &policy_diag) catch |err| {
+        try writeFormatted(getStdErr(), "error: refusing to start: service policy {f}: {s}\n", .{ &policy_diag, @errorName(err) });
+        std.process.exit(1);
+    };
     service_filter.resolveAliases(config_dir);
     service_filter.resolveOrgNames(config_dir);
     if (service_filter.global != null or service_filter.peer_count > 0 or service_filter.org_count > 0) {
@@ -1372,19 +1407,27 @@ fn cmdUp(allocator: std.mem.Allocator, extra_args: []const []const u8) !void {
                     try stdout.writeStreamingAll(zio(), "  trying UPnP port forwarding...\n");
                     const UPnP = lib.nat.UPnP;
                     if (UPnP.addPortMapping(gossip_port, gossip_port, "meshguard", 3600)) |upnp_result| {
-                        // Use UPnP external IP if available, otherwise fall back to STUN IP
-                        const effective_ip = if (upnp_result.external_ip[0] == 0 and upnp_result.external_ip[1] == 0)
-                            stun_result.external.addr
-                        else
-                            upnp_result.external_ip;
+                        // SECURITY: the gateway's external address is trusted only when it
+                        // agrees with what STUN observed (or the gateway reported none). A
+                        // rogue SSDP responder on the LAN could otherwise choose the address
+                        // every peer sends our traffic to, and a disagreement also means a
+                        // second NAT sits in front of the router, so the mapping would not
+                        // make us reachable anyway.
+                        const upnp_ip = upnp_result.external_ip;
+                        const upnp_unset = upnp_ip[0] == 0 and upnp_ip[1] == 0;
                         var upnp_ip_buf: [15]u8 = undefined;
-                        const upnp_ip = lib.wireguard.Ip.formatIp(effective_ip, &upnp_ip_buf);
-                        try writeFormatted(stdout, "  ✓ UPnP: port {d} forwarded (external IP: {s})\n", .{ gossip_port, upnp_ip });
-                        // Update public endpoint — UPnP makes us directly reachable
-                        swim.setPublicEndpoint(
-                            messages.Endpoint{ .addr = effective_ip, .port = gossip_port },
-                            .public,
-                        );
+                        if (upnp_unset or std.mem.eql(u8, &upnp_ip, &stun_result.external.addr)) {
+                            const ip_text = lib.wireguard.Ip.formatIp(stun_result.external.addr, &upnp_ip_buf);
+                            try writeFormatted(stdout, "  ✓ UPnP: port {d} forwarded (external IP: {s})\n", .{ gossip_port, ip_text });
+                            // Update public endpoint — UPnP makes us directly reachable
+                            swim.setPublicEndpoint(
+                                messages.Endpoint{ .addr = stun_result.external.addr, .port = gossip_port },
+                                .public,
+                            );
+                        } else {
+                            const ip_text = lib.wireguard.Ip.formatIp(upnp_ip, &upnp_ip_buf);
+                            try writeFormatted(stdout, "  UPnP: router reports external IP {s}, which differs from the STUN result; keeping the STUN endpoint (will use hole punching)\n", .{ip_text});
+                        }
                     } else |upnp_err| {
                         try writeFormatted(stdout, "  UPnP: {s} (will use hole punching)\n", .{@errorName(upnp_err)});
                     }
@@ -1654,7 +1697,14 @@ fn cmdConnect(allocator: std.mem.Allocator, extra_args: []const []const u8) !voi
                 join_token_arg = extra_args[i];
             } else if (std.mem.eql(u8, extra_args[i], "--in") and i + 1 < extra_args.len) {
                 i += 1;
-                punch_delay_min = std.fmt.parseInt(u64, extra_args[i], 10) catch 1;
+                // The joiner refuses punch times more than MAX_PUNCH_FUTURE_SECS ahead,
+                // so the delay is bounded to what a peer will accept.
+                const max_delay_min = CoordinatedPunch.MAX_PUNCH_FUTURE_SECS / 60;
+                punch_delay_min = std.fmt.parseInt(u64, extra_args[i], 10) catch 0;
+                if (punch_delay_min < 1 or punch_delay_min > max_delay_min) {
+                    try writeFormatted(getStdErr(), "error: --in must be a whole number of minutes from 1 to {d}\n", .{max_delay_min});
+                    std.process.exit(1);
+                }
             } else if (std.mem.eql(u8, extra_args[i], "--help") or std.mem.eql(u8, extra_args[i], "-h")) {
                 try stdout.writeStreamingAll(zio(),
                     \\meshguard connect — Direct peer connection via token exchange
@@ -1846,6 +1896,7 @@ fn cmdConnect(allocator: std.mem.Allocator, extra_args: []const []const u8) !voi
                 kp.public_key.toBytes(),
                 nonce,
                 peer_token.nonce,
+                peer_token.pubkey,
                 peer_token.stun_addr,
                 peer_token.stun_port,
                 punch_time,
@@ -1870,6 +1921,11 @@ fn cmdConnect(allocator: std.mem.Allocator, extra_args: []const []const u8) !voi
 
             const peer_token = CoordinatedPunch.decodeTokenUri(peer_uri) catch {
                 try stderr.writeStreamingAll(zio(), "error: invalid token\n");
+                std.process.exit(1);
+            };
+            // Never wait on an unbounded, peer-supplied punch time.
+            CoordinatedPunch.checkPunchTime(peer_token.punch_time) catch |err| {
+                try writeFormatted(stderr, "error: token punch time rejected ({s}): it must be at most {d}s ahead of or {d}s behind the local clock\n", .{ @errorName(err), CoordinatedPunch.MAX_PUNCH_FUTURE_SECS, CoordinatedPunch.MAX_PUNCH_PAST_SECS });
                 std.process.exit(1);
             };
 
@@ -1920,6 +1976,7 @@ fn cmdConnect(allocator: std.mem.Allocator, extra_args: []const []const u8) !voi
                 kp.public_key.toBytes(),
                 nonce,
                 peer_token.nonce,
+                peer_token.pubkey,
                 peer_token.stun_addr,
                 peer_token.stun_port,
                 punch_time,
@@ -2237,38 +2294,51 @@ fn wgOnPeerPunched(ctx: *anyopaque, peer: *const lib.discovery.Membership.Peer, 
                 };
             }
         } else if (handler.wg_device) |dev| {
-
-            // Userspace mode: update peer endpoint
-            if (dev.findByWgPubkey(wg_key)) |slot| {
-                if (dev.peers[slot]) |*p| {
-                    p.endpoint_addr = endpoint.addr;
-                    p.endpoint_addr6 = endpoint.addr6;
-                    p.endpoint_port = endpoint.port;
-                }
+            // Userspace mode: a punch result comes from an unauthenticated probe, so
+            // it is only a hint about where the peer may be reachable. Never move the
+            // peer's endpoint on it (anyone able to forge a holepunch request could
+            // redirect our traffic). When we are the designated initiator, send a
+            // handshake there instead; the endpoint is rebound only once the response
+            // authenticates (handleResponseFromEndpoint).
+            if (std.mem.order(u8, &dev.static_public, &wg_key) == .lt) {
+                if (dev.reinitiate(wg_key)) |init_msg| {
+                    if (handler.socket) |sock| {
+                        _ = sock.sendToEndpoint(std.mem.asBytes(&init_msg), endpoint) catch 0;
+                    }
+                } else |_| {}
             }
         }
 
-        writeFormatted(handler.stdout, "  peer punched: {s} (direct connection established)\n", .{ip_str}) catch {};
+        writeFormatted(handler.stdout, "  peer punched: {s} (direct path probed; awaiting authenticated handshake)\n", .{ip_str}) catch {};
     }
 }
 
-var recent_app_nonces: [128][12]u8 = undefined;
+// Replay ring for authenticated application frames, keyed by (sender, nonce) so
+// one busy sender cannot flush another sender's nonces. A relay or on-path party
+// can still replay a frame older than the ring; applications that need stronger
+// guarantees carry their own sequence numbers.
+const AppNonceKey = [32 + 12]u8;
+var recent_app_nonces: [1024]AppNonceKey = undefined;
 var recent_app_nonces_head: usize = 0;
 var recent_app_nonces_count: usize = 0;
 var recent_app_nonces_lock: std.Io.Mutex = .init;
 
-fn isDuplicateAppNonce(nonce: [12]u8) bool {
+fn isDuplicateAppNonce(sender: [32]u8, nonce: [12]u8) bool {
+    var key: AppNonceKey = undefined;
+    @memcpy(key[0..32], &sender);
+    @memcpy(key[32..], &nonce);
+
     recent_app_nonces_lock.lockUncancelable(zio());
     defer recent_app_nonces_lock.unlock(zio());
 
     var i: usize = 0;
     while (i < recent_app_nonces_count) : (i += 1) {
-        if (std.mem.eql(u8, &recent_app_nonces[i], &nonce)) {
+        if (std.mem.eql(u8, &recent_app_nonces[i], &key)) {
             return true;
         }
     }
 
-    recent_app_nonces[recent_app_nonces_head] = nonce;
+    recent_app_nonces[recent_app_nonces_head] = key;
     recent_app_nonces_head = (recent_app_nonces_head + 1) % recent_app_nonces.len;
     if (recent_app_nonces_count < recent_app_nonces.len) {
         recent_app_nonces_count += 1;
@@ -2293,6 +2363,10 @@ fn wgOnAppMessage(ctx: *anyopaque, data: []const u8) void {
     @memcpy(&peer_key, sender_pubkey);
     const peer = handler.membership.peers.get(peer_key) orelse return;
     const peer_wg_pubkey = peer.wg_pubkey orelse return;
+    // SECURITY: a WireGuard key learned from third-party gossip authenticates
+    // nobody unless it is the identity's own derived key. Otherwise wait for the
+    // peer's signed binding or certificate before accepting frames in its name.
+    if (peer.wg_key_source == .gossip and !lib.identity.Binding.isDerived(peer_key, peer_wg_pubkey)) return;
     var plaintext: [1024]u8 = undefined;
     _ = AppPacket.open(control.our_pubkey, handler.our_wg_private, peer_wg_pubkey, data, &plaintext) catch return;
 
@@ -2301,7 +2375,7 @@ fn wgOnAppMessage(ctx: *anyopaque, data: []const u8) void {
     // rules; keeping them out of this small ring stops bulk traffic from flushing
     // the nonces that protect application messages.
     const plaintext_slice = plaintext[0..payload_len];
-    if (!lib.protocol.Transfer.looksLikeTransferFrame(plaintext_slice) and isDuplicateAppNonce(nonce)) return;
+    if (!lib.protocol.Transfer.looksLikeTransferFrame(plaintext_slice) and isDuplicateAppNonce(peer_key, nonce)) return;
     _ = control.pushMessage(peer_key, plaintext_slice);
 }
 
@@ -2433,7 +2507,12 @@ fn tunReaderPipeline(
                         pkt.endpoint_addr = peer.endpoint_addr;
                         pkt.endpoint_port = peer.endpoint_port;
 
-                        const batch_idx = local_batches[peer_slot].?;
+                        const batch_idx = local_batches[peer_slot] orelse {
+                            // Batch pool exhausted: drop the remaining segments rather
+                            // than dereferencing null (undefined behaviour in ReleaseFast).
+                            pool.freeBuffers(pool_indices[s..seg_count]);
+                            break;
+                        };
                         var batch = &pool.batches[batch_idx];
                         batch.buf_indices[batch.count] = buf_idx;
                         batch.lengths[batch.count] = @intCast(seg_sizes[s]);
@@ -2604,7 +2683,12 @@ fn tunReaderIoUring(
                         pkt.endpoint_addr = peer.endpoint_addr;
                         pkt.endpoint_port = peer.endpoint_port;
 
-                        const batch_idx = local_batches[peer_slot].?;
+                        const batch_idx = local_batches[peer_slot] orelse {
+                            // Batch pool exhausted: drop the remaining segments rather
+                            // than dereferencing null (undefined behaviour in ReleaseFast).
+                            pool.freeBuffers(pool_indices[s..seg_count]);
+                            break;
+                        };
                         var batch = &pool.batches[batch_idx];
                         batch.buf_indices[batch.count] = buf_idx;
                         batch.lengths[batch.count] = @intCast(seg_sizes[s]);
@@ -2739,6 +2823,9 @@ fn dispatchBatch(
     // 1. Lock per-peer push_lock briefly for nonce assignment + ring insertion
     peer.tx_ring.push_lock.lockUncancelable(zio());
 
+    // Remember which key set these nonces belong to (see cryptoWorkerPipeline).
+    batch.tunnel_generation = tun.generation;
+
     // Bulk nonce assignment: reserve(count) claims a contiguous block
     const start_nonce = tun.send_counter.reserve(batch.count);
     for (0..batch.count) |i| {
@@ -2779,13 +2866,22 @@ fn cryptoWorkerPipeline(
         var tun = &(peer.active_tunnel orelse continue);
 
         // STAGE 2: Encrypt all packets in-place (100% cache-local, no locks)
-        for (0..batch.count) |i| {
-            var pkt = &pool.buffers[batch.buf_indices[i]];
-            if (tun.encryptPreassigned(&pkt.data, batch.lengths[i], batch.nonces[i])) |enc_len| {
-                pkt.len = @intCast(enc_len);
-            } else {
-                pkt.len = 0; // mark as failed
+        if (tun.generation == batch.tunnel_generation) {
+            for (0..batch.count) |i| {
+                var pkt = &pool.buffers[batch.buf_indices[i]];
+                if (tun.encryptPreassigned(&pkt.data, batch.lengths[i], batch.nonces[i])) |enc_len| {
+                    pkt.len = @intCast(enc_len);
+                } else {
+                    pkt.len = 0; // mark as failed
+                }
             }
+        } else {
+            // SECURITY: the nonces were reserved from the tunnel that was active at
+            // dispatch. A handshake has since installed new keys with a fresh counter;
+            // encrypting under those keys with the old counter values would reuse
+            // every one of these nonces once the new counter catches up (keystream
+            // and Poly1305 key reuse). Fail the whole batch; the flusher frees it.
+            for (0..batch.count) |i| pool.buffers[batch.buf_indices[i]].len = 0;
         }
 
         // Mark batch as Ready for sequential sending
@@ -4908,7 +5004,11 @@ fn cmdServiceShow(allocator: std.mem.Allocator, config_dir: []const u8, target: 
     const stdout = getStdOut();
 
     const PolicyMod = lib.services.Policy;
-    var filter = PolicyMod.ServiceFilter.loadFromDir(config_dir);
+    var policy_diag = PolicyMod.LoadDiagnostics{};
+    var filter = PolicyMod.ServiceFilter.loadFromDir(config_dir, &policy_diag) catch |err| {
+        try writeFormatted(getStdErr(), "error: service policy {f}: {s}\n", .{ &policy_diag, @errorName(err) });
+        std.process.exit(1);
+    };
     filter.resolveAliases(config_dir);
     filter.resolveOrgNames(config_dir);
 
@@ -5196,204 +5296,275 @@ fn parseSemver(s: []const u8) ?[3]u32 {
     return parts;
 }
 
-fn cmdUpgrade(_: std.mem.Allocator) !void {
+/// Release asset for this build's platform, or null where `upgrade` is unsupported.
+const upgrade_asset: ?[]const u8 = blk: {
+    const b = @import("builtin");
+    if (b.os.tag != .linux) break :blk null;
+    break :blk switch (b.cpu.arch) {
+        .x86_64 => "meshguard-linux-amd64",
+        .aarch64 => "meshguard-linux-arm64",
+        else => null,
+    };
+};
+
+const upgrade_install_path = "/usr/local/bin/meshguard";
+const upgrade_install_dir = "/usr/local/bin";
+const upgrade_repo_url = "https://github.com/igorls/meshguard";
+
+/// POSIX mode bits for a file created by this process; Windows has no mode bits.
+fn filePermissions(comptime mode: comptime_int) std.Io.File.Permissions {
+    if (comptime !@hasDecl(std.Io.File.Permissions, "fromMode")) return .default_file;
+    return .fromMode(mode);
+}
+
+/// Runs a command, waits for it, and returns true when it exited with status 0.
+/// The child's stderr is inherited so the user sees why a download failed.
+fn runQuietly(argv: []const []const u8) bool {
+    const term = spawnAndWaitChild(.{ .argv = argv, .stdout = .ignore, .stderr = .inherit }) catch return false;
+    return childExitedSuccessfully(term);
+}
+
+/// Runs a command and captures its stdout (up to buf.len bytes) without touching the file system.
+fn runCaptureStdout(argv: []const []const u8, buf: []u8) !usize {
+    var child = try spawnChild(.{ .argv = argv, .stdout = .pipe, .stderr = .ignore });
+    defer child.kill(zio());
+    const n = readAll(child.stdout.?, buf) catch 0;
+    const term = child.wait(zio()) catch return error.CommandFailed;
+    if (!childExitedSuccessfully(term)) return error.CommandFailed;
+    return n;
+}
+
+/// Extracts "tag_name" from the GitHub release JSON. Only tags shaped like
+/// `v1.2.3` (letters, digits, '.', '-', '_') are accepted, since the tag becomes
+/// part of a URL path.
+fn parseReleaseTag(json: []const u8) ?[]const u8 {
+    const key = "\"tag_name\"";
+    const key_pos = std.mem.indexOf(u8, json, key) orelse return null;
+    var scan = key_pos + key.len;
+    while (scan < json.len and (json[scan] == ':' or json[scan] == ' ')) : (scan += 1) {}
+    if (scan >= json.len or json[scan] != '"') return null;
+    scan += 1;
+    const end = std.mem.indexOfScalarPos(u8, json, scan, '"') orelse return null;
+    const tag = json[scan..end];
+    if (tag.len < 2 or tag.len > 64 or tag[0] != 'v' or !std.ascii.isDigit(tag[1])) return null;
+    for (tag[1..]) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '.' or c == '-' or c == '_')) return null;
+    }
+    return tag;
+}
+
+/// Finds the SHA-256 listed for `name` in sha256sum-format text ("<hex>  <name>",
+/// a leading '*' marks binary mode).
+fn expectedChecksumFor(manifest: []const u8, name: []const u8) ?[64]u8 {
+    var lines = std.mem.splitScalar(u8, manifest, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        const split = std.mem.indexOfAny(u8, line, " \t") orelse continue;
+        const hash = line[0..split];
+        var file_name = std.mem.trim(u8, line[split..], " \t");
+        if (file_name.len > 0 and file_name[0] == '*') file_name = file_name[1..];
+        if (!std.mem.eql(u8, file_name, name)) continue;
+        if (hash.len != 64) return null;
+        var out: [64]u8 = undefined;
+        for (hash, 0..) |c, i| out[i] = std.ascii.toLower(c);
+        return out;
+    }
+    return null;
+}
+
+fn sha256File(path: []const u8, out: *[32]u8) !void {
+    const file = try std.Io.Dir.openFileAbsolute(zio(), path, .{});
+    defer file.close(zio());
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var reader = file.reader(zio(), &.{});
+    var chunk: [16 * 1024]u8 = undefined;
+    while (true) {
+        const n = reader.interface.readSliceShort(&chunk) catch return error.ReadFailed;
+        if (n == 0) break;
+        hasher.update(chunk[0..n]);
+    }
+    hasher.final(out);
+}
+
+fn cmdUpgrade(allocator: std.mem.Allocator) !void {
     const stdout = getStdOut();
     const stderr = getStdErr();
 
-    const current = version;
-    try writeFormatted(stdout, "meshguard upgrade\n  current version: {s}\n", .{current});
-
-    // Query GitHub API for latest release tag
-    try stdout.writeStreamingAll(zio(), "  checking for updates...\n");
-
-    const api_tmp = "/tmp/meshguard-api-response";
-    {
-        const api_term = spawnAndWaitChild(.{
-            .argv = &.{
-                "curl",                                                          "-fsSL", "-o", api_tmp,
-                "https://api.github.com/repos/igorls/meshguard/releases/latest",
-            },
-            .stderr = .ignore,
-            .stdout = .ignore,
-        }) catch {
-            try stderr.writeStreamingAll(zio(), "error: failed to query GitHub API (is curl installed?)\n");
+    if (upgrade_asset) |asset| {
+        try writeFormatted(stdout, "meshguard upgrade\n  current version: {s}\n", .{version});
+        performUpgrade(allocator, asset) catch {
+            try stderr.writeStreamingAll(zio(), "error: upgrade failed; the installed binary was not changed\n");
             std.process.exit(1);
         };
-        if (!childExitedSuccessfully(api_term)) {
-            try stderr.writeStreamingAll(zio(), "error: failed to fetch latest release info from GitHub\n");
-            try stderr.writeStreamingAll(zio(), "  hint: check internet connectivity\n");
-            std.process.exit(1);
-        }
-    }
-
-    // Parse tag_name from JSON response
-    const api_file = std.Io.Dir.openFileAbsolute(zio(), api_tmp, .{}) catch {
-        try stderr.writeStreamingAll(zio(), "error: could not read API response\n");
-        std.process.exit(1);
-    };
-    defer api_file.close(zio());
-    defer deleteFileAbsoluteNoErr(api_tmp);
-
-    var api_buf: [8192]u8 = undefined;
-    const api_len = readAll(api_file, &api_buf) catch 0;
-    if (api_len == 0) {
-        try stderr.writeStreamingAll(zio(), "error: empty API response\n");
+    } else {
+        try stderr.writeStreamingAll(zio(), "error: 'upgrade' is only available in the Linux amd64 and arm64 release builds\n");
+        try writeFormatted(stderr, "  download the asset for this platform from {s}/releases and verify it against checksums.txt\n", .{upgrade_repo_url});
         std.process.exit(1);
     }
-    const api_data = api_buf[0..api_len];
+}
 
-    // Find "tag_name" in JSON — handle optional whitespace after colon
-    const tag_key = "\"tag_name\"";
-    const tag_key_pos = std.mem.indexOf(u8, api_data, tag_key) orelse {
-        try stderr.writeStreamingAll(zio(), "error: could not parse release tag from GitHub API\n");
-        std.process.exit(1);
-    };
-    // Skip past the key, colon, whitespace, and opening quote
-    var tag_scan = tag_key_pos + tag_key.len;
-    while (tag_scan < api_data.len and (api_data[tag_scan] == ':' or api_data[tag_scan] == ' ' or api_data[tag_scan] == '"')) : (tag_scan += 1) {}
-    // Now tag_scan points to the first char of the version string
-    // But we went one past the opening quote, so back up: actually we skipped the quote too
-    // Find the closing quote
-    const tag_end = std.mem.indexOfScalarPos(u8, api_data, tag_scan, '"') orelse {
-        try stderr.writeStreamingAll(zio(), "error: malformed tag in API response\n");
-        std.process.exit(1);
-    };
-    const tag = api_data[tag_scan..tag_end]; // e.g. "v0.3.1"
+/// Downloads the latest release into a private staging file next to the installed
+/// binary, verifies it against the release's checksums.txt, and swaps it in with an
+/// atomic rename. Nothing is executed or installed before the checksum matches, and
+/// nothing is written under /tmp where another local user could race the download.
+fn performUpgrade(allocator: std.mem.Allocator, asset: []const u8) !void {
+    const stdout = getStdOut();
+    const stderr = getStdErr();
 
-    // Strip 'v' prefix for comparison
-    const latest = if (tag.len > 0 and tag[0] == 'v') tag[1..] else tag;
+    // 1. Latest release tag, read from curl's stdout (no temporary file).
+    try stdout.writeStreamingAll(zio(), "  checking for updates...\n");
+    const api_buf = try allocator.alloc(u8, 1024 * 1024);
+    defer allocator.free(api_buf);
+    const api_len = runCaptureStdout(&.{ "curl", "-fsSL", "https://api.github.com/repos/igorls/meshguard/releases/latest" }, api_buf) catch {
+        try stderr.writeStreamingAll(zio(), "error: failed to fetch the latest release from GitHub (is curl installed? is the network up?)\n");
+        return error.UpgradeFailed;
+    };
+    const tag = parseReleaseTag(api_buf[0..api_len]) orelse {
+        try stderr.writeStreamingAll(zio(), "error: could not parse a release tag from the GitHub API response\n");
+        return error.UpgradeFailed;
+    };
+    const latest = tag[1..];
     try writeFormatted(stdout, "  latest version:  {s}\n", .{latest});
 
-    if (std.mem.eql(u8, latest, current)) {
+    if (std.mem.eql(u8, latest, version)) {
         try stdout.writeStreamingAll(zio(), "  ✓ already up to date\n");
         return;
     }
-
-    // Simple semver comparison to prevent downgrades
-    if (!isNewerVersion(current, latest)) {
-        try writeFormatted(stdout, "  ✓ already up to date (local {s} >= remote {s})\n", .{ current, latest });
+    if (!isNewerVersion(version, latest)) {
+        try writeFormatted(stdout, "  ✓ already up to date (local {s} >= remote {s})\n", .{ version, latest });
         return;
     }
 
-    // Download binary
-    const download_path = "/tmp/meshguard-upgrade";
-    var url_buf: [256]u8 = undefined;
-    const download_url = std.fmt.bufPrint(&url_buf, "https://github.com/igorls/meshguard/releases/download/{s}/meshguard-linux-amd64", .{tag}) catch {
-        try stderr.writeStreamingAll(zio(), "error: URL too long\n");
-        std.process.exit(1);
+    // 2. Private staging files inside the install directory: it is root-owned and
+    //    not world-writable, and it is on the same file system as the target, so
+    //    the final swap can be an atomic rename.
+    var suffix_bytes: [8]u8 = undefined;
+    zio().random(&suffix_bytes);
+    const suffix = std.fmt.bytesToHex(suffix_bytes, .lower);
+    var staged_buf: [128]u8 = undefined;
+    const staged_path = try std.fmt.bufPrint(&staged_buf, "{s}/.meshguard-upgrade-{s}", .{ upgrade_install_dir, suffix });
+    var manifest_buf: [160]u8 = undefined;
+    const manifest_path = try std.fmt.bufPrint(&manifest_buf, "{s}.sha256", .{staged_path});
+
+    const create_options: std.Io.Dir.CreateFileOptions = .{ .exclusive = true, .permissions = filePermissions(0o600) };
+    const staged_file = std.Io.Dir.createFileAbsolute(zio(), staged_path, create_options) catch |err| {
+        switch (err) {
+            error.AccessDenied, error.PermissionDenied => try writeFormatted(stderr, "error: cannot write to {s}; run with sudo\n", .{upgrade_install_dir}),
+            else => try writeFormatted(stderr, "error: cannot create the staging file in {s}: {s}\n", .{ upgrade_install_dir, @errorName(err) }),
+        }
+        return error.UpgradeFailed;
     };
+    staged_file.close(zio());
+    var installed = false;
+    defer if (!installed) deleteFileAbsoluteNoErr(staged_path);
+    const manifest_file = std.Io.Dir.createFileAbsolute(zio(), manifest_path, create_options) catch |err| {
+        try writeFormatted(stderr, "error: cannot create the checksum file in {s}: {s}\n", .{ upgrade_install_dir, @errorName(err) });
+        return error.UpgradeFailed;
+    };
+    manifest_file.close(zio());
+    defer deleteFileAbsoluteNoErr(manifest_path);
 
-    try writeFormatted(stdout, "\n  downloading {s}...\n", .{tag});
-    {
-        const dl_term = spawnAndWaitChild(.{
-            .argv = &.{ "curl", "-fSL", "-o", download_path, download_url },
-            .stderr = .pipe,
-            .stdout = .ignore,
-        }) catch {
-            try stderr.writeStreamingAll(zio(), "error: failed to download release\n");
-            std.process.exit(1);
-        };
-        if (!childExitedSuccessfully(dl_term)) {
-            try writeFormatted(stderr, "error: download failed (exit {d})\n", .{childExitCode(dl_term) orelse 255});
-            std.process.exit(1);
-        }
+    // 3. Download the binary and the release manifest from the same tag.
+    var url_buf: [256]u8 = undefined;
+    const download_url = try std.fmt.bufPrint(&url_buf, "{s}/releases/download/{s}/{s}", .{ upgrade_repo_url, tag, asset });
+    var manifest_url_buf: [256]u8 = undefined;
+    const manifest_url = try std.fmt.bufPrint(&manifest_url_buf, "{s}/releases/download/{s}/checksums.txt", .{ upgrade_repo_url, tag });
+
+    try writeFormatted(stdout, "\n  downloading {s} ({s})...\n", .{ tag, asset });
+    if (!runQuietly(&.{ "curl", "-fSL", "-o", staged_path, download_url })) {
+        try stderr.writeStreamingAll(zio(), "error: download failed\n");
+        return error.UpgradeFailed;
+    }
+    if (!runQuietly(&.{ "curl", "-fsSL", "-o", manifest_path, manifest_url })) {
+        try writeFormatted(stderr, "error: could not download checksums.txt for {s}; refusing to install an unverified binary\n", .{tag});
+        return error.UpgradeFailed;
     }
 
-    // Make downloaded binary executable
-    {
-        _ = spawnAndWaitChild(.{
-            .argv = &.{ "chmod", "+x", download_path },
-            .stderr = .ignore,
-            .stdout = .ignore,
-        }) catch {};
+    // 4. Verify before anything is executed or installed.
+    try stdout.writeStreamingAll(zio(), "  verifying checksum...\n");
+    var manifest_data: [16 * 1024]u8 = undefined;
+    const manifest_len = blk: {
+        const file = std.Io.Dir.openFileAbsolute(zio(), manifest_path, .{}) catch return error.UpgradeFailed;
+        defer file.close(zio());
+        break :blk readAll(file, &manifest_data) catch 0;
+    };
+    const expected = expectedChecksumFor(manifest_data[0..manifest_len], asset) orelse {
+        try writeFormatted(stderr, "error: checksums.txt for {s} has no usable entry for {s}; refusing to install\n", .{ tag, asset });
+        return error.UpgradeFailed;
+    };
+    var digest: [32]u8 = undefined;
+    sha256File(staged_path, &digest) catch {
+        try stderr.writeStreamingAll(zio(), "error: could not read the downloaded binary\n");
+        return error.UpgradeFailed;
+    };
+    const actual = std.fmt.bytesToHex(digest, .lower);
+    if (!std.mem.eql(u8, &expected, &actual)) {
+        try writeFormatted(stderr, "error: checksum mismatch for {s}\n  expected: {s}\n  actual:   {s}\n  The download is corrupt or has been tampered with. Nothing was installed.\n", .{ asset, &expected, &actual });
+        return error.UpgradeFailed;
     }
+    try stdout.writeStreamingAll(zio(), "  ✓ checksum verified\n");
 
-    // Verify downloaded binary
-    try stdout.writeStreamingAll(zio(), "  verifying download...\n");
+    // 5. Make it executable and sanity-check the verified binary.
     {
-        var verify = spawnChild(.{
-            .argv = &.{ download_path, "version" },
-            .stdout = .pipe,
-            .stderr = .ignore,
-        }) catch {
-            try stderr.writeStreamingAll(zio(), "error: downloaded binary is not executable\n");
-            std.process.exit(1);
-        };
-        defer verify.kill(zio());
+        const file = std.Io.Dir.openFileAbsolute(zio(), staged_path, .{ .mode = .read_write }) catch return error.UpgradeFailed;
+        defer file.close(zio());
+        file.setPermissions(zio(), filePermissions(0o755)) catch return error.UpgradeFailed;
+    }
+    {
         var ver_buf: [128]u8 = undefined;
-        const ver_len = readAll(verify.stdout.?, &ver_buf) catch 0;
-        _ = verify.wait(zio()) catch {};
-        if (ver_len > 0) {
-            const ver_str = std.mem.trimEnd(u8, ver_buf[0..ver_len], "\n\r \t");
-            try writeFormatted(stdout, "  downloaded: {s}\n", .{ver_str});
-        }
+        const ver_len = runCaptureStdout(&.{ staged_path, "version" }, &ver_buf) catch {
+            try stderr.writeStreamingAll(zio(), "error: the downloaded binary does not run on this system\n");
+            return error.UpgradeFailed;
+        };
+        const ver_str = std.mem.trimEnd(u8, ver_buf[0..ver_len], "\n\r \t");
+        try writeFormatted(stdout, "  downloaded: {s}\n", .{ver_str});
     }
 
-    // Determine install path
-    const install_path = "/usr/local/bin/meshguard";
-
-    // Stop service if running
+    // 6. Stop the service, swap atomically, restart.
     try stdout.writeStreamingAll(zio(), "\n  stopping meshguard service...\n");
-    {
-        _ = spawnAndWaitChild(.{
-            .argv = &.{ "systemctl", "stop", "meshguard" },
-            .stderr = .ignore,
-            .stdout = .ignore,
-        }) catch {};
-    }
+    _ = runQuietly(&.{ "systemctl", "stop", "meshguard" });
+    sleepNs(std.time.ns_per_s);
 
-    // Brief pause for port release
-    const ts = std.os.linux.timespec{ .sec = 1, .nsec = 0 };
-    _ = std.os.linux.nanosleep(&ts, null);
-
-    // Swap binary: rm old, copy new
     try stdout.writeStreamingAll(zio(), "  installing new binary...\n");
-    deleteFileAbsoluteNoErr(install_path);
-    {
-        const cp_term = spawnAndWaitChild(.{
-            .argv = &.{ "cp", download_path, install_path },
-            .stderr = .ignore,
-            .stdout = .ignore,
-        }) catch {
-            try stderr.writeStreamingAll(zio(), "error: failed to install binary\n");
-            std.process.exit(1);
-        };
-        if (!childExitedSuccessfully(cp_term)) {
-            try stderr.writeStreamingAll(zio(), "error: cp failed — check permissions (run with sudo)\n");
-            std.process.exit(1);
-        }
-    }
-    {
-        _ = spawnAndWaitChild(.{
-            .argv = &.{ "chmod", "+x", install_path },
-            .stderr = .ignore,
-            .stdout = .ignore,
-        }) catch {};
-    }
+    std.Io.Dir.renameAbsolute(staged_path, upgrade_install_path, zio()) catch |err| {
+        try writeFormatted(stderr, "error: failed to install the new binary: {s}\n", .{@errorName(err)});
+        _ = runQuietly(&.{ "systemctl", "start", "meshguard" });
+        return error.UpgradeFailed;
+    };
+    installed = true;
 
-    // Restart service
     try stdout.writeStreamingAll(zio(), "  restarting meshguard service...\n");
-    {
-        const restart_term = spawnAndWaitChild(.{
-            .argv = &.{ "systemctl", "start", "meshguard" },
-            .stderr = .ignore,
-            .stdout = .ignore,
-        }) catch {
-            try stderr.writeStreamingAll(zio(), "warning: could not restart service\n");
-            return;
-        };
-        if (childExitedSuccessfully(restart_term)) {
-            try stdout.writeStreamingAll(zio(), "  ✓ meshguard service restarted\n");
-        } else {
-            try stderr.writeStreamingAll(zio(), "  warning: service restart failed — start manually\n");
-        }
+    if (runQuietly(&.{ "systemctl", "start", "meshguard" })) {
+        try stdout.writeStreamingAll(zio(), "  ✓ meshguard service restarted\n");
+    } else {
+        try stderr.writeStreamingAll(zio(), "  warning: service restart failed — start manually\n");
     }
-
-    // Cleanup
-    deleteFileAbsoluteNoErr(download_path);
 
     try stdout.writeStreamingAll(zio(), "\n  ✓ upgrade complete\n");
-    try writeFormatted(stdout, "  {s} → {s}\n", .{ current, latest });
+    try writeFormatted(stdout, "  {s} → {s}\n", .{ version, latest });
+}
+
+test "parseReleaseTag accepts release tags and rejects path tricks" {
+    try std.testing.expectEqualStrings("v0.10.0", parseReleaseTag("{\"url\":\"x\",\"tag_name\": \"v0.10.0\",\"name\":\"y\"}").?);
+    try std.testing.expectEqualStrings("v1.2.3-rc.1", parseReleaseTag("{\"tag_name\":\"v1.2.3-rc.1\"}").?);
+    try std.testing.expect(parseReleaseTag("{\"tag_name\":\"../../evil\"}") == null);
+    try std.testing.expect(parseReleaseTag("{\"tag_name\":\"v0.1/x\"}") == null);
+    try std.testing.expect(parseReleaseTag("{\"tag_name\":\"0.1.0\"}") == null);
+    try std.testing.expect(parseReleaseTag("{\"tag_name\":\"v\"}") == null);
+    try std.testing.expect(parseReleaseTag("{\"name\":\"v0.1.0\"}") == null);
+}
+
+test "expectedChecksumFor reads sha256sum manifests" {
+    const manifest =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  meshguard-linux-arm64\n" ++
+        "ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789 *meshguard-linux-amd64\r\n" ++
+        "deadbeef  wintun.dll\n";
+    const amd64 = expectedChecksumFor(manifest, "meshguard-linux-amd64").?;
+    try std.testing.expectEqualStrings("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789", &amd64);
+    const arm64 = expectedChecksumFor(manifest, "meshguard-linux-arm64").?;
+    try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", &arm64);
+    try std.testing.expect(expectedChecksumFor(manifest, "wintun.dll") == null); // malformed digest
+    try std.testing.expect(expectedChecksumFor(manifest, "meshguard-macos-arm64") == null);
 }
 
 // ─── Agent & E2EE Messaging Commands ───
@@ -5898,6 +6069,13 @@ fn cmdInvite(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     try stdout.writeStreamingAll(zio(), "================================================================\n\n");
 }
 
+fn isPrintableAscii(text: []const u8) bool {
+    for (text) |c| {
+        if (c < 0x20 or c > 0x7e) return false;
+    }
+    return true;
+}
+
 fn cmdJoin(allocator: std.mem.Allocator, exe_path: []const u8, token_arg: []const u8) !void {
     const stdout = getStdOut();
     const stderr = getStdErr();
@@ -5953,13 +6131,22 @@ fn cmdJoin(allocator: std.mem.Allocator, exe_path: []const u8, token_arg: []cons
         try stderr.writeStreamingAll(zio(), "error: invite token missing 'host'\n");
         std.process.exit(1);
     };
+    // The host key decides whose commands the agent loop executes: refuse a token
+    // whose key does not parse instead of falling back to "any sender".
+    const host_pub = parsePubkey(host_hex) orelse {
+        try stderr.writeStreamingAll(zio(), "error: invite token has an invalid host public key\n");
+        std.process.exit(1);
+    };
     const seed = findJsonStringField(json, "seed") orelse "";
     if (seed.len == 0) {
         try stderr.writeStreamingAll(zio(), "error: invite token has no seed address\n");
         try stderr.writeStreamingAll(zio(), "  hint: ask the host for a new token made with 'meshguard invite --seed <host:port>'\n");
         std.process.exit(1);
     }
-    const name = findJsonStringField(json, "name") orelse "agent";
+    const requested_name = findJsonStringField(json, "name") orelse "agent";
+    // The label is host-chosen text: keep it short and printable before it is
+    // displayed or embedded in the greeting.
+    const name: []const u8 = if (requested_name.len > 0 and requested_name.len <= 64 and isPrintableAscii(requested_name)) requested_name else "agent";
 
     try stdout.writeStreamingAll(zio(), "\n[join] Decoded invite token:\n");
     try writeFormatted(stdout, "  Session name:  {s}\n", .{name});
@@ -6072,7 +6259,21 @@ fn cmdJoin(allocator: std.mem.Allocator, exe_path: []const u8, token_arg: []cons
     try stdout.writeStreamingAll(zio(), "[join] Discovering host via seed...\n");
 
     var send_cmd_buf: [512]u8 = undefined;
-    const send_cmd = std.fmt.bufPrint(&send_cmd_buf, "SEND {s} {{\"type\":\"agent.joined\",\"name\":\"{s}\"}}\n", .{ host_hex, name }) catch unreachable;
+    var send_pos: usize = 0;
+    const greeting_head = std.fmt.bufPrint(&send_cmd_buf, "SEND {s} {{\"type\":\"agent.joined\",\"name\":\"", .{host_hex}) catch {
+        try stderr.writeStreamingAll(zio(), "error: invite token host key is too long\n");
+        std.process.exit(1);
+    };
+    send_pos = greeting_head.len;
+    _ = appendJsonEscaped(&send_cmd_buf, &send_pos, name);
+    const greeting_tail = "\"}\n";
+    if (send_pos + greeting_tail.len > send_cmd_buf.len) {
+        try stderr.writeStreamingAll(zio(), "error: invite label does not fit the greeting\n");
+        std.process.exit(1);
+    }
+    @memcpy(send_cmd_buf[send_pos..][0..greeting_tail.len], greeting_tail);
+    send_pos += greeting_tail.len;
+    const send_cmd = send_cmd_buf[0..send_pos];
 
     var greeting_sent = false;
     var greet_attempts: usize = 0;
@@ -6092,13 +6293,13 @@ fn cmdJoin(allocator: std.mem.Allocator, exe_path: []const u8, token_arg: []cons
         try stdout.writeStreamingAll(zio(), "[join] (warning: greeting not acknowledged yet; proceeding to agent loop)\n");
     }
 
-    const host_pub = parsePubkey(host_hex);
     try runAgentLoop(allocator, host_pub);
 }
 
 fn cmdAgent(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     const stderr = getStdErr();
     var host_filter: ?[32]u8 = null;
+    var any_host = false;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -6108,7 +6309,16 @@ fn cmdAgent(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                 try stderr.writeStreamingAll(zio(), "error: invalid host public key\n");
                 std.process.exit(1);
             };
+        } else if (std.mem.eql(u8, args[i], "--any-host")) {
+            any_host = true;
         }
+    }
+
+    // Fail closed: without a host filter every admitted peer could run commands here.
+    if (host_filter == null and !any_host) {
+        try stderr.writeStreamingAll(zio(), "error: 'agent' executes shell commands sent by its host\n");
+        try stderr.writeStreamingAll(zio(), "  name the host with --host <pubkey>, or pass --any-host to run commands from every peer the daemon admits\n");
+        std.process.exit(1);
     }
 
     try runAgentLoop(allocator, host_filter);
@@ -6117,6 +6327,12 @@ fn cmdAgent(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 fn runAgentLoop(allocator: std.mem.Allocator, host_filter: ?[32]u8) !void {
     const stdout = getStdOut();
     try stdout.writeStreamingAll(zio(), "\n[agent] Worker loop active, listening for encrypted tasks...\n");
+    if (host_filter) |host| {
+        const host_hex = std.fmt.bytesToHex(host, .lower);
+        try writeFormatted(stdout, "[agent] WARNING: shell commands from host {s} will be executed on this machine as this user.\n", .{&host_hex});
+    } else {
+        try stdout.writeStreamingAll(zio(), "[agent] WARNING: --any-host: shell commands from EVERY peer the daemon admits will be executed on this machine as this user.\n");
+    }
     try stdout.writeStreamingAll(zio(), "[agent] Press Ctrl+C to stop.\n\n");
 
     var resp_buf: [4096]u8 = undefined;
@@ -6149,7 +6365,9 @@ fn runAgentLoop(allocator: std.mem.Allocator, host_filter: ?[32]u8) !void {
         const unescaped_len = unescapeJsonString(data_raw, &unescaped_buf);
         const payload = unescaped_buf[0..unescaped_len];
 
-        const task_id = findJsonStringField(payload, "id") orelse "task";
+        const task_id_raw = findJsonStringField(payload, "id") orelse "task";
+        // The id is host-chosen text; bound it so the reply always fits its buffer.
+        const task_id = task_id_raw[0..@min(task_id_raw.len, 64)];
         const command = findJsonStringField(payload, "command") orelse {
             if (std.mem.indexOf(u8, payload, "agent.joined") != null) {
                 try writeFormatted(stdout, "[agent] Peer {s} joined.\n", .{sender_hex});
@@ -6190,7 +6408,8 @@ fn runAgentLoop(allocator: std.mem.Allocator, host_filter: ?[32]u8) !void {
         }) catch continue;
         pos += rep_pre.len;
 
-        _ = appendJsonEscaped(&reply_buf, &pos, out_slice);
+        // Leave room for the stderr field and the closing bytes appended below.
+        _ = appendJsonEscaped(reply_buf[0 .. reply_buf.len - 256], &pos, out_slice);
         if (out_truncated) {
             const trunc = "...[truncated]";
             if (pos + trunc.len < reply_buf.len - 100) {
@@ -6200,10 +6419,11 @@ fn runAgentLoop(allocator: std.mem.Allocator, host_filter: ?[32]u8) !void {
         }
 
         const rep_mid = "\",\"stderr\":\"";
+        if (pos + rep_mid.len > reply_buf.len) continue;
         @memcpy(reply_buf[pos..][0..rep_mid.len], rep_mid);
         pos += rep_mid.len;
 
-        _ = appendJsonEscaped(&reply_buf, &pos, err_slice);
+        _ = appendJsonEscaped(reply_buf[0 .. reply_buf.len - 8], &pos, err_slice);
         if (err_truncated) {
             const trunc = "...[truncated]";
             if (pos + trunc.len < reply_buf.len - 50) {
@@ -6213,6 +6433,7 @@ fn runAgentLoop(allocator: std.mem.Allocator, host_filter: ?[32]u8) !void {
         }
 
         const rep_post = "\"}\n";
+        if (pos + rep_post.len > reply_buf.len) continue;
         @memcpy(reply_buf[pos..][0..rep_post.len], rep_post);
         pos += rep_post.len;
 

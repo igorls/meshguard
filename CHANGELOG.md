@@ -7,6 +7,142 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## Unreleased
 
+### Security
+- Pipelined encryption (`--encrypt-workers`) no longer encrypts a batch whose
+  nonces were reserved from a previous key set: every batch records the tunnel
+  generation it was dispatched under and is dropped if a handshake replaced the
+  keys in between. Encrypting the stale counter values under the new key would
+  have reused nonces once the new counter caught up.
+- The userspace device refuses a second peer whose key hashes to an occupied
+  16-bit mesh host id (`error.MeshIpCollision`) instead of silently taking over
+  the first peer's routing slot, which handed the newcomer every packet
+  addressed to that peer and let it source that peer's address.
+- Handshake responses are verified (MAC1, keyed with our public key) before any
+  Diffie-Hellman work, `consumeResponse` commits its transcript only after the
+  response authenticates (a forged response can no longer wedge a pending
+  handshake), sender indices are random and never reused while mapped, and a
+  refreshing handshake keeps the live session's receive index mapped until the
+  response arrives. Received counters past `REJECT_AFTER_MESSAGES` are rejected.
+- A WireGuard key learned from third-party gossip no longer authenticates
+  application messages (`0x50`) for that identity unless it is the identity's
+  own derived key; the replay ring for application frames is keyed by sender.
+- Hole-punch results are treated as reachability hints: the userspace device
+  sends a handshake to the punched address instead of rebinding the peer's
+  endpoint on an unauthenticated probe.
+- SWIM control plane: a WireGuard key carried in third-party gossip is
+  installed for an identity only when it is that identity's own derived key;
+  otherwise the peer stays without a key (no tunnel, no application messages)
+  until its own signed binding or certificate arrives. Previously one unsigned
+  gossip entry could impersonate any offline peer on the data plane.
+  Hole-punch requests are accepted only from a member's recorded endpoint on
+  behalf of a live member, and a live punch session's token cannot be replaced
+  by another request. A claimed restart (higher incarnation) is honoured at
+  most once per minute per peer and only from the peer's recorded endpoint, so
+  a stranger can no longer tear a peer's tunnel down at line rate. The all-zero
+  "hello" sender gets a minimal ACK and nothing else; senders that are not
+  members (or that ping from an unknown address) get a minimal ACK without
+  gossip, certificate or binding, and self-refutation queues one entry instead
+  of one per gossip entry (reflection and gossip-queue starvation). Revocation
+  and vouch tables grow from 64 to 1024 entries, make room by evicting
+  revocations whose certificate has expired, and still enforce a revocation
+  against current members when it cannot be remembered (logged as an error);
+  revocation re-advertising round-robins instead of stopping at the queue
+  size. Same-organisation alias updates require a higher Lamport timestamp.
+  Certificates are handed to the relay core only after this node's own trust
+  checks (trusted organisation, not revoked, not expired) accepted them.
+- Relay core: a certificate vouches for a WireGuard key only when the
+  admission callbacks confirm its organisation is trusted. Anyone can mint an
+  organisation and certify a victim's identity with a key they hold, which
+  previously rebound the victim's relayed traffic to the attacker and let the
+  attacker send in the victim's name. The per-source handshake limiter is
+  charged before the shared budget, so one flooding address cannot starve every
+  other client's endpoint proof. Claims of proven clients are never evicted by
+  a flood of fresh claims (new claims are refused as overloaded instead), and
+  forwarding refreshes the sender's claim.
+- Transfers: an offer's wire `created_unix` is age-checked with saturating
+  arithmetic, and offers dated more than 300 s in the future are refused. A
+  crafted timestamp previously overflowed the check (a panic in safe builds).
+- Embedding library (FFI): `meshguard_leave` stops the event loop before
+  broadcasting the leave instead of iterating the membership table while that
+  thread still runs; identity seeds and application-frame nonces come from the
+  operating system entropy source and fail instead of falling back to
+  pid-and-clock seeding; the seed, the X25519 private key, device keys and
+  their stack copies are wiped on destroy and on init; and a peer's WireGuard
+  key is used for application messages, `meshguard_tunnel_open` and responder
+  auto-registration only when a registered contact or the peer itself
+  (binding, certificate or derived key) vouched for it. Contacts-only mode now
+  also gates tunnel auto-registration.
+- Service policies fail closed. A malformed or unreadable policy file, an
+  unrecognised `default` value or an oversized configuration path now stops
+  `meshguard up` with the offending file and line instead of running with an
+  allow-all filter. `default` accepts `allow`/`deny` case-insensitively with
+  trailing comments. IPv4 non-first fragments are classified as `unclassified`
+  (never port-matched from payload bytes), and IPv6 extension headers
+  (Hop-by-Hop, Routing, Destination Options, AH, first Fragment) are walked to
+  the real transport header so `deny` rules cannot be bypassed by prepending one.
+- NAT traversal trusts its inputs less. STUN accepts a response only from the
+  queried server (address and port), keeps listening until its deadline instead
+  of giving up on the first unrelated datagram, reports an unknown NAT type when
+  two servers disagree on the public address, and rejects mapped addresses that
+  cannot be a public endpoint (0/8, 127/8, 169.254/16, multicast and reserved
+  ranges, the mesh prefix). UPnP accepts SSDP responders only from private or
+  link-local addresses whose LOCATION host is the responder itself, rejects
+  control bytes, whitespace and non-ASCII in URLs and control paths (no request
+  line injection), bounds discovery with an absolute deadline, sets socket
+  timeouts before connecting, and its external address is used only when it
+  equals the STUN result. Coordinated punch counts a probe only from the
+  expected peer address carrying that peer's key tag, binds SNTP replies to a
+  random origin timestamp over a connected socket and ignores readings far from
+  the system clock, and rejects tokens whose punch time is more than 300 s ahead
+  or 60 s behind (`connect --in` is bounded accordingly). mDNS collection has an
+  absolute deadline and a result cap. The UPnP and coordinated-punch unit tests
+  (and several other modules') are now actually run by `zig build test`.
+- Control socket: `SEND`, `RECV`, `MSGS`, `APPSEND` and `APPRECV` now require
+  the daemon's owner (same uid, or root) on Unix, like `STOP`, `RELOAD` and the
+  transfer commands; only `STATUS`, `PEERS` and `APPINFO` remain open to every
+  local user. Previously any local user could read this node's messages or send
+  in its name (and, through the agent feature, run commands on remote agents).
+  The world-writable mode is now applied via `umask` at bind time instead of
+  `chmod` on the path. On Windows the CLI opens the control pipe without
+  impersonation (`SECURITY_IDENTIFICATION`) and only talks to a server running
+  as the same user, LocalSystem or an administrator, so a squatted pipe name
+  cannot feed fake daemon responses to `meshguard agent`.
+- `identity.key` is created owner-only (0600) as the comment always claimed,
+  the config directory is created 0700, and loading a secret key that other
+  users can read logs a warning. Key files and key arguments must be exactly 44
+  (public) or 88 (secret) base64 characters before decoding: the standard
+  decoder does not bound its output, so an over-long `.pub` file or `trust`
+  argument could overflow a stack buffer.
+- `meshguard upgrade` verifies the download against the release's
+  `checksums.txt` before executing or installing anything, stages it in a
+  private file inside `/usr/local/bin` instead of fixed paths under `/tmp`
+  (where another local user could swap the file between download and install),
+  accepts only `vX.Y.Z`-shaped tags, picks the asset for the running
+  architecture, and installs with an atomic rename.
+- `install.sh`, `install.ps1` and `dist/agent-join.sh` resolve one release tag,
+  download the binary (and `wintun.dll`) plus `checksums.txt` from it, verify
+  SHA-256 sums before installing, and fetch the systemd unit from the same tag.
+  `agent-join.sh` was pinned to a removed release and to asset names that no
+  longer exist.
+- `meshguard agent` refuses to start without `--host <pubkey>` or an explicit
+  `--any-host`: the loop executes shell commands from the chosen sender and
+  previously defaulted to every admitted peer. `meshguard join` rejects a token
+  whose host key does not parse (it used to fall back to "any sender"), bounds
+  and JSON-escapes the token's label, and the agent reply builder bounds the
+  host-chosen task id and its buffer writes.
+- `--name` for `trust`, `trust --org` and `org-sign` must be 1-64 characters
+  from `[A-Za-z0-9._-]` and not start with `-` or `.`, so a name can no longer
+  escape the config directory (`--name ../identity`); `org-sign --expires`
+  rejects values that do not parse instead of silently issuing a never-expiring
+  certificate.
+- Windows: `wintun.dll` is loaded only from the directory holding
+  `meshguard.exe` and System32, never from the current directory or `PATH`.
+- Browser gateway: the delegation payload copies the certificate's `expires_at`
+  bytes verbatim (re-encoding through `Number` lost precision above 2^53), the
+  relay client ignores a second `challenge` after admission, and the WASM
+  wrapper rejects numbers where bytes are expected (`createIdentity(32)` would
+  have produced an all-zero seed).
+
 ### Changed
 - Building from source now requires Zig 0.17.0. The source, build definitions,
   packaging scripts and CI use the 0.17 APIs; Zig 0.16 is no longer supported.

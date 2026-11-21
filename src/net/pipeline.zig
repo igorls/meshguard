@@ -50,6 +50,8 @@ pub const PacketBatch = struct {
     state: std.atomic.Value(u32) align(CACHE_LINE) = std.atomic.Value(u32).init(@backingInt(BatchState.Empty)),
     peer_slot: usize = 0,
     count: u16 = 0,
+    /// Tunnel generation the nonces were reserved from (see Tunnel.generation).
+    tunnel_generation: u32 = 0,
 
     // SoA layout for cache-friendly sequential access
     buf_indices: [BATCH_SIZE]u16 = undefined,

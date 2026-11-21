@@ -41,5 +41,12 @@ Instead, please report via one of:
 - **Authenticated org control plane**: revoke/alias/vouch messages require a verified org Ed25519 signature
 - **Confirmed failure detection**: gossiped death only suspects a peer locally; eviction requires our own probe to fail
 - **Inbound-handshake rate limiting**: per-source + global token bucket before the X25519
+- **Response authentication**: handshake responses are MAC1-checked before any DH and only an authenticated response changes handshake state
+- **Rekey-safe pipelining**: encrypted batches carry the key generation their nonces were reserved under; stale batches are dropped rather than encrypted under new keys
+- **First-claim mesh addressing**: a peer cannot take over another peer's routing slot through a mesh host-id collision
+- **Signed WireGuard keys**: gossip-learned keys that are not an identity's own derived key authenticate neither tunnels nor application messages until the owner's signed binding or certificate arrives
+- **Fail-closed service policy**: malformed policy files stop the daemon; fragments and IPv6 extension headers cannot bypass port rules
+- **Owner-only control**: messaging, transfers, reload and stop on the control socket require the daemon's owner; key files are owner-only (0600)
+- **Verified installs**: installers and `meshguard upgrade` check release SHA-256 sums before anything is executed or installed
 
 See [docs/concepts/security.md](docs/concepts/security.md) for full security model documentation.

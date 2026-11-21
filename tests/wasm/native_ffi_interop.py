@@ -11,6 +11,10 @@ recv=bind('meshguard_recv',[c.c_void_p]*4,c.c_int)
 public=bind('meshguard_get_pubkey_b64',[c.c_void_p,c.c_void_p])
 destroy=bind('meshguard_destroy',[c.c_void_p])
 browser=bytes.fromhex(request['public']);wg=bytes.fromhex(request['wgPublic'])
+# A portable-core WireGuard key is not derived from the Ed25519 identity, so
+# gossip alone vouches for nothing: the ACK carries the browser's own signed
+# binding (extension 0x02), as the browser runtime and the FFI library send it.
+binding=bytes.fromhex(request['binding']);assert len(binding)==64
 sock=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);sock.bind(('127.0.0.1',0));sock.settimeout(.1)
 port=sock.getsockname()[1]
 endpoint=b'\x01\x04'+bytes([127,0,0,1])+bytes(12)+struct.pack('<H',port)
@@ -25,7 +29,7 @@ def pump():
  except socket.timeout: return None
  if packet[0]==1 and len(packet)>=50 and packet[1:33]!=bytes(32):
   native_endpoint=address
-  sock.sendto(b'\x03'+browser+packet[33:41]+bytes(8)+b'\x01'+gossip,address)
+  sock.sendto(b'\x03'+browser+packet[33:41]+bytes(8)+b'\x01'+gossip+b'\x02'+wg+binding,address)
  return packet
 try:
  b=c.create_string_buffer(48);public(ctx,b)
