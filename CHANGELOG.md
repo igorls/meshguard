@@ -7,397 +7,61 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## Unreleased
 
-### Security
-- Pipelined encryption (`--encrypt-workers`) no longer encrypts a batch whose
-  nonces were reserved from a previous key set: every batch records the tunnel
-  generation it was dispatched under and is dropped if a handshake replaced the
-  keys in between. Encrypting the stale counter values under the new key would
-  have reused nonces once the new counter caught up.
-- The userspace device refuses a second peer whose key hashes to an occupied
-  16-bit mesh host id (`error.MeshIpCollision`) instead of silently taking over
-  the first peer's routing slot, which handed the newcomer every packet
-  addressed to that peer and let it source that peer's address.
-- Handshake responses are verified (MAC1, keyed with our public key) before any
-  Diffie-Hellman work, `consumeResponse` commits its transcript only after the
-  response authenticates (a forged response can no longer wedge a pending
-  handshake), sender indices are random and never reused while mapped, and a
-  refreshing handshake keeps the live session's receive index mapped until the
-  response arrives. Received counters past `REJECT_AFTER_MESSAGES` are rejected.
-- A WireGuard key learned from third-party gossip no longer authenticates
-  application messages (`0x50`) for that identity unless it is the identity's
-  own derived key; the replay ring for application frames is keyed by sender.
-- Hole-punch results are treated as reachability hints: the userspace device
-  sends a handshake to the punched address instead of rebinding the peer's
-  endpoint on an unauthenticated probe.
-- SWIM control plane: a WireGuard key carried in third-party gossip is
-  installed for an identity only when it is that identity's own derived key;
-  otherwise the peer stays without a key (no tunnel, no application messages)
-  until its own signed binding or certificate arrives. Previously one unsigned
-  gossip entry could impersonate any offline peer on the data plane.
-  Hole-punch requests are accepted only from a member's recorded endpoint on
-  behalf of a live member, and a live punch session's token cannot be replaced
-  by another request. A claimed restart (higher incarnation) is honoured at
-  most once per minute per peer and only from the peer's recorded endpoint, so
-  a stranger can no longer tear a peer's tunnel down at line rate. The all-zero
-  "hello" sender gets a minimal ACK and nothing else; senders that are not
-  members (or that ping from an unknown address) get a minimal ACK without
-  gossip, certificate or binding, and self-refutation queues one entry instead
-  of one per gossip entry (reflection and gossip-queue starvation). Revocation
-  and vouch tables grow from 64 to 1024 entries, make room by evicting
-  revocations whose certificate has expired, and still enforce a revocation
-  against current members when it cannot be remembered (logged as an error);
-  revocation re-advertising round-robins instead of stopping at the queue
-  size. Same-organisation alias updates require a higher Lamport timestamp.
-  Certificates are handed to the relay core only after this node's own trust
-  checks (trusted organisation, not revoked, not expired) accepted them.
-- Relay core: a certificate vouches for a WireGuard key only when the
-  admission callbacks confirm its organisation is trusted. Anyone can mint an
-  organisation and certify a victim's identity with a key they hold, which
-  previously rebound the victim's relayed traffic to the attacker and let the
-  attacker send in the victim's name. The per-source handshake limiter is
-  charged before the shared budget, so one flooding address cannot starve every
-  other client's endpoint proof. Claims of proven clients are never evicted by
-  a flood of fresh claims (new claims are refused as overloaded instead), and
-  forwarding refreshes the sender's claim.
-- Transfers: an offer's wire `created_unix` is age-checked with saturating
-  arithmetic, and offers dated more than 300 s in the future are refused. A
-  crafted timestamp previously overflowed the check (a panic in safe builds).
-- Embedding library (FFI): `meshguard_leave` stops the event loop before
-  broadcasting the leave instead of iterating the membership table while that
-  thread still runs; identity seeds and application-frame nonces come from the
-  operating system entropy source and fail instead of falling back to
-  pid-and-clock seeding; the seed, the X25519 private key, device keys and
-  their stack copies are wiped on destroy and on init; and a peer's WireGuard
-  key is used for application messages, `meshguard_tunnel_open` and responder
-  auto-registration only when a registered contact or the peer itself
-  (binding, certificate or derived key) vouched for it. Contacts-only mode now
-  also gates tunnel auto-registration.
-- Service policies fail closed. A malformed or unreadable policy file, an
-  unrecognised `default` value or an oversized configuration path now stops
-  `meshguard up` with the offending file and line instead of running with an
-  allow-all filter. `default` accepts `allow`/`deny` case-insensitively with
-  trailing comments. IPv4 non-first fragments are classified as `unclassified`
-  (never port-matched from payload bytes), and IPv6 extension headers
-  (Hop-by-Hop, Routing, Destination Options, AH, first Fragment) are walked to
-  the real transport header so `deny` rules cannot be bypassed by prepending one.
-- NAT traversal trusts its inputs less. STUN accepts a response only from the
-  queried server (address and port), keeps listening until its deadline instead
-  of giving up on the first unrelated datagram, reports an unknown NAT type when
-  two servers disagree on the public address, and rejects mapped addresses that
-  cannot be a public endpoint (0/8, 127/8, 169.254/16, multicast and reserved
-  ranges, the mesh prefix). UPnP accepts SSDP responders only from private or
-  link-local addresses whose LOCATION host is the responder itself, rejects
-  control bytes, whitespace and non-ASCII in URLs and control paths (no request
-  line injection), bounds discovery with an absolute deadline, sets socket
-  timeouts before connecting, and its external address is used only when it
-  equals the STUN result. Coordinated punch counts a probe only from the
-  expected peer address carrying that peer's key tag, binds SNTP replies to a
-  random origin timestamp over a connected socket and ignores readings far from
-  the system clock, and rejects tokens whose punch time is more than 300 s ahead
-  or 60 s behind (`connect --in` is bounded accordingly). mDNS collection has an
-  absolute deadline and a result cap. The UPnP and coordinated-punch unit tests
-  (and several other modules') are now actually run by `zig build test`.
-- Control socket: `SEND`, `RECV`, `MSGS`, `APPSEND` and `APPRECV` now require
-  the daemon's owner (same uid, or root) on Unix, like `STOP`, `RELOAD` and the
-  transfer commands; only `STATUS`, `PEERS` and `APPINFO` remain open to every
-  local user. Previously any local user could read this node's messages or send
-  in its name (and, through the agent feature, run commands on remote agents).
-  The world-writable mode is now applied via `umask` at bind time instead of
-  `chmod` on the path. On Windows the CLI opens the control pipe without
-  impersonation (`SECURITY_IDENTIFICATION`) and only talks to a server running
-  as the same user, LocalSystem or an administrator, so a squatted pipe name
-  cannot feed fake daemon responses to `meshguard agent`.
-- `identity.key` is created owner-only (0600) as the comment always claimed,
-  the config directory is created 0700, and loading a secret key that other
-  users can read logs a warning. Key files and key arguments must be exactly 44
-  (public) or 88 (secret) base64 characters before decoding: the standard
-  decoder does not bound its output, so an over-long `.pub` file or `trust`
-  argument could overflow a stack buffer.
-- `meshguard upgrade` verifies the download against the release's
-  `checksums.txt` before executing or installing anything, stages it in a
-  private file inside `/usr/local/bin` instead of fixed paths under `/tmp`
-  (where another local user could swap the file between download and install),
-  accepts only `vX.Y.Z`-shaped tags, picks the asset for the running
-  architecture, and installs with an atomic rename.
-- `install.sh`, `install.ps1` and `dist/agent-join.sh` resolve one release tag,
-  download the binary (and `wintun.dll`) plus `checksums.txt` from it, verify
-  SHA-256 sums before installing, and fetch the systemd unit from the same tag.
-  `agent-join.sh` was pinned to a removed release and to asset names that no
-  longer exist.
-- `meshguard agent` refuses to start without `--host <pubkey>` or an explicit
-  `--any-host`: the loop executes shell commands from the chosen sender and
-  previously defaulted to every admitted peer. `meshguard join` rejects a token
-  whose host key does not parse (it used to fall back to "any sender"), bounds
-  and JSON-escapes the token's label, and the agent reply builder bounds the
-  host-chosen task id and its buffer writes.
-- `--name` for `trust`, `trust --org` and `org-sign` must be 1-64 characters
-  from `[A-Za-z0-9._-]` and not start with `-` or `.`, so a name can no longer
-  escape the config directory (`--name ../identity`); `org-sign --expires`
-  rejects values that do not parse instead of silently issuing a never-expiring
-  certificate.
-- Windows: `wintun.dll` is loaded only from the directory holding
-  `meshguard.exe` and System32, never from the current directory or `PATH`.
-- Browser gateway: the delegation payload copies the certificate's `expires_at`
-  bytes verbatim (re-encoding through `Number` lost precision above 2^53), the
-  relay client ignores a second `challenge` after admission, and the WASM
-  wrapper rejects numbers where bytes are expected (`createIdentity(32)` would
-  have produced an all-zero seed).
-
-### Changed
-- Building from source now requires Zig 0.17.0. The source, build definitions,
-  packaging scripts and CI use the 0.17 APIs; Zig 0.16 is no longer supported.
-- Apple packaging uses Zig `0.18.0-dev.253+16d31ceed`, which includes the
-  upstream fix for the iOS `std.Io.Threaded.NullFile.fd` compilation regression
-  in Zig 0.17.0. Device and simulator static libraries, their XCFramework archive,
-  and both iOS Swift consumer link checks are restored. The other CI jobs keep
-  Zig 0.17.0; no local standard-library patches are needed.
+## [0.10.0] — 2026-11-23
 
 ### Added
-- Browser packages in releases: `meshguard-web-<version>.tgz` (npm package
-  `@meshguard/web`) holds `meshguard.wasm` (ReleaseSmall), `meshguard.mjs`,
-  `relay-protocol.mjs`, TypeScript declarations for `MeshguardWasm`, identities
-  and `MeshguardRelayClient` (methods and event payloads) and a `SHA256SUMS` of
-  the runtime files; `meshguard-gateway-<version>.tgz` (npm package
-  `@meshguard/gateway`) holds the browser gateway (`gateway/server.mjs`,
-  `gateway/pass.mjs` and the shared `web/relay-protocol.mjs`, with a
-  `meshguard-gateway` command), an example configuration, and the systemd and
-  nginx templates. Both are `npm pack` tarballs listed in `checksums.txt`; they
-  are not published to the npm registry. File names and relative imports are
-  unchanged, so copied runtime files remain drop-in. `meshguard.mjs` now exports
-  `ABI_VERSION`, and `MeshguardWasm.load()` without a URL loads the
-  `meshguard.wasm` next to it. `scripts/build-web.sh` builds and packs both,
-  checks that the wrapper and the module share an ABI version and that every
-  export is declared, then runs the WASM and gateway tests and a strict
-  TypeScript check against the unpacked packages; CI runs it on every pull
-  request. The shipped files are checked out with LF line endings on every
-  platform, so their checksums match. A new guide, *Using MeshGuard in the
-  browser*, covers installation, identity storage and gateway deployment.
-- Linux, FreeBSD and Android embedding libraries in releases:
-  `meshguard-ffi-linux-amd64.tar.gz`, `meshguard-ffi-linux-arm64.tar.gz` and
-  `meshguard-ffi-freebsd-amd64.tar.gz` each hold `libmeshguard-ffi.so`, the
-  static `libmeshguard-ffi.a` and `meshguard.h` (glibc 2.28 or newer, FreeBSD
-  14.0 or newer); `meshguard-ffi-android.zip` holds
-  `jniLibs/{arm64-v8a,x86_64}/libmeshguard-ffi.so` (API 24 or newer, 16 KB
-  page aligned) and the header. All use `std.crypto` and depend only on the C
-  library. `scripts/build-libraries.sh` builds them and
-  `scripts/test-libraries.sh` checks exports against the source and header,
-  dependencies, Android alignment, and C hosts linked against every desktop
-  package; CI runs both and the relay test against the packaged Linux
-  library. `zig build` now also installs the static FFI library on Linux and
-  FreeBSD, and Android 64-bit libraries are linked with 16 KB maximum page
-  size. A new Linux / FreeBSD embedding guide covers linking, threading and
-  polling; the Android guide documents the release package and NDK builds.
-- 32-bit ARM embedding libraries: `meshguard-ffi-android.zip` now also holds
-  `jniLibs/armeabi-v7a/libmeshguard-ffi.so`, and releases ship
-  `meshguard-ffi-linux-armhf.tar.gz` (ARMv7-A with NEON, hard-float, glibc
-  2.28 or newer). Zig has no 64-bit atomics on 32-bit ARM, so on targets with
-  32-bit pointers the WireGuard send counter, route statistics and last
-  receive time are guarded by a short mutex (`src/atomic64.zig`); the send
-  counter is reserved under the lock and saturates instead of wrapping, so a
-  nonce is never reused. 64-bit targets keep the same lock-free atomics, with
-  unchanged machine code. The anti-replay window indexes its bitmap with
-  `usize`. `scripts/test-libraries.sh` checks the new libraries (exports,
-  dependencies, API 24 symbols, stripping) and runs the armhf C hosts under
-  qemu-user when available; CI runs them and the unit tests on
-  `arm-linux-musleabihf` under qemu. The FFI now treats every Android ABI
-  (including `androideabi`) as Android.
-- Windows embedding library: `zig build` for Windows now produces
-  `meshguard-ffi.dll` and its import library `meshguard-ffi.lib`, with the same
-  `meshguard_*` exports and behaviour as the Linux, macOS, Android and iOS
-  libraries. No function is unsupported, and the tunnel functions need no
-  Wintun adapter or Administrator rights. The FFI unit tests run in
-  `zig build test` on Windows. `scripts/test-relay.py` runs against the DLL,
-  reaching the relay daemon over its named pipe, and also covers tunnels and
-  checks that every exported function resolves. CI gains a Windows test job,
-  and releases ship `meshguard-ffi-windows-amd64.dll` and
-  `meshguard-ffi-windows-amd64.lib`. The Windows guide documents embedding for
-  any host language.
-- Apple C ABI embedding packages: macOS arm64, x86_64 and universal static and
-  dynamic libraries, plus an iOS device/simulator XCFramework. A public
-  `meshguard.h` and `MeshGuardFFI` Clang module support C, Objective-C, C++ and
-  Swift hosts. Apple build and link-smoke scripts and integration guides cover
-  identity persistence, polling, relay configuration and lifecycle limits.
-- Relay switching: `meshguard_switch_relay` moves a mobile context to another
-  relay, and leaving now forgets the old network (peers, WireGuard sessions,
-  relay proof) while keeping the identity, contacts and certificate. Several
-  relays at once take one context per relay (mobile) or one identity handle per
-  relay client (browser); both are covered by end-to-end tests.
-- Contacts and delivery status for mobile and browser clients, needed behind
-  opaque relays: `meshguard_add_contact` / `remove` / `clear` / `count`,
-  `meshguard_set_contacts_only`, `meshguard_send_ex` (returns the nonce),
-  `meshguard_set_on_delivery_status` (accepted only from the pinned relay for a
-  recently sent frame; `handshake again` re-proves the endpoint at once),
-  `meshguard_recv_delivery_status` (the same statuses for hosts that poll from
-  another thread, since the callback's pointers last only for the call), and
-  `meshguard_set_keepalive_interval` / `meshguard_set_relay_proof_interval`.
-  The browser client gains `addContact`, `removeContact`, `status` events and
-  `send` returning the nonce.
-- Opaque relays (`meshguard up --opaque`): clients stay out of the relay's
-  membership and gossip, and a client's ACK describes only the relay, so no
-  client learns about another; no ping-req or rendezvous on clients' behalf.
-- Delivery status (`0x51`, 47 bytes): a relay answers a sealed frame it does not
-  forward with why (offline, rate limited, handshake again, not admitted,
-  overloaded), echoing the frame's nonce, limited per source address;
-  `--no-delivery-status` turns it off.
-- Browser gateway passes: the gateway admits a browser presenting a valid
-  pass (organization certificate) from `trustedOrgs`, in addition to
-  `allowedIdentities`; `allowedDestinations` becomes optional. Sessions end with
-  `4004` when the pass expires and can renew it in place; self-advertisements
-  may carry the session's own pass to the relay. New `maxSessions` and
-  `maxSessionsPerIp` caps (`1013` when full) and `SIGHUP` reload.
-  `gateway/pass.mjs` verifies passes against fixtures shared with the native
-  code (`zig build pass-fixtures`). The browser client gains `pass`,
-  `renewPass()` and jittered reconnects.
-- Trust lifecycle for relays: `meshguard up --relay` fails closed when it has
-  no authorized keys or trusted orgs; `SIGHUP` and the owner-only control
-  command `RELOAD` re-read `authorized_keys/`, `trusted_orgs/` and `node.cert`
-  without a restart and re-check relay clients; certificates tolerate five
-  minutes of clock skew with their issuer. Mobile contexts install and replace
-  certificates such as relay passes at any time with `meshguard_set_org_cert`
-  (`meshguard_clear_org_cert`, `meshguard_get_wg_pubkey`).
-
-- Relay load harness (`bench/relay-load`, `zig build relay-loadgen`):
-  simulates thousands of mobile-style relay clients on loopback, with
-  flooders, spoofers and reconnect storms, and reports loss, latency and the
-  relay's CPU and memory. Baseline numbers are in `PERFORMANCE.md`; CI runs a
-  small smoke scenario.
-- Authenticated relay forwarding (`src/relay/core.zig`). A relay forwards
-  sealed `0x50` and `0x31` frames only from an endpoint where the sender's
-  signed WireGuard key is proven by a Noise handshake, only to a destination
-  proven the same way, within per-key packet and byte budgets and a global
-  forwarding budget that no longer shares the discovery send budget. Every
-  daemon answers proof handshakes statelessly, gossip-only relays included,
-  without WireGuard peer slots. `meshguard up --relay` requires proof for all
-  forwarding; other daemons still forward for senders seen at their known
-  endpoint; mobile contexts never forward. New `up` flags set client and
-  forwarding limits, and `status` reports relay counters. See
-  `docs/reference/relay-forwarding.md`.
-- Signed WireGuard bindings: every node, mobile context and browser client
-  advertises its WireGuard key with its own Ed25519 signature as an optional
-  Ping/Ack extension (`0x02`, 97 bytes). Receivers replace a gossip-claimed key
-  with the owner's signed one, certificate-bound keys keep precedence, and
-  mobile clients only handshake with a pinned relay whose key is signed or
-  derived from its identity. The browser gateway verifies a client's binding
-  once at authentication and forwards 262-byte self-advertisements that carry
-  it. Older decoders ignore the extension. See
-  `docs/concepts/wire-protocol.md`.
-- Verified application transfers (`XFER*` control commands, `MGXF1` frames over
-  the encrypted `0x50` path): windowed, selectively acknowledged, congestion-
-  controlled delivery of files up to 32 MiB with SHA-256 verification, opt-in
-  receiving channels, bounded memory, and resend after a receiver restart.
-  Transfer commands require the daemon owner on Unix. See
-  `docs/reference/app-transfers.md`.
-- Isolated application messaging channels over the existing encrypted `0x50`
-  payload: `APPSEND` / `APPRECV` / `APPINFO`, `MGAPP1` framing, and per-channel
-  queues so an application channel cannot be starved by legacy `RECV`.
-- `MESHGUARD_CONTROL_PATH` honored on both daemon bind and CLI connect, plus
-  `meshguard up --control-path`. Isolated candidate daemons no longer steal
-  `/run/meshguard/meshguard.sock` or `\\.\pipe\meshguard`.
-- Gossip/listen UDP port override via `--gossip-port` and `MESHGUARD_GOSSIP_PORT`.
-  Explicit invalid values fail closed (no silent fallback to 51821).
+- **Embedding libraries for every platform**: release packages for Linux (amd64, arm64, armhf), FreeBSD amd64, Android (`arm64-v8a`, `armeabi-v7a`, `x86_64`, 16 KB page aligned), Windows (`meshguard-ffi.dll` + `.lib`), macOS (arm64, x86_64, universal) and an iOS device/simulator XCFramework. All of them ship the public `meshguard.h`, and Apple also ships a `MeshGuardFFI` Clang module for Swift. New guides cover Linux/FreeBSD, Android, Windows and Apple embedding.
+- **Browser runtime and gateway**: `meshguard-web-<version>.tgz` (`@meshguard/web`: `meshguard.wasm`, `meshguard.mjs`, relay client, TypeScript declarations) and `meshguard-gateway-<version>.tgz` (`@meshguard/gateway`, with systemd and nginx templates) are attached as `npm pack` tarballs and listed in `checksums.txt`. They are not published to the npm registry. WASM clients can talk to native relays. New guide: *Using MeshGuard in the browser*.
+- **Authenticated relay stack**: relays forward sealed `0x50`/`0x31` frames only between endpoints proven by a Noise handshake, within per-key and global budgets (`docs/reference/relay-forwarding.md`). Also new: ciphertext-only rendezvous for symmetric-NAT meshes, opaque relays (`up --opaque`), delivery status frames (`0x51`, `--no-delivery-status`), relay switching and several relays at once, and a separate ping reply budget (`--reply-pps`).
+- **Signed WireGuard bindings**: every node, mobile context and browser client advertises its WireGuard key with its own Ed25519 signature (Ping/Ack extension `0x02`). Certificate v2 adds org-signed WireGuard key binding and delegation tiers. Older decoders ignore the extension.
+- **Application channels and verified transfers** over the encrypted `0x50` path: `APPSEND`/`APPRECV`/`APPINFO` with isolated per-channel queues, and `XFER*` transfers of files up to 32 MiB with SHA-256 verification and resume after a receiver restart (`docs/reference/app-transfers.md`).
+- Contacts and delivery status for mobile and browser clients (`meshguard_add_contact`, `meshguard_set_contacts_only`, `meshguard_send_ex`, `meshguard_set_on_delivery_status`, `meshguard_recv_delivery_status`, …).
+- Trust lifecycle for relays: `SIGHUP` and the owner-only `RELOAD` command re-read `authorized_keys/`, `trusted_orgs/` and `node.cert` without a restart. Mobile contexts can install certificates at runtime (`meshguard_set_org_cert`).
+- Browser gateway passes: admits browsers that hold an org certificate from `trustedOrgs`, with in-place renewal, `maxSessions`/`maxSessionsPerIp` caps and `SIGHUP` reload.
+- Org certificate revocation CLI.
+- `meshguard up --gossip-only` / `--no-tun` for discovery and rendezvous nodes, and macOS gossip-only relay support.
+- Optional crypto backend: `-Dcrypto-backend=auto|std|sodium` and the `-Dno-sodium=true` alias. Linux desktop builds still use libsodium by default, and every other target uses Zig `std.crypto`.
+- `--gossip-port` / `MESHGUARD_GOSSIP_PORT`, `--control-path` / `MESHGUARD_CONTROL_PATH`, and `meshguard_init_bind` plus `MESHGUARD_STATS=1` for the FFI.
+- io_uring UDP event loop on Linux, used only where its timeouts work.
+- Relay load harness (`bench/relay-load`, `zig build relay-loadgen`) and a browser load harness. Baselines are in `PERFORMANCE.md`.
 
 ### Changed
-- `meshguard invite` requires `--seed <host:port>`; it no longer falls back to a
-  built-in seed address, and its default agent label is `agent`. `meshguard
-  join` rejects a token that carries no seed instead of using a built-in one.
-- The LAN discovery app ID constant is now `APP_ID_DEFAULT` (same value,
-  `0x5043`, so beacons stay compatible), and the example application channel
-  constant is `app_channel.EXAMPLE_CHANNEL` (`example-v1`).
-- Relays (`--relay`) ask for 8 MiB socket buffers so bursts from many clients
-  queue instead of being dropped, and the browser gateway's unit file allows
-  65,536 descriptors, 1 GiB and two cores (it held about 120 sessions before).
-  `bench/relay-load/browser.mjs` measures browser sessions: 2,000 through one
-  gateway with no loss (`PERFORMANCE.md`).
-- Answers to pings use their own budget (`--reply-pps`, default 5,000/s) instead
-  of the 500/s discovery budget. At 10,000 mobile clients pinging every 3 s only
-  15% of pings were answered before; now all are.
-- Retained org revocations are re-sent once every five minutes
-  (`org_revoke_readvertise_interval_ms`) instead of as fresh broadcasts every
-  five seconds, and revoking walks the membership once per batch of affected
-  peers instead of once per peer.
+- **Breaking: Zig 0.17.0** is now required to build from source, and Zig 0.16 is no longer supported. Apple packaging uses Zig `0.18.0-dev.253+16d31ceed` for an upstream iOS fix.
+- **Breaking:** `meshguard invite` requires `--seed <host:port>`, and `meshguard join` rejects tokens without a seed. There is no longer a built-in seed address.
+- **Breaking:** `meshguard agent` refuses to start without `--host <pubkey>` or an explicit `--any-host`.
+- **Breaking:** `meshguard up --relay` fails closed when it has no authorized keys or trusted orgs, and requires proof for all forwarding.
+- **Breaking:** service policies fail closed. A malformed or unreadable policy file now stops `meshguard up` instead of running with allow-all.
+- **Breaking:** on Unix, the control commands `SEND`, `RECV`, `MSGS`, `APPSEND` and `APPRECV` now require the daemon owner (same uid, or root). `STATUS`, `PEERS` and `APPINFO` stay open to every local user.
+- `--name` for `trust`, `trust --org` and `org-sign` must be 1–64 characters from `[A-Za-z0-9._-]`. `org-sign --expires` rejects values it cannot parse.
+- `meshguard upgrade`, `install.sh`, `install.ps1` and `dist/agent-join.sh` verify downloads against the release `checksums.txt` before installing anything.
+- Relays ask for 8 MiB socket buffers, and the gateway unit allows 65,536 descriptors. Retained org revocations are re-sent every five minutes instead of every five seconds.
+- Release validation checks `src/version.zig`, its semantic version components and `build.zig.zon`. The Linux ARM64 binary is built with `std.crypto`, so it needs no libsodium.
+- Examples are neutral, with no hard-coded infrastructure defaults. The LAN app ID constant is renamed to `APP_ID_DEFAULT`, with the same value, so beacons stay compatible.
+- CI actions are pinned to commit SHAs, and release permissions are narrowed.
 
 ### Fixed
-- LAN discovery on Windows: the multicast socket stayed blocking because the
-  `FIONBIO` request used the wrong ioctl code and its failure was ignored, so
-  `recvBeacons` could stall an event loop. `SO_BROADCAST` went through
-  `std.posix.setsockopt`, which does not compile for Windows. Socket creation
-  failures are now detected, and Winsock is initialized before the socket is
-  created.
-- Idle daemons in full mode no longer keep a core busy. The io_uring UDP loop
-  slept 100 µs whenever the ring was empty (about 5,000 wakeups a second) and
-  its rings used SQPOLL, whose kernel thread polls for a second after every
-  submission, so any node that sent at least once a second used half to a full
-  core. The loop now waits in the kernel for a datagram, a control connection
-  or the same 50 ms/5 ms timeouts as the poll() path, and rings no longer use
-  SQPOLL: an idle daemon went from 48% of a core to under 1%. The io_uring
-  module's tests now run in `zig build test` (they were never referenced).
-- `meshguard_last_recv_time` no longer reads SWIM state from the host thread,
-  which could race with `meshguard_leave`.
-- Event loops no longer block forever in `recvfrom` once a peer is live: UDP
-  sockets are non-blocking on macOS/BSD (`fcntl`) and Windows (`FIONBIO`) as on
-  Linux, with IPv4/IPv6 empty-drain regression tests. Previously the control
-  socket stopped answering (`status`, `APPRECV`, …) in `--gossip-only` and TUN
-  modes. (Reviewed pilot control fix, patch `c2362fe0`.)
-- Control commands no longer wait out the 200 ms gossip poll: gossip-only and
-  macOS loops wake on the control socket (and TUN) as well as UDP.
-- `0x50` replay state is updated only after a packet authenticates, so forged
-  datagrams cannot evict real nonces; transfer frames are kept out of that ring.
-- Reject empty control-path overrides before startup side effects, and prevent
-  explicit endpoint failures from falling back to the default kernel interface.
-- Validate gossip-port overrides before creating an interface; reclaim drained
-  application-channel slots and reject empty application payloads consistently.
-- Preserve maximum-size JSON-escaped application messages and fragmented Unix
-  responses in `apprecv`; accept valid channel names beginning with a hyphen.
-
-## [0.10.0] — 2026-07-05
-
-### Added
-- Optional crypto backend selection with `-Dcrypto-backend=auto|std|sodium`
-  and the `-Dno-sodium=true` alias. Linux desktop builds still use libsodium
-  as an accelerator by default; other targets use Zig `std.crypto`.
-- No-libsodium Linux CI coverage and a Linux ARM64 release artifact built with
-  `std.crypto`, matching the installer-supported `meshguard-linux-arm64` asset.
-- `meshguard up --gossip-only` / `--no-tun` for discovery and rendezvous nodes
-  that should not create a TUN/WireGuard interface.
-- FFI support for explicit local binds via `meshguard_init_bind` plus opt-in
-  `MESHGUARD_STATS=1` diagnostic counters.
-- io_uring UDP receive path groundwork and macOS gossip-only relay support.
-- Networking adversarial review documentation for the June 2026 hardening pass.
-
-### Changed
-- Release validation now checks `src/version.zig`, semantic version constants,
-  and `build.zig.zon` before publishing tag artifacts.
-- Zig package paths now include the bundled Wintun files needed for Windows
-  builds, along with release/security metadata.
-- Linux ARM64 install no longer installs libsodium unnecessarily because the
-  release artifact is built against the portable `std.crypto` backend.
-
-### Fixed
-- SWIM trust admission now rejects untrusted gossip subjects, quarantines
-  gossip-discovered certificate peers, and keeps candidate probes direct-only.
-- Org certificate admission and org control-plane messages are authenticated
-  before they can admit, vouch, alias, or revoke peers.
-- WireGuard restart healing now re-advertises peer WG keys, detects peer
-  incarnation changes, and avoids spoofed restart teardown while a tunnel is
-  still active.
-- Lamport clocks saturate safely and remote Lamport absorption is bounded.
-- WireGuard anti-replay check/update is atomic, and active tunnel checks honor
-  session expiry.
-- UDP and DNS paths no longer treat raw syscall `-errno` values as lengths.
-- Decoder and FFI receive paths tolerate malformed or truncated packets without
-  out-of-bounds reads.
-- Windows sockets initialize Winsock before bind/poll and use the correct
-  `WSAPoll` flags.
-- macOS and FreeBSD interface configuration no longer reports false
-  `OutOfMemory` failures from command execution.
-- Outdated internal `.jules` prompt/journal files were removed from the
-  published tree.
+- Idle daemons no longer keep a core busy: the io_uring UDP loop went from about 48% of a core to under 1%.
+- Event loops no longer block forever in `recvfrom` on macOS/BSD/Windows once a peer is live, and control commands no longer wait out the 200 ms gossip poll.
+- Hostname seeds given with `--seed` are resolved at startup even when DNS/mDNS discovery is off, so invites that carry a hostname seed can bootstrap `join`.
+- WireGuard tunnels heal after a peer restarts (incarnation-based rejoin and periodic `wg_pubkey` re-advertising, #114). A daemon started at boot no longer ignores peer restarts for its first minute.
+- Windows: Winsock is initialized before bind/poll, `WSAPoll` uses the correct flags, and LAN discovery sockets work (#112).
+- macOS/FreeBSD interface configuration no longer fails with a false `OutOfMemory` (#113).
+- `status` and `down` work through cross-platform control sockets, and configured STUN hostnames are used instead of embedded provider IPs.
+- Mobile FFI initialization no longer overflows the stack on physical iPhones.
+- UDP and DNS paths no longer treat raw syscall `-errno` values as lengths. Decoder and FFI receive paths tolerate truncated packets.
+- WireGuard anti-replay check/update is atomic, and session expiry is honoured.
 
 ### Security
-- Hardened the networking control plane against unauthenticated gossip
-  admission, forged org revocations/vouches/aliases, replay-window races,
-  packet parsing OOBs, and several DoS-prone edge cases found in the
-  adversarial review.
+- Two adversarial hardening passes (June and November 2026) across the control plane, data plane and tooling. Highlights:
+  - Gossip admission is gated by trust, and org certificates are enforced at admission. Org revocations, vouches and aliases are authenticated.
+  - A WireGuard key learned from third-party gossip is installed only when it is that identity's own derived key, so one unsigned gossip entry can no longer impersonate an offline peer. Relays vouch for a key only for trusted organisations.
+  - Handshake responses are authenticated before any Diffie-Hellman work. Sender indices are random, counters past `REJECT_AFTER_MESSAGES` are rejected, and pipelined encryption drops batches whose nonces came from a replaced key set (no nonce reuse).
+  - Restart claims, hole-punch requests and pings from strangers are rate-limited or restricted to recorded endpoints, which blocks tunnel teardown and reflection attacks.
+  - NAT traversal (STUN, UPnP, coordinated punch, SNTP, mDNS) validates its sources and bounds its deadlines.
+  - Service policies walk IPv6 extension headers and never port-match IPv4 non-first fragments.
+  - Local hardening: `identity.key` is created 0600 and the config dir 0700, key inputs are length-checked, and names cannot escape the config directory. On Windows, `wintun.dll` loads only from the executable's directory or System32, and the CLI refuses squatted control pipes.
+  - FFI: entropy comes from the OS only, key material is wiped on destroy, and `meshguard_leave` no longer races the event loop.
+- See `SECURITY.md` and `docs/networking-adversarial-review-2026-06-06.md`.
 
 ## [0.9.0] — 2026-04-28
 
