@@ -92,6 +92,24 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
+      # Pin the compiler instead of relying on whatever Zig the self-hosted
+      # runner has installed. The Zig cache stays on the runner's disk, so the
+      # action's GitHub cache upload is off.
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.17.0
+          use-cache: false
+
+      - name: Check Zig version
+        run: |
+          ZIG_VERSION="$(zig version)"
+          if [ "$ZIG_VERSION" != "0.17.0" ]; then
+            echo "::error::Expected Zig 0.17.0, got $ZIG_VERSION"
+            exit 1
+          fi
+          echo "✓ Zig $ZIG_VERSION"
+
       - name: Build
         run: |
           if [ -n "${{ matrix.target }}" ]; then
